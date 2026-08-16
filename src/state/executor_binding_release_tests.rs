@@ -6,12 +6,15 @@
 //! that need SQL beyond the public repository API run through crate-private
 //! helpers only and are `#[cfg(test)]`-gated.
 //!
-//! T25–T28 (no public binding delete / replacement / lease-renewal /
+//! T25, T26, and T28 (no public binding delete / replacement /
 //! lease-expiry-evaluation API) are compile-time/API-absence invariants
 //! established by inspecting the public surface of this crate, not runtime
 //! tests; per the task rules no runtime tests are fabricated for them. They
 //! are documented in the task handoff's COMPILE_TIME_API_INVARIANTS
-//! section.
+//! section. T27's lease-renewal absence held for the release slice; the
+//! bounded `SqliteStateRepository::renew_executor_binding_lease`
+//! capability was subsequently authorized and added by the A3-008
+//! lease-persistence slice (see `executor_binding_lease_tests`).
 
 use crate::error::StateError;
 use crate::executor_binding::{ExecutorBinding, ReleaseReason, apply_release};
@@ -685,8 +688,12 @@ fn t24_forced_transaction_failure_leaves_release_unchanged() {
 
 // T27 — no public lease-renewal operation is introduced.
 //
-// Compile-time/API-absence invariant; no runtime test is fabricated. See
-// the module documentation and the task handoff.
+// Compile-time/API-absence invariant that held for the release slice; no
+// runtime test is fabricated. The subsequently authorized A3-008
+// lease-persistence slice added exactly one bounded renewal capability,
+// `SqliteStateRepository::renew_executor_binding_lease` (guarded
+// `lease_expires_at`-only renewal of a non-released binding, covered in
+// `executor_binding_lease_tests`); it introduces no other mutation path.
 
 // T28 — no public lease-expiry evaluation operation is introduced.
 //

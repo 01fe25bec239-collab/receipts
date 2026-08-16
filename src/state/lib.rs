@@ -27,6 +27,9 @@ mod migrations;
 mod event_tests;
 
 #[cfg(test)]
+mod executor_binding_lease_tests;
+
+#[cfg(test)]
 mod executor_binding_release_tests;
 
 #[cfg(test)]

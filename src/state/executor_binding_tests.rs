@@ -9,7 +9,10 @@
 //! T35 (no public update/delete/release/renew/expiry API) is a
 //! compile-time/API-absence invariant established by inspecting the public
 //! surface of this crate, not a runtime test; it is documented in the task
-//! handoff.
+//! handoff. Two later authorized slices each added exactly one bounded
+//! mutation capability — A3-005 `release_executor_binding` and A3-008
+//! `renew_executor_binding_lease` (see the T35 note at the bottom of this
+//! module and `executor_binding_lease_tests`).
 
 use crate::error::StateError;
 use crate::executor_binding::{ExecutorBinding, ReleaseReason};
@@ -1016,8 +1019,8 @@ fn t34_failed_creation_is_atomic() {
 // ExecutorBinding API is introduced.
 //
 // This is a compile-time/API-absence invariant, not a runtime behavior, so
-// no runtime test is fabricated for it. It is established by inspecting the
-// public surface of the crate (see the task handoff's
+// no runtime test is fabricated for it. It is established by inspecting
+// the public surface of the crate (see the task handoff's
 // COMPILE_TIME_API_INVARIANTS section): the only public ExecutorBinding
 // capabilities of this slice are `SqliteStateRepository::create_executor_binding`
 // and `SqliteStateRepository::find_executor_binding`, and no method named
@@ -1026,6 +1029,9 @@ fn t34_failed_creation_is_atomic() {
 //
 // The accepted release slice (A3-005) later added exactly one further
 // public capability, `SqliteStateRepository::release_executor_binding`
-// (the one-time terminal released_at/release_reason transition); the
-// update/delete/renew/expire absence invariant above continues to hold
-// beyond that single authorized addition.
+// (the one-time terminal released_at/release_reason transition), and the
+// accepted lease-persistence slice (A3-008) added exactly one further
+// bounded capability, `SqliteStateRepository::renew_executor_binding_lease`
+// (the guarded lease_expires_at-only renewal of a non-released binding);
+// the update/delete/expire absence invariant above continues to hold
+// beyond those two authorized additions.

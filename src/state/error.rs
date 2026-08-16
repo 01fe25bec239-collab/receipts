@@ -139,25 +139,27 @@ pub enum StateError {
         /// The `role_id` that does not exist.
         role_id: String,
     },
-    /// Releasing an ExecutorBinding whose durable identity does not exist.
+    /// Releasing or lease-renewing an ExecutorBinding whose durable identity
+    /// does not exist.
     ///
-    /// Release requires an already persisted binding: it never fabricates,
-    /// creates, or implicitly materializes one, and never silently
-    /// succeeds.
+    /// Both operations require an already persisted binding: they never
+    /// fabricate, create, or implicitly materialize one, and never silently
+    /// succeed.
     ExecutorBindingNotFound {
         /// The `binding_id` that does not exist.
         binding_id: String,
     },
-    /// Releasing an ExecutorBinding whose write-once terminal release slot
-    /// is already occupied.
+    /// Releasing, or renewing the lease of, an ExecutorBinding whose
+    /// write-once terminal release slot is already occupied.
     ///
     /// `released_at` and `release_reason` are terminal fields recorded at
     /// most once: the originally recorded release evidence is never
-    /// overwritten, replaced, or merged, and a repeat release is never
-    /// treated as idempotent success. This also covers any persisted
-    /// partial terminal shape (exactly one of the two fields non-NULL),
-    /// which this repository never produces but must still refuse to
-    /// complete.
+    /// overwritten, replaced, or merged, a repeat release is never treated
+    /// as idempotent success, and a terminally released binding — including
+    /// one released with `LEASE_EXPIRED` — can never be renewed or reopened.
+    /// This also covers any persisted partial terminal shape (exactly one
+    /// of the two fields non-NULL), which this repository never produces
+    /// but must still refuse to complete or renew.
     ExecutorBindingAlreadyReleased {
         /// The `binding_id` that is already released.
         binding_id: String,
@@ -308,13 +310,13 @@ impl fmt::Display for StateError {
             StateError::ExecutorBindingNotFound { binding_id } => {
                 write!(
                     f,
-                    "no ExecutorBinding with binding_id {binding_id:?} exists; release requires an already persisted binding and never fabricates one"
+                    "no ExecutorBinding with binding_id {binding_id:?} exists; release and lease renewal require an already persisted binding and never fabricate one"
                 )
             }
             StateError::ExecutorBindingAlreadyReleased { binding_id } => {
                 write!(
                     f,
-                    "ExecutorBinding with binding_id {binding_id:?} is already released; released_at/release_reason are write-once terminal evidence and are never overwritten"
+                    "ExecutorBinding with binding_id {binding_id:?} is already released; released_at/release_reason are write-once terminal evidence that are never overwritten, and a released binding cannot be renewed"
                 )
             }
             StateError::ExecutorBindingWriteFailed { detail } => {
