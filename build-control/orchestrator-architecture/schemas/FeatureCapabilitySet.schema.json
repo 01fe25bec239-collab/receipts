@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/FeatureCapabilitySet.schema.json",
+  "title": "Feature Capability Set \u2014 the catalog shown to users and used for admission",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-ORCHESTRATION",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "catalog_version",
+    "features"
+  ],
+  "properties": {
+    "catalog_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "features": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "capability_id",
+          "name",
+          "tier_required",
+          "description"
+        ],
+        "properties": {
+          "capability_id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$",
+            "description": "Namespaced capability id, e.g. graph.core or orchestration.multi_runtime. Extensible string, never an enum."
+          },
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1
+          },
+          "tier_required": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Extensible tier id, e.g. free or pro."
+          },
+          "status": {
+            "enum": [
+              "AVAILABLE_FREE",
+              "AVAILABLE_ENTITLED",
+              "LOCKED_REQUIRES_PRO",
+              "UNAVAILABLE_PROVIDER",
+              "UNAVAILABLE_POLICY",
+              "UNAVAILABLE_HOST",
+              "UNAVAILABLE_RUNTIME",
+              "BLOCKED_SAFETY"
+            ]
+          },
+          "upgrade_hint": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

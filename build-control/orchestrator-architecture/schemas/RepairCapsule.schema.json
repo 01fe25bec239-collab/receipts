@@ -1,0 +1,475 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/RepairCapsule.schema.json",
+  "title": "Repair Capsule \u2014 enables a different agent on a different provider to continue",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-ORCHESTRATION",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "type": "object",
+  "required": [
+    "task_id",
+    "original_task_id",
+    "attempt_number",
+    "current_sha",
+    "original_objective",
+    "original_acceptance_criteria",
+    "blocking_findings",
+    "repair_scope",
+    "required_quality_floor",
+    "allowed_write_paths",
+    "branch",
+    "worktree",
+    "context_epoch"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "revision id, e.g. TASK-004-R1"
+    },
+    "original_task_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "parent"
+    },
+    "parent_attempt_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "prior attempt"
+    },
+    "attempt_number": {
+      "type": "integer",
+      "minimum": 2
+    },
+    "current_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "original_objective": {
+      "type": "string",
+      "minLength": 1
+    },
+    "original_acceptance_criteria": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "description",
+          "kind"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "criterion id"
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1
+          },
+          "kind": {
+            "enum": [
+              "DETERMINISTIC",
+              "SEMANTIC"
+            ]
+          },
+          "check_command": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "rationale": {
+            "type": "string"
+          }
+        }
+      },
+      "minItems": 1
+    },
+    "a4_findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "finding_id",
+          "severity",
+          "category",
+          "description",
+          "blocking"
+        ],
+        "properties": {
+          "finding_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "finding id"
+          },
+          "severity": {
+            "enum": [
+              "INFO",
+              "LOW",
+              "MEDIUM",
+              "HIGH",
+              "CRITICAL"
+            ]
+          },
+          "category": {
+            "enum": [
+              "ARCHITECTURE_VIOLATION",
+              "CONTRACT_VIOLATION",
+              "SECURITY_BOUNDARY_VIOLATION",
+              "WRITE_SCOPE_VIOLATION",
+              "UNDISCLOSED_CHANGE",
+              "MISSING_REQUIRED_NEGATIVE_TEST",
+              "UNREPRODUCIBLE_EVIDENCE",
+              "OVERSTATED_LABEL",
+              "TEST_WEAKENED_OR_DELETED",
+              "ACCEPTANCE_CRITERION_UNMET",
+              "CORRECTNESS",
+              "ERROR_HANDLING",
+              "REGRESSION_RISK",
+              "STYLE",
+              "NAMING",
+              "MINOR_PERFORMANCE",
+              "DOC_GAP"
+            ]
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1
+          },
+          "blocking": {
+            "type": "boolean"
+          },
+          "path": {
+            "type": "string"
+          },
+          "line": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "evidence_ref": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "ref_type",
+              "target"
+            ],
+            "properties": {
+              "ref_type": {
+                "enum": [
+                  "REPO_PATH",
+                  "STATE_QUERY",
+                  "ARTIFACT_ID",
+                  "URL"
+                ]
+              },
+              "target": {
+                "type": "string",
+                "minLength": 1
+              },
+              "digest": {
+                "type": "string"
+              },
+              "section": {
+                "type": "string"
+              }
+            }
+          },
+          "confidence": {
+            "enum": [
+              "HIGH",
+              "MEDIUM",
+              "LOW"
+            ]
+          },
+          "source": {
+            "enum": [
+              "LLM_REVIEW",
+              "STATIC_ANALYSIS",
+              "DEPENDENCY_SCAN",
+              "TEST",
+              "CONFIG_CHECK"
+            ]
+          }
+        }
+      }
+    },
+    "blocking_findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "finding_id",
+          "severity",
+          "category",
+          "description",
+          "blocking"
+        ],
+        "properties": {
+          "finding_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "finding id"
+          },
+          "severity": {
+            "enum": [
+              "INFO",
+              "LOW",
+              "MEDIUM",
+              "HIGH",
+              "CRITICAL"
+            ]
+          },
+          "category": {
+            "enum": [
+              "ARCHITECTURE_VIOLATION",
+              "CONTRACT_VIOLATION",
+              "SECURITY_BOUNDARY_VIOLATION",
+              "WRITE_SCOPE_VIOLATION",
+              "UNDISCLOSED_CHANGE",
+              "MISSING_REQUIRED_NEGATIVE_TEST",
+              "UNREPRODUCIBLE_EVIDENCE",
+              "OVERSTATED_LABEL",
+              "TEST_WEAKENED_OR_DELETED",
+              "ACCEPTANCE_CRITERION_UNMET",
+              "CORRECTNESS",
+              "ERROR_HANDLING",
+              "REGRESSION_RISK",
+              "STYLE",
+              "NAMING",
+              "MINOR_PERFORMANCE",
+              "DOC_GAP"
+            ]
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1
+          },
+          "blocking": {
+            "type": "boolean"
+          },
+          "path": {
+            "type": "string"
+          },
+          "line": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "evidence_ref": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "ref_type",
+              "target"
+            ],
+            "properties": {
+              "ref_type": {
+                "enum": [
+                  "REPO_PATH",
+                  "STATE_QUERY",
+                  "ARTIFACT_ID",
+                  "URL"
+                ]
+              },
+              "target": {
+                "type": "string",
+                "minLength": 1
+              },
+              "digest": {
+                "type": "string"
+              },
+              "section": {
+                "type": "string"
+              }
+            }
+          },
+          "confidence": {
+            "enum": [
+              "HIGH",
+              "MEDIUM",
+              "LOW"
+            ]
+          },
+          "source": {
+            "enum": [
+              "LLM_REVIEW",
+              "STATIC_ANALYSIS",
+              "DEPENDENCY_SCAN",
+              "TEST",
+              "CONFIG_CHECK"
+            ]
+          }
+        }
+      },
+      "minItems": 1,
+      "description": "Non-empty by definition; a repair with no blocking finding is not a repair."
+    },
+    "failed_checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "source",
+          "command",
+          "exit_code",
+          "code_sha"
+        ],
+        "properties": {
+          "source": {
+            "enum": [
+              "WORKER_EXECUTION",
+              "BROKER_EXECUTION",
+              "REVIEW_EXECUTION",
+              "GIT_PROVENANCE"
+            ]
+          },
+          "command": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "description": "Explicit argv. Never a shell string."
+          },
+          "exit_code": {
+            "type": "integer"
+          },
+          "code_sha": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$"
+          },
+          "timed_out": {
+            "type": "boolean"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "finished_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "output_ref": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "ref_type",
+              "target"
+            ],
+            "properties": {
+              "ref_type": {
+                "enum": [
+                  "REPO_PATH",
+                  "STATE_QUERY",
+                  "ARTIFACT_ID",
+                  "URL"
+                ]
+              },
+              "target": {
+                "type": "string",
+                "minLength": 1
+              },
+              "digest": {
+                "type": "string"
+              },
+              "section": {
+                "type": "string"
+              }
+            }
+          },
+          "result": {
+            "enum": [
+              "PASS",
+              "FAIL",
+              "ERROR",
+              "SKIPPED",
+              "UNKNOWN"
+            ]
+          }
+        }
+      }
+    },
+    "repair_scope": {
+      "type": "string",
+      "minLength": 1
+    },
+    "prior_attempt_summary": {
+      "type": "string",
+      "description": "Factual, orchestrator-generated. Never a transcript."
+    },
+    "relevant_context_refs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ref_type",
+          "target"
+        ],
+        "properties": {
+          "ref_type": {
+            "enum": [
+              "REPO_PATH",
+              "STATE_QUERY",
+              "ARTIFACT_ID",
+              "URL"
+            ]
+          },
+          "target": {
+            "type": "string",
+            "minLength": 1
+          },
+          "digest": {
+            "type": "string"
+          },
+          "section": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "allowed_write_paths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1
+    },
+    "forbidden_write_paths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "required_quality_floor": {
+      "enum": [
+        "FRONTIER",
+        "BALANCED",
+        "ECONOMY"
+      ]
+    },
+    "branch": {
+      "type": "string",
+      "pattern": "^runtime-a3/"
+    },
+    "worktree": {
+      "type": "string"
+    },
+    "context_epoch": {
+      "type": "integer",
+      "minimum": 0
+    }
+  }
+}

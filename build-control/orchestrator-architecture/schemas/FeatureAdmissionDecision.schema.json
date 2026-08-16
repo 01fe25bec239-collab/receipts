@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/FeatureAdmissionDecision.schema.json",
+  "title": "Feature Admission Decision \u2014 answers ONLY: may OUR product capability execute?",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-ORCHESTRATION",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "type": "object",
+  "additionalProperties": false,
+  "description": "Entitlement axis only. It MUST NOT represent provider auth, provider policy, provider availability, or safety state \u2014 those are separate axes composed by DispatchAdmissionDecision. V1.3.1 narrowing: provider/host/runtime/safety outcomes removed.",
+  "required": [
+    "decision_id",
+    "capability_id",
+    "outcome",
+    "entitlement_state",
+    "activation_state",
+    "decided_at"
+  ],
+  "properties": {
+    "decision_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "decision"
+    },
+    "capability_id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$",
+      "description": "Namespaced capability id, e.g. graph.core or orchestration.multi_runtime. Extensible string, never an enum."
+    },
+    "outcome": {
+      "enum": [
+        "ALLOW",
+        "LOCKED_REQUIRES_PRO",
+        "ENTITLEMENT_UNKNOWN",
+        "ENTITLEMENT_EXPIRED"
+      ],
+      "description": "Entitlement-axis outcomes only. Provider, host, runtime and safety outcomes are structurally excluded."
+    },
+    "entitlement_state": {
+      "enum": [
+        "FREE",
+        "PRO_ACTIVE",
+        "PRO_GRACE",
+        "PRO_EXPIRED",
+        "ENTITLEMENT_UNKNOWN"
+      ]
+    },
+    "tier_id": {
+      "type": "string"
+    },
+    "reason": {
+      "type": "string"
+    },
+    "upgrade_info": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "dispatch_permitted": {
+      "type": "boolean",
+      "description": "False guarantees zero provider dispatch and zero authoritative state mutation for this capability on the entitlement axis alone. Final dispatch requires DispatchAdmissionDecision."
+    },
+    "decided_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "activation_state": {
+      "enum": [
+        "NEVER_ACTIVATED",
+        "ACTIVATED_KNOWN",
+        "LOGGED_OUT"
+      ],
+      "description": "Activation provenance. Distinguishes a fresh Free install from a previously activated install whose entitlement is missing."
+    }
+  }
+}

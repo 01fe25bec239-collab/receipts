@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/NormalizedHostEvent.schema.json",
+  "title": "Normalized Host Event \u2014 the single vocabulary between host adapters and the core",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-HOST-INTEGRATION",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "type": "object",
+  "required": [
+    "event_id",
+    "event_type",
+    "host",
+    "host_session_id",
+    "occurred_at",
+    "confidence"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "ULID"
+    },
+    "event_type": {
+      "enum": [
+        "HOST_SESSION_STARTED",
+        "HOST_SESSION_ENDING",
+        "USER_GOAL_SUBMITTED",
+        "USER_INPUT_PROVIDED",
+        "ROLE_EXECUTOR_STARTED",
+        "ROLE_EXECUTOR_STOPPED",
+        "TASK_STARTED",
+        "TASK_COMPLETED",
+        "TASK_FAILED",
+        "TOOL_EXECUTED",
+        "WORKSPACE_CREATED",
+        "WORKSPACE_CHANGED",
+        "WORKSPACE_REMOVED",
+        "CONTEXT_COMPACTED",
+        "PROVIDER_SIGNAL",
+        "HOST_ERROR"
+      ]
+    },
+    "host": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Open vocabulary so a third host can be added without a schema change."
+    },
+    "host_session_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "host session"
+    },
+    "project_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "project"
+    },
+    "occurred_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "payload": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "raw_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ref_type",
+        "target"
+      ],
+      "properties": {
+        "ref_type": {
+          "enum": [
+            "REPO_PATH",
+            "STATE_QUERY",
+            "ARTIFACT_ID",
+            "URL"
+          ]
+        },
+        "target": {
+          "type": "string",
+          "minLength": 1
+        },
+        "digest": {
+          "type": "string"
+        },
+        "section": {
+          "type": "string"
+        }
+      }
+    },
+    "confidence": {
+      "enum": [
+        "OBSERVED",
+        "INFERRED"
+      ],
+      "description": "INFERRED marks events derived rather than directly observed, e.g. compaction on a supervised host."
+    }
+  }
+}

@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/ModelCapability.schema.json",
+  "title": "Model Capability \u2014 one capability assertion with provenance and confidence",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-MODEL-ROUTING",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "type": "object",
+  "required": [
+    "subject_kind",
+    "capability",
+    "confidence",
+    "observed_at"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "subject_kind": {
+      "enum": [
+        "MODEL",
+        "RUNTIME",
+        "MODEL_RUNTIME_PAIR"
+      ]
+    },
+    "provider_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque provider identifier. MUST NOT be constrained to an enum; new providers must validate without a schema change."
+    },
+    "model_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque model identifier. MUST NOT be constrained to an enum."
+    },
+    "runtime_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque agent-runtime identifier. MUST NOT be constrained to an enum."
+    },
+    "capability": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Open vocabulary, e.g. coding, review, reasoning, structured_output, long_context, security_review."
+    },
+    "value": {
+      "description": "Scalar, boolean, or null. Null means UNKNOWN and MUST NOT be coerced to a default."
+    },
+    "confidence": {
+      "enum": [
+        "OFFICIAL_VERIFIED",
+        "INDEPENDENT_VERIFIED",
+        "LOCAL_EMPIRICAL",
+        "USER_DECLARED",
+        "UNVERIFIED"
+      ]
+    },
+    "source_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ref_type",
+        "target"
+      ],
+      "properties": {
+        "ref_type": {
+          "enum": [
+            "REPO_PATH",
+            "STATE_QUERY",
+            "ARTIFACT_ID",
+            "URL"
+          ]
+        },
+        "target": {
+          "type": "string",
+          "minLength": 1
+        },
+        "digest": {
+          "type": "string"
+        },
+        "section": {
+          "type": "string"
+        }
+      }
+    },
+    "observed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "sample_size": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "lifecycle_state": {
+      "enum": [
+        "DISCOVERED",
+        "UNASSESSED",
+        "CAPABILITY_VERIFIED",
+        "CALIBRATING",
+        "ROUTABLE",
+        "DEPRECATED",
+        "DISABLED",
+        "UNAVAILABLE",
+        "USER_BLOCKED"
+      ]
+    }
+  }
+}

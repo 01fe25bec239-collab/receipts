@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/ContextManifest.schema.json",
+  "title": "Context Manifest \u2014 the authoritative source list for a durable role",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-STATE-CONTEXT",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "type": "object",
+  "required": [
+    "manifest_id",
+    "role_id",
+    "epoch",
+    "sources"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "manifest_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "manifest"
+    },
+    "role_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "role"
+    },
+    "project_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "project"
+    },
+    "epoch": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "sources": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ref",
+          "source_class"
+        ],
+        "properties": {
+          "ref": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "ref_type",
+              "target"
+            ],
+            "properties": {
+              "ref_type": {
+                "enum": [
+                  "REPO_PATH",
+                  "STATE_QUERY",
+                  "ARTIFACT_ID",
+                  "URL"
+                ]
+              },
+              "target": {
+                "type": "string",
+                "minLength": 1
+              },
+              "digest": {
+                "type": "string"
+              },
+              "section": {
+                "type": "string"
+              }
+            }
+          },
+          "source_class": {
+            "enum": [
+              "MANDATORY",
+              "CONSUMED",
+              "REFERENCE"
+            ]
+          },
+          "digest": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_read_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "required_for": {
+            "type": "array",
+            "items": {
+              "enum": [
+                "DECOMPOSITION",
+                "DISPATCH",
+                "ACCEPTANCE",
+                "INTEGRATION",
+                "EVALUATION"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "derived_state": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "last_rehydrated_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

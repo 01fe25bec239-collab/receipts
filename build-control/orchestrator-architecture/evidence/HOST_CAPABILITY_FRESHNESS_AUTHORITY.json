@@ -1,0 +1,8 @@
+{
+  "authority_version": 1,
+  "owner": "BUILD-A2-HOST-INTEGRATION",
+  "validity_inputs": ["host_plugin_integration_capability", "plugin_hook_definition_identity", "explicit_hook_trust_state", "hook_enablement", "admin_policy", "required_lifecycle_event_coverage", "relevant_configuration"],
+  "reprobe_triggers": ["INITIAL_INSTALL", "PLUGIN_INSTALL_OR_REMOVAL", "PLUGIN_UPDATE", "HOOK_DEFINITION_CHANGE", "HOST_VERSION_CHANGE", "TRUST_STATE_CHANGE", "HOOK_ENABLEMENT_OR_CONFIG_CHANGE", "ADMIN_POLICY_CHANGE", "SESSION_START_OR_RESUME", "UNPROVEN_VALIDITY_BEFORE_EMBEDDED"],
+  "selection": {"session_entry": "LIGHTWEIGHT_VALIDITY_CHECK", "valid_fingerprint": "REUSE_REPORT", "changed_or_unknown_fingerprint": "REPROBE_THEN_SELECT", "embedded_requires": ["probe_status=COMPLETE", "stale_reason=NONE", "all_native_prerequisites=true"], "unknown_or_failed": "CONSERVATIVE_SUPERVISED", "override": "EXPLICIT_SOURCE_AND_REASON_REQUIRED"},
+  "stale_report_authorizes_embedded": false
+}

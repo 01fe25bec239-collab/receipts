@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/LogicalRole.schema.json",
+  "title": "Logical Role \u2014 durable identity that is NOT an LLM session",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-STATE-CONTEXT",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "type": "object",
+  "required": [
+    "role_id",
+    "project_id",
+    "role_type",
+    "status",
+    "current_context_epoch"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "role_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "role"
+    },
+    "project_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "project"
+    },
+    "role_type": {
+      "enum": [
+        "RUNTIME_A1",
+        "RUNTIME_A2"
+      ],
+      "description": "Only durable roles have logical identity. A3 and A4 are ephemeral and have none."
+    },
+    "name": {
+      "type": "string"
+    },
+    "workstream_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "workstream"
+    },
+    "ownership_paths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "integration_branch": {
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "ACTIVE",
+        "SUSPENDED",
+        "RETIRED"
+      ]
+    },
+    "context_manifest_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "manifest"
+    },
+    "current_context_epoch": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "active_binding_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

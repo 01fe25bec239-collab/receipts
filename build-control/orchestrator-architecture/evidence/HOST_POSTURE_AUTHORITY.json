@@ -1,0 +1,34 @@
+{
+  "authority_version": 1,
+  "generated_for": "V1.3.4",
+  "description": "Single structured authority for current host posture. CURRENT_HOST_POSTURE_MISMATCHES checks the CURRENT_NORMATIVE documents named in 'scanned_documents' against this file. A host's 'primary' is the posture selected when the native path can safely operate; 'fallbacks' are compatibility postures selected by HostCapabilityReport discovery when it cannot.",
+  "hosts": {
+    "claude-code": {
+      "primary": "EMBEDDED_NATIVE_PLUGIN",
+      "fallbacks": ["SUPERVISED", "HYBRID"],
+      "evidence": ["C-04", "C-05"]
+    },
+    "codex": {
+      "primary": "EMBEDDED_NATIVE_PLUGIN",
+      "fallbacks": ["HYBRID", "SUPERVISED"],
+      "evidence": ["C-01", "C-02"]
+    }
+  },
+  "retired_assumptions": ["C-03"],
+  "scanned_documents": [
+    "CODEX_HOST_ADAPTER.md",
+    "CLAUDE_HOST_ADAPTER.md",
+    "HOST_ARCHITECTURE.md",
+    "HOST_CAPABILITY_DISCOVERY.md",
+    "HOST_PARITY_CONTRACT.md",
+    "NORMALIZED_HOST_EVENTS.md",
+    "MCP_POSITION.md",
+    "SYSTEM_DIAGRAM.md",
+    "SCENARIO_VALIDATION.md",
+    "REPOSITORY_LAYOUT_PROPOSAL.md",
+    "BUILD_A2_MANAGERS/BUILD_A2_HOST_INTEGRATION.md",
+    "BUILD_A2_OWNERSHIP_MATRIX.md",
+    "CODEX_PLUGIN_PACKAGING.md",
+    "CLAUDE_PLUGIN_PACKAGING.md"
+  ]
+}

@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/ActivationState.schema.json",
+  "title": "Activation State \u2014 provenance that distinguishes a fresh Free install from a lost Pro entitlement",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-STATE-CONTEXT",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "description": "Serialized because the distinction must survive a lost or corrupt entitlement cache. Without it, 'no token exists' is ambiguous between NEVER_ACTIVATED and a previously-Pro install whose cache was lost.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "activation_state",
+    "recorded_at"
+  ],
+  "properties": {
+    "activation_state": {
+      "enum": [
+        "NEVER_ACTIVATED",
+        "ACTIVATED_KNOWN",
+        "LOGGED_OUT"
+      ]
+    },
+    "subject_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Opaque product subject. Null when NEVER_ACTIVATED."
+    },
+    "first_activated_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "last_known_tier_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Extensible tier id. Never an enum."
+    },
+    "last_entitlement_seen_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "last_observed_server_time": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time",
+      "description": "Used to detect local clock rollback. A local clock earlier than this degrades to ENTITLEMENT_UNKNOWN."
+    },
+    "logged_out_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "recorded_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "x-resolution-rules": [
+    "NEVER_ACTIVATED + no token + offline  -> FREE",
+    "LOGGED_OUT + no Pro entitlement       -> FREE",
+    "ACTIVATED_KNOWN + missing/corrupt entitlement + service unavailable -> ENTITLEMENT_UNKNOWN",
+    "valid token  -> PRO_ACTIVE or PRO_GRACE",
+    "expired token -> PRO_EXPIRED",
+    "FREE is the locally available baseline capability set and requires no signed licence from our server."
+  ]
+}

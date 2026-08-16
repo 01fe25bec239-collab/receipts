@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/GraphNode.schema.json",
+  "title": "Graph Node \u2014 one unit of planned or executed work",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-ORCHESTRATION",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "node_id",
+    "graph_id",
+    "kind",
+    "state"
+  ],
+  "properties": {
+    "node_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "node"
+    },
+    "graph_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "graph"
+    },
+    "kind": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Extensible node kind. Well-known: GOAL, WORKSTREAM, TASK, ATTEMPT, IMPLEMENTATION, REVIEW, REPAIR, DETERMINISTIC_CHECK, ROUTING, INTEGRATION, HUMAN_GATE, GOAL_EVALUATION. NOT an enum \u2014 new kinds must not require a schema change."
+    },
+    "state": {
+      "enum": [
+        "PLANNED",
+        "READY",
+        "ADMITTED",
+        "DISPATCHED",
+        "RUNNING",
+        "AWAITING_REVIEW",
+        "PASSED",
+        "REJECTED",
+        "REPAIRING",
+        "ACCEPTED",
+        "INTEGRATED",
+        "BLOCKED",
+        "LOCKED_REQUIRES_PRO",
+        "CANCELLED",
+        "HUMAN_REQUIRED"
+      ]
+    },
+    "title": {
+      "type": "string"
+    },
+    "parent_node_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "expansion parent"
+    },
+    "attempt_number": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "required_capabilities": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$",
+        "description": "Namespaced capability id, e.g. graph.core or orchestration.multi_runtime. Extensible string, never an enum."
+      },
+      "description": "Product capabilities this node needs. Empty means FREE-executable."
+    },
+    "task_capsule_ref": {
+      "type": "string"
+    },
+    "workstream_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "workstream"
+    },
+    "code_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "workspace_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "workspace"
+    },
+    "result_ref": {
+      "type": "string"
+    },
+    "locked_reason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Set when state is LOCKED_REQUIRES_PRO. A locked node is visible but never dispatched."
+    },
+    "created_in_version": {
+      "type": "integer",
+      "minimum": 1
+    }
+  }
+}

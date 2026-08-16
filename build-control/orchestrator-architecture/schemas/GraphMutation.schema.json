@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/GraphMutation.schema.json",
+  "title": "Graph Mutation \u2014 an auditable change to the plan",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-ORCHESTRATION",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "type": "object",
+  "additionalProperties": false,
+  "description": "Every load-bearing change produces an identifiable new graph version. The Goal Evaluator may append work; it may never silently mutate the plan.",
+  "required": [
+    "mutation_id",
+    "graph_id",
+    "parent_version",
+    "resulting_version",
+    "actor",
+    "reason",
+    "created_at",
+    "operations"
+  ],
+  "properties": {
+    "mutation_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "mutation"
+    },
+    "graph_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "graph"
+    },
+    "parent_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "resulting_version": {
+      "type": "integer",
+      "minimum": 2
+    },
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role"
+      ],
+      "properties": {
+        "role": {
+          "type": "string",
+          "description": "Logical role, e.g. RUNTIME_A1, RUNTIME_A2, GOAL_EVALUATOR, GRAPH_COMPILER, USER."
+        },
+        "role_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "logical role id"
+        }
+      }
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1
+    },
+    "operations": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "op"
+        ],
+        "properties": {
+          "op": {
+            "enum": [
+              "ADD_NODE",
+              "ADD_EDGE",
+              "SET_NODE_STATE",
+              "ATTACH_RESULT",
+              "CANCEL_NODE",
+              "EXPAND_REPAIR"
+            ]
+          },
+          "node_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "node"
+          },
+          "edge_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "edge"
+          },
+          "detail": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "resulting_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

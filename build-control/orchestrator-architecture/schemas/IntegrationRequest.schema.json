@@ -1,0 +1,320 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/IntegrationRequest.schema.json",
+  "title": "Integration Request \u2014 evidence submitted to a gate, not an assurance that work is done",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-REVIEW-INTEGRATION",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "type": "object",
+  "required": [
+    "request_id",
+    "gate_level",
+    "source_branch",
+    "source_sha",
+    "target_ref",
+    "tasks_included"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "request_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "request"
+    },
+    "gate_level": {
+      "enum": [
+        "A2_ACCEPTANCE",
+        "A1_INTEGRATION"
+      ]
+    },
+    "source_branch": {
+      "type": "string"
+    },
+    "source_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "target_ref": {
+      "type": "string"
+    },
+    "tasks_included": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "task_id",
+          "implementation_sha",
+          "review_sha",
+          "a4_verdict"
+        ],
+        "properties": {
+          "task_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "task"
+          },
+          "implementation_sha": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$"
+          },
+          "review_sha": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$"
+          },
+          "a4_verdict": {
+            "enum": [
+              "PASS",
+              "PASS_WITH_NONBLOCKING_FINDINGS"
+            ]
+          },
+          "findings_disposition": {
+            "type": "string"
+          },
+          "merge_commit": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      }
+    },
+    "assurance_profile": {
+      "enum": [
+        "LIGHT",
+        "STANDARD",
+        "HIGH_ASSURANCE"
+      ]
+    },
+    "post_merge_checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "source",
+          "command",
+          "exit_code",
+          "code_sha"
+        ],
+        "properties": {
+          "source": {
+            "enum": [
+              "WORKER_EXECUTION",
+              "BROKER_EXECUTION",
+              "REVIEW_EXECUTION",
+              "GIT_PROVENANCE"
+            ]
+          },
+          "command": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "description": "Explicit argv. Never a shell string."
+          },
+          "exit_code": {
+            "type": "integer"
+          },
+          "code_sha": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$"
+          },
+          "timed_out": {
+            "type": "boolean"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "finished_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "output_ref": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "ref_type",
+              "target"
+            ],
+            "properties": {
+              "ref_type": {
+                "enum": [
+                  "REPO_PATH",
+                  "STATE_QUERY",
+                  "ARTIFACT_ID",
+                  "URL"
+                ]
+              },
+              "target": {
+                "type": "string",
+                "minLength": 1
+              },
+              "digest": {
+                "type": "string"
+              },
+              "section": {
+                "type": "string"
+              }
+            }
+          },
+          "result": {
+            "enum": [
+              "PASS",
+              "FAIL",
+              "ERROR",
+              "SKIPPED",
+              "UNKNOWN"
+            ]
+          }
+        }
+      }
+    },
+    "open_nonblocking_findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "finding_id",
+          "severity",
+          "category",
+          "description",
+          "blocking"
+        ],
+        "properties": {
+          "finding_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "finding id"
+          },
+          "severity": {
+            "enum": [
+              "INFO",
+              "LOW",
+              "MEDIUM",
+              "HIGH",
+              "CRITICAL"
+            ]
+          },
+          "category": {
+            "enum": [
+              "ARCHITECTURE_VIOLATION",
+              "CONTRACT_VIOLATION",
+              "SECURITY_BOUNDARY_VIOLATION",
+              "WRITE_SCOPE_VIOLATION",
+              "UNDISCLOSED_CHANGE",
+              "MISSING_REQUIRED_NEGATIVE_TEST",
+              "UNREPRODUCIBLE_EVIDENCE",
+              "OVERSTATED_LABEL",
+              "TEST_WEAKENED_OR_DELETED",
+              "ACCEPTANCE_CRITERION_UNMET",
+              "CORRECTNESS",
+              "ERROR_HANDLING",
+              "REGRESSION_RISK",
+              "STYLE",
+              "NAMING",
+              "MINOR_PERFORMANCE",
+              "DOC_GAP"
+            ]
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1
+          },
+          "blocking": {
+            "type": "boolean"
+          },
+          "path": {
+            "type": "string"
+          },
+          "line": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "evidence_ref": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "ref_type",
+              "target"
+            ],
+            "properties": {
+              "ref_type": {
+                "enum": [
+                  "REPO_PATH",
+                  "STATE_QUERY",
+                  "ARTIFACT_ID",
+                  "URL"
+                ]
+              },
+              "target": {
+                "type": "string",
+                "minLength": 1
+              },
+              "digest": {
+                "type": "string"
+              },
+              "section": {
+                "type": "string"
+              }
+            }
+          },
+          "confidence": {
+            "enum": [
+              "HIGH",
+              "MEDIUM",
+              "LOW"
+            ]
+          },
+          "source": {
+            "enum": [
+              "LLM_REVIEW",
+              "STATIC_ANALYSIS",
+              "DEPENDENCY_SCAN",
+              "TEST",
+              "CONFIG_CHECK"
+            ]
+          }
+        }
+      }
+    },
+    "known_limitations": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "attestations": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "all_tasks_accepted": {
+          "type": "boolean"
+        },
+        "review_sha_equals_implementation_sha": {
+          "type": "boolean"
+        },
+        "no_commit_after_review": {
+          "type": "boolean"
+        },
+        "no_unresolved_blocking_finding": {
+          "type": "boolean"
+        },
+        "no_frozen_artifact_modified": {
+          "type": "boolean"
+        },
+        "no_out_of_scope_write": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

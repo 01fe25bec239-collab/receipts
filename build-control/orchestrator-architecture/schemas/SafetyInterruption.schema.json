@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/SafetyInterruption.schema.json",
+  "title": "Safety Interruption \u2014 distinguishes a pending check from a policy refusal; never a false PASS",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-REVIEW-INTEGRATION",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "type": "object",
+  "required": [
+    "interruption_id",
+    "task_id",
+    "attempt_id",
+    "state",
+    "provider_id",
+    "observed_at"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "interruption_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "interruption"
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "task"
+    },
+    "attempt_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "attempt"
+    },
+    "provider_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque provider identifier. MUST NOT be constrained to an enum; new providers must validate without a schema change."
+    },
+    "model_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque model identifier. MUST NOT be constrained to an enum."
+    },
+    "state": {
+      "enum": [
+        "SAFETY_CHECK_PENDING",
+        "POLICY_BLOCKED",
+        "UNKNOWN"
+      ]
+    },
+    "detection_confidence": {
+      "enum": [
+        "EXPLICIT_PROVIDER_SIGNAL",
+        "HEURISTIC",
+        "UNKNOWN"
+      ],
+      "description": "UNKNOWN is the default. Policy state is never inferred from silence."
+    },
+    "task_classified_defensive": {
+      "type": "boolean"
+    },
+    "capsule_narrowed": {
+      "type": "boolean",
+      "description": "A retry on another provider is permitted only if the capsule was narrowed. An unchanged retry is prohibited provider-shopping."
+    },
+    "retry_attempted": {
+      "type": "boolean"
+    },
+    "retry_provider_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque provider identifier. MUST NOT be constrained to an enum; new providers must validate without a schema change."
+    },
+    "deterministic_tooling_used": {
+      "type": "boolean"
+    },
+    "terminal_outcome": {
+      "enum": [
+        "RESUMED",
+        "HUMAN_REQUIRED",
+        "ROUTED_ELSEWHERE_COMPLIANTLY",
+        "ABANDONED",
+        "PENDING"
+      ]
+    },
+    "observed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "preserved_evidence_refs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ref_type",
+          "target"
+        ],
+        "properties": {
+          "ref_type": {
+            "enum": [
+              "REPO_PATH",
+              "STATE_QUERY",
+              "ARTIFACT_ID",
+              "URL"
+            ]
+          },
+          "target": {
+            "type": "string",
+            "minLength": 1
+          },
+          "digest": {
+            "type": "string"
+          },
+          "section": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

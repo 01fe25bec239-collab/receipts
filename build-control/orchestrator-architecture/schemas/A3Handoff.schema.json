@@ -1,0 +1,300 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/A3Handoff.schema.json",
+  "title": "A3 Handoff \u2014 the structured evidence artifact an ephemeral implementer returns",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-REVIEW-INTEGRATION",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "type": "object",
+  "required": [
+    "task_id",
+    "attempt_id",
+    "start_sha",
+    "final_sha",
+    "branch",
+    "files_changed",
+    "checks",
+    "ready_for_a4"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "task"
+    },
+    "attempt_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "attempt"
+    },
+    "implementer": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Opaque provider identifier. MUST NOT be constrained to an enum; new providers must validate without a schema change."
+        },
+        "model_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Opaque model identifier. MUST NOT be constrained to an enum."
+        },
+        "runtime_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Opaque agent-runtime identifier. MUST NOT be constrained to an enum."
+        },
+        "binding_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "binding"
+        }
+      }
+    },
+    "start_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "final_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "branch": {
+      "type": "string"
+    },
+    "files_changed": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "files_created": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "files_deleted": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "contracts_consumed": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "contract_id",
+          "version"
+        ],
+        "properties": {
+          "contract_id": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "implementation_summary": {
+      "type": "string"
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "source",
+          "command",
+          "exit_code",
+          "code_sha"
+        ],
+        "properties": {
+          "source": {
+            "enum": [
+              "WORKER_EXECUTION",
+              "BROKER_EXECUTION",
+              "REVIEW_EXECUTION",
+              "GIT_PROVENANCE"
+            ]
+          },
+          "command": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "description": "Explicit argv. Never a shell string."
+          },
+          "exit_code": {
+            "type": "integer"
+          },
+          "code_sha": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$"
+          },
+          "timed_out": {
+            "type": "boolean"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "finished_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "output_ref": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "ref_type",
+              "target"
+            ],
+            "properties": {
+              "ref_type": {
+                "enum": [
+                  "REPO_PATH",
+                  "STATE_QUERY",
+                  "ARTIFACT_ID",
+                  "URL"
+                ]
+              },
+              "target": {
+                "type": "string",
+                "minLength": 1
+              },
+              "digest": {
+                "type": "string"
+              },
+              "section": {
+                "type": "string"
+              }
+            }
+          },
+          "result": {
+            "enum": [
+              "PASS",
+              "FAIL",
+              "ERROR",
+              "SKIPPED",
+              "UNKNOWN"
+            ]
+          }
+        }
+      }
+    },
+    "not_run": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Specified checks that were NOT executed. Empty only if genuinely true."
+    },
+    "evidence_labels": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "claim",
+          "label"
+        ],
+        "properties": {
+          "claim": {
+            "type": "string"
+          },
+          "label": {
+            "enum": [
+              "IMPLEMENTED",
+              "TESTED",
+              "NOT_TESTED",
+              "BLOCKED",
+              "ASSUMED"
+            ]
+          }
+        }
+      }
+    },
+    "known_limitations": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "assumptions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "security_notes": {
+      "type": "string"
+    },
+    "subtask_requests": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 200,
+        "description": "subtask request id"
+      }
+    },
+    "open_questions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "evidence_refs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ref_type",
+          "target"
+        ],
+        "properties": {
+          "ref_type": {
+            "enum": [
+              "REPO_PATH",
+              "STATE_QUERY",
+              "ARTIFACT_ID",
+              "URL"
+            ]
+          },
+          "target": {
+            "type": "string",
+            "minLength": 1
+          },
+          "digest": {
+            "type": "string"
+          },
+          "section": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "ready_for_a4": {
+      "type": "boolean"
+    },
+    "blocker": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

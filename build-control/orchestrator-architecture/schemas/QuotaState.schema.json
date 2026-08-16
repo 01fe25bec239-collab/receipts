@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/QuotaState.schema.json",
+  "title": "Quota State \u2014 UNKNOWN is a valid and common value; never fabricate a number",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-MODEL-ROUTING",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "type": "object",
+  "required": [
+    "provider_id",
+    "quota_scope",
+    "observed_at"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "provider_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque provider identifier. MUST NOT be constrained to an enum; new providers must validate without a schema change."
+    },
+    "model_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque model identifier. MUST NOT be constrained to an enum."
+    },
+    "quota_scope": {
+      "enum": [
+        "PROVIDER",
+        "MODEL",
+        "SESSION",
+        "UNKNOWN"
+      ],
+      "description": "Defaults to UNKNOWN. MUST NOT assert shared or separate scope without evidence."
+    },
+    "limit": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "remaining": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "resets_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "retry_after_seconds": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "visibility": {
+      "enum": [
+        "HEADERS",
+        "LOCAL_APPROX",
+        "NONE",
+        "UNKNOWN"
+      ]
+    },
+    "observed_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

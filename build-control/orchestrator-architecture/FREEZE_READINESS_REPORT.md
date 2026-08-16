@@ -1,0 +1,204 @@
+<!--
+MultiAgent Orchestrator Architecture — V1.3.7 CANDIDATE
+DOCUMENT_AUTHORITY: CURRENT_NORMATIVE
+Package: MultiAgent_Orchestrator_Architecture_V1_3_7_CANDIDATE
+Issued by: BUILD-A1-BOOTSTRAP | Revision issued: 2026-08-16
+Status: CANDIDATE — requires final independent review. NOT installed, NOT frozen.
+Repository baseline unchanged: 01fe25bec239-collab/receipts @ 3c70f4d8bac1732058de50b383f0485ab4632de9
+NEW_ARCHITECTURE_FREEZE_SHA: NOT ASSIGNED
+FREEZE_READY: PENDING_FINAL_INDEPENDENT_REVIEW
+Evidence authority: evidence/SOURCE_CLAIM_REGISTRY.json
+Counts are DERIVED programmatically. Validators: evidence/validate_sources.py and
+evidence/validate_package.py (both exit non-zero on failure).
+-->
+<!-- FINAL_PACKAGE_GATES: {"ADMISSION_FIXTURE_FAILURES": 0, "AMBIGUOUS_REQUIRED_PATHS": 0, "BUILD_A2_COUNT_MISMATCH": 0, "BUILD_DAG_CYCLES": 0, "CONTRACT_OWNERSHIP_RULE_RUNTIME_FLOW_CONTRADICTIONS": 0, "CONTRACT_OWNER_COLLISIONS": 0, "DISPLAYED_DERIVED_COUNT_MISMATCHES": 0, "EVENT_AUTHORITY_DUPLICATE_EVENTS": 0, "EVENT_AUTHORITY_MISSING_REQUIRED_HOST_SOURCES": 0, "EVENT_AUTHORITY_SCHEMA_INVALID": 0, "EVENT_AUTHORITY_UNKNOWN_SOURCE_CLASSES": 0, "FEATURE_ADMISSION_PROVIDER_OUTCOMES": 0, "FEATURE_ADMISSION_SAFETY_OUTCOMES": 0, "FINAL_REPORT_PACKAGE_GATE_MISMATCHES": 0, "GRAPH_SCHEMA_FAILURES": 0, "HEALTHY_NATIVE_PATH_FALLBACK_WITHOUT_OVERRIDE_ACCEPTED": 0, "HOOKS_CONFIGURED_WITHOUT_SUPPORT_ACCEPTED": 0, "HOOKS_ENABLED_WITHOUT_SUPPORT_ACCEPTED": 0, "HOOK_TRUST_REQUIRED_UNKNOWN_ACCEPTED": 0, "HOST_CAPABILITY_DOC_SCHEMA_FIELD_MISMATCHES": 0, "HOST_CAPABILITY_FRESHNESS_TRIGGER_MISMATCHES": 0, "HOST_CAPABILITY_INACTIVE_REASON_MISMATCHES_ACCEPTED": 0, "HOST_CAPABILITY_INSUFFICIENT_COVERAGE_EMBEDDED_ACCEPTED": 0, "HOST_CAPABILITY_INVALID_STATE_ACCEPTED": 0, "HOST_CAPABILITY_TRUST_MODEL_AMBIGUITY_ACCEPTED": 0, "HOST_CAPABILITY_VALID_STATE_REJECTED": 0, "INSTALLATION_MAP_AMBIGUOUS_PATHS": 0, "INSTALLATION_MAP_PATH_MISMATCHES": 0, "INSTALL_MANIFEST_UNMAPPED_PATHS": 0, "INVALID_GRAPH_EDGE_CLASS_COMBINATIONS_ACCEPTED": 0, "M0_SCHEMA_CLASSIFICATION_MISMATCHES": 0, "MANAGER_DUPLICATE_NORMATIVE_OWNERSHIP_SECTIONS": 0, "MANAGER_OWNED_CONTRACT_SET_MISMATCHES": 0, "MANIFEST_HASH_FAILURES": 0, "MISSING_REQUIRED_VALIDATION_DEPENDENCY_ACCEPTED": 0, "MODE_SELECTION_STATE_MISMATCHES": 0, "NORMALIZED_HOST_EVENT_TABLE_AUTHORITY_MISMATCHES": 0, "OPEN_QUESTION_BLOCKING_SUMMARY_MISMATCHES": 0, "OPEN_QUESTION_STATUS_SOURCE_MISMATCHES": 0, "PARITY_CONFORMANCE_COVERAGE_MISSING": 0, "PARITY_DISPLAYED_COUNT_MISMATCHES": 0, "PATH_OWNER_COLLISIONS": 0, "PLUGIN_INSTALLED_WITHOUT_SUPPORT_ACCEPTED": 0, "PRECEDENCE_DAG_CYCLE_COUNT": 0, "REQUIRED_PATH_OWNER_MISMATCHES": 0, "SCHEMA_INVALID": 0, "SCHEMA_OWNER_MISMATCH": 0, "SELF_OWNED_EXTERNAL_CONSUMPTIONS": 0, "STALE_HOST_CAPABILITY_REPORT_EMBEDDED_ACCEPTED": 0, "TRACEABILITY_CURRENT_ROW_COUNT_MISMATCH": 0, "TRACEABILITY_DUPLICATE_CURRENT_SUMMARIES": 0, "TRACEABILITY_STALE_RESOLVED_QUESTION_REFS": 0, "TRACEABILITY_STATUS_COUNT_MISMATCHES": 0, "UNKNOWN_REASON_WITH_KNOWN_FAILURE_ACCEPTED": 0, "UNOWNED_REQUIRED_PATHS": 0, "UNSATISFIED_SAME_OR_LATER_WAVE_CONTRACT_DEPENDENCIES": 0, "VALIDATION_DEPENDENCY_FAIL_OPEN": 0, "VENDOR_ENUM_VIOLATIONS": 0, "WAVE_ORDER_VIOLATIONS": 0, "ZIP_SAFETY_VIOLATIONS": 0} -->
+FINAL_ZIP_VALIDATE_SOURCES_EXIT = 0
+FINAL_ZIP_REGRESSION_EXIT = 0
+FINAL_ZIP_VALIDATE_PACKAGE_EXIT = 0
+FINAL_REPORT_PACKAGE_GATE_MISMATCHES = 0
+
+# FREEZE_READINESS_REPORT
+
+Every value below was computed **from the final ZIP after it was written and reopened**. Nothing on this page was typed.
+
+```
+ARCHITECTURE_VERSION:                             V1.3.6 CANDIDATE
+CORRECTION_TYPE:                                  HOSTCAPABILITYREPORT TRUST/COVERAGE/REASON PRECEDENCE / EVENT PROVENANCE / INSTALL MAP CLOSURE
+PRODUCT_ARCHITECTURE_REDESIGNED:                  NO
+NEW_BUILD_A2_CREATED:                             NO
+
+CODEX_NATIVE_PLUGIN_PRIMARY:                      YES
+CODEX_SUPERVISOR:                                 FALLBACK
+A14_CURRENT_STATUS:                               RETIRED
+CODEX_HOOK_TRUST_MODEL:                           SPECIFIED (definition/hash scoped)
+PLUGIN_INSTALLED_IMPLIES_HOOKS_ACTIVE:            NO
+ANTHROPIC_THIRD_PARTY_EXTERNAL_WORKER:            VERIFIED_DISALLOWED (not routable)
+OPENAI_CONSUMER_THIRD_PARTY_EXTERNAL_WORKER:      POLICY_NEEDS_REVIEW (not routable)
+OPENAI_USER_API_PROGRAMMATIC:                     VERIFIED_ALLOWED
+
+SOURCE_VALIDATOR:                                 PASS
+SOURCE_VALIDATOR_EXIT_STATUS_TEST:                PASS
+SOURCE_VALIDATOR_REGRESSION_FIXTURES:             12
+SOURCE_VALIDATOR_REGRESSION_PASSED:               12
+SOURCE_VALIDATOR_FALSE_NEGATIVE_FIXTURES:         0
+PACKAGE_VALIDATOR:                                PASS
+REQUIRED_VALIDATION_DEPENDENCIES_AVAILABLE:       YES
+SCHEMA_VALIDATION_EXECUTED:                        YES
+
+CURRENT_CLAIM_WITHOUT_CURRENT_SOURCE:             0
+SOURCE_MATRIX_STATUS_MISMATCHES:                  0
+STALE_A14_CURRENT_ASSERTIONS:                     0
+CONTRADICTORY_VENDOR_STATUS_ASSERTIONS:           0
+STALE_RESEARCH_UNAVAILABLE_ASSERTIONS:            0
+STALE_USER_DECLARED_CODEX_PLUGIN_ASSERTIONS:      0
+UNDECLARED_DOCUMENT_AUTHORITY:                    0
+OVERSTATED_CODEX_HOOK_RETRUST_ASSERTIONS:         0
+CURRENT_SOURCE_MATRIX_REFERENCE_MISMATCHES:       0
+SOURCE_VALIDATOR_HEADER_COMMENT_BYPASS:           0
+POLICY_NEEDS_REVIEW_ROUTABLE_PATHS:               0
+VERIFIED_DISALLOWED_ROUTABLE_PATHS:               0
+POLICY_SCHEMA_REGISTRY_EVIDENCE_LABEL_MISMATCHES: 0
+CURRENT_HOST_POSTURE_MISMATCHES:                  0
+CURRENT_HOST_EVENT_SOURCE_MISMATCHES:             0
+CURRENT_HOST_PRIMARY_MECHANISM_MISMATCHES:        0
+BUILD_A2_COUNT_MISMATCH:                          0
+BUILD_DAG_CYCLES:                                 0
+WAVE_ORDER_VIOLATIONS:                            0
+SCHEMA_INVALID:                                   0
+SCHEMA_OWNER_MISMATCH:                            0
+VENDOR_ENUM_VIOLATIONS:                           0
+GRAPH_SCHEMA_FAILURES:                            0
+PRECEDENCE_DAG_CYCLE_COUNT:                       0
+INVALID_GRAPH_EDGE_CLASS_COMBINATIONS_ACCEPTED:   0
+ADMISSION_FIXTURE_FAILURES:                       0
+FEATURE_ADMISSION_PROVIDER_OUTCOMES:              0
+FEATURE_ADMISSION_SAFETY_OUTCOMES:                0
+CONTRACT_OWNER_COLLISIONS:                        0
+PATH_OWNER_COLLISIONS:                            0
+MANAGER_OWNED_CONTRACT_SET_MISMATCHES:            0
+MANAGER_DUPLICATE_NORMATIVE_OWNERSHIP_SECTIONS:   0
+SELF_OWNED_EXTERNAL_CONSUMPTIONS:                 0
+UNOWNED_REQUIRED_PATHS:                           0
+AMBIGUOUS_REQUIRED_PATHS:                         0
+REQUIRED_PATH_OWNER_MISMATCHES:                   0
+M0_SCHEMA_CLASSIFICATION_MISMATCHES:              0
+UNSATISFIED_SAME_OR_LATER_WAVE_CONTRACT_DEPENDENCIES:0
+HOST_CAPABILITY_INVALID_STATE_ACCEPTED:           0
+HOST_CAPABILITY_VALID_STATE_REJECTED:             0
+PLUGIN_INSTALLED_WITHOUT_SUPPORT_ACCEPTED:        0
+HOOKS_CONFIGURED_WITHOUT_SUPPORT_ACCEPTED:        0
+HOOKS_ENABLED_WITHOUT_SUPPORT_ACCEPTED:           0
+HOOK_TRUST_REQUIRED_UNKNOWN_ACCEPTED:             0
+HOST_CAPABILITY_DOC_SCHEMA_FIELD_MISMATCHES:      0
+HOST_CAPABILITY_TRUST_MODEL_AMBIGUITY_ACCEPTED:   0
+HOST_CAPABILITY_INSUFFICIENT_COVERAGE_EMBEDDED_ACCEPTED:0
+HOST_CAPABILITY_INACTIVE_REASON_MISMATCHES_ACCEPTED:0
+STALE_HOST_CAPABILITY_REPORT_EMBEDDED_ACCEPTED:   0
+UNKNOWN_REASON_WITH_KNOWN_FAILURE_ACCEPTED:       0
+HEALTHY_NATIVE_PATH_FALLBACK_WITHOUT_OVERRIDE_ACCEPTED:0
+MODE_SELECTION_STATE_MISMATCHES:                  0
+HOST_CAPABILITY_FRESHNESS_TRIGGER_MISMATCHES:     0
+EVENT_AUTHORITY_SCHEMA_INVALID:                   0
+EVENT_AUTHORITY_UNKNOWN_SOURCE_CLASSES:           0
+EVENT_AUTHORITY_DUPLICATE_EVENTS:                 0
+EVENT_AUTHORITY_MISSING_REQUIRED_HOST_SOURCES:    0
+NORMALIZED_HOST_EVENT_TABLE_AUTHORITY_MISMATCHES: 0
+PARITY_DISPLAYED_COUNT_MISMATCHES:                0
+PARITY_CONFORMANCE_COVERAGE_MISSING:              0
+INSTALL_MANIFEST_UNMAPPED_PATHS:                  0
+INSTALLATION_MAP_AMBIGUOUS_PATHS:                 0
+INSTALLATION_MAP_PATH_MISMATCHES:                 0
+OPEN_QUESTION_STATUS_SOURCE_MISMATCHES:           0
+OPEN_QUESTION_BLOCKING_SUMMARY_MISMATCHES:        0
+TRACEABILITY_CURRENT_ROW_COUNT_MISMATCH:          0
+TRACEABILITY_STATUS_COUNT_MISMATCHES:             0
+TRACEABILITY_STALE_RESOLVED_QUESTION_REFS:        0
+TRACEABILITY_DUPLICATE_CURRENT_SUMMARIES:         0
+CONTRACT_OWNERSHIP_RULE_RUNTIME_FLOW_CONTRADICTIONS:0
+MANIFEST_HASH_FAILURES:                           0
+ZIP_SAFETY_VIOLATIONS:                            0
+MISSING_REQUIRED_VALIDATION_DEPENDENCY_ACCEPTED:  0
+VALIDATION_DEPENDENCY_FAIL_OPEN:                  0
+FINAL_REPORT_PACKAGE_GATE_MISMATCHES:             0
+DISPLAYED_DERIVED_COUNT_MISMATCHES:               0
+
+BUILD_A2_COUNT:                                   7
+BUILD_DAG_NODES:                                  7
+BUILD_DAG_EDGES:                                  10
+SCHEMA_COUNT:                                     36
+INDIVIDUAL_CONTRACTS:                             51
+GRAPH_FIXTURE_COUNT:                              7
+GRAPH_NEGATIVE_FIXTURE_COUNT:                     4
+ADMISSION_FIXTURE_COUNT:                          7
+SCENARIO_COUNT:                                   46
+SOURCE_CLAIM_COUNT:                               24
+TRACE_ROWS:                                       98
+TRACE_SPECIFIED:                                  90
+TRACE_PARTIAL:                                    8
+OPEN_QUESTION_TOTAL:                              26
+OQ_RESOLVED:                                      8
+CURRENT_NORMATIVE_DOCS:                           110
+HISTORICAL_SNAPSHOT_DOCS:                         5
+
+REQUIRED_PATH_COUNT:                              35
+M0_SCHEMA_COUNT_ACTUAL:                           36
+M0_BEHAVIOURAL_COUNT_ACTUAL:                      7
+M0_SCHEMA_COUNT_MATCHES_ACTUAL:                   YES
+M0_BEHAVIOURAL_CONTRACT_COUNT_MATCHES_ACTUAL:     YES
+HOST_CAPABILITY_FIXTURE_COUNT:                    8
+HOST_CAPABILITY_NEGATIVE_FIXTURE_COUNT:           13
+PARITY_CAPABILITY_COUNT:                          25
+
+ZIP_ENTRY_COUNT:                                  224
+FILE_COUNT:                                       214
+DIRECTORY_COUNT:                                  10
+PACKAGE_MANIFEST_ENTRY_COUNT:                     213
+INSTALL_MANIFEST_ENTRY_COUNT:                     212
+
+FINAL_ZIP_ENTRY_COUNT_MATCH:                      YES
+FINAL_ZIP_FILE_COUNT_MATCH:                       YES
+FINAL_PACKAGE_MANIFEST_COUNT_MATCH:               YES
+FINAL_INSTALL_MANIFEST_COUNT_MATCH:               YES
+PACKAGE_MANIFEST_PASS:                            YES
+INSTALL_MANIFEST_PASS:                            YES
+ZIP_SAFETY_PASS:                                  YES
+TRACEABILITY_CURRENT_ROW_COUNT_MATCH:             YES
+TRACEABILITY_STATUS_COUNTS_MATCH:                 YES
+DISPLAYED_CURRENT_NORMATIVE_DOC_COUNT:            110
+VALIDATOR_CURRENT_NORMATIVE_DOC_COUNT:            110
+
+IMPLEMENTATION:                                   NOT STARTED
+BUILD_A2_INITIALIZATION:                          NOT AUTHORIZED
+BUILD_A3_A4_INITIALIZATION:                       NOT AUTHORIZED
+A1_RUNTIME:                                       NOT CREATED
+BRANCHES_OR_WORKTREES_CREATED:                    NONE
+COMMITTED_OR_PUSHED:                              NO
+NEW_ARCHITECTURE_FREEZE_SHA:                      NOT ASSIGNED
+
+FREEZE_READY:                                     PENDING_FINAL_INDEPENDENT_REVIEW
+```
+
+## What this pass fixed
+
+Seven closure items, none of them architectural. `HostCapabilityReport` gained a host-neutral `hook_trust_required` field so `hooks_trusted = null` can no longer mean both "no trust model" and "explicit trust model, state unreported" — only the latter is now INVALID. A new `required_hook_coverage_satisfied` field separates "sufficient for what this orchestrator needs" from `hook_coverage_class`'s "coverage against the host's entire vendor surface," and gates `EMBEDDED` on the former. Eight precedence-ordered rules now require `inactive_reason` to match its own condition and never mask a higher-precedence one — closing the false-reporting case where `hooks_trusted = false` coexisted with `inactive_reason = HOOKS_DISABLED`. `HOST_PARITY_CONTRACT.md` and `CODEX_HOST_ADAPTER.md`'s last "Shallower; supervisor-mediated" framing of Codex's ordinary in-session path is corrected, and `NORMALIZED_HOST_EVENTS.md`'s event table is now validated row-by-row against a new canonical `evidence/HOST_EVENT_SOURCE_AUTHORITY.json` rather than trusted as free prose. `REPOSITORY_INSTALLATION_MAP.md` gained the seven rows it was missing for `evidence/**` and `fixtures/**`, checked against the manifest actually shipped. `V1_3_4_TO_V1_3_6_IMPACT_MATRIX.md` records each with its verifying gate.
+
+## What did not change
+
+ExecutionGraph · one graph core · Free/Pro as policies · FeatureAdmission/DispatchAdmission split · ActivationState · GraphEdge exclusivity · SQLite · seven BUILD-A2 topology · durable A1/A2 · fresh A3/A4 · Model Intelligence · independent A4 and repair · exact-SHA provenance · cross-host state · open core · no managed inference · provider policy classifications.
+
+## What remains honestly open
+
+`C-12` — consumer-subscription third-party external-worker policy — stays `POLICY_NEEDS_REVIEW` and **not routable by default** (`Q-V13-04`). `C-13-ANTHROPIC` stays `UNVERIFIED` (`Q-V13-09-ANTHROPIC`). Neither was promoted, and no other resolution in this pass was allowed to drag them along.
+
+## Package identity
+
+```
+PACKAGE: MultiAgent_Orchestrator_Architecture_V1_3_6_CANDIDATE.zip
+SHA256:  computed at build time — printed by evidence/build_package.py
+```
+
+The archive digest is deliberately **not** printed inside the archive: a file cannot contain its own hash. `evidence/build_package.py` prints it as the last line of the run that produced the file, and `PACKAGE_MANIFEST.sha256` covers every file the archive contains.
+
+## Next step
+
+Final independent review. If accepted: install per `REPOSITORY_INSTALLATION_MAP.md` → commit → push → the resulting `main` SHA becomes `NEW_ARCHITECTURE_FREEZE_SHA`. **Not done in this pass.**

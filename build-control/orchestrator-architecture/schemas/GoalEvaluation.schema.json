@@ -1,0 +1,226 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/GoalEvaluation.schema.json",
+  "title": "Goal Evaluation \u2014 deterministic first, frontier semantic second; never a cheap-model opinion",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-ORCHESTRATION",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "type": "object",
+  "required": [
+    "evaluation_id",
+    "goal_id",
+    "state",
+    "deterministic_layer",
+    "evaluated_at"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "evaluation_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "evaluation"
+    },
+    "goal_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "goal"
+    },
+    "project_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "project"
+    },
+    "state": {
+      "enum": [
+        "COMPLETE",
+        "INCOMPLETE",
+        "BLOCKED",
+        "HUMAN_REQUIRED"
+      ]
+    },
+    "deterministic_layer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "passed"
+      ],
+      "properties": {
+        "passed": {
+          "type": "boolean"
+        },
+        "conditions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "condition",
+              "result"
+            ],
+            "properties": {
+              "condition": {
+                "type": "string"
+              },
+              "result": {
+                "enum": [
+                  "PASS",
+                  "FAIL",
+                  "NOT_APPLICABLE"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "semantic_layer": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "performed": {
+          "type": "boolean"
+        },
+        "routing_decision_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "routing decision"
+        },
+        "criteria_assessed": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "criterion_id",
+              "satisfied"
+            ],
+            "properties": {
+              "criterion_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "description": "criterion"
+              },
+              "satisfied": {
+                "type": "boolean"
+              },
+              "evidence_ref": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "ref_type",
+                  "target"
+                ],
+                "properties": {
+                  "ref_type": {
+                    "enum": [
+                      "REPO_PATH",
+                      "STATE_QUERY",
+                      "ARTIFACT_ID",
+                      "URL"
+                    ]
+                  },
+                  "target": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "digest": {
+                    "type": "string"
+                  },
+                  "section": {
+                    "type": "string"
+                  }
+                }
+              },
+              "note": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "gaps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "criterion_id",
+          "description"
+        ],
+        "properties": {
+          "criterion_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "criterion"
+          },
+          "description": {
+            "type": "string"
+          },
+          "evidence_ref": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "ref_type",
+              "target"
+            ],
+            "properties": {
+              "ref_type": {
+                "enum": [
+                  "REPO_PATH",
+                  "STATE_QUERY",
+                  "ARTIFACT_ID",
+                  "URL"
+                ]
+              },
+              "target": {
+                "type": "string",
+                "minLength": 1
+              },
+              "digest": {
+                "type": "string"
+              },
+              "section": {
+                "type": "string"
+              }
+            }
+          },
+          "proposed_task": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "convergence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repeated_gap_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "escalated": {
+          "type": "boolean"
+        }
+      }
+    },
+    "integrated_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "context_epoch": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "evaluated_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

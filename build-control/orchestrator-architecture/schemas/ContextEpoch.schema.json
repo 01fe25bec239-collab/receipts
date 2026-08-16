@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/ContextEpoch.schema.json",
+  "title": "Context Epoch \u2014 invalidation marker forcing genuine rehydration",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-STATE-CONTEXT",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "type": "object",
+  "required": [
+    "epoch",
+    "project_id",
+    "advanced_at",
+    "trigger"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "epoch": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "project_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "project"
+    },
+    "advanced_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "trigger": {
+      "enum": [
+        "A1_INIT",
+        "A2_INIT",
+        "MODEL_REPLACEMENT",
+        "PROVIDER_REPLACEMENT",
+        "HOST_SWITCH",
+        "CONTEXT_COMPACTION",
+        "ARCHITECTURE_CHANGE",
+        "CONTRACT_CHANGE",
+        "NEW_WAVE",
+        "TASK_THRESHOLD",
+        "SERIOUS_A4_REJECTION",
+        "SECURITY_ESCALATION",
+        "BEFORE_A2_INTEGRATION",
+        "BEFORE_A1_INTEGRATION",
+        "BEFORE_GOAL_COMPLETE"
+      ]
+    },
+    "changed_sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ref_type",
+          "target"
+        ],
+        "properties": {
+          "ref_type": {
+            "enum": [
+              "REPO_PATH",
+              "STATE_QUERY",
+              "ARTIFACT_ID",
+              "URL"
+            ]
+          },
+          "target": {
+            "type": "string",
+            "minLength": 1
+          },
+          "digest": {
+            "type": "string"
+          },
+          "section": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "invalidated_role_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 200,
+        "description": "role"
+      }
+    }
+  }
+}

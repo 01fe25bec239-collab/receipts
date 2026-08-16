@@ -1,0 +1,23 @@
+{
+  "authority_version": 2,
+  "generated_for": "V1.3.6",
+  "source_classes": ["HOST_HOOK", "WORKER_DISPATCH", "ELICITATION", "CORE_DRIVEN"],
+  "events": [
+    {"event":"HOST_SESSION_STARTED","sources":{"claude-code":{"source_class":"HOST_HOOK","source":"SessionStart hook"},"codex-worker":{"source_class":"HOST_HOOK","source":"SessionStart hook (fallback when SUPERVISED: supervisor start)"}}},
+    {"event":"HOST_SESSION_ENDING","sources":{"claude-code":{"source_class":"HOST_HOOK","source":"SessionEnd hook"},"codex-worker":{"source_class":"HOST_HOOK","source":"SessionEnd hook (fallback when SUPERVISED: process exit)"}}},
+    {"event":"USER_GOAL_SUBMITTED","sources":{"claude-code":{"source_class":"ELICITATION","source":"command/skill"},"codex-worker":{"source_class":"ELICITATION","source":"command wrapper"}}},
+    {"event":"USER_INPUT_PROVIDED","sources":{"claude-code":{"source_class":"ELICITATION","source":"elicitation"},"codex-worker":{"source_class":"ELICITATION","source":"supervisor prompt (this is a direct user turn, not a host-hook path, in either posture)"}}},
+    {"event":"ROLE_EXECUTOR_STARTED","sources":{"claude-code":{"source_class":"CORE_DRIVEN","source":"core-driven"},"codex-worker":{"source_class":"CORE_DRIVEN","source":"core-driven"}}},
+    {"event":"ROLE_EXECUTOR_STOPPED","sources":{"claude-code":{"source_class":"CORE_DRIVEN","source":"core-driven"},"codex-worker":{"source_class":"CORE_DRIVEN","source":"core-driven"}}},
+    {"event":"TASK_STARTED","sources":{"claude-code":{"source_class":"WORKER_DISPATCH","source":"adapter dispatch"},"codex-worker":{"source_class":"WORKER_DISPATCH","source":"adapter dispatch"}}},
+    {"event":"TASK_COMPLETED","sources":{"claude-code":{"source_class":"WORKER_DISPATCH","source":"handoff"},"codex-worker":{"source_class":"WORKER_DISPATCH","source":"codex exec exit + JSONL"}}},
+    {"event":"TASK_FAILED","sources":{"claude-code":{"source_class":"WORKER_DISPATCH","source":"error/exit"},"codex-worker":{"source_class":"WORKER_DISPATCH","source":"non-zero exit"}}},
+    {"event":"TOOL_EXECUTED","sources":{"claude-code":{"source_class":"HOST_HOOK","source":"PostToolUse hook"},"codex-worker":{"source_class":"WORKER_DISPATCH","source":"JSONL event from the dispatched worker's codex exec run — a worker-lifecycle signal, not a host-hook substitute"}}},
+    {"event":"WORKSPACE_CREATED","sources":{"claude-code":{"source_class":"CORE_DRIVEN","source":"WorktreeCreate"},"codex-worker":{"source_class":"CORE_DRIVEN","source":"core-driven"}}},
+    {"event":"WORKSPACE_CHANGED","sources":{"claude-code":{"source_class":"WORKER_DISPATCH","source":"FileChanged"},"codex-worker":{"source_class":"WORKER_DISPATCH","source":"polling/diff over the dispatched worker's workspace"}}},
+    {"event":"WORKSPACE_REMOVED","sources":{"claude-code":{"source_class":"CORE_DRIVEN","source":"WorktreeRemove"},"codex-worker":{"source_class":"CORE_DRIVEN","source":"core-driven"}}},
+    {"event":"CONTEXT_COMPACTED","sources":{"claude-code":{"source_class":"HOST_HOOK","source":"PreCompact/PostCompact hooks"},"codex-worker":{"source_class":"HOST_HOOK","source":"PreCompact/PostCompact hooks (fallback when SUPERVISED: inferred)"}}},
+    {"event":"PROVIDER_SIGNAL","sources":{"claude-code":{"source_class":"WORKER_DISPATCH","source":"error surface"},"codex-worker":{"source_class":"WORKER_DISPATCH","source":"JSONL/stderr classification"}}},
+    {"event":"HOST_ERROR","sources":{"claude-code":{"source_class":"HOST_HOOK","source":"any"},"codex-worker":{"source_class":"HOST_HOOK","source":"any"}}}
+  ]
+}

@@ -1,0 +1,277 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/ReviewRequest.schema.json",
+  "title": "Review Request \u2014 ORCHESTRATION asks REVIEW-INTEGRATION to audit one completed attempt",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-REVIEW-INTEGRATION",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "description": "The dependency-inversion boundary between ORCHESTRATION and REVIEW-INTEGRATION. ORCHESTRATION emits this; REVIEW-INTEGRATION owns the schema, constructs the ReviewCapsule from it, dispatches a fresh ephemeral RUNTIME-A4, and returns an A4Review. Neither module imports the other. This is deliberately NOT the ReviewCapsule: the capsule is the reviewer-facing artifact and is assembled by its owner, so ORCHESTRATION never needs to know how a review is constructed.",
+  "type": "object",
+  "required": [
+    "request_id",
+    "task_id",
+    "attempt_id",
+    "implementation_sha",
+    "baseline_sha",
+    "objective",
+    "acceptance_criteria",
+    "allowed_write_paths",
+    "assurance_profile",
+    "review_scope",
+    "context_epoch"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "request_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "review request id"
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "task the attempt belongs to"
+    },
+    "attempt_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "the completed A3 attempt"
+    },
+    "workstream_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "owning workstream"
+    },
+    "baseline_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "implementation_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "The exact commit to audit. A review of this SHA never validates another."
+    },
+    "branch": {
+      "type": "string"
+    },
+    "objective": {
+      "type": "string",
+      "minLength": 1
+    },
+    "acceptance_criteria": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "description",
+          "kind"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "criterion id"
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1
+          },
+          "kind": {
+            "enum": [
+              "DETERMINISTIC",
+              "SEMANTIC"
+            ]
+          },
+          "check_command": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "rationale": {
+            "type": "string"
+          }
+        }
+      },
+      "minItems": 1
+    },
+    "non_goals": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "allowed_write_paths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "description": "Carried through so the reviewer can detect write-scope violations."
+    },
+    "architecture_refs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ref_type",
+          "target"
+        ],
+        "properties": {
+          "ref_type": {
+            "enum": [
+              "REPO_PATH",
+              "STATE_QUERY",
+              "ARTIFACT_ID",
+              "URL"
+            ]
+          },
+          "target": {
+            "type": "string",
+            "minLength": 1
+          },
+          "digest": {
+            "type": "string"
+          },
+          "section": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "contract_refs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ref_type",
+          "target"
+        ],
+        "properties": {
+          "ref_type": {
+            "enum": [
+              "REPO_PATH",
+              "STATE_QUERY",
+              "ARTIFACT_ID",
+              "URL"
+            ]
+          },
+          "target": {
+            "type": "string",
+            "minLength": 1
+          },
+          "digest": {
+            "type": "string"
+          },
+          "section": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "a3_handoff_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ref_type",
+        "target"
+      ],
+      "properties": {
+        "ref_type": {
+          "enum": [
+            "REPO_PATH",
+            "STATE_QUERY",
+            "ARTIFACT_ID",
+            "URL"
+          ]
+        },
+        "target": {
+          "type": "string",
+          "minLength": 1
+        },
+        "digest": {
+          "type": "string"
+        },
+        "section": {
+          "type": "string"
+        }
+      }
+    },
+    "assurance_profile": {
+      "enum": [
+        "LIGHT",
+        "STANDARD",
+        "HIGH_ASSURANCE"
+      ]
+    },
+    "review_scope": {
+      "enum": [
+        "FULL",
+        "SECURITY",
+        "REGRESSION",
+        "REPAIR_VERIFICATION"
+      ]
+    },
+    "review_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "required": {
+          "type": "boolean"
+        },
+        "distinct_provider": {
+          "enum": [
+            "OFF",
+            "PREFERRED",
+            "REQUIRED"
+          ]
+        },
+        "reviewer_floor": {
+          "enum": [
+            "FRONTIER",
+            "BALANCED",
+            "ECONOMY"
+          ]
+        },
+        "excluded_session_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Sessions that may NOT review, e.g. the implementing session. Enforces independence structurally."
+        }
+      }
+    },
+    "prior_review_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 200,
+        "description": "prior review"
+      },
+      "description": "Populated for REPAIR_VERIFICATION so the reviewer confirms specific blocking findings are closed."
+    },
+    "attempt_number": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "requested_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "context_epoch": {
+      "type": "integer",
+      "minimum": 0
+    }
+  }
+}
