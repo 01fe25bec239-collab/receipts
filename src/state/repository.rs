@@ -95,6 +95,13 @@ impl SqliteStateRepository {
         self.read_schema_version()
     }
 
+    /// Crate-private read access to the underlying connection for
+    /// repository-internal domain reads (e.g. LogicalRole lookups). The
+    /// connection never crosses the crate boundary.
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
     /// Runs `work` inside one SQLite transaction.
     ///
     /// This is the State-layer primitive for the future invariant
@@ -355,6 +362,12 @@ pub struct UnitOfWork<'a> {
 }
 
 impl UnitOfWork<'_> {
+    /// Crate-private access to the open transaction for repository-internal
+    /// domain writes (e.g. LogicalRole insertion).
+    pub(crate) fn tx(&self) -> &Transaction<'_> {
+        &self.tx
+    }
+
     /// Executes one statement with bound parameters. Crate-private;
     /// repository-internal and test-support only.
     #[cfg(test)]

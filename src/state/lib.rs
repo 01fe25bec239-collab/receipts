@@ -16,12 +16,17 @@
 //! or model-facing mutation path.
 
 pub mod error;
+pub mod logical_role;
 pub mod repository;
 
 mod migrations;
 
 #[cfg(test)]
+mod logical_role_tests;
+
+#[cfg(test)]
 mod tests;
 
 pub use error::StateError;
+pub use logical_role::{LogicalRole, LogicalRoleStatus, LogicalRoleType};
 pub use repository::SqliteStateRepository;

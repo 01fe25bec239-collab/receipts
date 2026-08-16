@@ -88,6 +88,33 @@ pub enum StateError {
         /// Underlying driver detail.
         detail: String,
     },
+    /// A LogicalRole failed contract-level validation before persistence.
+    LogicalRoleValidation {
+        /// Which frozen constraint was violated.
+        detail: String,
+    },
+    /// Creating a LogicalRole whose durable identity already exists.
+    ///
+    /// Durable role identities are never overwritten, replaced, upserted,
+    /// or merged; the original row remains untouched.
+    LogicalRoleAlreadyExists {
+        /// The `role_id` that already exists.
+        role_id: String,
+    },
+    /// Writing a LogicalRole failed at the storage layer.
+    LogicalRoleWriteFailed {
+        /// Underlying driver detail.
+        detail: String,
+    },
+    /// A persisted LogicalRole row could not be decoded against the frozen
+    /// contract.
+    ///
+    /// Decoding fails closed: partially decoded or contract-violating rows
+    /// are never surfaced as valid roles.
+    LogicalRoleDecodeFailed {
+        /// What could not be decoded.
+        detail: String,
+    },
 }
 
 impl fmt::Display for StateError {
@@ -149,6 +176,21 @@ impl fmt::Display for StateError {
             }
             StateError::InternalQueryFailed { detail } => {
                 write!(f, "internal repository query failed: {detail}")
+            }
+            StateError::LogicalRoleValidation { detail } => {
+                write!(f, "invalid LogicalRole: {detail}")
+            }
+            StateError::LogicalRoleAlreadyExists { role_id } => {
+                write!(
+                    f,
+                    "a LogicalRole with role_id {role_id:?} already exists; durable role identities are never overwritten, replaced, or merged"
+                )
+            }
+            StateError::LogicalRoleWriteFailed { detail } => {
+                write!(f, "failed to write LogicalRole: {detail}")
+            }
+            StateError::LogicalRoleDecodeFailed { detail } => {
+                write!(f, "failed to decode persisted LogicalRole: {detail}")
             }
         }
     }

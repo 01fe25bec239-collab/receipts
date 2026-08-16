@@ -6,6 +6,7 @@
 //! repository implementation detail and is not a cross-manager contract.
 
 mod v0001_schema_foundation;
+mod v0002_logical_role;
 
 use crate::error::StateError;
 
@@ -22,7 +23,10 @@ pub(crate) struct Migration {
 }
 
 /// The registered migration chain, in deterministic application order.
-static REGISTERED: &[Migration] = &[v0001_schema_foundation::MIGRATION];
+static REGISTERED: &[Migration] = &[
+    v0001_schema_foundation::MIGRATION,
+    v0002_logical_role::MIGRATION,
+];
 
 /// The registered migration chain in application order.
 pub(crate) fn registered() -> &'static [Migration] {
