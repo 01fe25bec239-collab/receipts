@@ -33,6 +33,9 @@ mod executor_binding_lease_tests;
 mod executor_binding_release_tests;
 
 #[cfg(test)]
+mod executor_binding_single_active_tests;
+
+#[cfg(test)]
 mod executor_binding_tests;
 
 #[cfg(test)]

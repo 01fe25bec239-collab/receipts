@@ -169,6 +169,29 @@ pub enum StateError {
         /// Underlying driver detail.
         detail: String,
     },
+    /// Creating an ExecutorBinding for a role that already has one
+    /// not-fully-released binding.
+    ///
+    /// At most one binding per LogicalRole may exist that is not conclusively
+    /// fully released — that is, whose durable terminal pair
+    /// `released_at`/`release_reason` is not both recorded. A valid unreleased
+    /// binding, a renewed-but-unreleased binding, a binding whose
+    /// `lease_expires_at` merely looks old, and either corrupt partial
+    /// terminal shape all block creation of another binding for the same
+    /// role until an authorized explicit release records the complete
+    /// terminal pair. This error names no wall-clock verdict: it never claims
+    /// the blocking lease is currently valid, and State never evaluates
+    /// `lease_expires_at` against any clock. The blocking row is durable
+    /// evidence and is never deleted, released, repaired, or replaced by
+    /// conflict handling; it is distinct from
+    /// [`StateError::ExecutorBindingAlreadyExists`], which keeps reporting
+    /// duplicate durable `binding_id` alone.
+    ExecutorBindingUnreleasedConflict {
+        /// The `role_id` that already has a not-fully-released binding.
+        role_id: String,
+        /// The `binding_id` of the existing blocking binding.
+        blocking_binding_id: String,
+    },
     /// A persisted ExecutorBinding row could not be decoded against the
     /// frozen contract.
     ///
@@ -321,6 +344,15 @@ impl fmt::Display for StateError {
             }
             StateError::ExecutorBindingWriteFailed { detail } => {
                 write!(f, "failed to write ExecutorBinding: {detail}")
+            }
+            StateError::ExecutorBindingUnreleasedConflict {
+                role_id,
+                blocking_binding_id,
+            } => {
+                write!(
+                    f,
+                    "ExecutorBinding with binding_id {blocking_binding_id:?} for role_id {role_id:?} is not fully released; a role may have at most one not-fully-released binding, so the existing binding must be explicitly released before another binding for this role may be created (no wall-clock lease verdict is implied)"
+                )
             }
             StateError::ExecutorBindingDecodeFailed { detail } => {
                 write!(f, "failed to decode persisted ExecutorBinding: {detail}")

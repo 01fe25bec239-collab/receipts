@@ -8,19 +8,26 @@
 //! replacement must never replace role identity, so a binding row always
 //! references — and never mutates — an existing persisted role.
 //!
-//! Scope: immutable create, durable read by `binding_id`, the guarded
-//! renewal of `lease_expires_at` on an existing non-released binding, and
-//! the one-time terminal release of an existing binding. Binding history is
-//! append-only durable evidence: the only authorized mutations of a
-//! persisted binding are the bounded lease renewal of `lease_expires_at`
-//! while the binding is non-released (see
+//! Scope: immutable create guarded by the single-active-binding persistence
+//! invariant, durable read by `binding_id`, the guarded renewal of
+//! `lease_expires_at` on an existing non-released binding, and the one-time
+//! terminal release of an existing binding. Binding history is append-only
+//! durable evidence: the only authorized mutations of a persisted binding
+//! are the bounded lease renewal of `lease_expires_at` while the binding is
+//! non-released (see
 //! [`SqliteStateRepository::renew_executor_binding_lease`]) and the single
 //! write-once terminal transition of `released_at`/`release_reason` from
 //! NULL to recorded (see
 //! [`SqliteStateRepository::release_executor_binding`]); every other
 //! binding field is immutable, and there is deliberately no public update,
-//! delete, or expiry-evaluation path, and no single-active-binding or
-//! failover semantics. `provider_id`, `model_id`, and `runtime_id` are
+//! delete, or expiry-evaluation path, and no failover orchestration
+//! semantics. Creation is refused while the target role already has a
+//! binding that is not conclusively fully released — enforced once as a
+//! transactional create-time pre-check (see
+//! [`SqliteStateRepository::create_executor_binding`]) and once durably by
+//! the migration-0005 partial unique index over `executor_binding(role_id)`
+//! — so at most one not-fully-released binding per role can ever persist.
+//! `provider_id`, `model_id`, and `runtime_id` are
 //! opaque non-empty strings: State persists them but never decides
 //! provider, model, runtime, or routing eligibility.
 //!
@@ -164,23 +171,47 @@ impl SqliteStateRepository {
     /// that already exists fails explicitly with
     /// [`StateError::ExecutorBindingAlreadyExists`]; a `role_id` that does
     /// not reference an existing persisted LogicalRole fails explicitly with
-    /// [`StateError::ExecutorBindingRoleNotFound`]. This repository never
-    /// overwrites, replaces, upserts, merges, or deletes-and-reinserts
-    /// binding history, and creating a binding never mutates the referenced
-    /// LogicalRole (its `active_binding_id`, status, epoch, and identity all
-    /// remain untouched).
+    /// [`StateError::ExecutorBindingRoleNotFound`]. A `role_id` that already
+    /// has one not-fully-released binding fails explicitly with
+    /// [`StateError::ExecutorBindingUnreleasedConflict`]: duplicate durable
+    /// `binding_id` and same-role unreleased-binding conflict remain two
+    /// independently observable failure conditions, and duplicate-ID
+    /// semantics keep precedence.
+    ///
+    /// The single-active-binding persistence guard reasons only from the
+    /// durable terminal pair `released_at`/`release_reason`, inside the
+    /// same transaction as the INSERT: a role is rebindable only once its
+    /// existing binding is conclusively fully released (both terminal
+    /// fields recorded by an authorized explicit release). A valid
+    /// unreleased binding, a renewed-but-unreleased binding, a binding
+    /// whose `lease_expires_at` merely looks old, and either corrupt
+    /// partial terminal shape all block creation — `lease_expires_at` is
+    /// never evaluated against any clock, and this operation never claims
+    /// or decides current lease validity, executor authority, or failover.
+    /// The blocking row is never mutated, released, repaired, deleted, or
+    /// replaced by the refusal. Behind the pre-check, the migration-0005
+    /// partial unique index over `executor_binding(role_id)` is the durable
+    /// storage backstop, so even a write that bypassed the typed check can
+    /// never durably produce a second not-fully-released binding for one
+    /// role; a constraint hit there also fails closed and is never reported
+    /// as successful creation.
+    ///
+    /// This repository never overwrites, replaces, upserts, merges, or
+    /// deletes-and-reinserts binding history, and creating a binding never
+    /// mutates the referenced LogicalRole (its `active_binding_id`,
+    /// status, epoch, and identity all remain untouched).
     ///
     /// Contract-level validation runs before any storage access, and the
-    /// primary-key and foreign-key constraints re-enforce the same rules as
-    /// durable backstops.
+    /// primary-key, foreign-key, and partial-unique-index constraints
+    /// re-enforce the same rules as durable backstops.
     ///
     /// This is the create half of the binding lifecycle offered here: the
     /// only later transitions this repository offers for a persisted
     /// binding are the bounded lease renewal while it is non-released and
-    /// the one-time terminal release. No expiry evaluation,
-    /// single-active-binding enforcement, or failover behavior is offered,
-    /// and persisting a binding does not make that executor active,
-    /// authoritative, rehydrated, or permitted to mutate State.
+    /// the one-time terminal release. No expiry evaluation or failover
+    /// behavior is offered, and persisting a binding does not make that
+    /// executor active, authoritative, rehydrated, or permitted to mutate
+    /// State.
     pub fn create_executor_binding(&mut self, binding: ExecutorBinding) -> Result<(), StateError> {
         validate_for_create(&binding)?;
         self.run_transaction(|uow| uow.insert_executor_binding(&binding))
@@ -314,6 +345,18 @@ const BINDING_EXISTS_SQL: &str = "SELECT 1 FROM executor_binding WHERE binding_i
 
 const ROLE_EXISTS_FOR_BINDING_SQL: &str = "SELECT 1 FROM logical_role WHERE role_id = ?1";
 
+/// Create-time single-active-binding pre-check: the first binding for the
+/// target role that is not conclusively fully released, if any. The
+/// predicate is the same fail-closed shape as the migration-0005 partial
+/// unique index — a row blocks rebind unless its terminal pair is complete
+/// — and deliberately never mentions `lease_expires_at`. `ORDER BY
+/// binding_id LIMIT 1` keeps the reported blocker deterministic even for
+/// storage this repository could not itself have produced.
+const ROLE_BLOCKING_BINDING_SQL: &str = "SELECT binding_id FROM executor_binding
+WHERE role_id = ?1 AND (released_at IS NULL OR release_reason IS NULL)
+ORDER BY binding_id
+LIMIT 1";
+
 const INSERT_BINDING_SQL: &str = "INSERT INTO executor_binding (
     binding_id,
     role_id,
@@ -365,11 +408,14 @@ WHERE binding_id = ?2 AND released_at IS NULL AND release_reason IS NULL";
 
 /// Inserts the binding row using bound parameters.
 ///
-/// The two frozen relational rules are refused twice each: explicit
-/// existence checks give the common path deterministic,
-/// driver-independent errors, while the primary-key and foreign-key
-/// constraints remain the durable backstops (including against a concurrent
-/// writer on the same database file).
+/// The frozen relational rules are refused twice each: explicit in-
+/// transaction checks give the common path deterministic,
+/// driver-independent errors, while the primary-key, foreign-key, and
+/// migration-0005 partial-unique-index constraints remain the durable
+/// backstops (including against a concurrent writer on the same database
+/// file). Check order preserves accepted semantics: duplicate
+/// `binding_id` first, then role existence, then the same-role
+/// not-fully-released guard, then the INSERT itself.
 fn insert_executor_binding(conn: &Connection, binding: &ExecutorBinding) -> Result<(), StateError> {
     let duplicate: Option<i64> = conn
         .query_row(BINDING_EXISTS_SQL, [&binding.binding_id], |row| row.get(0))
@@ -393,6 +439,13 @@ fn insert_executor_binding(conn: &Connection, binding: &ExecutorBinding) -> Resu
         });
     }
 
+    if let Some(blocking_binding_id) = find_role_blocking_binding(conn, &binding.role_id)? {
+        return Err(StateError::ExecutorBindingUnreleasedConflict {
+            role_id: binding.role_id.clone(),
+            blocking_binding_id,
+        });
+    }
+
     conn.execute(
         INSERT_BINDING_SQL,
         params![
@@ -411,7 +464,9 @@ fn insert_executor_binding(conn: &Connection, binding: &ExecutorBinding) -> Resu
         ],
     )
     .map_err(|error| {
-        if is_binding_id_constraint_violation(&error) {
+        if is_role_uniqueness_violation(&error) {
+            role_conflict_from_backstop(conn, &binding.role_id, error)
+        } else if is_binding_id_constraint_violation(&error) {
             StateError::ExecutorBindingAlreadyExists {
                 binding_id: binding.binding_id.clone(),
             }
@@ -424,6 +479,47 @@ fn insert_executor_binding(conn: &Connection, binding: &ExecutorBinding) -> Resu
         }
     })?;
     Ok(())
+}
+
+/// Reads the deterministic first not-fully-released binding for `role_id`
+/// on the caller's transaction snapshot, if one exists.
+///
+/// This is the bounded internal role-history inspection behind the
+/// create-time guard: one indexed lookup, no public binding-history query
+/// surface. Fail-closed predicate: a row blocks unless its terminal pair is
+/// completely recorded, so valid unreleased rows and both corrupt partial
+/// terminal shapes are all blocking; `lease_expires_at` is never consulted.
+fn find_role_blocking_binding(
+    conn: &Connection,
+    role_id: &str,
+) -> Result<Option<String>, StateError> {
+    conn.query_row(ROLE_BLOCKING_BINDING_SQL, [role_id], |row| {
+        row.get::<_, String>(0)
+    })
+    .optional()
+    .map_err(write_failure)
+}
+
+/// Maps a storage-level unique-constraint hit on the single-active-binding
+/// partial index to the deterministic domain conflict.
+///
+/// The failed statement leaves the still-open transaction usable, so the
+/// blocking row is re-read to identify the conflict. If it cannot be
+/// re-read, the storage failure itself is surfaced: the operation fails
+/// closed either way and is never reported as successful creation, and no
+/// binding identity is ever fabricated.
+fn role_conflict_from_backstop(
+    conn: &Connection,
+    role_id: &str,
+    error: rusqlite::Error,
+) -> StateError {
+    match find_role_blocking_binding(conn, role_id) {
+        Ok(Some(blocking_binding_id)) => StateError::ExecutorBindingUnreleasedConflict {
+            role_id: role_id.to_string(),
+            blocking_binding_id,
+        },
+        _ => write_failure(error),
+    }
 }
 
 /// Reads one binding row on the caller's snapshot and applies contract
@@ -657,7 +753,10 @@ fn internal_query_failure(error: rusqlite::Error) -> StateError {
 
 /// SQLite extended result codes for identity constraint violations on the
 /// `executor_binding` primary key: 1555 = `SQLITE_CONSTRAINT_PRIMARYKEY`,
-/// 2067 = `SQLITE_CONSTRAINT_UNIQUE`.
+/// 2067 = `SQLITE_CONSTRAINT_UNIQUE`. Checked after
+/// [`is_role_uniqueness_violation`] so a 2067 raised by the
+/// single-active-binding partial index is never misreported as a duplicate
+/// `binding_id`.
 fn is_binding_id_constraint_violation(error: &rusqlite::Error) -> bool {
     matches!(
         error,
@@ -668,6 +767,22 @@ fn is_binding_id_constraint_violation(error: &rusqlite::Error) -> bool {
             },
             _
         )
+    )
+}
+
+/// A storage-level violation of the migration-0005 partial unique index over
+/// `executor_binding(role_id)`: 2067 = `SQLITE_CONSTRAINT_UNIQUE` with the
+/// driver message naming `role_id`, the only column of that index.
+fn is_role_uniqueness_violation(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                extended_code: 2067,
+                ..
+            },
+            Some(message),
+        ) if message.contains("role_id")
     )
 }
 

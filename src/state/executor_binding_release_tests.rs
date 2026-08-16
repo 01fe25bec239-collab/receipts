@@ -700,11 +700,11 @@ fn t24_forced_transaction_failure_leaves_release_unchanged() {
 // Compile-time/API-absence invariant; no runtime test is fabricated. See
 // the module documentation and the task handoff.
 
-// T29 — the schema version remains exactly 4 (the registered chain head)
+// T29 — the schema version remains exactly 5 (the registered chain head)
 // before and after releases, with exactly one metadata row per applied
-// migration and no migration 5.
+// migration and no migration 6.
 #[test]
-fn t29_schema_version_remains_exactly_4() {
+fn t29_schema_version_remains_exactly_5() {
     let tmp = TempDir::new("ebr-t29");
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
     assert_eq!(
@@ -712,10 +712,10 @@ fn t29_schema_version_remains_exactly_4() {
             .last()
             .expect("registered chain is non-empty")
             .version,
-        4,
-        "the registered chain itself must end at version 4"
+        5,
+        "the registered chain itself must end at version 5"
     );
-    assert_eq!(repo.schema_version().expect("version read"), 4);
+    assert_eq!(repo.schema_version().expect("version read"), 5);
     repo.create_logical_role(minimal_role("role-ver-001", LogicalRoleType::RuntimeA1))
         .expect("role create");
     repo.create_executor_binding(minimal_binding("binding-ver-001", "role-ver-001"))
@@ -724,17 +724,17 @@ fn t29_schema_version_remains_exactly_4() {
         .expect("release");
     assert_eq!(
         repo.schema_version().expect("version read"),
-        4,
+        5,
         "a release must not change the schema version"
     );
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        4,
-        "no migration 5 metadata row may appear"
+        5,
+        "no migration 6 metadata row may appear"
     );
     drop(repo);
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("reopen");
-    assert_eq!(repo.schema_version().expect("version read"), 4);
+    assert_eq!(repo.schema_version().expect("version read"), 5);
 }
 
 // T30 — a release introduces no new schema objects: after releases the
@@ -879,11 +879,15 @@ fn t32_partial_terminal_shape_fails_closed() {
     );
     assert_eq!(found.release_reason, None);
 
-    // Partial shape B: release_reason recorded, released_at NULL.
+    // Partial shape B: release_reason recorded, released_at NULL. Since the
+    // single-active-binding guard (migration 0005) makes each partial shape
+    // uniqueness-blocking for its role, shape B probes from its own role.
+    repo.create_logical_role(minimal_role("role-partial-002", LogicalRoleType::RuntimeA2))
+        .expect("role create");
     repo.run_transaction(|uow| {
         let values: &[&dyn rusqlite::ToSql] = &[
             &"binding-partial-b",
-            &"role-partial-001",
+            &"role-partial-002",
             &"p",
             &"m",
             &"r",

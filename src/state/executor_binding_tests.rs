@@ -86,12 +86,12 @@ const ALL_NINE_STRINGS: [&str; 9] = [
 ];
 
 // T01 — a fresh version-0 database bootstraps through the full chain
-// 0 → 1 → 2 → 3 → 4, and migration 3 creates only ExecutorBinding storage.
+// 0 → 1 → 2 → 3 → 4 → 5, and migration 3 creates only ExecutorBinding storage.
 #[test]
-fn t01_fresh_database_reaches_schema_version_4() {
+fn t01_fresh_database_reaches_schema_version_5() {
     let tmp = TempDir::new("eb-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 4);
+    assert_eq!(repo.schema_version().expect("version read"), 5);
     assert!(
         repo.table_exists("executor_binding").expect("table check"),
         "executor_binding must exist after migration 3"
@@ -125,16 +125,16 @@ fn t01_fresh_database_reaches_schema_version_4() {
     }
 }
 
-// T02 — a version-4 database reopens successfully and idempotently.
+// T02 — a version-5 database reopens successfully and idempotently.
 #[test]
-fn t02_version_4_reopen_idempotent() {
+fn t02_version_5_reopen_idempotent() {
     let tmp = TempDir::new("eb-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 4);
+        assert_eq!(repo.schema_version().expect("version read"), 5);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            4,
+            5,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -157,7 +157,7 @@ fn t03_ordinary_open_of_version_2_database_fails() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 2,
-                supported: 4
+                supported: 5
             }
         ),
         "unexpected error: {error}"
@@ -637,6 +637,17 @@ fn t21_routing_decision_id_constraints_enforced() {
         Some(accepted)
     );
 
+    // The single-active-binding guard (A3-009) permits one not-fully-
+    // released binding per role, so the prior binding is explicitly
+    // released before the next create for the same role; the
+    // routing_decision_id-absence assertion below is unaffected.
+    repo.release_executor_binding(
+        "binding-probe-021c",
+        "2026-08-16T10:45:00.000Z",
+        ReleaseReason::UserRequest,
+    )
+    .expect("release");
+
     let absent = minimal_binding("binding-probe-021d", "role-probe-021");
     repo.create_executor_binding(absent.clone())
         .expect("an absent routing_decision_id is valid");
@@ -794,8 +805,12 @@ fn t25_unknown_release_reason_fails_closed_decode() {
         matches!(error, StateError::ExecutorBindingDecodeFailed { .. }),
         "unexpected error: {error}"
     );
-    // The healthy binding on the same database still reads fine.
-    repo.create_executor_binding(minimal_binding("binding-healthy-001", "role-decode-001"))
+    // The healthy binding on the same database still reads fine. The
+    // single-active-binding guard (A3-009) makes the corrupt row block its
+    // own role, so the healthy binding targets a second role.
+    repo.create_logical_role(minimal_role("role-decode-002", LogicalRoleType::RuntimeA2))
+        .expect("role create");
+    repo.create_executor_binding(minimal_binding("binding-healthy-001", "role-decode-002"))
         .expect("binding create");
     assert!(
         repo.find_executor_binding("binding-healthy-001")
@@ -890,11 +905,16 @@ fn t30_rehydration_completed_false_round_trips() {
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
     repo.create_logical_role(minimal_role("role-rh-003", LogicalRoleType::RuntimeA2))
         .expect("role create");
+    // The single-active-binding guard (A3-009) permits one not-fully-
+    // released binding per role, so the absent-value probe targets a second
+    // role; the false-versus-absence comparison is unaffected.
+    repo.create_logical_role(minimal_role("role-rh-004", LogicalRoleType::RuntimeA1))
+        .expect("role create");
     let mut explicit_false = minimal_binding("binding-rh-003a", "role-rh-003");
     explicit_false.rehydration_completed = Some(false);
     repo.create_executor_binding(explicit_false.clone())
         .expect("binding create");
-    let absent = minimal_binding("binding-rh-003b", "role-rh-003");
+    let absent = minimal_binding("binding-rh-003b", "role-rh-004");
     repo.create_executor_binding(absent.clone())
         .expect("binding create");
     let found_false = repo

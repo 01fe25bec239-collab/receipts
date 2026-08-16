@@ -169,16 +169,16 @@ fn forced_failure() -> StateError {
     }
 }
 
-// T01 — the schema version remains exactly 4 before and after lease
+// T01 — the schema version remains exactly 5 before and after lease
 // renewals, including across close/reopen.
 #[test]
-fn t01_schema_version_remains_4() {
+fn t01_schema_version_remains_5() {
     let tmp = TempDir::new("ebl-t01");
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
     assert_eq!(
         repo.schema_version().expect("version read"),
-        4,
-        "the supported schema version must be 4 before any renewal"
+        5,
+        "the supported schema version must be 5 before any renewal"
     );
     repo.create_logical_role(minimal_role("role-ver-001", LogicalRoleType::RuntimeA1))
         .expect("role create");
@@ -188,29 +188,29 @@ fn t01_schema_version_remains_4() {
         .expect("renew");
     assert_eq!(
         repo.schema_version().expect("version read"),
-        4,
+        5,
         "a lease renewal must not change the schema version"
     );
     drop(repo);
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("reopen");
-    assert_eq!(repo.schema_version().expect("version read"), 4);
+    assert_eq!(repo.schema_version().expect("version read"), 5);
 }
 
-// T02 — no migration v5 is introduced: the registered chain has exactly
-// four migrations ending at version 4, and the durable metadata carries
+// T02 — no migration v6 is introduced: the registered chain has exactly
+// five migrations ending at version 5, and the durable metadata carries
 // exactly one row per applied migration after renewals.
 #[test]
-fn t02_no_migration_v5_introduced() {
+fn t02_no_migration_v6_introduced() {
     let registered = migrations::registered();
     assert_eq!(
         registered.len(),
-        4,
-        "exactly four registered migrations (v0001–v0004) may exist"
+        5,
+        "exactly five registered migrations (v0001–v0005) may exist"
     );
     assert_eq!(
         registered.last().expect("chain is non-empty").version,
-        4,
-        "the registered chain must end at version 4"
+        5,
+        "the registered chain must end at version 5"
     );
     let tmp = TempDir::new("ebl-t02");
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
@@ -222,8 +222,8 @@ fn t02_no_migration_v5_introduced() {
         .expect("renew");
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        4,
-        "no migration 5 metadata row may appear"
+        5,
+        "no migration 6 metadata row may appear"
     );
 }
 
@@ -795,11 +795,15 @@ fn t29_guarded_update_refuses_occupied_terminal_slot() {
         "unexpected error: {error}"
     );
 
-    // Partial shape B: release_reason recorded, released_at NULL.
+    // Partial shape B: release_reason recorded, released_at NULL. Since the
+    // single-active-binding guard (migration 0005) makes each partial shape
+    // uniqueness-blocking for its role, shape B probes from its own role.
+    repo.create_logical_role(minimal_role("role-guard-002", LogicalRoleType::RuntimeA2))
+        .expect("role create");
     repo.run_transaction(|uow| {
         let values: &[&dyn rusqlite::ToSql] = &[
             &"binding-guard-b",
-            &"role-guard-001",
+            &"role-guard-002",
             &"p",
             &"m",
             &"r",

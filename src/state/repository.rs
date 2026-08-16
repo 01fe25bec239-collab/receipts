@@ -243,6 +243,40 @@ impl SqliteStateRepository {
             })
     }
 
+    /// Lists the `(name, sql)` schema entries of one `sqlite_master` kind
+    /// (e.g. `'index'` or `'trigger'`) for one internal table, sorted by
+    /// name. Crate-private test/inspection support for exact-schema-shape
+    /// assertions; `kind` and `table` are always repository-internal or
+    /// test-literal identifiers, never caller- or model-supplied data.
+    #[cfg(test)]
+    pub(crate) fn sqlite_master_entries(
+        &self,
+        kind: &str,
+        table: &str,
+    ) -> Result<Vec<(String, String)>, StateError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT name, sql FROM sqlite_master WHERE type = ?1 AND tbl_name = ?2 ORDER BY name")
+            .map_err(|e| StateError::InternalQueryFailed {
+                detail: e.to_string(),
+            })?;
+        let rows = statement
+            .query_map([kind, table], |row| {
+                // Implicit `sqlite_autoindex_*` entries carry no stored SQL.
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                ))
+            })
+            .map_err(|e| StateError::InternalQueryFailed {
+                detail: e.to_string(),
+            })?;
+        rows.collect::<Result<Vec<(String, String)>, _>>()
+            .map_err(|e| StateError::InternalQueryFailed {
+                detail: e.to_string(),
+            })
+    }
+
     fn supported_version(chain: &[Migration]) -> Result<u32, StateError> {
         chain
             .last()
