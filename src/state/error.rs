@@ -139,6 +139,29 @@ pub enum StateError {
         /// The `role_id` that does not exist.
         role_id: String,
     },
+    /// Releasing an ExecutorBinding whose durable identity does not exist.
+    ///
+    /// Release requires an already persisted binding: it never fabricates,
+    /// creates, or implicitly materializes one, and never silently
+    /// succeeds.
+    ExecutorBindingNotFound {
+        /// The `binding_id` that does not exist.
+        binding_id: String,
+    },
+    /// Releasing an ExecutorBinding whose write-once terminal release slot
+    /// is already occupied.
+    ///
+    /// `released_at` and `release_reason` are terminal fields recorded at
+    /// most once: the originally recorded release evidence is never
+    /// overwritten, replaced, or merged, and a repeat release is never
+    /// treated as idempotent success. This also covers any persisted
+    /// partial terminal shape (exactly one of the two fields non-NULL),
+    /// which this repository never produces but must still refuse to
+    /// complete.
+    ExecutorBindingAlreadyReleased {
+        /// The `binding_id` that is already released.
+        binding_id: String,
+    },
     /// Writing an ExecutorBinding failed at the storage layer.
     ExecutorBindingWriteFailed {
         /// Underlying driver detail.
@@ -245,6 +268,18 @@ impl fmt::Display for StateError {
                 write!(
                     f,
                     "no LogicalRole with role_id {role_id:?} exists; an ExecutorBinding may not be created for a nonexistent role"
+                )
+            }
+            StateError::ExecutorBindingNotFound { binding_id } => {
+                write!(
+                    f,
+                    "no ExecutorBinding with binding_id {binding_id:?} exists; release requires an already persisted binding and never fabricates one"
+                )
+            }
+            StateError::ExecutorBindingAlreadyReleased { binding_id } => {
+                write!(
+                    f,
+                    "ExecutorBinding with binding_id {binding_id:?} is already released; released_at/release_reason are write-once terminal evidence and are never overwritten"
                 )
             }
             StateError::ExecutorBindingWriteFailed { detail } => {

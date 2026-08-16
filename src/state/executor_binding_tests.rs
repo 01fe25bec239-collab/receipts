@@ -1019,7 +1019,13 @@ fn t34_failed_creation_is_atomic() {
 // no runtime test is fabricated for it. It is established by inspecting the
 // public surface of the crate (see the task handoff's
 // COMPILE_TIME_API_INVARIANTS section): the only public ExecutorBinding
-// capabilities are `SqliteStateRepository::create_executor_binding` and
-// `SqliteStateRepository::find_executor_binding`, and no method named or
-// behaving like update/delete/release/renew/expire exists on any public
+// capabilities of this slice are `SqliteStateRepository::create_executor_binding`
+// and `SqliteStateRepository::find_executor_binding`, and no method named
+// or behaving like update/delete/release/renew/expire exists on any public
 // type.
+//
+// The accepted release slice (A3-005) later added exactly one further
+// public capability, `SqliteStateRepository::release_executor_binding`
+// (the one-time terminal released_at/release_reason transition); the
+// update/delete/renew/expire absence invariant above continues to hold
+// beyond that single authorized addition.

@@ -7,12 +7,17 @@
 //! replacement must never replace role identity, so a binding row always
 //! references — and never mutates — an existing persisted role.
 //!
-//! Scope of this slice: immutable create + durable read by `binding_id`.
-//! Binding history is append-only durable evidence: there is deliberately no
-//! public update, delete, release, lease-renewal, or expiry-evaluation path,
-//! and no single-active-binding or failover semantics. `provider_id`,
-//! `model_id`, and `runtime_id` are opaque non-empty strings: State persists
-//! them but never decides provider, model, runtime, or routing eligibility.
+//! Scope of this slice: immutable create, durable read by `binding_id`, and
+//! the one-time terminal release of an existing binding. Binding history is
+//! append-only durable evidence: the only authorized mutation of a
+//! persisted binding is the single write-once terminal transition of
+//! `released_at`/`release_reason` from NULL to recorded (see
+//! [`SqliteStateRepository::release_executor_binding`]); every other
+//! binding field is immutable, and there is deliberately no public update,
+//! delete, lease-renewal, or expiry-evaluation path, and no
+//! single-active-binding or failover semantics. `provider_id`, `model_id`,
+//! and `runtime_id` are opaque non-empty strings: State persists them but
+//! never decides provider, model, runtime, or routing eligibility.
 //!
 //! `bound_at`, `lease_expires_at`, and `released_at` are persisted contract
 //! date-time strings, stored exactly as provided: State never inspects the
@@ -159,11 +164,12 @@ impl SqliteStateRepository {
     /// primary-key and foreign-key constraints re-enforce the same rules as
     /// durable backstops.
     ///
-    /// This is the create half of an insert/read-only slice: no release,
-    /// renewal, expiry evaluation, single-active-binding enforcement, or
-    /// failover behavior is offered, and persisting a binding does not make
-    /// that executor active, authoritative, rehydrated, or permitted to
-    /// mutate State.
+    /// This is the create half of the binding lifecycle offered here: the
+    /// only later transition this repository offers for a persisted binding
+    /// is the one-time terminal release. No renewal, expiry evaluation,
+    /// single-active-binding enforcement, or failover behavior is offered,
+    /// and persisting a binding does not make that executor active,
+    /// authoritative, rehydrated, or permitted to mutate State.
     pub fn create_executor_binding(&mut self, binding: ExecutorBinding) -> Result<(), StateError> {
         validate_for_create(&binding)?;
         self.run_transaction(|uow| uow.insert_executor_binding(&binding))
@@ -189,6 +195,48 @@ impl SqliteStateRepository {
         // the transaction rolls back on drop, with nothing written to undo.
         tx.commit().map_err(internal_query_failure)?;
         Ok(found)
+    }
+
+    /// Durably records the one-time terminal release of an existing
+    /// persisted ExecutorBinding.
+    ///
+    /// Exactly two fields change, exactly once, in one atomic transaction:
+    /// `released_at` and `release_reason`. `released_at` is stored exactly
+    /// as supplied — State never reads the wall clock, generates,
+    /// parses, compares, or orders it — and `release_reason` is one of the
+    /// nine frozen reasons supplied by the caller: State never decides lease
+    /// validity or expiry, including for
+    /// [`ReleaseReason::LeaseExpired`]. Every other binding field is
+    /// immutable, the binding is never deleted or replaced, no other
+    /// binding is created, and the referenced LogicalRole (including its
+    /// `active_binding_id`) is never touched. Recording a release does not
+    /// select, authorize, activate, or rehydrate any other executor.
+    ///
+    /// Fail-closed results:
+    ///
+    /// * an unknown `binding_id` fails with
+    ///   [`StateError::ExecutorBindingNotFound`]: release requires an
+    ///   already persisted binding and never fabricates one;
+    /// * a binding whose terminal release slot is already occupied —
+    ///   released through this API, created already-released, or carrying
+    ///   any partial terminal shape — fails with
+    ///   [`StateError::ExecutorBindingAlreadyReleased`], leaving the
+    ///   originally recorded evidence untouched: a repeat release is never
+    ///   treated as idempotent success;
+    /// * an invalid input shape fails with
+    ///   [`StateError::ExecutorBindingValidation`] before any storage
+    ///   access;
+    /// * storage, transaction, and corrupt-row failures surface as explicit
+    ///   errors and never persist a partial release pair.
+    pub fn release_executor_binding(
+        &mut self,
+        binding_id: &str,
+        released_at: &str,
+        release_reason: ReleaseReason,
+    ) -> Result<(), StateError> {
+        ensure_identifier("binding_id", binding_id)?;
+        ensure_non_empty("released_at", released_at)?;
+        self.run_transaction(|uow| apply_release(uow.tx(), binding_id, released_at, release_reason))
     }
 }
 
@@ -238,6 +286,15 @@ const SELECT_BINDING_SQL: &str = "SELECT
     rehydration_completed
 FROM executor_binding
 WHERE binding_id = ?1";
+
+/// The one authorized mutation of a persisted binding: the write-once
+/// terminal release transition. Both terminal fields are set by the same
+/// single statement — the pair commits atomically or not at all — and the
+/// guarded WHERE re-enforces terminal-slot emptiness as a durable backstop
+/// behind the explicit pre-check.
+const RELEASE_BINDING_SQL: &str = "UPDATE executor_binding
+SET released_at = ?1, release_reason = ?2
+WHERE binding_id = ?3 AND released_at IS NULL AND release_reason IS NULL";
 
 /// Inserts the binding row using bound parameters.
 ///
@@ -313,6 +370,62 @@ fn read_executor_binding(
         .map_err(internal_query_failure)?
         .map(BindingRow::into_executor_binding)
         .transpose()
+}
+
+/// Applies the one-time terminal release inside the open transaction.
+///
+/// Crate-private; invoked by
+/// [`SqliteStateRepository::release_executor_binding`]. The full row is
+/// decoded first so corrupt persisted data fails closed before any write
+/// decision is made; the guarded UPDATE then re-enforces write-once
+/// emptiness as a durable backstop.
+pub(crate) fn apply_release(
+    conn: &Connection,
+    binding_id: &str,
+    released_at: &str,
+    release_reason: ReleaseReason,
+) -> Result<(), StateError> {
+    require_releasable_binding(conn, binding_id)?;
+    let changed = conn
+        .execute(
+            RELEASE_BINDING_SQL,
+            params![released_at, release_reason.as_str(), binding_id],
+        )
+        .map_err(write_failure)?;
+    if changed == 0 {
+        // Unreachable behind the pre-check within this single transaction;
+        // if the guarded WHERE ever refuses a write, re-decide
+        // deterministically instead of fabricating success.
+        require_releasable_binding(conn, binding_id)?;
+    }
+    Ok(())
+}
+
+/// Verifies on the caller's snapshot that the binding exists and that its
+/// write-once terminal release slot is completely empty, failing closed
+/// otherwise.
+///
+/// "Completely empty" means both `released_at` and `release_reason` are
+/// NULL. Any other stored shape — a complete prior release, a binding
+/// created already-released, or a partial terminal write this repository
+/// cannot produce — occupies the write-once slot and is refused as already
+/// released, so no evidence is ever overwritten. The decoded read means
+/// corrupt persisted rows fail closed with a decode error before any
+/// release decision is made.
+fn require_releasable_binding(conn: &Connection, binding_id: &str) -> Result<(), StateError> {
+    match read_executor_binding(conn, binding_id)? {
+        None => Err(StateError::ExecutorBindingNotFound {
+            binding_id: binding_id.to_string(),
+        }),
+        Some(binding) => {
+            if binding.released_at.is_some() || binding.release_reason.is_some() {
+                return Err(StateError::ExecutorBindingAlreadyReleased {
+                    binding_id: binding_id.to_string(),
+                });
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Raw column image of one `executor_binding` row, before any contract

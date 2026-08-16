@@ -23,6 +23,9 @@ pub mod repository;
 mod migrations;
 
 #[cfg(test)]
+mod executor_binding_release_tests;
+
+#[cfg(test)]
 mod executor_binding_tests;
 
 #[cfg(test)]
