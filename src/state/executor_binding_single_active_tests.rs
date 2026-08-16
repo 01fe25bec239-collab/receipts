@@ -133,17 +133,17 @@ fn named_binding_indexes(repo: &SqliteStateRepository) -> Vec<(String, String)> 
         .collect()
 }
 
-// T01 — a fresh database bootstraps 0 → 1 → 2 → 3 → 4 → 5, and schema
-// version 5 is durably recorded with exactly one metadata row per
+// T01 — a fresh database bootstraps 0 → 1 → 2 → 3 → 4 → 5 → 6, and schema
+// version 6 is durably recorded with exactly one metadata row per
 // migration.
 #[test]
-fn t01_fresh_database_bootstraps_through_schema_5() {
+fn t01_fresh_database_bootstraps_through_schema_6() {
     let tmp = TempDir::new("sab-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 5);
+    assert_eq!(repo.schema_version().expect("version read"), 6);
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        5,
+        6,
         "one metadata row per applied migration"
     );
     // The guard index is part of the fresh bootstrap.
@@ -157,16 +157,16 @@ fn t01_fresh_database_bootstraps_through_schema_5() {
     );
 }
 
-// T02 — a schema-version-5 database reopens successfully and idempotently.
+// T02 — a schema-version-6 database reopens successfully and idempotently.
 #[test]
-fn t02_schema_version_5_reopens() {
+fn t02_schema_version_6_reopens() {
     let tmp = TempDir::new("sab-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 5);
+        assert_eq!(repo.schema_version().expect("version read"), 6);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            5,
+            6,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -185,7 +185,7 @@ fn t03_ordinary_open_of_version_4_fails_closed() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 4,
-                supported: 5
+                supported: 6
             }
         ),
         "unexpected error: {error}"
@@ -230,8 +230,12 @@ fn t04_migration_v5_adds_exactly_one_partial_unique_index() {
             .expect("apply migration 5");
     }
 
-    // Ordinary open now succeeds at version 5.
-    let repo = SqliteStateRepository::open(tmp.db_path()).expect("open at version 5");
+    // The database now records version 5, so it opens with the version-5
+    // prefix of the registered chain (the ordinary chain ends at version 6
+    // and refuses a version-5 database).
+    let version_5_chain = &migrations::registered()[..5];
+    let repo = SqliteStateRepository::open_with_migrations(tmp.db_path(), version_5_chain)
+        .expect("open at version 5");
     assert_eq!(repo.schema_version().expect("version read"), 5);
 
     // Exactly one named index exists, it is the guard index, and its stored
@@ -1163,7 +1167,12 @@ fn t50_migration_preserves_binding_history() {
         repo.run_transaction(|uow| uow.execute_batch(migrations::registered()[4].sql))
             .expect("apply migration 5 over conforming version-4 history");
     }
-    let repo = SqliteStateRepository::open(tmp.db_path()).expect("open at version 5");
+    // The database now records version 5, so it opens with the version-5
+    // prefix of the registered chain (the ordinary chain ends at version 6
+    // and refuses a version-5 database).
+    let repo =
+        SqliteStateRepository::open_with_migrations(tmp.db_path(), &migrations::registered()[..5])
+            .expect("open at version 5");
     assert_eq!(
         repo.find_executor_binding("binding-ag1-001").expect("find"),
         Some(released),

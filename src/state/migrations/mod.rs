@@ -10,6 +10,7 @@ mod v0002_logical_role;
 mod v0003_executor_binding;
 mod v0004_event;
 mod v0005_single_active_binding;
+mod v0006_context_manifest;
 
 use crate::error::StateError;
 
@@ -32,6 +33,7 @@ static REGISTERED: &[Migration] = &[
     v0003_executor_binding::MIGRATION,
     v0004_event::MIGRATION,
     v0005_single_active_binding::MIGRATION,
+    v0006_context_manifest::MIGRATION,
 ];
 
 /// The registered migration chain in application order.

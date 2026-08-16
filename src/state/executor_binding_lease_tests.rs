@@ -169,16 +169,16 @@ fn forced_failure() -> StateError {
     }
 }
 
-// T01 — the schema version remains exactly 5 before and after lease
+// T01 — the schema version remains exactly 6 before and after lease
 // renewals, including across close/reopen.
 #[test]
-fn t01_schema_version_remains_5() {
+fn t01_schema_version_remains_6() {
     let tmp = TempDir::new("ebl-t01");
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
     assert_eq!(
         repo.schema_version().expect("version read"),
-        5,
-        "the supported schema version must be 5 before any renewal"
+        6,
+        "the supported schema version must be 6 before any renewal"
     );
     repo.create_logical_role(minimal_role("role-ver-001", LogicalRoleType::RuntimeA1))
         .expect("role create");
@@ -188,42 +188,43 @@ fn t01_schema_version_remains_5() {
         .expect("renew");
     assert_eq!(
         repo.schema_version().expect("version read"),
-        5,
+        6,
         "a lease renewal must not change the schema version"
     );
     drop(repo);
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("reopen");
-    assert_eq!(repo.schema_version().expect("version read"), 5);
+    assert_eq!(repo.schema_version().expect("version read"), 6);
 }
 
-// T02 — no migration v6 is introduced: the registered chain has exactly
-// five migrations ending at version 5, and the durable metadata carries
-// exactly one row per applied migration after renewals.
+// T02 — no migration is introduced by the lease-renewal slice: the
+// registered chain has exactly six migrations ending at version 6, and the
+// durable metadata carries exactly one row per applied migration after
+// renewals.
 #[test]
-fn t02_no_migration_v6_introduced() {
+fn t02_no_migration_introduced_by_lease_renewal() {
     let registered = migrations::registered();
     assert_eq!(
         registered.len(),
-        5,
-        "exactly five registered migrations (v0001–v0005) may exist"
+        6,
+        "exactly six registered migrations (v0001–v0006) may exist"
     );
     assert_eq!(
         registered.last().expect("chain is non-empty").version,
-        5,
-        "the registered chain must end at version 5"
+        6,
+        "the registered chain must end at version 6"
     );
     let tmp = TempDir::new("ebl-t02");
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
-    repo.create_logical_role(minimal_role("role-v5-001", LogicalRoleType::RuntimeA1))
+    repo.create_logical_role(minimal_role("role-v6-001", LogicalRoleType::RuntimeA1))
         .expect("role create");
-    repo.create_executor_binding(minimal_binding("binding-v5-001", "role-v5-001"))
+    repo.create_executor_binding(minimal_binding("binding-v6-001", "role-v6-001"))
         .expect("binding create");
-    repo.renew_executor_binding_lease("binding-v5-001", RENEWED_LEASE)
+    repo.renew_executor_binding_lease("binding-v6-001", RENEWED_LEASE)
         .expect("renew");
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        5,
-        "no migration 6 metadata row may appear"
+        6,
+        "no migration 7 metadata row may appear"
     );
 }
 

@@ -238,6 +238,67 @@ pub enum StateError {
         /// What could not be decoded.
         detail: String,
     },
+    /// A ContextManifest failed contract-level validation before
+    /// persistence.
+    ///
+    /// Validation accepts each supplied structural value byte-for-byte
+    /// unchanged or rejects the create; it never normalizes, repairs,
+    /// trims, or rewrites a value into a different persisted value.
+    ContextManifestValidation {
+        /// Which frozen structural constraint was violated.
+        detail: String,
+    },
+    /// Creating a ContextManifest whose durable identity already exists.
+    ///
+    /// Manifests are immutable at this slice: an existing `manifest_id` is
+    /// never overwritten, replaced, upserted, merged, or
+    /// deleted-and-reinserted; the original row remains untouched.
+    ContextManifestAlreadyExists {
+        /// The `manifest_id` that already exists.
+        manifest_id: String,
+    },
+    /// Creating a ContextManifest whose `role_id` does not reference an
+    /// existing persisted LogicalRole.
+    ///
+    /// No orphan manifest may ever be persisted; a durable role is the
+    /// only valid manifest owner.
+    ContextManifestRoleNotFound {
+        /// The `role_id` that does not exist.
+        role_id: String,
+    },
+    /// Creating a ContextManifest for a role that already owns one.
+    ///
+    /// Each durable role has exactly one authoritative ContextManifest, so
+    /// at most one manifest per `role_id` may persist. The existing
+    /// manifest is never replaced, deleted, updated, or silently chosen
+    /// over: the refusal names the existing manifest instead. This is
+    /// deliberately distinct from
+    /// [`StateError::ContextManifestAlreadyExists`], which keeps reporting
+    /// duplicate durable `manifest_id` alone.
+    ContextManifestRoleAlreadyHasManifest {
+        /// The `role_id` that already owns a manifest.
+        role_id: String,
+        /// The `manifest_id` of the existing authoritative manifest.
+        existing_manifest_id: String,
+    },
+    /// Writing a ContextManifest failed at the storage layer.
+    ContextManifestWriteFailed {
+        /// Underlying driver detail.
+        detail: String,
+    },
+    /// A persisted ContextManifest graph could not be decoded against the
+    /// frozen contract.
+    ///
+    /// Decoding fails closed: unknown `ref_type`, `source_class`, or
+    /// `required_for` values, empty structural strings, a negative epoch,
+    /// a zero-source manifest, ordinal gaps, and any other
+    /// contract-violating row are never surfaced as a valid manifest,
+    /// never mapped to an `UNKNOWN` variant, never silently dropped, and
+    /// never repaired into a plausible default manifest.
+    ContextManifestDecodeFailed {
+        /// What could not be decoded.
+        detail: String,
+    },
 }
 
 impl fmt::Display for StateError {
@@ -371,6 +432,36 @@ impl fmt::Display for StateError {
             }
             StateError::EventDecodeFailed { detail } => {
                 write!(f, "failed to decode persisted event: {detail}")
+            }
+            StateError::ContextManifestValidation { detail } => {
+                write!(f, "invalid ContextManifest: {detail}")
+            }
+            StateError::ContextManifestAlreadyExists { manifest_id } => {
+                write!(
+                    f,
+                    "a ContextManifest with manifest_id {manifest_id:?} already exists; manifests are immutable at this slice and are never overwritten, replaced, or merged"
+                )
+            }
+            StateError::ContextManifestRoleNotFound { role_id } => {
+                write!(
+                    f,
+                    "no LogicalRole with role_id {role_id:?} exists; a ContextManifest may not be created for a nonexistent role"
+                )
+            }
+            StateError::ContextManifestRoleAlreadyHasManifest {
+                role_id,
+                existing_manifest_id,
+            } => {
+                write!(
+                    f,
+                    "role_id {role_id:?} already owns authoritative manifest {existing_manifest_id:?}; a role may have at most one manifest, and the existing manifest is never replaced, updated, or deleted by conflict handling"
+                )
+            }
+            StateError::ContextManifestWriteFailed { detail } => {
+                write!(f, "failed to write ContextManifest: {detail}")
+            }
+            StateError::ContextManifestDecodeFailed { detail } => {
+                write!(f, "failed to decode persisted ContextManifest: {detail}")
             }
         }
     }
