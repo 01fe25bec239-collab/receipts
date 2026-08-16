@@ -1,0 +1,19 @@
+# BUILD-A3 task bootstrap manifest (BUILD-A1-approved substrate only).
+# Rust 1.97.1 stable, edition 2024, rusqlite 0.40.1 + bundled SQLite, Tokio ~1.51.
+[package]
+name = "receipts-state"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+publish = false
+
+# Product source for this task lives under src/state/** only; the lib target
+# is pointed there so no crate topology is defined for other managers.
+[lib]
+path = "src/state/lib.rs"
+
+[dependencies]
+rusqlite = { version = "=0.40.1", features = ["bundled"] }
+# Approved async substrate for later State/Context milestones; this foundation
+# slice is synchronous, so no Tokio features are enabled yet.
+tokio = { version = "~1.51", default-features = false }
