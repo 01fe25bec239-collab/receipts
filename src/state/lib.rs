@@ -15,6 +15,7 @@
 //! orchestrator core). This foundation provides no worker-, host-, adapter-,
 //! or model-facing mutation path.
 
+pub mod context_epoch;
 pub mod context_manifest;
 pub mod error;
 pub mod event;
@@ -23,6 +24,9 @@ pub mod logical_role;
 pub mod repository;
 
 mod migrations;
+
+#[cfg(test)]
+mod context_epoch_tests;
 
 #[cfg(test)]
 mod context_manifest_tests;
@@ -48,6 +52,7 @@ mod logical_role_tests;
 #[cfg(test)]
 mod tests;
 
+pub use context_epoch::{ContextEpoch, ContextEpochTrigger};
 pub use context_manifest::{
     ContextManifest, ContextManifestSource, ContextSourceRef, ContextSourceRefType, RequiredFor,
     SourceClass,

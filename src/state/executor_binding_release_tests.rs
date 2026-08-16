@@ -700,11 +700,11 @@ fn t24_forced_transaction_failure_leaves_release_unchanged() {
 // Compile-time/API-absence invariant; no runtime test is fabricated. See
 // the module documentation and the task handoff.
 
-// T29 — the schema version remains exactly 6 (the registered chain head)
+// T29 — the schema version remains exactly 7 (the registered chain head)
 // before and after releases, with exactly one metadata row per applied
-// migration and no migration 7.
+// migration and no migration 8.
 #[test]
-fn t29_schema_version_remains_exactly_6() {
+fn t29_schema_version_remains_exactly_7() {
     let tmp = TempDir::new("ebr-t29");
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
     assert_eq!(
@@ -712,10 +712,10 @@ fn t29_schema_version_remains_exactly_6() {
             .last()
             .expect("registered chain is non-empty")
             .version,
-        6,
-        "the registered chain itself must end at version 6"
+        7,
+        "the registered chain itself must end at version 7"
     );
-    assert_eq!(repo.schema_version().expect("version read"), 6);
+    assert_eq!(repo.schema_version().expect("version read"), 7);
     repo.create_logical_role(minimal_role("role-ver-001", LogicalRoleType::RuntimeA1))
         .expect("role create");
     repo.create_executor_binding(minimal_binding("binding-ver-001", "role-ver-001"))
@@ -724,21 +724,21 @@ fn t29_schema_version_remains_exactly_6() {
         .expect("release");
     assert_eq!(
         repo.schema_version().expect("version read"),
-        6,
+        7,
         "a release must not change the schema version"
     );
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        6,
-        "no migration 7 metadata row may appear"
+        7,
+        "no migration 8 metadata row may appear"
     );
     drop(repo);
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("reopen");
-    assert_eq!(repo.schema_version().expect("version read"), 6);
+    assert_eq!(repo.schema_version().expect("version read"), 7);
 }
 
 // T30 — a release introduces no new schema objects: after releases the
-// database contains exactly the version-1/2/3/4/6 tables and none of the
+// database contains exactly the version-1/2/3/4/6/7 tables and none of the
 // forbidden future storage.
 #[test]
 fn t30_no_new_schema_objects_introduced() {
@@ -760,6 +760,7 @@ fn t30_no_new_schema_objects_introduced() {
         "context_manifest",
         "context_manifest_source",
         "context_manifest_source_required_for",
+        "context_epoch",
     ] {
         assert!(
             repo.table_exists(expected).expect("table check"),
@@ -768,7 +769,6 @@ fn t30_no_new_schema_objects_introduced() {
     }
     for forbidden in [
         "event_log",
-        "context_epoch",
         "entitlement",
         "graph",
         "graph_node",

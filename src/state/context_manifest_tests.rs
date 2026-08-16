@@ -106,42 +106,42 @@ fn direct_exec(repo: &mut SqliteStateRepository, sql: &str, params: &[&dyn ToSql
         .expect("test corruption statement");
 }
 
-// T01 — a fresh version-0 database bootstraps 0 → 1 → 2 → 3 → 4 → 5 → 6,
-// with exactly six registered migrations ending at version 6 and exactly
+// T01 — a fresh version-0 database bootstraps 0 → 1 → 2 → 3 → 4 → 5 → 6 → 7,
+// with exactly seven registered migrations ending at version 7 and exactly
 // one metadata row per migration.
 #[test]
-fn t01_fresh_database_bootstraps_to_schema_version_6() {
+fn t01_fresh_database_bootstraps_to_schema_version_7() {
     let registered = migrations::registered();
     assert_eq!(
         registered.len(),
-        6,
-        "exactly six registered migrations (v0001–v0006) may exist"
+        7,
+        "exactly seven registered migrations (v0001–v0007) may exist"
     );
     assert_eq!(
         registered.last().expect("chain is non-empty").version,
-        6,
-        "the registered chain must end at version 6"
+        7,
+        "the registered chain must end at version 7"
     );
     let tmp = TempDir::new("cm-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 6);
+    assert_eq!(repo.schema_version().expect("version read"), 7);
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        6,
+        7,
         "one metadata row per applied migration"
     );
 }
 
-// T02 — a version-6 database reopens successfully and idempotently.
+// T02 — a version-7 database reopens successfully and idempotently.
 #[test]
-fn t02_version_6_database_reopens_idempotently() {
+fn t02_version_7_database_reopens_idempotently() {
     let tmp = TempDir::new("cm-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 6);
+        assert_eq!(repo.schema_version().expect("version read"), 7);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            6,
+            7,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -164,7 +164,7 @@ fn t03_ordinary_open_of_version_5_fails_closed() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 5,
-                supported: 6
+                supported: 7
             }
         ),
         "unexpected error: {error}"
@@ -265,15 +265,16 @@ fn t04_migration_v6_creates_exactly_the_authorized_schema() {
     }
 }
 
-// T05 — migration 6 adds no ContextEpoch, derived-state, source-content,
-// digest-cache, URL-fetch, event, or binding storage: none of the forbidden
-// future schema exists in a fully bootstrapped database.
+// T05 — migration 6 adds no derived-state, source-content, digest-cache,
+// URL-fetch, event, or binding storage: none of the forbidden future
+// schema exists in a fully bootstrapped database. (`context_epoch` belongs
+// to the later migration 7 and is not forbidden by this test.)
 #[test]
 fn t05_no_forbidden_future_schema_exists() {
     let tmp = TempDir::new("cm-t05");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
     for forbidden in [
-        "context_epoch",
+        "context_epoch_changed_source",
         "context_epoch_history",
         "derived_state",
         "context_manifest_derived_state",

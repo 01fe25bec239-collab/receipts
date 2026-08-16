@@ -168,13 +168,13 @@ fn check_values(sql: &str, column: &str) -> Vec<String> {
         .collect()
 }
 
-// T01 — a fresh version-0 database bootstraps 0 → 1 → 2 → 3 → 4 → 5 → 6,
+// T01 — a fresh version-0 database bootstraps 0 → 1 → 2 → 3 → 4 → 5 → 6 → 7,
 // and migration 4 creates exactly the event-log schema objects.
 #[test]
-fn t01_fresh_database_bootstraps_to_schema_version_6() {
+fn t01_fresh_database_bootstraps_to_schema_version_7() {
     let tmp = TempDir::new("ev-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 6);
+    assert_eq!(repo.schema_version().expect("version read"), 7);
     assert!(
         repo.table_exists("event").expect("table check"),
         "event must exist after migration 4"
@@ -182,27 +182,27 @@ fn t01_fresh_database_bootstraps_to_schema_version_6() {
     // Exactly one metadata row per applied migration.
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        6
+        7
     );
 }
 
-// T02 — a version-6 database reopens successfully and idempotently.
+// T02 — a version-7 database reopens successfully and idempotently.
 #[test]
-fn t02_version_6_database_reopens() {
+fn t02_version_7_database_reopens() {
     let tmp = TempDir::new("ev-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 6);
+        assert_eq!(repo.schema_version().expect("version read"), 7);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            6,
+            7,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
 }
 
 // T03 — ordinary open of an existing version-3 database fails closed
-// instead of silently migrating it to version 5.
+// instead of silently migrating it to version 7.
 #[test]
 fn t03_ordinary_open_of_version_3_database_fails() {
     let tmp = TempDir::new("ev-t03");
@@ -218,7 +218,7 @@ fn t03_ordinary_open_of_version_3_database_fails() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 3,
-                supported: 6
+                supported: 7
             }
         ),
         "unexpected error: {error}"
@@ -959,7 +959,7 @@ fn t45_migration4_preserves_logical_roles() {
         repo.run_transaction(|uow| uow.execute_batch(migration.sql))
             .expect("apply migration 4");
     }
-    // The ordinary registered chain now ends at version 6 and refuses to
+    // The ordinary registered chain now ends at version 7 and refuses to
     // open a version-4 database, so the migrated database is verified
     // through the version-4 prefix of the same chain.
     let version_4_chain = &migrations::registered()[..4];
@@ -1012,8 +1012,9 @@ fn t46_migration4_preserves_executor_bindings() {
 // adds exactly one table.
 #[test]
 fn t47_migration4_creates_only_event_schema() {
-    // Full bootstrap: exactly the eight expected tables exist (the four
-    // prior tables, `event`, and the migration-6 context manifest tables).
+    // Full bootstrap: exactly the nine expected tables exist (the four
+    // prior tables, `event`, the migration-6 context manifest tables, and
+    // the migration-7 context epoch table).
     let tmp = TempDir::new("ev-t47a");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
     let mut expected = vec![
@@ -1025,12 +1026,13 @@ fn t47_migration4_creates_only_event_schema() {
         "context_manifest",
         "context_manifest_source",
         "context_manifest_source_required_for",
+        "context_epoch",
     ];
     expected.sort_unstable();
     assert_eq!(
         repo.list_tables().expect("tables"),
         expected,
-        "the registered chain must create exactly its own eight tables"
+        "the registered chain must create exactly its own nine tables"
     );
 
     // Applying migration 4 to a version-3 database adds exactly `event`.
@@ -1048,7 +1050,7 @@ fn t47_migration4_creates_only_event_schema() {
             .expect("apply migration 4");
     }
     // Verified through the version-4 prefix of the registered chain; the
-    // ordinary chain now ends at version 6 and refuses a version-4 database.
+    // ordinary chain now ends at version 7 and refuses a version-4 database.
     let version_4_chain = &migrations::registered()[..4];
     let repo = SqliteStateRepository::open_with_migrations(tmp.db_path(), version_4_chain)
         .expect("open at version 4");

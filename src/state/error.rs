@@ -299,6 +299,48 @@ pub enum StateError {
         /// What could not be decoded.
         detail: String,
     },
+    /// A ContextEpoch failed contract-level validation before persistence.
+    ///
+    /// Validation accepts each supplied structural value byte-for-byte
+    /// unchanged or rejects the append; it never normalizes, repairs,
+    /// trims, or rewrites a value into a different persisted value.
+    ContextEpochValidation {
+        /// Which frozen structural constraint was violated.
+        detail: String,
+    },
+    /// Appending a ContextEpoch whose `(project_id, epoch)` already
+    /// exists.
+    ///
+    /// Epoch history is immutable append-only evidence: an existing
+    /// `(project_id, epoch)` record is never overwritten, replaced,
+    /// upserted, merged, or deleted-and-reinserted; the original record
+    /// remains untouched. Uniqueness is per `(project_id, epoch)`, never
+    /// database-global: the same epoch number may legitimately exist for
+    /// different projects.
+    ContextEpochAlreadyExists {
+        /// The `project_id` of the duplicate record.
+        project_id: String,
+        /// The `epoch` number of the duplicate record.
+        epoch: i64,
+    },
+    /// Writing a ContextEpoch failed at the storage layer.
+    ContextEpochWriteFailed {
+        /// Underlying driver detail.
+        detail: String,
+    },
+    /// A persisted ContextEpoch row could not be decoded against the
+    /// frozen contract.
+    ///
+    /// Decoding fails closed: an unknown `trigger` value, an empty or
+    /// overlong `project_id`, a negative `epoch`, an empty `advanced_at`,
+    /// and any other contract-violating row are never surfaced as a valid
+    /// epoch record, never mapped to an `UNKNOWN`/fallback variant, never
+    /// clamped or defaulted, and never silently skipped in favor of
+    /// another row.
+    ContextEpochDecodeFailed {
+        /// What could not be decoded.
+        detail: String,
+    },
 }
 
 impl fmt::Display for StateError {
@@ -462,6 +504,21 @@ impl fmt::Display for StateError {
             }
             StateError::ContextManifestDecodeFailed { detail } => {
                 write!(f, "failed to decode persisted ContextManifest: {detail}")
+            }
+            StateError::ContextEpochValidation { detail } => {
+                write!(f, "invalid ContextEpoch: {detail}")
+            }
+            StateError::ContextEpochAlreadyExists { project_id, epoch } => {
+                write!(
+                    f,
+                    "a ContextEpoch for project_id {project_id:?} epoch {epoch} already exists; epoch history is immutable and append-only and is never overwritten, replaced, or merged"
+                )
+            }
+            StateError::ContextEpochWriteFailed { detail } => {
+                write!(f, "failed to write ContextEpoch: {detail}")
+            }
+            StateError::ContextEpochDecodeFailed { detail } => {
+                write!(f, "failed to decode persisted ContextEpoch: {detail}")
             }
         }
     }

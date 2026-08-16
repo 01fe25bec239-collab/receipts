@@ -1,0 +1,526 @@
+//! Durable ContextEpoch history persistence (migration 0007 slice).
+//!
+//! [`ContextEpoch`] is the immutable, project-scoped history record for a
+//! context-epoch transition: which project reached which epoch number, the
+//! opaque timestamp supplied for that transition, and the frozen
+//! closed-set trigger category that caused it. One row per
+//! `(project_id, epoch)`: duplicates are refused, records are never
+//! updated, replaced, or deleted, and there is no mutable `current_epoch`
+//! pointer — the latest epoch is always a derived query over the history
+//! (highest numeric `epoch`), never a duplicated fact.
+//!
+//! Scope of this slice: append + exact read + latest read only. State
+//! stores epoch records that the trusted core boundary has already
+//! constructed; it never decides that an epoch should advance. There is
+//! deliberately no `advance`, `increment`, `next_epoch`, `invalidate`,
+//! `reconcile`, monotonic-sequencing, or contiguity rule — structurally
+//! valid out-of-order history is storable because lifecycle advancement
+//! policy is a later, separately authorized slice. The trigger enum is
+//! persisted metadata only: State implements none of the behavior any
+//! trigger name represents.
+//!
+//! This module loads no source contents and computes or compares no
+//! digests (`changed_sources` belongs to the later rehydration slice and
+//! is deliberately not persisted); it determines no invalidated roles
+//! (`invalidated_role_ids` is likewise deliberately not persisted); it
+//! mutates no ContextManifest, LogicalRole, or ExecutorBinding; and it
+//! emits no events — `CONTEXT_EPOCH_ADVANCED` production belongs to the
+//! later authorized orchestration action. `advanced_at` is an opaque
+//! contract timestamp string stored exactly as supplied: State never
+//! calls a clock, parses, normalizes, or compares timestamps, and never
+//! uses timestamp or insertion order to determine the latest epoch.
+
+use rusqlite::{Connection, OptionalExtension, params};
+
+use crate::error::StateError;
+use crate::repository::{SqliteStateRepository, UnitOfWork};
+
+/// Maximum allowed length, in Unicode scalar values, of the constrained
+/// ContextEpoch identifier (accepted State convention: 200).
+pub const MAX_IDENTIFIER_LENGTH: usize = 200;
+
+/// The trigger category that caused a context-epoch transition (frozen
+/// closed enum of exactly the fifteen rehydration-architecture triggers).
+///
+/// There is no `UNKNOWN`, `OTHER`, `CUSTOM`, `MANUAL`, `TIMER`, or
+/// fallback variant: any value outside the fifteen frozen triggers fails
+/// closed at the decode boundary and is rejected by the storage backstop.
+/// This slice persists the category only; the behavior a trigger name
+/// represents (host-switch detection, compaction, security escalation,
+/// and so on) belongs to later orchestration slices and is never
+/// implemented or wired here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextEpochTrigger {
+    /// `A1_INIT` — RUNTIME-A1 initialization.
+    A1Init,
+    /// `A2_INIT` — RUNTIME-A2 initialization.
+    A2Init,
+    /// `MODEL_REPLACEMENT` — the bound model was replaced.
+    ModelReplacement,
+    /// `PROVIDER_REPLACEMENT` — the provider was replaced.
+    ProviderReplacement,
+    /// `HOST_SWITCH` — execution switched host. Metadata only here: State
+    /// detects no host change.
+    HostSwitch,
+    /// `CONTEXT_COMPACTION` — host context compaction. Metadata only
+    /// here: State detects and summarizes nothing.
+    ContextCompaction,
+    /// `ARCHITECTURE_CHANGE` — an authoritative architecture source
+    /// changed. Authorizes no digest comparison in this slice.
+    ArchitectureChange,
+    /// `CONTRACT_CHANGE` — an authoritative contract changed. Authorizes
+    /// no digest comparison in this slice.
+    ContractChange,
+    /// `NEW_WAVE` — a new implementation wave began.
+    NewWave,
+    /// `TASK_THRESHOLD` — the configurable completed-task threshold was
+    /// reached.
+    TaskThreshold,
+    /// `SERIOUS_A4_REJECTION` — a serious architecture/security review
+    /// rejection. Metadata only here: State inspects no reviews.
+    SeriousA4Rejection,
+    /// `SECURITY_ESCALATION` — a security escalation occurred.
+    SecurityEscalation,
+    /// `BEFORE_A2_INTEGRATION` — immediately before A2 integration.
+    BeforeA2Integration,
+    /// `BEFORE_A1_INTEGRATION` — immediately before A1 integration.
+    BeforeA1Integration,
+    /// `BEFORE_GOAL_COMPLETE` — immediately before declaring the goal
+    /// complete. Metadata only here: State evaluates no goal completion.
+    BeforeGoalComplete,
+}
+
+impl ContextEpochTrigger {
+    /// Every frozen trigger, in contract order.
+    pub const ALL: [ContextEpochTrigger; 15] = [
+        ContextEpochTrigger::A1Init,
+        ContextEpochTrigger::A2Init,
+        ContextEpochTrigger::ModelReplacement,
+        ContextEpochTrigger::ProviderReplacement,
+        ContextEpochTrigger::HostSwitch,
+        ContextEpochTrigger::ContextCompaction,
+        ContextEpochTrigger::ArchitectureChange,
+        ContextEpochTrigger::ContractChange,
+        ContextEpochTrigger::NewWave,
+        ContextEpochTrigger::TaskThreshold,
+        ContextEpochTrigger::SeriousA4Rejection,
+        ContextEpochTrigger::SecurityEscalation,
+        ContextEpochTrigger::BeforeA2Integration,
+        ContextEpochTrigger::BeforeA1Integration,
+        ContextEpochTrigger::BeforeGoalComplete,
+    ];
+
+    /// The durable storage representation required by the contract.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContextEpochTrigger::A1Init => "A1_INIT",
+            ContextEpochTrigger::A2Init => "A2_INIT",
+            ContextEpochTrigger::ModelReplacement => "MODEL_REPLACEMENT",
+            ContextEpochTrigger::ProviderReplacement => "PROVIDER_REPLACEMENT",
+            ContextEpochTrigger::HostSwitch => "HOST_SWITCH",
+            ContextEpochTrigger::ContextCompaction => "CONTEXT_COMPACTION",
+            ContextEpochTrigger::ArchitectureChange => "ARCHITECTURE_CHANGE",
+            ContextEpochTrigger::ContractChange => "CONTRACT_CHANGE",
+            ContextEpochTrigger::NewWave => "NEW_WAVE",
+            ContextEpochTrigger::TaskThreshold => "TASK_THRESHOLD",
+            ContextEpochTrigger::SeriousA4Rejection => "SERIOUS_A4_REJECTION",
+            ContextEpochTrigger::SecurityEscalation => "SECURITY_ESCALATION",
+            ContextEpochTrigger::BeforeA2Integration => "BEFORE_A2_INTEGRATION",
+            ContextEpochTrigger::BeforeA1Integration => "BEFORE_A1_INTEGRATION",
+            ContextEpochTrigger::BeforeGoalComplete => "BEFORE_GOAL_COMPLETE",
+        }
+    }
+
+    /// Decodes the durable representation, failing closed on anything
+    /// other than the fifteen frozen triggers.
+    pub(crate) fn from_storage(value: &str) -> Result<Self, StateError> {
+        match value {
+            "A1_INIT" => Ok(ContextEpochTrigger::A1Init),
+            "A2_INIT" => Ok(ContextEpochTrigger::A2Init),
+            "MODEL_REPLACEMENT" => Ok(ContextEpochTrigger::ModelReplacement),
+            "PROVIDER_REPLACEMENT" => Ok(ContextEpochTrigger::ProviderReplacement),
+            "HOST_SWITCH" => Ok(ContextEpochTrigger::HostSwitch),
+            "CONTEXT_COMPACTION" => Ok(ContextEpochTrigger::ContextCompaction),
+            "ARCHITECTURE_CHANGE" => Ok(ContextEpochTrigger::ArchitectureChange),
+            "CONTRACT_CHANGE" => Ok(ContextEpochTrigger::ContractChange),
+            "NEW_WAVE" => Ok(ContextEpochTrigger::NewWave),
+            "TASK_THRESHOLD" => Ok(ContextEpochTrigger::TaskThreshold),
+            "SERIOUS_A4_REJECTION" => Ok(ContextEpochTrigger::SeriousA4Rejection),
+            "SECURITY_ESCALATION" => Ok(ContextEpochTrigger::SecurityEscalation),
+            "BEFORE_A2_INTEGRATION" => Ok(ContextEpochTrigger::BeforeA2Integration),
+            "BEFORE_A1_INTEGRATION" => Ok(ContextEpochTrigger::BeforeA1Integration),
+            "BEFORE_GOAL_COMPLETE" => Ok(ContextEpochTrigger::BeforeGoalComplete),
+            other => Err(StateError::ContextEpochDecodeFailed {
+                detail: format!(
+                    "unknown trigger {other:?}: only the fifteen frozen rehydration triggers are representable"
+                ),
+            }),
+        }
+    }
+}
+
+/// One immutable project-scoped context-epoch history record (frozen
+/// contract core fields).
+///
+/// `project_id` is opaque structural metadata (no project table or
+/// cross-component validation) persisted byte-for-byte. `epoch` is a
+/// non-negative integer exactly as supplied by the trusted core boundary:
+/// State neither increments it nor enforces any contiguity or ordering
+/// rule against other records. `advanced_at` is an opaque contract
+/// timestamp string stored exactly as supplied and never parsed,
+/// normalized, compared, or regenerated. The candidate-only
+/// `changed_sources` and `invalidated_role_ids` fields are deliberately
+/// absent from this slice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextEpoch {
+    /// Owning project identity. Non-empty, at most
+    /// [`MAX_IDENTIFIER_LENGTH`] scalar values; persisted byte-for-byte.
+    pub project_id: String,
+    /// The epoch number reached. Must be >= 0.
+    pub epoch: i64,
+    /// The opaque timestamp supplied for the transition. Non-empty;
+    /// stored exactly as provided and never parsed.
+    pub advanced_at: String,
+    /// The frozen trigger category that caused the transition.
+    pub trigger: ContextEpochTrigger,
+}
+
+impl SqliteStateRepository {
+    /// Durably appends one immutable ContextEpoch history record.
+    ///
+    /// The append is atomic: validation, the duplicate pre-check, and the
+    /// insert commit together in one transaction or not at all; there is
+    /// no success before commit. A failure caused by validation, a
+    /// duplicate, a SQLite constraint, or a transaction failure leaves no
+    /// record and modifies nothing else.
+    ///
+    /// Fail-closed results, in deterministic precedence order:
+    ///
+    /// * an invalid input shape fails with
+    ///   [`StateError::ContextEpochValidation`] before any storage
+    ///   access;
+    /// * a `(project_id, epoch)` pair that already exists fails with
+    ///   [`StateError::ContextEpochAlreadyExists`], leaving the original
+    ///   record untouched — this repository never overwrites, replaces,
+    ///   upserts, merges, or deletes-and-reinserts epoch history.
+    ///
+    /// Uniqueness is per `(project_id, epoch)`, never database-global:
+    /// the same epoch number for a different project remains appendable.
+    /// Out-of-order epochs are accepted as supplied: this operation
+    /// stores a record the trusted core boundary already constructed and
+    /// never decides advancement, incrementing, sequencing, or trigger
+    /// behavior. The schema's primary-key, CHECK, and NOT NULL
+    /// constraints re-enforce the same rules as durable backstops, and
+    /// all caller values reach SQL through bound parameters.
+    pub fn append_context_epoch(&mut self, context_epoch: ContextEpoch) -> Result<(), StateError> {
+        validate_for_append(&context_epoch)?;
+        self.run_transaction(|uow| uow.insert_context_epoch(&context_epoch))
+    }
+
+    /// Reads one ContextEpoch by exact `(project_id, epoch)` identity.
+    ///
+    /// `Ok(None)` is the deterministic absence result for a record that
+    /// does not exist. Both inputs are structurally validated first: an
+    /// invalid `project_id` or a negative query `epoch` fails with
+    /// [`StateError::ContextEpochValidation`] rather than querying for a
+    /// shape that could never have persisted. The found row is decoded
+    /// through the same fail-closed decoder as every other read: an
+    /// unknown trigger, empty or overlong `project_id`, negative epoch,
+    /// or empty `advanced_at` surfaces as
+    /// [`StateError::ContextEpochDecodeFailed`] instead of a partially
+    /// decoded or repaired record.
+    pub fn find_context_epoch(
+        &self,
+        project_id: &str,
+        epoch: i64,
+    ) -> Result<Option<ContextEpoch>, StateError> {
+        validate_project_id(project_id)?;
+        if epoch < 0 {
+            return Err(StateError::ContextEpochValidation {
+                detail: format!("epoch must be >= 0, found {epoch}"),
+            });
+        }
+        let conn = self.connection();
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(internal_query_failure)?;
+        let found = read_context_epoch(conn, project_id, epoch);
+        // Read-only snapshot: commit merely ends it. On the error path above
+        // the transaction rolls back on drop, with nothing written to undo.
+        tx.commit().map_err(internal_query_failure)?;
+        found
+    }
+
+    /// Derives the latest ContextEpoch record for one project from the
+    /// immutable history: the record with the highest numeric `epoch`.
+    ///
+    /// This is a read-only query over persisted records, not a mutable
+    /// current-epoch pointer, and nothing is mutated. `Ok(None)` is the
+    /// deterministic result for a project with no epoch records. The
+    /// numeric `epoch` field alone defines latest: `advanced_at` is never
+    /// parsed or compared, insertion order and rowids are never
+    /// authority, and epochs are not required to be contiguous — for
+    /// epochs `0, 2, 7` the record with epoch `7` is returned. The
+    /// selected row is decoded through the same fail-closed decoder as
+    /// [`Self::find_context_epoch`]; a corrupt latest row is an error,
+    /// never a silent fallback to an older valid row. `project_id` is
+    /// structurally validated first.
+    pub fn find_latest_context_epoch(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<ContextEpoch>, StateError> {
+        validate_project_id(project_id)?;
+        let conn = self.connection();
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(internal_query_failure)?;
+        let row = conn
+            .query_row(SELECT_LATEST_SQL, [project_id], extract_epoch_row)
+            .optional()
+            .map_err(internal_query_failure)?;
+        let found = row.map(EpochRow::into_context_epoch).transpose();
+        // Read-only snapshot: commit merely ends it. On the error path above
+        // the transaction rolls back on drop, with nothing written to undo.
+        tx.commit().map_err(internal_query_failure)?;
+        found
+    }
+}
+
+impl UnitOfWork<'_> {
+    /// Inserts one validated ContextEpoch inside the open transaction.
+    /// Crate-private; invoked by
+    /// [`SqliteStateRepository::append_context_epoch`].
+    pub(crate) fn insert_context_epoch(
+        &self,
+        context_epoch: &ContextEpoch,
+    ) -> Result<(), StateError> {
+        insert_context_epoch(self.tx(), context_epoch)
+    }
+}
+
+const EPOCH_EXISTS_SQL: &str = "SELECT 1 FROM context_epoch WHERE project_id = ?1 AND epoch = ?2";
+
+const INSERT_EPOCH_SQL: &str = "INSERT INTO context_epoch (
+    project_id,
+    epoch,
+    advanced_at,
+    trigger
+) VALUES (?1, ?2, ?3, ?4)";
+
+const SELECT_EPOCH_SQL: &str = "SELECT
+    project_id,
+    epoch,
+    advanced_at,
+    trigger
+FROM context_epoch
+WHERE project_id = ?1 AND epoch = ?2";
+
+/// Latest-by-numeric-epoch query: an ordered lookup, not a timestamp or
+/// insertion-order derivation.
+const SELECT_LATEST_SQL: &str = "SELECT
+    project_id,
+    epoch,
+    advanced_at,
+    trigger
+FROM context_epoch
+WHERE project_id = ?1
+ORDER BY epoch DESC
+LIMIT 1";
+
+/// Inserts one epoch record using bound parameters.
+///
+/// The composite `(project_id, epoch)` primary key is refused twice: an
+/// explicit in-transaction check gives the common path a deterministic,
+/// driver-independent error, while the primary-key constraint remains
+/// the durable backstop (including against a concurrent writer on the
+/// same database file). A backstop primary-key hit is mapped to the same
+/// [`StateError::ContextEpochAlreadyExists`] result; the failed statement
+/// leaves the still-open transaction rolled back by the caller's error
+/// path, so no partial record can persist.
+fn insert_context_epoch(conn: &Connection, epoch: &ContextEpoch) -> Result<(), StateError> {
+    let duplicate: Option<i64> = conn
+        .query_row(
+            EPOCH_EXISTS_SQL,
+            params![epoch.project_id, epoch.epoch],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(write_failure)?;
+    if duplicate.is_some() {
+        return Err(StateError::ContextEpochAlreadyExists {
+            project_id: epoch.project_id.clone(),
+            epoch: epoch.epoch,
+        });
+    }
+    conn.execute(
+        INSERT_EPOCH_SQL,
+        params![
+            epoch.project_id,
+            epoch.epoch,
+            epoch.advanced_at,
+            epoch.trigger.as_str()
+        ],
+    )
+    .map_err(|error| {
+        if is_primary_key_violation(&error) {
+            StateError::ContextEpochAlreadyExists {
+                project_id: epoch.project_id.clone(),
+                epoch: epoch.epoch,
+            }
+        } else {
+            write_failure(error)
+        }
+    })?;
+    Ok(())
+}
+
+/// Reads one epoch record on the caller's snapshot and applies contract
+/// decoding, failing closed on any violation.
+fn read_context_epoch(
+    conn: &Connection,
+    project_id: &str,
+    epoch: i64,
+) -> Result<Option<ContextEpoch>, StateError> {
+    conn.query_row(
+        SELECT_EPOCH_SQL,
+        params![project_id, epoch],
+        extract_epoch_row,
+    )
+    .optional()
+    .map_err(internal_query_failure)?
+    .map(EpochRow::into_context_epoch)
+    .transpose()
+}
+
+/// Raw column image of one `context_epoch` row, before any contract
+/// interpretation is applied.
+struct EpochRow {
+    project_id: String,
+    epoch: i64,
+    advanced_at: String,
+    trigger: String,
+}
+
+impl EpochRow {
+    /// Applies contract decoding to the row, failing closed on any
+    /// violation: no fabricated trigger, no normalized `project_id`, no
+    /// clamped epoch, no defaulted `advanced_at`.
+    fn into_context_epoch(self) -> Result<ContextEpoch, StateError> {
+        ensure_decoded_identifier("project_id", &self.project_id)?;
+        if self.epoch < 0 {
+            return Err(StateError::ContextEpochDecodeFailed {
+                detail: format!("persisted epoch {} is negative", self.epoch),
+            });
+        }
+        if self.advanced_at.is_empty() {
+            return Err(StateError::ContextEpochDecodeFailed {
+                detail: "persisted advanced_at is empty".to_string(),
+            });
+        }
+        Ok(ContextEpoch {
+            project_id: self.project_id,
+            epoch: self.epoch,
+            advanced_at: self.advanced_at,
+            trigger: ContextEpochTrigger::from_storage(&self.trigger)?,
+        })
+    }
+}
+
+fn extract_epoch_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EpochRow> {
+    Ok(EpochRow {
+        project_id: row.get("project_id")?,
+        epoch: row.get("epoch")?,
+        advanced_at: row.get("advanced_at")?,
+        trigger: row.get("trigger")?,
+    })
+}
+
+/// Contract-level validation performed before any storage access on
+/// append.
+///
+/// Exactly the frozen constraints are enforced — no invented lifecycle
+/// rules: `project_id` non-empty and at most [`MAX_IDENTIFIER_LENGTH`]
+/// scalar values; a non-negative `epoch`; a non-empty `advanced_at`. The
+/// trigger is already restricted to the closed enumeration by its type.
+/// Every value is accepted unchanged or rejected — never normalized,
+/// trimmed, parsed, or regenerated.
+fn validate_for_append(epoch: &ContextEpoch) -> Result<(), StateError> {
+    validate_project_id(&epoch.project_id)?;
+    if epoch.epoch < 0 {
+        return Err(StateError::ContextEpochValidation {
+            detail: format!("epoch must be >= 0, found {}", epoch.epoch),
+        });
+    }
+    ensure_non_empty("advanced_at", &epoch.advanced_at)?;
+    Ok(())
+}
+
+/// Shared `project_id` structural check for the append and read paths.
+fn validate_project_id(project_id: &str) -> Result<(), StateError> {
+    ensure_non_empty("project_id", project_id)?;
+    let length = project_id.chars().count();
+    if length > MAX_IDENTIFIER_LENGTH {
+        return Err(StateError::ContextEpochValidation {
+            detail: format!(
+                "project_id length {length} exceeds the maximum of {MAX_IDENTIFIER_LENGTH}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_non_empty(field: &str, value: &str) -> Result<(), StateError> {
+    if value.is_empty() {
+        return Err(StateError::ContextEpochValidation {
+            detail: format!("{field} must not be empty"),
+        });
+    }
+    Ok(())
+}
+
+/// Decode-boundary identifier check mirroring the create-time rule so
+/// contract-violating persisted rows fail closed instead of decoding.
+fn ensure_decoded_identifier(field: &str, value: &str) -> Result<(), StateError> {
+    if value.is_empty() {
+        return Err(StateError::ContextEpochDecodeFailed {
+            detail: format!("persisted {field} is empty"),
+        });
+    }
+    let length = value.chars().count();
+    if length > MAX_IDENTIFIER_LENGTH {
+        return Err(StateError::ContextEpochDecodeFailed {
+            detail: format!(
+                "persisted {field} length {length} exceeds the maximum of {MAX_IDENTIFIER_LENGTH}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn write_failure(error: rusqlite::Error) -> StateError {
+    StateError::ContextEpochWriteFailed {
+        detail: error.to_string(),
+    }
+}
+
+fn internal_query_failure(error: rusqlite::Error) -> StateError {
+    StateError::InternalQueryFailed {
+        detail: error.to_string(),
+    }
+}
+
+/// SQLite extended result codes for a composite primary-key violation on
+/// `context_epoch`: 1555 = `SQLITE_CONSTRAINT_PRIMARYKEY`, 2067 =
+/// `SQLITE_CONSTRAINT_UNIQUE`.
+fn is_primary_key_violation(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                extended_code: 1555 | 2067,
+                ..
+            },
+            _
+        )
+    )
+}
