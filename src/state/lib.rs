@@ -16,11 +16,15 @@
 //! or model-facing mutation path.
 
 pub mod error;
+pub mod event;
 pub mod executor_binding;
 pub mod logical_role;
 pub mod repository;
 
 mod migrations;
+
+#[cfg(test)]
+mod event_tests;
 
 #[cfg(test)]
 mod executor_binding_release_tests;
@@ -35,6 +39,10 @@ mod logical_role_tests;
 mod tests;
 
 pub use error::StateError;
+pub use event::{
+    ActorKind, EventActor, EventEnvelope, EventPayloadReference, EventSubject, EventType,
+    SubjectKind,
+};
 pub use executor_binding::{ExecutorBinding, ReleaseReason};
 pub use logical_role::{LogicalRole, LogicalRoleStatus, LogicalRoleType};
 pub use repository::SqliteStateRepository;

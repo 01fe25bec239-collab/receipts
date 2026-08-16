@@ -178,6 +178,41 @@ pub enum StateError {
         /// What could not be decoded.
         detail: String,
     },
+    /// An EventEnvelope failed structural validation before persistence.
+    ///
+    /// Validation accepts each supplied structural value byte-for-byte
+    /// unchanged or rejects the append; it never transforms, repairs, or
+    /// redacts a value into a different persisted value.
+    EventValidation {
+        /// Which frozen structural constraint was violated.
+        detail: String,
+    },
+    /// Appending an EventEnvelope whose durable identity already exists.
+    ///
+    /// Events are immutable append-only evidence: an existing `event_id` is
+    /// never overwritten, replaced, upserted, merged, or
+    /// deleted-and-reinserted; the original row remains untouched.
+    EventAlreadyExists {
+        /// The `event_id` that already exists.
+        event_id: String,
+    },
+    /// Writing an EventEnvelope failed at the storage layer.
+    EventWriteFailed {
+        /// Underlying driver detail.
+        detail: String,
+    },
+    /// A persisted EventEnvelope row could not be decoded against the
+    /// frozen contract.
+    ///
+    /// Decoding fails closed: unknown `event_type`, `actor_kind`, or
+    /// `subject_kind` values, a negative `epoch`, and any other
+    /// contract-violating row are never surfaced as valid events, never
+    /// mapped to an `UNKNOWN` variant, and never repaired into a plausible
+    /// default envelope.
+    EventDecodeFailed {
+        /// What could not be decoded.
+        detail: String,
+    },
 }
 
 impl fmt::Display for StateError {
@@ -287,6 +322,21 @@ impl fmt::Display for StateError {
             }
             StateError::ExecutorBindingDecodeFailed { detail } => {
                 write!(f, "failed to decode persisted ExecutorBinding: {detail}")
+            }
+            StateError::EventValidation { detail } => {
+                write!(f, "invalid EventEnvelope: {detail}")
+            }
+            StateError::EventAlreadyExists { event_id } => {
+                write!(
+                    f,
+                    "an event with event_id {event_id:?} already exists; the event log is append-only and is never overwritten, replaced, or merged"
+                )
+            }
+            StateError::EventWriteFailed { detail } => {
+                write!(f, "failed to append event: {detail}")
+            }
+            StateError::EventDecodeFailed { detail } => {
+                write!(f, "failed to decode persisted event: {detail}")
             }
         }
     }

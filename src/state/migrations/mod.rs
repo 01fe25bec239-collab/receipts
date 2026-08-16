@@ -8,6 +8,7 @@
 mod v0001_schema_foundation;
 mod v0002_logical_role;
 mod v0003_executor_binding;
+mod v0004_event;
 
 use crate::error::StateError;
 
@@ -28,6 +29,7 @@ static REGISTERED: &[Migration] = &[
     v0001_schema_foundation::MIGRATION,
     v0002_logical_role::MIGRATION,
     v0003_executor_binding::MIGRATION,
+    v0004_event::MIGRATION,
 ];
 
 /// The registered migration chain in application order.

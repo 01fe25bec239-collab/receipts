@@ -200,6 +200,49 @@ impl SqliteStateRepository {
             })
     }
 
+    /// Lists the column names of an internal table in declared order.
+    /// Crate-private test/inspection support; `table` is always a
+    /// repository-internal or test-literal identifier.
+    #[cfg(test)]
+    pub(crate) fn table_columns(&self, table: &str) -> Result<Vec<String>, StateError> {
+        let mut statement = self
+            .conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|e| StateError::InternalQueryFailed {
+                detail: e.to_string(),
+            })?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| StateError::InternalQueryFailed {
+                detail: e.to_string(),
+            })?;
+        rows.collect::<Result<Vec<String>, _>>()
+            .map_err(|e| StateError::InternalQueryFailed {
+                detail: e.to_string(),
+            })
+    }
+
+    /// Lists every table name in the database, sorted. Crate-private
+    /// test/inspection support for exact-schema-shape assertions.
+    #[cfg(test)]
+    pub(crate) fn list_tables(&self) -> Result<Vec<String>, StateError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .map_err(|e| StateError::InternalQueryFailed {
+                detail: e.to_string(),
+            })?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| StateError::InternalQueryFailed {
+                detail: e.to_string(),
+            })?;
+        rows.collect::<Result<Vec<String>, _>>()
+            .map_err(|e| StateError::InternalQueryFailed {
+                detail: e.to_string(),
+            })
+    }
+
     fn supported_version(chain: &[Migration]) -> Result<u32, StateError> {
         chain
             .last()
