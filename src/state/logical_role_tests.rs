@@ -30,12 +30,13 @@ fn minimal_role(role_id: &str, role_type: LogicalRoleType) -> LogicalRole {
     }
 }
 
-// T01 — a fresh database bootstraps through migrations 1 and 2.
+// T01 — a fresh database bootstraps through the registered chain, which
+// since migration 0003 ends at schema version 3.
 #[test]
-fn t01_fresh_database_reaches_schema_version_2() {
+fn t01_fresh_database_reaches_schema_version_3() {
     let tmp = TempDir::new("lr-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 2);
+    assert_eq!(repo.schema_version().expect("version read"), 3);
     assert!(
         repo.table_exists("logical_role").expect("table check"),
         "logical_role must exist after migration 2"
@@ -45,31 +46,36 @@ fn t01_fresh_database_reaches_schema_version_2() {
             .expect("table check"),
         "ownership-path table must exist after migration 2"
     );
-    // Migration 2 creates only LogicalRole structures.
+    assert!(
+        repo.table_exists("executor_binding").expect("table check"),
+        "executor_binding must exist after migration 3"
+    );
+    // The registered chain creates no domain storage beyond roles and
+    // executor bindings.
     for forbidden in [
-        "executor_binding",
         "event_log",
         "context_manifest",
         "context_epoch",
         "entitlement",
+        "binding_lease",
     ] {
         assert!(
             !repo.table_exists(forbidden).expect("table check"),
-            "no {forbidden} storage may be created by migration 2"
+            "no {forbidden} storage may be created by the registered chain"
         );
     }
 }
 
-// T02 — reopening a version-2 database is idempotent.
+// T02 — reopening a version-3 database is idempotent.
 #[test]
-fn t02_version_2_reopen_idempotent() {
+fn t02_version_3_reopen_idempotent() {
     let tmp = TempDir::new("lr-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 2);
+        assert_eq!(repo.schema_version().expect("version read"), 3);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            2,
+            3,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -92,7 +98,7 @@ fn t03_ordinary_open_of_version_1_database_fails() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 1,
-                supported: 2
+                supported: 3
             }
         ),
         "unexpected error: {error}"
@@ -507,10 +513,11 @@ fn t18_identity_survives_reopen_without_executor_or_session_identity() {
     // Identity persists without any binding or manifest reference attached.
     assert_eq!(found.active_binding_id, None);
     assert_eq!(found.context_manifest_id, None);
-    // A LogicalRole is durable identity, not an LLM session: no executor,
-    // session, context, or epoch storage exists in this schema.
+    // A LogicalRole is durable identity, not an LLM session: no lease,
+    // session, context, or epoch storage exists in this schema (the
+    // executor_binding table of migration 3 stores associations only and
+    // never attaches one to the role).
     for absent in [
-        "executor_binding",
         "binding_lease",
         "llm_session",
         "session",

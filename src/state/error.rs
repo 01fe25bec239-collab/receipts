@@ -115,6 +115,46 @@ pub enum StateError {
         /// What could not be decoded.
         detail: String,
     },
+    /// An ExecutorBinding failed contract-level validation before
+    /// persistence.
+    ExecutorBindingValidation {
+        /// Which frozen constraint was violated.
+        detail: String,
+    },
+    /// Creating an ExecutorBinding whose durable identity already exists.
+    ///
+    /// Binding history is append-only durable evidence: an existing
+    /// `binding_id` is never overwritten, replaced, upserted, merged, or
+    /// deleted-and-reinserted; the original row remains untouched.
+    ExecutorBindingAlreadyExists {
+        /// The `binding_id` that already exists.
+        binding_id: String,
+    },
+    /// Creating an ExecutorBinding whose `role_id` does not reference an
+    /// existing persisted LogicalRole.
+    ///
+    /// No orphan binding may ever be persisted; durable role identity is the
+    /// only valid binding target.
+    ExecutorBindingRoleNotFound {
+        /// The `role_id` that does not exist.
+        role_id: String,
+    },
+    /// Writing an ExecutorBinding failed at the storage layer.
+    ExecutorBindingWriteFailed {
+        /// Underlying driver detail.
+        detail: String,
+    },
+    /// A persisted ExecutorBinding row could not be decoded against the
+    /// frozen contract.
+    ///
+    /// Decoding fails closed: unknown `release_reason` values, corrupt
+    /// `rehydration_completed` values, and any other contract-violating row
+    /// are never surfaced as valid bindings, and no plausible default
+    /// binding is constructed.
+    ExecutorBindingDecodeFailed {
+        /// What could not be decoded.
+        detail: String,
+    },
 }
 
 impl fmt::Display for StateError {
@@ -191,6 +231,27 @@ impl fmt::Display for StateError {
             }
             StateError::LogicalRoleDecodeFailed { detail } => {
                 write!(f, "failed to decode persisted LogicalRole: {detail}")
+            }
+            StateError::ExecutorBindingValidation { detail } => {
+                write!(f, "invalid ExecutorBinding: {detail}")
+            }
+            StateError::ExecutorBindingAlreadyExists { binding_id } => {
+                write!(
+                    f,
+                    "an ExecutorBinding with binding_id {binding_id:?} already exists; binding history is append-only and is never overwritten, replaced, or merged"
+                )
+            }
+            StateError::ExecutorBindingRoleNotFound { role_id } => {
+                write!(
+                    f,
+                    "no LogicalRole with role_id {role_id:?} exists; an ExecutorBinding may not be created for a nonexistent role"
+                )
+            }
+            StateError::ExecutorBindingWriteFailed { detail } => {
+                write!(f, "failed to write ExecutorBinding: {detail}")
+            }
+            StateError::ExecutorBindingDecodeFailed { detail } => {
+                write!(f, "failed to decode persisted ExecutorBinding: {detail}")
             }
         }
     }

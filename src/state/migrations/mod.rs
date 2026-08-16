@@ -7,6 +7,7 @@
 
 mod v0001_schema_foundation;
 mod v0002_logical_role;
+mod v0003_executor_binding;
 
 use crate::error::StateError;
 
@@ -26,6 +27,7 @@ pub(crate) struct Migration {
 static REGISTERED: &[Migration] = &[
     v0001_schema_foundation::MIGRATION,
     v0002_logical_role::MIGRATION,
+    v0003_executor_binding::MIGRATION,
 ];
 
 /// The registered migration chain in application order.
