@@ -177,8 +177,8 @@ fn t01_schema_version_remains_7() {
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
     assert_eq!(
         repo.schema_version().expect("version read"),
-        8,
-        "the supported schema version must be 8 before any renewal"
+        9,
+        "the supported schema version must be 9 before any renewal"
     );
     repo.create_logical_role(minimal_role("role-ver-001", LogicalRoleType::RuntimeA1))
         .expect("role create");
@@ -188,12 +188,12 @@ fn t01_schema_version_remains_7() {
         .expect("renew");
     assert_eq!(
         repo.schema_version().expect("version read"),
-        8,
+        9,
         "a lease renewal must not change the schema version"
     );
     drop(repo);
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("reopen");
-    assert_eq!(repo.schema_version().expect("version read"), 8);
+    assert_eq!(repo.schema_version().expect("version read"), 9);
 }
 
 // T02 — no migration is introduced by the lease-renewal slice: the
@@ -205,13 +205,13 @@ fn t02_no_migration_introduced_by_lease_renewal() {
     let registered = migrations::registered();
     assert_eq!(
         registered.len(),
-        8,
-        "exactly eight registered migrations (v0001–v0008) may exist"
+        9,
+        "exactly nine registered migrations (v0001–v0009) may exist"
     );
     assert_eq!(
         registered.last().expect("chain is non-empty").version,
-        8,
-        "the registered chain must end at version 8"
+        9,
+        "the registered chain must end at version 9"
     );
     let tmp = TempDir::new("ebl-t02");
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
@@ -223,7 +223,7 @@ fn t02_no_migration_introduced_by_lease_renewal() {
         .expect("renew");
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        8,
+        9,
         "no extra migration metadata row may appear"
     );
 }

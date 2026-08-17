@@ -384,6 +384,17 @@ pub enum StateError {
         /// What could not be decoded.
         detail: String,
     },
+    /// A context-rehydration request violated the closed typed boundary.
+    ContextRehydrationValidation { detail: String },
+    /// The immutable project-scoped attempt identity already exists.
+    ContextRehydrationAttemptAlreadyExists {
+        project_id: String,
+        rehydration_attempt_id: String,
+    },
+    /// Writing immutable attempt/evidence failed.
+    ContextRehydrationWriteFailed { detail: String },
+    /// Persisted attempt/evidence failed closed decoding.
+    ContextRehydrationDecodeFailed { detail: String },
 }
 
 impl fmt::Display for StateError {
@@ -605,6 +616,22 @@ impl fmt::Display for StateError {
             }
             StateError::ContextEpochDecodeFailed { detail } => {
                 write!(f, "failed to decode persisted ContextEpoch: {detail}")
+            }
+            StateError::ContextRehydrationValidation { detail } => {
+                write!(f, "invalid context rehydration: {detail}")
+            }
+            StateError::ContextRehydrationAttemptAlreadyExists {
+                project_id,
+                rehydration_attempt_id,
+            } => write!(
+                f,
+                "ContextRehydrationAttempt ({project_id:?}, {rehydration_attempt_id:?}) already exists; attempts are immutable"
+            ),
+            StateError::ContextRehydrationWriteFailed { detail } => {
+                write!(f, "failed to write ContextRehydrationAttempt: {detail}")
+            }
+            StateError::ContextRehydrationDecodeFailed { detail } => {
+                write!(f, "failed to decode ContextRehydrationAttempt: {detail}")
             }
         }
     }

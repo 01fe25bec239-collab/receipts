@@ -68,16 +68,16 @@ fn direct_child(
 #[test]
 fn v8_bootstrap_reopen_and_v7_open_fail_closed() {
     let fresh = TempDir::new("cei-v8-fresh");
-    let repo = SqliteStateRepository::open(fresh.db_path()).expect("bootstrap v8");
-    assert_eq!(repo.schema_version().expect("version"), 8);
-    assert_eq!(migrations::registered().len(), 8);
+    let repo = SqliteStateRepository::open(fresh.db_path()).expect("bootstrap v9");
+    assert_eq!(repo.schema_version().expect("version"), 9);
+    assert_eq!(migrations::registered().len(), 9);
     drop(repo);
     assert_eq!(
         SqliteStateRepository::open(fresh.db_path())
-            .expect("reopen v8")
+            .expect("reopen v9")
             .schema_version()
             .expect("version"),
-        8
+        9
     );
 
     let old = TempDir::new("cei-v7-open");
@@ -89,7 +89,7 @@ fn v8_bootstrap_reopen_and_v7_open_fail_closed() {
         SqliteStateRepository::open(old.db_path()).expect_err("ordinary open refuses upgrade"),
         StateError::SchemaVersionMismatch {
             found: 7,
-            supported: 8
+            supported: 9
         }
     ));
 }

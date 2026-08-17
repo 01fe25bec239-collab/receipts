@@ -13,6 +13,7 @@ mod v0005_single_active_binding;
 mod v0006_context_manifest;
 mod v0007_context_epoch;
 mod v0008_context_epoch_invalidation;
+mod v0009_context_rehydration;
 
 use crate::error::StateError;
 
@@ -38,6 +39,7 @@ static REGISTERED: &[Migration] = &[
     v0006_context_manifest::MIGRATION,
     v0007_context_epoch::MIGRATION,
     v0008_context_epoch_invalidation::MIGRATION,
+    v0009_context_rehydration::MIGRATION,
 ];
 
 /// The registered migration chain in application order.

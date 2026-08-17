@@ -156,7 +156,7 @@ fn t07_current_version_reopen_succeeds() {
     let tmp = TempDir::new("t07");
     drop(SqliteStateRepository::open(tmp.db_path()).expect("bootstrap"));
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("reopen succeeds");
-    assert_eq!(repo.schema_version().expect("version read"), 8);
+    assert_eq!(repo.schema_version().expect("version read"), 9);
 }
 
 // T8 — bootstrap/reopen is idempotent: no duplicate metadata, no reinit.
@@ -167,7 +167,7 @@ fn t08_reopen_idempotent() {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            8,
+            9,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -178,33 +178,33 @@ fn t08_reopen_idempotent() {
 #[test]
 fn t09_lower_unsupported_version_fails() {
     let tmp = TempDir::new("t09");
-    // Database initialized at version 9 by the registered chain plus one.
-    let v9_chain = chain_with(&[probe_migration(9, "probe_v9")]);
+    // Database initialized at version 10 by the registered chain plus one.
+    let v10_chain = chain_with(&[probe_migration(10, "probe_v10")]);
     drop(
-        SqliteStateRepository::open_with_migrations(tmp.db_path(), &v9_chain)
-            .expect("bootstrap at version 9"),
+        SqliteStateRepository::open_with_migrations(tmp.db_path(), &v10_chain)
+            .expect("bootstrap at version 10"),
     );
-    // Opening against a chain supporting version 10 must fail closed.
-    let v10_chain = chain_with(&[
-        probe_migration(9, "probe_v9"),
+    // Opening against a chain supporting version 11 must fail closed.
+    let v11_chain = chain_with(&[
         probe_migration(10, "probe_v10"),
+        probe_migration(11, "probe_v11"),
     ]);
-    let error = SqliteStateRepository::open_with_migrations(tmp.db_path(), &v10_chain)
+    let error = SqliteStateRepository::open_with_migrations(tmp.db_path(), &v11_chain)
         .expect_err("older version must not be silently upgraded");
     assert!(
         matches!(
             error,
             StateError::SchemaVersionMismatch {
-                found: 9,
-                supported: 10
+                found: 10,
+                supported: 11
             }
         ),
         "unexpected error: {error}"
     );
     // The stored version was not altered by the failed open.
-    let repo = SqliteStateRepository::open_with_migrations(tmp.db_path(), &v9_chain)
+    let repo = SqliteStateRepository::open_with_migrations(tmp.db_path(), &v10_chain)
         .expect("database still opens with its original chain");
-    assert_eq!(repo.schema_version().expect("version read"), 9);
+    assert_eq!(repo.schema_version().expect("version read"), 10);
 }
 
 // T10 — an existing database at a higher/unknown version fails to open and
@@ -212,10 +212,10 @@ fn t09_lower_unsupported_version_fails() {
 #[test]
 fn t10_higher_unsupported_version_fails() {
     let tmp = TempDir::new("t10");
-    let v9_chain = chain_with(&[probe_migration(9, "probe_v9")]);
+    let v10_chain = chain_with(&[probe_migration(10, "probe_v10")]);
     drop(
-        SqliteStateRepository::open_with_migrations(tmp.db_path(), &v9_chain)
-            .expect("bootstrap at version 9"),
+        SqliteStateRepository::open_with_migrations(tmp.db_path(), &v10_chain)
+            .expect("bootstrap at version 10"),
     );
     let error = SqliteStateRepository::open(tmp.db_path())
         .expect_err("newer/unknown version must fail closed");
@@ -223,15 +223,15 @@ fn t10_higher_unsupported_version_fails() {
         matches!(
             error,
             StateError::SchemaVersionMismatch {
-                found: 9,
-                supported: 8
+                found: 10,
+                supported: 9
             }
         ),
         "unexpected error: {error}"
     );
-    let repo = SqliteStateRepository::open_with_migrations(tmp.db_path(), &v9_chain)
+    let repo = SqliteStateRepository::open_with_migrations(tmp.db_path(), &v10_chain)
         .expect("database still opens with its original chain");
-    assert_eq!(repo.schema_version().expect("version read"), 9);
+    assert_eq!(repo.schema_version().expect("version read"), 10);
 }
 
 // T11 — a successful transaction commits all of its mutations.

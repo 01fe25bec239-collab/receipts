@@ -206,33 +206,33 @@ fn direct_exec(repo: &mut SqliteStateRepository, sql: &str, params: &[&dyn ToSql
         .expect("test corruption statement");
 }
 
-// T01 — the schema remains version 8 and advancement leaves it there.
+// T01 — the schema remains at the current version after advancement.
 #[test]
 fn t01_schema_remains_version_8() {
     let (tmp, mut repo) = opened_repo("cea-t01");
-    assert_eq!(repo.schema_version().expect("version read"), 8);
+    assert_eq!(repo.schema_version().expect("version read"), 9);
     advance(&mut repo, "project-1", ContextEpochTrigger::A1Init).expect("advance");
     assert_eq!(
         repo.schema_version().expect("version read"),
-        8,
+        9,
         "advancement must not change the schema version"
     );
     drop(repo);
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("reopen");
-    assert_eq!(repo.schema_version().expect("version read"), 8);
+    assert_eq!(repo.schema_version().expect("version read"), 9);
 }
 
-// T02 — migration v8 is the exact registered chain head.
+// T02 — migration v9 is the exact registered chain head.
 #[test]
 fn t02_migration_v8_registered() {
     let registered = migrations::registered();
     assert_eq!(
         registered.len(),
-        8,
-        "exactly eight registered migrations may exist"
+        9,
+        "exactly nine registered migrations may exist"
     );
     let versions: Vec<u32> = registered.iter().map(|m| m.version).collect();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
 }
 
 // T03 — the first advancement for a project with no history returns and
@@ -1033,6 +1033,9 @@ fn t36_no_current_epoch_pointer() {
         "context_manifest_source_required_for",
         "context_epoch",
         "context_epoch_invalidated_role",
+        "context_rehydration_attempt",
+        "context_rehydration_repository_snapshot",
+        "context_rehydration_source_evidence",
     ] {
         assert!(
             !repo
@@ -1259,6 +1262,9 @@ fn t64_no_new_schema_object() {
         "context_manifest_source_required_for",
         "context_epoch",
         "context_epoch_invalidated_role",
+        "context_rehydration_attempt",
+        "context_rehydration_repository_snapshot",
+        "context_rehydration_source_evidence",
     ];
     expected.sort_unstable();
     let tables_before = repo.list_tables().expect("tables");

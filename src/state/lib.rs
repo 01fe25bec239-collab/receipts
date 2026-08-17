@@ -17,6 +17,7 @@
 
 pub mod context_epoch;
 pub mod context_manifest;
+pub mod context_rehydration;
 pub mod error;
 pub mod event;
 pub mod executor_binding;
@@ -36,6 +37,9 @@ mod context_epoch_tests;
 
 #[cfg(test)]
 mod context_manifest_tests;
+
+#[cfg(test)]
+mod context_rehydration_tests;
 
 #[cfg(test)]
 mod event_tests;
@@ -62,6 +66,15 @@ pub use context_epoch::{ContextEpoch, ContextEpochTrigger};
 pub use context_manifest::{
     ContextManifest, ContextManifestSource, ContextSourceRef, ContextSourceRefType, RequiredFor,
     SourceClass,
+};
+pub use context_rehydration::{
+    ArtifactMaterializer, ArtifactRefV1, BoundContextSourceRefV1, ContextRehydratedEventSupplier,
+    ContextRehydrationAttempt, ContextRehydrationOutcome, ContextRehydrationRequest,
+    ContextRehydrationSourceEvidence, ContextRehydrationStatus, ContextSourceBindingV1,
+    ContextSourceDemand, ContextSourceTouchEvidence, ExternalSourceMaterialization,
+    RehydratedContextSource, RepositorySnapshotMaterializer, RepositorySnapshotRefV1,
+    SourceDigestComparison, SourceDisposition, SourceMaterializationFailure, StateQueryRefV1,
+    context_rehydration_event_payload, context_source_digest_v1,
 };
 pub use error::StateError;
 pub use event::{

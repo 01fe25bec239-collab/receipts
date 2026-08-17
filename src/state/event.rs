@@ -718,7 +718,7 @@ fn extract_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
 ///
 /// Validation never transforms a supplied value: each field is either
 /// accepted byte-for-byte unchanged or the append is rejected.
-fn validate_for_append(event: &EventEnvelope) -> Result<(), StateError> {
+pub(crate) fn validate_for_append(event: &EventEnvelope) -> Result<(), StateError> {
     ensure_canonical_ulid(&event.event_id)?;
     ensure_non_empty("project_id", &event.project_id)?;
     if let Some(goal_id) = &event.goal_id {
