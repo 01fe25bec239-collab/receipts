@@ -1,4 +1,5 @@
-//! Durable ContextEpoch history persistence (migration 0007 slice).
+//! Durable ContextEpoch history persistence (migration 0007 slice) and
+//! the transactional advancement primitive (A3-012 slice).
 //!
 //! [`ContextEpoch`] is the immutable, project-scoped history record for a
 //! context-epoch transition: which project reached which epoch number, the
@@ -9,15 +10,27 @@
 //! pointer — the latest epoch is always a derived query over the history
 //! (highest numeric `epoch`), never a duplicated fact.
 //!
-//! Scope of this slice: append + exact read + latest read only. State
-//! stores epoch records that the trusted core boundary has already
-//! constructed; it never decides that an epoch should advance. There is
-//! deliberately no `advance`, `increment`, `next_epoch`, `invalidate`,
-//! `reconcile`, monotonic-sequencing, or contiguity rule — structurally
-//! valid out-of-order history is storable because lifecycle advancement
-//! policy is a later, separately authorized slice. The trigger enum is
-//! persisted metadata only: State implements none of the behavior any
-//! trigger name represents.
+//! Scope of this slice: append + exact read + latest read, plus exactly
+//! one bounded advancement mutation,
+//! [`SqliteStateRepository::advance_context_epoch`]. State stores epoch
+//! records the trusted core boundary has already constructed; it never
+//! decides that an epoch should advance — the advancement operation is
+//! invoked only after trusted core/orchestration logic has already made
+//! that decision, and the caller supplies the trigger as closed typed
+//! data. Advancement derives the next epoch strictly inside one
+//! transaction from the persisted history (no history → epoch `0`;
+//! existing history → `max(epoch) + 1` with checked arithmetic, failing
+//! closed at `i64::MAX`), inserts exactly that derived record in the same
+//! transaction, and returns the committed record. A conflicting insert is
+//! a failure, never a retry with a different number. There is still
+//! deliberately no `increment`, `next_epoch`, `peek`, `reserve`,
+//! `allocate`, `set_current_epoch`, `invalidate`, `reconcile`,
+//! monotonic-sequencing enforcement, or contiguity rule: structurally
+//! valid out-of-order explicit history remains storable through
+//! [`SqliteStateRepository::append_context_epoch`], because explicit
+//! immutable append and authoritative advancement are distinct
+//! capabilities. The trigger enum is persisted metadata only: State
+//! implements none of the behavior any trigger name represents.
 //!
 //! This module loads no source contents and computes or compares no
 //! digests (`changed_sources` belongs to the later rehydration slice and
@@ -217,6 +230,80 @@ impl SqliteStateRepository {
         self.run_transaction(|uow| uow.insert_context_epoch(&context_epoch))
     }
 
+    /// Derives and durably appends exactly one next ContextEpoch record
+    /// for `project_id`, returning the committed record.
+    ///
+    /// This is the authoritative advancement primitive, invoked only after
+    /// the trusted core boundary has already decided that advancement is
+    /// required and has chosen the trigger: State performs no trigger
+    /// detection of its own. The authoritative derivation rule is applied
+    /// transactionally, per the frozen A1 bootstrap decision:
+    ///
+    /// * no persisted history for the project → the next epoch is `0`;
+    /// * existing history → the next epoch is `max(persisted epoch) + 1`,
+    ///   where the maximum is the highest numeric `epoch` (never the
+    ///   latest timestamp, insertion order, rowid, or row count, and
+    ///   history is not required to be contiguous).
+    ///
+    /// The latest-epoch lookup, the successor derivation, and the insert
+    /// all occur inside one transaction: there is no success before
+    /// commit, and any failure after derivation leaves the project
+    /// history byte-for-byte unchanged, consuming nothing — because there
+    /// is no sequence or pointer storage, a later successful call derives
+    /// the same next number again. The latest lookup decodes the selected
+    /// highest-epoch row through the same fail-closed contract decoder as
+    /// every other read: a corrupt highest row fails the advancement
+    /// rather than being ignored or skipped in favor of a lower row.
+    ///
+    /// Fail-closed results, in deterministic precedence order:
+    ///
+    /// * an invalid `project_id` or an empty `advanced_at` fails with
+    ///   [`StateError::ContextEpochValidation`] before any storage
+    ///   access — inputs are accepted unchanged or rejected, never
+    ///   normalized, trimmed, parsed, or regenerated;
+    /// * a persisted maximum epoch of `i64::MAX` fails with
+    ///   [`StateError::ContextEpochAdvanceOverflow`]: `max + 1` is not
+    ///   representable, so the successor is derived with checked
+    ///   arithmetic that never wraps, saturates, resets, or reuses the
+    ///   current maximum, and no row is written;
+    /// * a `(project_id, derived epoch)` pair that already exists fails
+    ///   with [`StateError::ContextEpochAlreadyExists`] (explicit
+    ///   in-transaction pre-check, with the composite primary key as the
+    ///   durable backstop against a concurrent writer). The conflict is
+    ///   never resolved by retrying with a different epoch number,
+    ///   skipping over the conflicting value, deleting, or replacing a
+    ///   record.
+    ///
+    /// Advancement mutates nothing but the immutable `context_epoch`
+    /// history: no LogicalRole (including any `current_context_epoch`
+    /// field), no ContextManifest (including its epoch snapshot and
+    /// `last_rehydrated_at`), no ExecutorBinding, and no event — in
+    /// particular no automatic `CONTEXT_EPOCH_ADVANCED` emission. There is
+    /// no current-epoch pointer: the authoritative latest epoch remains
+    /// the derived [`Self::find_latest_context_epoch`] query. All caller
+    /// values reach SQL through bound parameters.
+    pub fn advance_context_epoch(
+        &mut self,
+        project_id: &str,
+        advanced_at: &str,
+        trigger: ContextEpochTrigger,
+    ) -> Result<ContextEpoch, StateError> {
+        validate_project_id(project_id)?;
+        ensure_non_empty("advanced_at", advanced_at)?;
+        self.run_transaction(|uow| {
+            let latest = uow.read_latest_context_epoch(project_id)?;
+            let epoch = derive_next_epoch(project_id, latest.map(|record| record.epoch))?;
+            let created = ContextEpoch {
+                project_id: project_id.to_string(),
+                epoch,
+                advanced_at: advanced_at.to_string(),
+                trigger,
+            };
+            uow.insert_context_epoch(&created)?;
+            Ok(created)
+        })
+    }
+
     /// Reads one ContextEpoch by exact `(project_id, epoch)` identity.
     ///
     /// `Ok(None)` is the deterministic absence result for a record that
@@ -274,11 +361,7 @@ impl SqliteStateRepository {
         let tx = conn
             .unchecked_transaction()
             .map_err(internal_query_failure)?;
-        let row = conn
-            .query_row(SELECT_LATEST_SQL, [project_id], extract_epoch_row)
-            .optional()
-            .map_err(internal_query_failure)?;
-        let found = row.map(EpochRow::into_context_epoch).transpose();
+        let found = query_latest_context_epoch(conn, project_id);
         // Read-only snapshot: commit merely ends it. On the error path above
         // the transaction rolls back on drop, with nothing written to undo.
         tx.commit().map_err(internal_query_failure)?;
@@ -295,6 +378,20 @@ impl UnitOfWork<'_> {
         context_epoch: &ContextEpoch,
     ) -> Result<(), StateError> {
         insert_context_epoch(self.tx(), context_epoch)
+    }
+
+    /// Reads the latest ContextEpoch for `project_id` on the open
+    /// transaction's snapshot: the row with the highest numeric `epoch`,
+    /// decoded through the same fail-closed contract decoder as
+    /// [`SqliteStateRepository::find_latest_context_epoch`]. Crate-private;
+    /// the authoritative advancement derivation queries its maximum
+    /// through this read so that lookup, derivation, and insert share one
+    /// transaction.
+    pub(crate) fn read_latest_context_epoch(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<ContextEpoch>, StateError> {
+        query_latest_context_epoch(self.tx(), project_id)
     }
 }
 
@@ -326,6 +423,40 @@ FROM context_epoch
 WHERE project_id = ?1
 ORDER BY epoch DESC
 LIMIT 1";
+
+/// Queries the highest-numeric-epoch record for `project_id` on the
+/// caller's connection or open transaction snapshot and applies the
+/// fail-closed contract decode: `Ok(None)` when the project has no
+/// history, and a corrupt selected row is an error — never a silent
+/// fallback to an older valid row.
+fn query_latest_context_epoch(
+    conn: &Connection,
+    project_id: &str,
+) -> Result<Option<ContextEpoch>, StateError> {
+    conn.query_row(SELECT_LATEST_SQL, [project_id], extract_epoch_row)
+        .optional()
+        .map_err(internal_query_failure)?
+        .map(EpochRow::into_context_epoch)
+        .transpose()
+}
+
+/// Derives the next epoch from the transaction-snapshot latest-epoch
+/// lookup, per the frozen advancement rule: no persisted history for the
+/// project → `0`; otherwise `max + 1` with checked arithmetic. The only
+/// non-negative `max` without a representable successor is `i64::MAX`:
+/// the result fails closed with
+/// [`StateError::ContextEpochAdvanceOverflow`] — never wrapping,
+/// saturating, resetting to zero, or reusing the current maximum.
+fn derive_next_epoch(project_id: &str, latest_epoch: Option<i64>) -> Result<i64, StateError> {
+    match latest_epoch {
+        None => Ok(0),
+        Some(max) => max
+            .checked_add(1)
+            .ok_or_else(|| StateError::ContextEpochAdvanceOverflow {
+                project_id: project_id.to_string(),
+            }),
+    }
+}
 
 /// Inserts one epoch record using bound parameters.
 ///

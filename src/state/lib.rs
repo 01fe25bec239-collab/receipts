@@ -26,6 +26,9 @@ pub mod repository;
 mod migrations;
 
 #[cfg(test)]
+mod context_epoch_advance_tests;
+
+#[cfg(test)]
 mod context_epoch_tests;
 
 #[cfg(test)]

@@ -22,9 +22,13 @@
 //!   `ON CONFLICT DO UPDATE` / `UPDATE` / `DELETE` anywhere in this
 //!   slice's SQL (duplicates are refused by pre-check + primary-key
 //!   backstop);
-//! * no `advance_context_epoch`, `increment_context_epoch`,
-//!   `next_epoch`, `invalidate_context`, `reconcile_epoch`,
-//!   `advance_if_changed`, or any other epoch-advancement/increment API;
+//! * beyond the single authorized
+//!   `advance_context_epoch(project_id, advanced_at, trigger)`, no
+//!   `increment_context_epoch`, `next_context_epoch`, `peek_next_epoch`,
+//!   `reserve_epoch`, `allocate_epoch`, `set_current_epoch`,
+//!   `increment_epoch_without_insert`, `invalidate_context`,
+//!   `reconcile_epoch`, `advance_if_changed`, or any other
+//!   epoch-advancement/increment API;
 //! * no trigger handler: `HOST_SWITCH`, `CONTEXT_COMPACTION`,
 //!   `SERIOUS_A4_REJECTION`, `BEFORE_GOAL_COMPLETE`, and every other
 //!   trigger are persisted metadata only;

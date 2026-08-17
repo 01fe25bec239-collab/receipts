@@ -323,6 +323,18 @@ pub enum StateError {
         /// The `epoch` number of the duplicate record.
         epoch: i64,
     },
+    /// Advancing a project's context epoch cannot derive a representable
+    /// successor.
+    ///
+    /// The persisted maximum epoch for the project is `i64::MAX`, so
+    /// `max + 1` overflows the stored integer type: advancement fails
+    /// closed rather than wrapping, saturating, resetting, reusing the
+    /// current maximum, or deleting history. The failure is decided before
+    /// any insert is attempted, so no row is written.
+    ContextEpochAdvanceOverflow {
+        /// The `project_id` whose history is at the representable maximum.
+        project_id: String,
+    },
     /// Writing a ContextEpoch failed at the storage layer.
     ContextEpochWriteFailed {
         /// Underlying driver detail.
@@ -512,6 +524,12 @@ impl fmt::Display for StateError {
                 write!(
                     f,
                     "a ContextEpoch for project_id {project_id:?} epoch {epoch} already exists; epoch history is immutable and append-only and is never overwritten, replaced, or merged"
+                )
+            }
+            StateError::ContextEpochAdvanceOverflow { project_id } => {
+                write!(
+                    f,
+                    "the next context epoch for project_id {project_id:?} cannot be derived: the persisted maximum epoch is i64::MAX and has no representable successor; advancement fails closed and writes nothing"
                 )
             }
             StateError::ContextEpochWriteFailed { detail } => {
