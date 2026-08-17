@@ -1,5 +1,5 @@
 //! Deterministic tests for durable ContextEpoch history persistence
-//! (migration 0007 slice).
+//! (migration 0007 parent-record slice).
 //!
 //! All tests use real temporary SQLite database files under the system
 //! temporary directory (never inside the repository). Storage-backstop and
@@ -23,7 +23,7 @@
 //!   slice's SQL (duplicates are refused by pre-check + primary-key
 //!   backstop);
 //! * beyond the single authorized
-//!   `advance_context_epoch(project_id, advanced_at, trigger)`, no
+//!   `advance_context_epoch(project_id, advanced_at, trigger, invalidated_role_ids)`, no
 //!   `increment_context_epoch`, `next_context_epoch`, `peek_next_epoch`,
 //!   `reserve_epoch`, `allocate_epoch`, `set_current_epoch`,
 //!   `increment_epoch_without_insert`, `invalidate_context`,
@@ -38,8 +38,8 @@
 //!   an artifact reference), and no hashing dependency;
 //! * no `rehydrate`, `reconcile`, `resume_role`, `rebuild_context`,
 //!   `mark_rehydrated`, or `set_last_rehydrated_at`;
-//! * no `changed_sources` or `invalidated_role_ids` field, column,
-//!   table, or calculation anywhere in this slice;
+//! * no `changed_sources` persistence and no invalidation data embedded in
+//!   the four-field parent record;
 //! * no `chrono`, `time`, `SystemTime`, `Instant`, or other clock
 //!   dependency: timestamps are opaque strings;
 //! * no ContextManifest/LogicalRole/ExecutorBinding mutation method and
@@ -189,20 +189,20 @@ fn t01_fresh_database_bootstraps_to_schema_version_7() {
     let registered = migrations::registered();
     assert_eq!(
         registered.len(),
-        7,
-        "exactly seven registered migrations (v0001–v0007) may exist"
+        8,
+        "exactly eight registered migrations (v0001–v0008) may exist"
     );
     assert_eq!(
         registered.last().expect("chain is non-empty").version,
-        7,
-        "the registered chain must end at version 7"
+        8,
+        "the registered chain must end at version 8"
     );
     let tmp = TempDir::new("ce-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 7);
+    assert_eq!(repo.schema_version().expect("version read"), 8);
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        7,
+        8,
         "one metadata row per applied migration"
     );
 }
@@ -213,10 +213,10 @@ fn t02_version_7_database_reopens_idempotently() {
     let tmp = TempDir::new("ce-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 7);
+        assert_eq!(repo.schema_version().expect("version read"), 8);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            7,
+            8,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -239,7 +239,7 @@ fn t03_ordinary_open_of_version_6_fails_closed() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 6,
-                supported: 7
+                supported: 8
             }
         ),
         "unexpected error: {error}"
@@ -305,24 +305,23 @@ fn t04_migration_v7_creates_exactly_the_authorized_schema() {
         "context_manifest_source",
         "context_manifest_source_required_for",
         "context_epoch",
+        "context_epoch_invalidated_role",
     ];
     expected.sort_unstable();
     assert_eq!(
         repo.list_tables().expect("tables"),
         expected,
-        "the registered chain must create exactly its own nine tables"
+        "the registered chain must create exactly its own tables"
     );
 }
 
-// T05 — migration 7 adds no changed-source, invalidated-role, or
-// reconciliation storage of any kind.
+// T05 — no changed-source or reconciliation storage is introduced.
 #[test]
-fn t05_no_changed_source_invalidated_role_or_reconciliation_schema() {
+fn t05_no_changed_source_or_reconciliation_schema() {
     let tmp = TempDir::new("ce-t05");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
     for forbidden in [
         "context_epoch_changed_source",
-        "context_epoch_invalidated_role",
         "context_epoch_reconciliation",
         "context_epoch_current",
         "context_epoch_state",
@@ -336,7 +335,7 @@ fn t05_no_changed_source_invalidated_role_or_reconciliation_schema() {
     ] {
         assert!(
             !repo.table_exists(forbidden).expect("table check"),
-            "no {forbidden} storage may exist after migration 7"
+            "no {forbidden} storage may exist"
         );
     }
 }
@@ -1476,8 +1475,8 @@ fn t62_append_emits_no_event() {
     );
 }
 
-// T63/T64 — no changed_sources or invalidated_role_ids persistence exists
-// anywhere: the context_epoch table is exactly its four core columns.
+// T63/T64 — no changed_sources or embedded invalidation persistence exists
+// on the context_epoch parent: it remains exactly its four core columns.
 #[test]
 fn t63_t64_no_changed_sources_or_invalidated_roles_columns() {
     let (_tmp, mut repo) = opened_repo("ce-t63");

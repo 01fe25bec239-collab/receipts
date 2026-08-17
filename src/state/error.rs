@@ -335,6 +335,37 @@ pub enum StateError {
         /// The `project_id` whose history is at the representable maximum.
         project_id: String,
     },
+    /// The supplied invalidation set contains the same durable role twice.
+    ContextEpochInvalidatedRoleDuplicate {
+        /// The duplicated role identity.
+        role_id: String,
+    },
+    /// A supplied invalidated role does not exist.
+    ContextEpochInvalidatedRoleNotFound {
+        /// Project whose epoch was being advanced.
+        project_id: String,
+        /// Missing role identity.
+        role_id: String,
+    },
+    /// A supplied invalidated role belongs to another project.
+    ContextEpochInvalidatedRoleProjectMismatch {
+        /// Project whose epoch was being advanced.
+        epoch_project_id: String,
+        /// Referenced durable role identity.
+        role_id: String,
+        /// Project that owns the role.
+        role_project_id: String,
+    },
+    /// Writing ContextEpoch invalidation evidence failed at the storage layer.
+    ContextEpochInvalidationWriteFailed {
+        /// Underlying driver detail.
+        detail: String,
+    },
+    /// Persisted invalidation evidence could not be decoded safely.
+    ContextEpochInvalidationDecodeFailed {
+        /// What could not be decoded.
+        detail: String,
+    },
     /// Writing a ContextEpoch failed at the storage layer.
     ContextEpochWriteFailed {
         /// Underlying driver detail.
@@ -530,6 +561,43 @@ impl fmt::Display for StateError {
                 write!(
                     f,
                     "the next context epoch for project_id {project_id:?} cannot be derived: the persisted maximum epoch is i64::MAX and has no representable successor; advancement fails closed and writes nothing"
+                )
+            }
+            StateError::ContextEpochInvalidatedRoleDuplicate { role_id } => {
+                write!(
+                    f,
+                    "invalid ContextEpoch invalidation set: role_id {role_id:?} appears more than once"
+                )
+            }
+            StateError::ContextEpochInvalidatedRoleNotFound {
+                project_id,
+                role_id,
+            } => {
+                write!(
+                    f,
+                    "no LogicalRole with role_id {role_id:?} exists for ContextEpoch project_id {project_id:?}"
+                )
+            }
+            StateError::ContextEpochInvalidatedRoleProjectMismatch {
+                epoch_project_id,
+                role_id,
+                role_project_id,
+            } => {
+                write!(
+                    f,
+                    "LogicalRole {role_id:?} belongs to project_id {role_project_id:?}, not ContextEpoch project_id {epoch_project_id:?}"
+                )
+            }
+            StateError::ContextEpochInvalidationWriteFailed { detail } => {
+                write!(
+                    f,
+                    "failed to write ContextEpoch invalidation evidence: {detail}"
+                )
+            }
+            StateError::ContextEpochInvalidationDecodeFailed { detail } => {
+                write!(
+                    f,
+                    "failed to decode persisted ContextEpoch invalidation evidence: {detail}"
                 )
             }
             StateError::ContextEpochWriteFailed { detail } => {

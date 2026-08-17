@@ -29,6 +29,9 @@ mod migrations;
 mod context_epoch_advance_tests;
 
 #[cfg(test)]
+mod context_epoch_invalidation_tests;
+
+#[cfg(test)]
 mod context_epoch_tests;
 
 #[cfg(test)]

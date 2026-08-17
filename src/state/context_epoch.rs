@@ -1,5 +1,5 @@
-//! Durable ContextEpoch history persistence (migration 0007 slice) and
-//! the transactional advancement primitive (A3-012 slice).
+//! Durable ContextEpoch history and invalidation persistence (migrations
+//! 0007–0008), including the transactional advancement primitive.
 //!
 //! [`ContextEpoch`] is the immutable, project-scoped history record for a
 //! context-epoch transition: which project reached which epoch number, the
@@ -34,14 +34,16 @@
 //!
 //! This module loads no source contents and computes or compares no
 //! digests (`changed_sources` belongs to the later rehydration slice and
-//! is deliberately not persisted); it determines no invalidated roles
-//! (`invalidated_role_ids` is likewise deliberately not persisted); it
-//! mutates no ContextManifest, LogicalRole, or ExecutorBinding; and it
-//! emits no events — `CONTEXT_EPOCH_ADVANCED` production belongs to the
+//! is deliberately not persisted). The caller supplies the complete
+//! invalidated-role set; State only validates and persists it atomically
+//! with the new epoch. It mutates no ContextManifest, LogicalRole, or
+//! ExecutorBinding; and it emits no events — `CONTEXT_EPOCH_ADVANCED` production belongs to the
 //! later authorized orchestration action. `advanced_at` is an opaque
 //! contract timestamp string stored exactly as supplied: State never
 //! calls a clock, parses, normalizes, or compares timestamps, and never
 //! uses timestamp or insertion order to determine the latest epoch.
+
+use std::collections::HashSet;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -181,9 +183,9 @@ impl ContextEpochTrigger {
 /// State neither increments it nor enforces any contiguity or ordering
 /// rule against other records. `advanced_at` is an opaque contract
 /// timestamp string stored exactly as supplied and never parsed,
-/// normalized, compared, or regenerated. The candidate-only
-/// `changed_sources` and `invalidated_role_ids` fields are deliberately
-/// absent from this slice.
+/// normalized, compared, or regenerated. `changed_sources` remains absent;
+/// invalidated role identities live in immutable normalized child rows and
+/// do not alter this four-field parent record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextEpoch {
     /// Owning project identity. Non-empty, at most
@@ -274,8 +276,8 @@ impl SqliteStateRepository {
     ///   skipping over the conflicting value, deleting, or replacing a
     ///   record.
     ///
-    /// Advancement mutates nothing but the immutable `context_epoch`
-    /// history: no LogicalRole (including any `current_context_epoch`
+    /// Advancement mutates nothing but immutable `context_epoch` parent and
+    /// invalidated-role child history: no LogicalRole (including any `current_context_epoch`
     /// field), no ContextManifest (including its epoch snapshot and
     /// `last_rehydrated_at`), no ExecutorBinding, and no event — in
     /// particular no automatic `CONTEXT_EPOCH_ADVANCED` emission. There is
@@ -287,12 +289,15 @@ impl SqliteStateRepository {
         project_id: &str,
         advanced_at: &str,
         trigger: ContextEpochTrigger,
+        invalidated_role_ids: &[String],
     ) -> Result<ContextEpoch, StateError> {
         validate_project_id(project_id)?;
         ensure_non_empty("advanced_at", advanced_at)?;
+        validate_invalidated_role_ids(invalidated_role_ids)?;
         self.run_transaction(|uow| {
             let latest = uow.read_latest_context_epoch(project_id)?;
             let epoch = derive_next_epoch(project_id, latest.map(|record| record.epoch))?;
+            validate_invalidated_roles(uow.tx(), project_id, invalidated_role_ids)?;
             let created = ContextEpoch {
                 project_id: project_id.to_string(),
                 epoch,
@@ -300,8 +305,37 @@ impl SqliteStateRepository {
                 trigger,
             };
             uow.insert_context_epoch(&created)?;
+            insert_invalidated_roles(uow.tx(), project_id, epoch, invalidated_role_ids)?;
             Ok(created)
         })
+    }
+
+    /// Reads the immutable invalidated-role set for an exact epoch.
+    /// Missing epoch returns `None`; an existing epoch with no children
+    /// returns `Some(Vec::new())`. Results are sorted by role identity only
+    /// for deterministic presentation; no order is persisted.
+    pub fn find_context_epoch_invalidated_role_ids(
+        &self,
+        project_id: &str,
+        epoch: i64,
+    ) -> Result<Option<Vec<String>>, StateError> {
+        validate_project_id(project_id)?;
+        if epoch < 0 {
+            return Err(StateError::ContextEpochValidation {
+                detail: format!("epoch must be >= 0, found {epoch}"),
+            });
+        }
+        let conn = self.connection();
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(internal_query_failure)?;
+        if read_context_epoch(&tx, project_id, epoch)?.is_none() {
+            tx.commit().map_err(internal_query_failure)?;
+            return Ok(None);
+        }
+        let found = read_invalidated_role_ids(&tx, project_id, epoch)?;
+        tx.commit().map_err(internal_query_failure)?;
+        Ok(Some(found))
     }
 
     /// Reads one ContextEpoch by exact `(project_id, epoch)` identity.
@@ -423,6 +457,119 @@ FROM context_epoch
 WHERE project_id = ?1
 ORDER BY epoch DESC
 LIMIT 1";
+
+const SELECT_ROLE_PROJECT_SQL: &str = "SELECT project_id FROM logical_role WHERE role_id = ?1";
+
+const INSERT_INVALIDATED_ROLE_SQL: &str = "INSERT INTO context_epoch_invalidated_role (
+    project_id,
+    epoch,
+    role_id
+) VALUES (?1, ?2, ?3)";
+
+const SELECT_INVALIDATED_ROLE_IDS_SQL: &str = "SELECT role_id
+FROM context_epoch_invalidated_role
+WHERE project_id = ?1 AND epoch = ?2
+ORDER BY role_id";
+
+fn validate_invalidated_role_ids(role_ids: &[String]) -> Result<(), StateError> {
+    let mut seen = HashSet::with_capacity(role_ids.len());
+    for role_id in role_ids {
+        ensure_invalidated_role_id(role_id)?;
+        if !seen.insert(role_id.as_str()) {
+            return Err(StateError::ContextEpochInvalidatedRoleDuplicate {
+                role_id: role_id.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn ensure_invalidated_role_id(role_id: &str) -> Result<(), StateError> {
+    if role_id.is_empty() {
+        return Err(StateError::ContextEpochValidation {
+            detail: "invalidated role_id must not be empty".to_string(),
+        });
+    }
+    let length = role_id.chars().count();
+    if length > MAX_IDENTIFIER_LENGTH {
+        return Err(StateError::ContextEpochValidation {
+            detail: format!(
+                "invalidated role_id length {length} exceeds the maximum of {MAX_IDENTIFIER_LENGTH}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_invalidated_roles(
+    conn: &Connection,
+    project_id: &str,
+    role_ids: &[String],
+) -> Result<(), StateError> {
+    for role_id in role_ids {
+        let role_project_id = conn
+            .query_row(SELECT_ROLE_PROJECT_SQL, [role_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()
+            .map_err(write_failure)?;
+        let Some(role_project_id) = role_project_id else {
+            return Err(StateError::ContextEpochInvalidatedRoleNotFound {
+                project_id: project_id.to_string(),
+                role_id: role_id.clone(),
+            });
+        };
+        if role_project_id != project_id {
+            return Err(StateError::ContextEpochInvalidatedRoleProjectMismatch {
+                epoch_project_id: project_id.to_string(),
+                role_id: role_id.clone(),
+                role_project_id,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn insert_invalidated_roles(
+    conn: &Connection,
+    project_id: &str,
+    epoch: i64,
+    role_ids: &[String],
+) -> Result<(), StateError> {
+    let mut statement = conn
+        .prepare(INSERT_INVALIDATED_ROLE_SQL)
+        .map_err(invalidation_write_failure)?;
+    for role_id in role_ids {
+        statement
+            .execute(params![project_id, epoch, role_id])
+            .map_err(invalidation_write_failure)?;
+    }
+    Ok(())
+}
+
+fn read_invalidated_role_ids(
+    conn: &Connection,
+    project_id: &str,
+    epoch: i64,
+) -> Result<Vec<String>, StateError> {
+    let mut statement = conn
+        .prepare(SELECT_INVALIDATED_ROLE_IDS_SQL)
+        .map_err(internal_query_failure)?;
+    let rows = statement
+        .query_map(params![project_id, epoch], |row| row.get::<_, String>(0))
+        .map_err(internal_query_failure)?;
+    let role_ids = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(internal_query_failure)?;
+    for role_id in &role_ids {
+        if role_id.is_empty() || role_id.chars().count() > MAX_IDENTIFIER_LENGTH {
+            return Err(StateError::ContextEpochInvalidationDecodeFailed {
+                detail: format!("persisted role_id {role_id:?} violates identifier constraints"),
+            });
+        }
+    }
+    Ok(role_ids)
+}
 
 /// Queries the highest-numeric-epoch record for `project_id` on the
 /// caller's connection or open transaction snapshot and applies the
@@ -630,6 +777,12 @@ fn ensure_decoded_identifier(field: &str, value: &str) -> Result<(), StateError>
 
 fn write_failure(error: rusqlite::Error) -> StateError {
     StateError::ContextEpochWriteFailed {
+        detail: error.to_string(),
+    }
+}
+
+fn invalidation_write_failure(error: rusqlite::Error) -> StateError {
+    StateError::ContextEpochInvalidationWriteFailed {
         detail: error.to_string(),
     }
 }

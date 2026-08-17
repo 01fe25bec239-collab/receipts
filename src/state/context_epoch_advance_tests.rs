@@ -14,7 +14,7 @@
 //!
 //! * exactly one advancement capability exists —
 //!   `advance_context_epoch(&mut self, project_id: &str, advanced_at:
-//!   &str, trigger: ContextEpochTrigger) -> Result<ContextEpoch,
+//!   &str, trigger: ContextEpochTrigger, invalidated_role_ids: &[String]) -> Result<ContextEpoch,
 //!   StateError>` (pinned by a function-pointer type assertion below);
 //!   no `next_context_epoch`, `peek_next_epoch`, `reserve_epoch`,
 //!   `allocate_epoch`, `set_current_epoch`,
@@ -40,8 +40,7 @@
 //!   `replace_context_epoch`, or `upsert_context_epoch`, and no
 //!   `INSERT OR REPLACE` / `UPSERT` / `ON CONFLICT DO UPDATE` / `UPDATE` /
 //!   `DELETE` anywhere in this slice's SQL;
-//! * no `changed_sources` or `invalidated_role_ids` field, column,
-//!   table, or calculation anywhere in this slice;
+//! * no `changed_sources` field, column, table, or calculation;
 //! * no `chrono`, `time`, `SystemTime`, `Instant`, or other clock
 //!   dependency: timestamps are opaque strings, never parsed, compared,
 //!   or regenerated;
@@ -76,13 +75,21 @@ use crate::tests::TempDir;
 /// The opaque timestamp used by the advancement helper.
 const ADVANCED_AT: &str = "2026-08-17T10:00:00.000Z";
 
+type AdvanceContextEpochFn = fn(
+    &mut SqliteStateRepository,
+    &str,
+    &str,
+    ContextEpochTrigger,
+    &[String],
+) -> Result<ContextEpoch, StateError>;
+
 /// Performs one authoritative advancement through the public API.
 fn advance(
     repo: &mut SqliteStateRepository,
     project_id: &str,
     trigger: ContextEpochTrigger,
 ) -> Result<ContextEpoch, StateError> {
-    repo.advance_context_epoch(project_id, ADVANCED_AT, trigger)
+    repo.advance_context_epoch(project_id, ADVANCED_AT, trigger, &[])
 }
 
 /// A minimal contract-valid explicit ContextEpoch for history seeding.
@@ -199,39 +206,33 @@ fn direct_exec(repo: &mut SqliteStateRepository, sql: &str, params: &[&dyn ToSql
         .expect("test corruption statement");
 }
 
-// T01 — the schema remains version 7: exactly seven registered
-// migrations ending at version 7, and an advancement leaves it there.
+// T01 — the schema remains version 8 and advancement leaves it there.
 #[test]
-fn t01_schema_remains_version_7() {
+fn t01_schema_remains_version_8() {
     let (tmp, mut repo) = opened_repo("cea-t01");
-    assert_eq!(repo.schema_version().expect("version read"), 7);
+    assert_eq!(repo.schema_version().expect("version read"), 8);
     advance(&mut repo, "project-1", ContextEpochTrigger::A1Init).expect("advance");
     assert_eq!(
         repo.schema_version().expect("version read"),
-        7,
+        8,
         "advancement must not change the schema version"
     );
     drop(repo);
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("reopen");
-    assert_eq!(repo.schema_version().expect("version read"), 7);
+    assert_eq!(repo.schema_version().expect("version read"), 8);
 }
 
-// T02 — no migration v8 exists: the registered chain is exactly versions
-// 1 through 7.
+// T02 — migration v8 is the exact registered chain head.
 #[test]
-fn t02_no_migration_v8() {
+fn t02_migration_v8_registered() {
     let registered = migrations::registered();
     assert_eq!(
         registered.len(),
-        7,
-        "exactly seven registered migrations may exist"
+        8,
+        "exactly eight registered migrations may exist"
     );
     let versions: Vec<u32> = registered.iter().map(|m| m.version).collect();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
-    assert!(
-        !versions.contains(&8),
-        "no v0008 migration may be registered"
-    );
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
 }
 
 // T03 — the first advancement for a project with no history returns and
@@ -378,6 +379,7 @@ fn t10_returned_record_equals_exact_readback() {
             "project-1",
             "2026-08-17T12:34:56.789Z",
             ContextEpochTrigger::SecurityEscalation,
+            &[],
         )
         .expect("advance");
     assert_eq!(
@@ -428,7 +430,12 @@ fn t13_advanced_at_round_trips_unchanged() {
     let (_tmp, mut repo) = opened_repo("cea-t13");
     let advanced_at = "  not-a-parsed-timestamp ☃ ";
     let created = repo
-        .advance_context_epoch("project-1", advanced_at, ContextEpochTrigger::HostSwitch)
+        .advance_context_epoch(
+            "project-1",
+            advanced_at,
+            ContextEpochTrigger::HostSwitch,
+            &[],
+        )
         .expect("advance");
     assert_eq!(created.advanced_at, advanced_at);
     assert_eq!(
@@ -445,7 +452,7 @@ fn t14_trigger_round_trips_unchanged() {
     for (index, trigger) in ContextEpochTrigger::ALL.iter().enumerate() {
         let project = format!("project-{index}");
         let created = repo
-            .advance_context_epoch(&project, ADVANCED_AT, *trigger)
+            .advance_context_epoch(&project, ADVANCED_AT, *trigger, &[])
             .expect("every frozen trigger advances");
         assert_eq!(created.trigger, *trigger);
         assert_eq!(
@@ -472,7 +479,7 @@ fn t14_trigger_round_trips_unchanged() {
 fn t15_empty_project_id_rejected() {
     let (_tmp, mut repo) = opened_repo("cea-t15");
     let error = repo
-        .advance_context_epoch("", ADVANCED_AT, ContextEpochTrigger::A1Init)
+        .advance_context_epoch("", ADVANCED_AT, ContextEpochTrigger::A1Init, &[])
         .expect_err("empty project_id must fail validation");
     assert!(
         matches!(error, StateError::ContextEpochValidation { .. }),
@@ -491,7 +498,12 @@ fn t15_empty_project_id_rejected() {
 fn t16_overlong_project_id_rejected() {
     let (_tmp, mut repo) = opened_repo("cea-t16");
     let error = repo
-        .advance_context_epoch(&"p".repeat(201), ADVANCED_AT, ContextEpochTrigger::A1Init)
+        .advance_context_epoch(
+            &"p".repeat(201),
+            ADVANCED_AT,
+            ContextEpochTrigger::A1Init,
+            &[],
+        )
         .expect_err("overlong project_id must fail validation");
     assert!(
         matches!(error, StateError::ContextEpochValidation { .. }),
@@ -502,8 +514,13 @@ fn t16_overlong_project_id_rejected() {
         0,
         "no record may persist from a rejected advancement"
     );
-    repo.advance_context_epoch(&"p".repeat(200), ADVANCED_AT, ContextEpochTrigger::A1Init)
-        .expect("200-character project_id is the accepted boundary");
+    repo.advance_context_epoch(
+        &"p".repeat(200),
+        ADVANCED_AT,
+        ContextEpochTrigger::A1Init,
+        &[],
+    )
+    .expect("200-character project_id is the accepted boundary");
 }
 
 // T17 — an empty advanced_at is rejected before any storage access.
@@ -511,7 +528,7 @@ fn t16_overlong_project_id_rejected() {
 fn t17_empty_advanced_at_rejected() {
     let (_tmp, mut repo) = opened_repo("cea-t17");
     let error = repo
-        .advance_context_epoch("project-1", "", ContextEpochTrigger::A1Init)
+        .advance_context_epoch("project-1", "", ContextEpochTrigger::A1Init, &[])
         .expect_err("empty advanced_at must fail validation");
     assert!(
         matches!(error, StateError::ContextEpochValidation { .. }),
@@ -531,7 +548,7 @@ fn t18_no_timestamp_parsing_or_normalization() {
     let (_tmp, mut repo) = opened_repo("cea-t18");
     let advanced_at = "sometime-yesterday-ish";
     let created = repo
-        .advance_context_epoch("project-1", advanced_at, ContextEpochTrigger::NewWave)
+        .advance_context_epoch("project-1", advanced_at, ContextEpochTrigger::NewWave, &[])
         .expect("advanced_at is opaque and needs no timestamp format");
     assert_eq!(created.advanced_at, advanced_at);
     assert_eq!(
@@ -1015,6 +1032,7 @@ fn t36_no_current_epoch_pointer() {
         "context_manifest_source",
         "context_manifest_source_required_for",
         "context_epoch",
+        "context_epoch_invalidated_role",
     ] {
         assert!(
             !repo
@@ -1143,11 +1161,10 @@ fn t43_t44_no_event_emission() {
     );
 }
 
-// T45/T46 — no changed_sources or invalidated_role_ids persistence: the
-// context_epoch table stays exactly its four core columns, and no such
-// table exists anywhere.
+// T45/T46 — no changed_sources persistence; the parent keeps its four
+// core columns.
 #[test]
-fn t45_t46_no_changed_sources_or_invalidated_roles() {
+fn t45_t46_no_changed_sources_and_parent_shape_unchanged() {
     let (_tmp, mut repo) = opened_repo("cea-t45");
     let columns = repo.table_columns("context_epoch").expect("columns");
     assert_eq!(
@@ -1173,7 +1190,6 @@ fn t45_t46_no_changed_sources_or_invalidated_roles() {
     );
     for forbidden in [
         "context_epoch_changed_source",
-        "context_epoch_invalidated_role",
         "context_epoch_source_digest",
     ] {
         assert!(
@@ -1242,10 +1258,11 @@ fn t64_no_new_schema_object() {
         "context_manifest_source",
         "context_manifest_source_required_for",
         "context_epoch",
+        "context_epoch_invalidated_role",
     ];
     expected.sort_unstable();
     let tables_before = repo.list_tables().expect("tables");
-    assert_eq!(tables_before, expected, "exactly the nine known tables");
+    assert_eq!(tables_before, expected, "exactly the known tables");
     advance(&mut repo, "project-1", ContextEpochTrigger::NewWave).expect("advance");
     assert_eq!(
         repo.list_tables().expect("tables"),
@@ -1285,12 +1302,7 @@ fn t64_no_new_schema_object() {
 // capability with the authorized shape, pinned at compile time.
 #[test]
 fn t66_public_api_surface_pinned() {
-    let advance: fn(
-        &mut SqliteStateRepository,
-        &str,
-        &str,
-        ContextEpochTrigger,
-    ) -> Result<ContextEpoch, StateError> = SqliteStateRepository::advance_context_epoch;
+    let advance: AdvanceContextEpochFn = SqliteStateRepository::advance_context_epoch;
     let _ = advance;
 }
 
