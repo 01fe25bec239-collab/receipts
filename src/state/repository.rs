@@ -12,7 +12,7 @@ use std::fmt;
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{Connection, Transaction};
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 #[cfg(test)]
 use rusqlite::ToSql;
@@ -139,6 +139,37 @@ impl SqliteStateRepository {
                         detail: e.to_string(),
                     })?;
                 Err(work_error)
+            }
+        }
+    }
+
+    /// Runs a lease-sensitive write after acquiring SQLite's write lock.
+    pub(crate) fn run_serialized_transaction<T>(
+        &mut self,
+        work: impl FnOnce(&mut UnitOfWork<'_>) -> Result<T, StateError>,
+    ) -> Result<T, StateError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| StateError::TransactionBeginFailed {
+                detail: error.to_string(),
+            })?;
+        let mut unit = UnitOfWork { tx };
+        match work(&mut unit) {
+            Ok(value) => unit
+                .tx
+                .commit()
+                .map_err(|error| StateError::TransactionCommitFailed {
+                    detail: error.to_string(),
+                })
+                .map(|_| value),
+            Err(error) => {
+                unit.tx
+                    .rollback()
+                    .map_err(|rollback| StateError::TransactionRollbackFailed {
+                        detail: rollback.to_string(),
+                    })?;
+                Err(error)
             }
         }
     }

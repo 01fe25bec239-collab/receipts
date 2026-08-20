@@ -15,19 +15,25 @@
 //! orchestrator core). This foundation provides no worker-, host-, adapter-,
 //! or model-facing mutation path.
 
+pub mod canonical_timestamp;
 pub mod context_epoch;
 pub mod context_manifest;
 pub mod context_rehydration;
 pub mod error;
 pub mod event;
 pub mod executor_binding;
+pub mod executor_binding_lease_expiry;
 pub mod logical_role;
 pub mod repository;
+pub mod trusted_time;
 
 mod migrations;
 
 #[cfg(test)]
 mod context_epoch_advance_tests;
+
+#[cfg(test)]
+mod canonical_timestamp_tests;
 
 #[cfg(test)]
 mod context_epoch_invalidation_tests;
@@ -48,6 +54,12 @@ mod event_tests;
 mod executor_binding_lease_tests;
 
 #[cfg(test)]
+mod executor_binding_lease_expiry_tests;
+
+#[cfg(test)]
+mod executor_binding_lease_renewal_temporal_tests;
+
+#[cfg(test)]
 mod executor_binding_release_tests;
 
 #[cfg(test)]
@@ -60,8 +72,12 @@ mod executor_binding_tests;
 mod logical_role_tests;
 
 #[cfg(test)]
+mod trusted_time_watermark_tests;
+
+#[cfg(test)]
 mod tests;
 
+pub use canonical_timestamp::CanonicalTimestampV1;
 pub use context_epoch::{ContextEpoch, ContextEpochTrigger};
 pub use context_manifest::{
     ContextManifest, ContextManifestSource, ContextSourceRef, ContextSourceRefType, RequiredFor,
@@ -82,5 +98,10 @@ pub use event::{
     SubjectKind,
 };
 pub use executor_binding::{ExecutorBinding, ReleaseReason};
+pub use executor_binding_lease_expiry::{
+    ExecutorLeaseExpiryOutcomeV1, ExecutorLeaseExpiryRequestV2,
+    ExecutorReleasedLifecycleAuthorityV1,
+};
 pub use logical_role::{LogicalRole, LogicalRoleStatus, LogicalRoleType};
 pub use repository::SqliteStateRepository;
+pub use trusted_time::{TrustedClockV1, TrustedTimeSampleV1, TrustedTimeWatermarkV1};

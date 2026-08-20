@@ -65,7 +65,7 @@ use crate::executor_binding::{ExecutorBinding, ReleaseReason};
 use crate::logical_role::{LogicalRole, LogicalRoleStatus, LogicalRoleType};
 use crate::migrations;
 use crate::repository::SqliteStateRepository;
-use crate::tests::TempDir;
+use crate::tests::{TempDir, trusted_clock};
 
 /// A minimal contract-valid ContextEpoch: only the four core fields.
 fn minimal_epoch(project_id: &str, epoch: i64, trigger: ContextEpochTrigger) -> ContextEpoch {
@@ -189,20 +189,20 @@ fn t01_fresh_database_bootstraps_to_schema_version_7() {
     let registered = migrations::registered();
     assert_eq!(
         registered.len(),
-        9,
-        "exactly nine registered migrations (v0001–v0009) may exist"
+        10,
+        "exactly ten registered migrations (v0001–v0010) may exist"
     );
     assert_eq!(
         registered.last().expect("chain is non-empty").version,
-        9,
-        "the registered chain must end at version 9"
+        10,
+        "the registered chain must end at version 10"
     );
     let tmp = TempDir::new("ce-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 9);
+    assert_eq!(repo.schema_version().expect("version read"), 10);
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        9,
+        10,
         "one metadata row per applied migration"
     );
 }
@@ -213,10 +213,10 @@ fn t02_version_7_database_reopens_idempotently() {
     let tmp = TempDir::new("ce-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 9);
+        assert_eq!(repo.schema_version().expect("version read"), 10);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            9,
+            10,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -239,7 +239,7 @@ fn t03_ordinary_open_of_version_6_fails_closed() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 6,
-                supported: 9
+                supported: 10
             }
         ),
         "unexpected error: {error}"
@@ -309,6 +309,7 @@ fn t04_migration_v7_creates_exactly_the_authorized_schema() {
         "context_rehydration_attempt",
         "context_rehydration_repository_snapshot",
         "context_rehydration_source_evidence",
+        "trusted_time_watermark",
     ];
     expected.sort_unstable();
     assert_eq!(
@@ -1794,7 +1795,7 @@ fn t74_executor_binding_behavior_unchanged() {
     )
     .expect("release");
     let error = repo
-        .renew_executor_binding_lease("binding-1", "2027-02-02T00:00:00.000Z")
+        .renew_executor_binding_lease(&trusted_clock(), "binding-1", "2027-02-02T00:00:00.000Z")
         .expect_err("renewal after release still refused");
     assert!(
         matches!(error, StateError::ExecutorBindingAlreadyReleased { .. }),

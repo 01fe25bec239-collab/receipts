@@ -22,7 +22,7 @@ use crate::executor_binding::{ExecutorBinding, ReleaseReason, apply_lease_renewa
 use crate::logical_role::{LogicalRole, LogicalRoleStatus, LogicalRoleType};
 use crate::migrations;
 use crate::repository::SqliteStateRepository;
-use crate::tests::TempDir;
+use crate::tests::{TempDir, trusted_clock};
 
 /// A minimal contract-valid LogicalRole for binding targets.
 fn minimal_role(role_id: &str, role_type: LogicalRoleType) -> LogicalRole {
@@ -55,7 +55,7 @@ fn minimal_binding(binding_id: &str, role_id: &str) -> ExecutorBinding {
         session_ref: None,
         routing_decision_id: None,
         bound_at: "2026-08-16T10:00:00.000Z".to_string(),
-        lease_expires_at: "2026-08-16T11:00:00.000Z".to_string(),
+        lease_expires_at: "2026-08-16T11:00:00.000000000Z".to_string(),
         released_at: None,
         release_reason: None,
         rehydration_completed: None,
@@ -74,7 +74,7 @@ fn full_binding(binding_id: &str, role_id: &str) -> ExecutorBinding {
         session_ref: Some("sessions/0192-abc/0042".to_string()),
         routing_decision_id: Some("routing-decision-0177".to_string()),
         bound_at: "2026-08-16T09:30:00.000Z".to_string(),
-        lease_expires_at: "2026-08-16T10:30:00.000Z".to_string(),
+        lease_expires_at: "2026-08-16T10:30:00.000000000Z".to_string(),
         released_at: None,
         release_reason: None,
         rehydration_completed: Some(false),
@@ -83,11 +83,11 @@ fn full_binding(binding_id: &str, role_id: &str) -> ExecutorBinding {
 
 /// The first renewed lease value, supplied by the caller — never
 /// generated, parsed, or compared by State.
-const RENEWED_LEASE: &str = "2026-08-16T12:00:00.000Z";
+const RENEWED_LEASE: &str = "2026-08-16T12:00:00.000000000Z";
 
 /// A second, deliberately different renewal value for repeat-renewal
 /// probing.
-const SECOND_RENEWED_LEASE: &str = "2026-08-16T13:30:00.000Z";
+const SECOND_RENEWED_LEASE: &str = "2026-08-16T13:30:00.000000000Z";
 
 /// The release timestamp used by the standard release path, supplied by
 /// the caller — never generated, parsed, or compared by State.
@@ -154,7 +154,7 @@ fn setup_renewed_full_binding(
     let original = full_binding("binding-full-001", "role-full-001");
     repo.create_executor_binding(original.clone())
         .expect("binding create");
-    repo.renew_executor_binding_lease("binding-full-001", RENEWED_LEASE)
+    repo.renew_executor_binding_lease(&trusted_clock(), "binding-full-001", RENEWED_LEASE)
         .expect("renew");
     let found = repo
         .find_executor_binding("binding-full-001")
@@ -169,35 +169,35 @@ fn forced_failure() -> StateError {
     }
 }
 
-// T01 — the schema version remains exactly 7 before and after lease
+// T01 — the schema version remains exactly 10 before and after lease
 // renewals, including across close/reopen.
 #[test]
-fn t01_schema_version_remains_7() {
+fn t01_schema_version_remains_10() {
     let tmp = TempDir::new("ebl-t01");
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
     assert_eq!(
         repo.schema_version().expect("version read"),
-        9,
-        "the supported schema version must be 9 before any renewal"
+        10,
+        "the supported schema version must be 10 before any renewal"
     );
     repo.create_logical_role(minimal_role("role-ver-001", LogicalRoleType::RuntimeA1))
         .expect("role create");
     repo.create_executor_binding(minimal_binding("binding-ver-001", "role-ver-001"))
         .expect("binding create");
-    repo.renew_executor_binding_lease("binding-ver-001", RENEWED_LEASE)
+    repo.renew_executor_binding_lease(&trusted_clock(), "binding-ver-001", RENEWED_LEASE)
         .expect("renew");
     assert_eq!(
         repo.schema_version().expect("version read"),
-        9,
+        10,
         "a lease renewal must not change the schema version"
     );
     drop(repo);
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("reopen");
-    assert_eq!(repo.schema_version().expect("version read"), 9);
+    assert_eq!(repo.schema_version().expect("version read"), 10);
 }
 
-// T02 — no migration is introduced by the lease-renewal slice: the
-// registered chain has exactly seven migrations ending at version 7, and the
+// T02 — lease renewal itself introduces no migration beyond the authorized
+// watermark migration: the registered chain ends at version 10, and the
 // durable metadata carries exactly one row per applied migration after
 // renewals.
 #[test]
@@ -205,13 +205,13 @@ fn t02_no_migration_introduced_by_lease_renewal() {
     let registered = migrations::registered();
     assert_eq!(
         registered.len(),
-        9,
-        "exactly nine registered migrations (v0001–v0009) may exist"
+        10,
+        "exactly ten registered migrations (v0001–v0010) may exist"
     );
     assert_eq!(
         registered.last().expect("chain is non-empty").version,
-        9,
-        "the registered chain must end at version 9"
+        10,
+        "the registered chain must end at version 10"
     );
     let tmp = TempDir::new("ebl-t02");
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
@@ -219,11 +219,11 @@ fn t02_no_migration_introduced_by_lease_renewal() {
         .expect("role create");
     repo.create_executor_binding(minimal_binding("binding-v6-001", "role-v6-001"))
         .expect("binding create");
-    repo.renew_executor_binding_lease("binding-v6-001", RENEWED_LEASE)
+    repo.renew_executor_binding_lease(&trusted_clock(), "binding-v6-001", RENEWED_LEASE)
         .expect("renew");
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        9,
+        10,
         "no extra migration metadata row may appear"
     );
 }
@@ -240,7 +240,7 @@ fn t03_renew_unreleased_binding_succeeds() {
     let binding = minimal_binding("binding-ren-001", "role-ren-001");
     repo.create_executor_binding(binding.clone())
         .expect("binding create");
-    repo.renew_executor_binding_lease("binding-ren-001", RENEWED_LEASE)
+    repo.renew_executor_binding_lease(&trusted_clock(), "binding-ren-001", RENEWED_LEASE)
         .expect("renew an existing unreleased binding");
     assert_eq!(
         repo.find_executor_binding("binding-ren-001")
@@ -261,7 +261,7 @@ fn t04_find_returns_renewed_lease_exactly() {
         .expect("role create");
     repo.create_executor_binding(minimal_binding("binding-ren-002", "role-ren-002"))
         .expect("binding create");
-    repo.renew_executor_binding_lease("binding-ren-002", RENEWED_LEASE)
+    repo.renew_executor_binding_lease(&trusted_clock(), "binding-ren-002", RENEWED_LEASE)
         .expect("renew");
     assert_eq!(
         repo.find_executor_binding("binding-ren-002")
@@ -285,7 +285,7 @@ fn t05_renewed_lease_survives_close_and_reopen() {
             .expect("role create");
         repo.create_executor_binding(binding.clone())
             .expect("binding create");
-        repo.renew_executor_binding_lease("binding-durable-001", RENEWED_LEASE)
+        repo.renew_executor_binding_lease(&trusted_clock(), "binding-durable-001", RENEWED_LEASE)
             .expect("renew");
     }
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("reopen");
@@ -308,9 +308,9 @@ fn t06_second_renewal_persists_second_value() {
         .expect("role create");
     repo.create_executor_binding(minimal_binding("binding-twice-001", "role-twice-001"))
         .expect("binding create");
-    repo.renew_executor_binding_lease("binding-twice-001", RENEWED_LEASE)
+    repo.renew_executor_binding_lease(&trusted_clock(), "binding-twice-001", RENEWED_LEASE)
         .expect("first renew");
-    repo.renew_executor_binding_lease("binding-twice-001", SECOND_RENEWED_LEASE)
+    repo.renew_executor_binding_lease(&trusted_clock(), "binding-twice-001", SECOND_RENEWED_LEASE)
         .expect("second renew on the same unreleased binding");
     assert_eq!(
         repo.find_executor_binding("binding-twice-001")
@@ -333,9 +333,9 @@ fn t07_second_renewal_changes_only_lease_expires_at() {
     let binding = full_binding("binding-only-001", "role-only-001");
     repo.create_executor_binding(binding.clone())
         .expect("binding create");
-    repo.renew_executor_binding_lease("binding-only-001", RENEWED_LEASE)
+    repo.renew_executor_binding_lease(&trusted_clock(), "binding-only-001", RENEWED_LEASE)
         .expect("first renew");
-    repo.renew_executor_binding_lease("binding-only-001", SECOND_RENEWED_LEASE)
+    repo.renew_executor_binding_lease(&trusted_clock(), "binding-only-001", SECOND_RENEWED_LEASE)
         .expect("second renew");
     assert_eq!(
         repo.find_executor_binding("binding-only-001")
@@ -429,7 +429,7 @@ fn t17_renewal_of_nonexistent_binding_fails_and_creates_no_row() {
     repo.create_executor_binding(minimal_binding("binding-unknown-001", "role-unknown-001"))
         .expect("binding create");
     let error = repo
-        .renew_executor_binding_lease("never-created", RENEWED_LEASE)
+        .renew_executor_binding_lease(&trusted_clock(), "never-created", RENEWED_LEASE)
         .expect_err("renewing an unknown binding must fail explicitly");
     assert!(
         matches!(
@@ -467,7 +467,7 @@ fn t18_empty_binding_id_rejected() {
     repo.create_executor_binding(minimal_binding("binding-input-001", "role-input-001"))
         .expect("binding create");
     let error = repo
-        .renew_executor_binding_lease("", RENEWED_LEASE)
+        .renew_executor_binding_lease(&trusted_clock(), "", RENEWED_LEASE)
         .expect_err("an empty binding_id must be rejected");
     assert!(
         matches!(error, StateError::ExecutorBindingValidation { .. }),
@@ -487,7 +487,7 @@ fn t19_overlong_binding_id_rejected() {
         .expect("binding create");
     let too_long = "b".repeat(201);
     let error = repo
-        .renew_executor_binding_lease(&too_long, RENEWED_LEASE)
+        .renew_executor_binding_lease(&trusted_clock(), &too_long, RENEWED_LEASE)
         .expect_err("an over-length binding_id must be rejected");
     assert!(
         matches!(error, StateError::ExecutorBindingValidation { .. }),
@@ -505,10 +505,10 @@ fn t20_empty_lease_expires_at_rejected() {
     repo.create_executor_binding(minimal_binding("binding-input-003", "role-input-003"))
         .expect("binding create");
     let error = repo
-        .renew_executor_binding_lease("binding-input-003", "")
+        .renew_executor_binding_lease(&trusted_clock(), "binding-input-003", "")
         .expect_err("an empty lease_expires_at must be rejected");
     assert!(
-        matches!(error, StateError::ExecutorBindingValidation { .. }),
+        matches!(error, StateError::CanonicalTimestampInvalid { .. }),
         "unexpected error: {error}"
     );
 }
@@ -525,14 +525,14 @@ fn t21_rejected_renewal_leaves_original_lease_unchanged() {
     repo.create_executor_binding(binding.clone())
         .expect("binding create");
 
-    repo.renew_executor_binding_lease("", RENEWED_LEASE)
+    repo.renew_executor_binding_lease(&trusted_clock(), "", RENEWED_LEASE)
         .expect_err("empty binding_id rejected");
     let too_long = "b".repeat(201);
-    repo.renew_executor_binding_lease(&too_long, RENEWED_LEASE)
+    repo.renew_executor_binding_lease(&trusted_clock(), &too_long, RENEWED_LEASE)
         .expect_err("over-length binding_id rejected");
-    repo.renew_executor_binding_lease("binding-reject-001", "")
+    repo.renew_executor_binding_lease(&trusted_clock(), "binding-reject-001", "")
         .expect_err("empty lease_expires_at rejected");
-    repo.renew_executor_binding_lease("never-created", RENEWED_LEASE)
+    repo.renew_executor_binding_lease(&trusted_clock(), "never-created", RENEWED_LEASE)
         .expect_err("unknown binding rejected");
 
     assert_eq!(
@@ -562,7 +562,7 @@ fn t22_renewal_after_release_fails() {
     repo.release_executor_binding("binding-rel-001", RELEASED_AT, ReleaseReason::HostSwitch)
         .expect("release");
     let error = repo
-        .renew_executor_binding_lease("binding-rel-001", RENEWED_LEASE)
+        .renew_executor_binding_lease(&trusted_clock(), "binding-rel-001", RENEWED_LEASE)
         .expect_err("renewing a released binding must fail explicitly");
     assert!(
         matches!(
@@ -585,7 +585,7 @@ fn t23_renewal_after_release_preserves_released_at() {
         .expect("binding create");
     repo.release_executor_binding("binding-rel-002", RELEASED_AT, ReleaseReason::Crash)
         .expect("release");
-    repo.renew_executor_binding_lease("binding-rel-002", RENEWED_LEASE)
+    repo.renew_executor_binding_lease(&trusted_clock(), "binding-rel-002", RENEWED_LEASE)
         .expect_err("renewal after release must fail");
     assert_eq!(
         repo.find_executor_binding("binding-rel-002")
@@ -609,7 +609,7 @@ fn t24_renewal_after_release_preserves_release_reason() {
         .expect("binding create");
     repo.release_executor_binding("binding-rel-003", RELEASED_AT, ReleaseReason::UserRequest)
         .expect("release");
-    repo.renew_executor_binding_lease("binding-rel-003", RENEWED_LEASE)
+    repo.renew_executor_binding_lease(&trusted_clock(), "binding-rel-003", RENEWED_LEASE)
         .expect_err("renewal after release must fail");
     assert_eq!(
         repo.find_executor_binding("binding-rel-003")
@@ -635,7 +635,7 @@ fn t25_lease_expired_released_binding_cannot_be_renewed() {
     repo.release_executor_binding("binding-exp-001", RELEASED_AT, ReleaseReason::LeaseExpired)
         .expect("release with LEASE_EXPIRED");
     let error = repo
-        .renew_executor_binding_lease("binding-exp-001", RENEWED_LEASE)
+        .renew_executor_binding_lease(&trusted_clock(), "binding-exp-001", RENEWED_LEASE)
         .expect_err("a LEASE_EXPIRED release is still terminal and must refuse renewal");
     assert!(
         matches!(
@@ -666,9 +666,9 @@ fn t26_renewal_then_release_preserves_last_renewed_lease() {
     let binding = full_binding("binding-seq-001", "role-seq-001");
     repo.create_executor_binding(binding.clone())
         .expect("binding create");
-    repo.renew_executor_binding_lease("binding-seq-001", RENEWED_LEASE)
+    repo.renew_executor_binding_lease(&trusted_clock(), "binding-seq-001", RENEWED_LEASE)
         .expect("first renew");
-    repo.renew_executor_binding_lease("binding-seq-001", SECOND_RENEWED_LEASE)
+    repo.renew_executor_binding_lease(&trusted_clock(), "binding-seq-001", SECOND_RENEWED_LEASE)
         .expect("second renew");
     repo.release_executor_binding("binding-seq-001", RELEASED_AT, ReleaseReason::Completed)
         .expect("release after renewals");
@@ -696,7 +696,7 @@ fn t27_release_remains_write_once_after_lease_renewal() {
         .expect("role create");
     repo.create_executor_binding(minimal_binding("binding-once-001", "role-once-001"))
         .expect("binding create");
-    repo.renew_executor_binding_lease("binding-once-001", RENEWED_LEASE)
+    repo.renew_executor_binding_lease(&trusted_clock(), "binding-once-001", RENEWED_LEASE)
         .expect("renew");
     repo.release_executor_binding("binding-once-001", RELEASED_AT, ReleaseReason::Crash)
         .expect("first release after renewal");
@@ -742,7 +742,7 @@ fn t28_renewal_never_clears_terminal_evidence() {
     repo.release_executor_binding("binding-term-001", RELEASED_AT, ReleaseReason::ProviderDown)
         .expect("release");
     let released = with_release(binding, RELEASED_AT, ReleaseReason::ProviderDown);
-    repo.renew_executor_binding_lease("binding-term-001", RENEWED_LEASE)
+    repo.renew_executor_binding_lease(&trusted_clock(), "binding-term-001", RENEWED_LEASE)
         .expect_err("renewal of a released binding must fail");
     assert_eq!(
         repo.find_executor_binding("binding-term-001")
@@ -789,7 +789,7 @@ fn t29_guarded_update_refuses_occupied_terminal_slot() {
     })
     .expect("partial shape A reaches storage through direct SQL");
     let error = repo
-        .renew_executor_binding_lease("binding-guard-a", RENEWED_LEASE)
+        .renew_executor_binding_lease(&trusted_clock(), "binding-guard-a", RENEWED_LEASE)
         .expect_err("a partially occupied terminal slot must refuse renewal");
     assert!(
         matches!(error, StateError::ExecutorBindingAlreadyReleased { .. }),
@@ -822,7 +822,7 @@ fn t29_guarded_update_refuses_occupied_terminal_slot() {
     })
     .expect("partial shape B reaches storage through direct SQL");
     let error = repo
-        .renew_executor_binding_lease("binding-guard-b", RENEWED_LEASE)
+        .renew_executor_binding_lease(&trusted_clock(), "binding-guard-b", RENEWED_LEASE)
         .expect_err("a partially occupied terminal slot must refuse renewal");
     assert!(
         matches!(error, StateError::ExecutorBindingAlreadyReleased { .. }),
@@ -874,7 +874,7 @@ fn t30_forced_transaction_failure_leaves_prior_lease_unchanged() {
             .expect("find")
             .expect("present")
             .lease_expires_at,
-        "2026-08-16T11:00:00.000Z",
+        "2026-08-16T11:00:00.000000000Z",
         "rollback must restore the prior lease value"
     );
 
@@ -886,7 +886,7 @@ fn t30_forced_transaction_failure_leaves_prior_lease_unchanged() {
             .expect("find")
             .expect("present")
             .lease_expires_at,
-        "2026-08-16T11:00:00.000Z"
+        "2026-08-16T11:00:00.000000000Z"
     );
 
     // Control: the same in-transaction write that is allowed to commit
@@ -917,16 +917,16 @@ fn t31_renewal_cannot_create_another_binding_row() {
         1,
         "exactly one binding row before renewal"
     );
-    repo.renew_executor_binding_lease("binding-count-001", RENEWED_LEASE)
+    repo.renew_executor_binding_lease(&trusted_clock(), "binding-count-001", RENEWED_LEASE)
         .expect("renew");
-    repo.renew_executor_binding_lease("binding-count-001", SECOND_RENEWED_LEASE)
+    repo.renew_executor_binding_lease(&trusted_clock(), "binding-count-001", SECOND_RENEWED_LEASE)
         .expect("renew again");
     assert_eq!(
         repo.count_table_rows("executor_binding").expect("rows"),
         1,
         "a lease renewal operates on the existing row and must never add one"
     );
-    repo.renew_executor_binding_lease("binding-never-created", RENEWED_LEASE)
+    repo.renew_executor_binding_lease(&trusted_clock(), "binding-never-created", RENEWED_LEASE)
         .expect_err("unknown binding renewal fails");
     assert_eq!(
         repo.count_table_rows("executor_binding").expect("rows"),
@@ -954,7 +954,7 @@ fn t32_renewal_does_not_mutate_logical_role() {
     repo.create_logical_role(role.clone()).expect("role create");
     repo.create_executor_binding(minimal_binding("binding-mut-001", "role-mut-001"))
         .expect("binding create");
-    repo.renew_executor_binding_lease("binding-mut-001", RENEWED_LEASE)
+    repo.renew_executor_binding_lease(&trusted_clock(), "binding-mut-001", RENEWED_LEASE)
         .expect("renew");
     assert_eq!(
         repo.find_logical_role("role-mut-001").expect("find"),
@@ -974,7 +974,7 @@ fn t33_renewal_does_not_mutate_event_rows() {
         .expect("binding create");
     let event = minimal_event("01ARZ3NDEKTSV4RRFFQ69G5FAK");
     repo.append_event(event.clone()).expect("append event");
-    repo.renew_executor_binding_lease("binding-evt-001", RENEWED_LEASE)
+    repo.renew_executor_binding_lease(&trusted_clock(), "binding-evt-001", RENEWED_LEASE)
         .expect("renew");
     assert_eq!(
         repo.find_event(&event.event_id).expect("find event"),
@@ -990,21 +990,31 @@ fn t33_renewal_does_not_mutate_event_rows() {
 
 // T43 — compile-time evidence: the renewal capability has exactly the
 // bounded public signature
-// `fn(&mut SqliteStateRepository, &str, &str) -> Result<(), StateError>`;
+// `fn(&mut SqliteStateRepository, &dyn TrustedClockV1, &str, &str) -> Result<(), StateError>`;
 // there is no SQL string, connection, transaction, redaction, or
 // arbitrary-execution parameter anywhere on the path. The function-pointer
 // coercion below compiles only for that exact signature.
 #[test]
 fn t43_renewal_signature_is_exactly_bounded() {
-    let renew: fn(&mut SqliteStateRepository, &str, &str) -> Result<(), StateError> =
-        SqliteStateRepository::renew_executor_binding_lease;
+    let renew: fn(
+        &mut SqliteStateRepository,
+        &dyn crate::trusted_time::TrustedClockV1,
+        &str,
+        &str,
+    ) -> Result<(), StateError> = SqliteStateRepository::renew_executor_binding_lease;
     let tmp = TempDir::new("ebl-t43");
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
     repo.create_logical_role(minimal_role("role-sig-001", LogicalRoleType::RuntimeA1))
         .expect("role create");
     repo.create_executor_binding(minimal_binding("binding-sig-001", "role-sig-001"))
         .expect("binding create");
-    renew(&mut repo, "binding-sig-001", RENEWED_LEASE).expect("renew through the exact signature");
+    renew(
+        &mut repo,
+        &trusted_clock(),
+        "binding-sig-001",
+        RENEWED_LEASE,
+    )
+    .expect("renew through the exact signature");
     assert_eq!(
         repo.find_executor_binding("binding-sig-001")
             .expect("find")
@@ -1040,7 +1050,7 @@ fn t46_all_nine_release_reasons_round_trip_after_renewal() {
         let binding = minimal_binding(&binding_id, "role-nine-001");
         repo.create_executor_binding(binding.clone())
             .expect("binding create");
-        repo.renew_executor_binding_lease(&binding_id, RENEWED_LEASE)
+        repo.renew_executor_binding_lease(&trusted_clock(), &binding_id, RENEWED_LEASE)
             .expect("renew before release");
         repo.release_executor_binding(&binding_id, RELEASED_AT, *reason)
             .expect("each frozen release reason must remain recordable");
@@ -1090,7 +1100,7 @@ fn t47_corrupt_persisted_binding_fails_closed() {
     })
     .expect("corruption reaches storage through direct SQL");
     let error = repo
-        .renew_executor_binding_lease("binding-corrupt-001", RENEWED_LEASE)
+        .renew_executor_binding_lease(&trusted_clock(), "binding-corrupt-001", RENEWED_LEASE)
         .expect_err("a corrupt row must fail closed instead of being renewed");
     assert!(
         matches!(error, StateError::ExecutorBindingDecodeFailed { .. }),
@@ -1105,7 +1115,7 @@ fn t47_corrupt_persisted_binding_fails_closed() {
         )
         .expect("raw lease read");
     assert_eq!(
-        stored, "2026-08-16T11:00:00.000Z",
+        stored, "2026-08-16T11:00:00.000000000Z",
         "the refused renewal must leave the stored lease value unchanged"
     );
     let still_corrupt: i64 = repo
@@ -1129,9 +1139,8 @@ fn t47_corrupt_persisted_binding_fails_closed() {
     );
 }
 
-// T48 — the caller-provided lease expiry is persisted exactly as the
-// supplied opaque contract string representation; State does not
-// normalize, rewrite, or reformat it.
+// T48 — a canonical caller-provided deadline is persisted exactly; State
+// validates but does not normalize or rewrite it.
 #[test]
 fn t48_caller_supplied_lease_value_persisted_exactly() {
     let tmp = TempDir::new("ebl-t48");
@@ -1140,17 +1149,15 @@ fn t48_caller_supplied_lease_value_persisted_exactly() {
         .expect("role create");
     repo.create_executor_binding(minimal_binding("binding-opaque-001", "role-opaque-001"))
         .expect("binding create");
-    // Deliberately not a normalized date-time form, including non-ASCII
-    // scalar values: the value is opaque at this layer.
-    let opaque = "lease-expiry/Ω-2026-08-16T14:00:00.000000Z-exact";
-    repo.renew_executor_binding_lease("binding-opaque-001", opaque)
-        .expect("renew with an opaque caller-supplied value");
+    let canonical = "2026-08-16T14:00:00.000000001Z";
+    repo.renew_executor_binding_lease(&trusted_clock(), "binding-opaque-001", canonical)
+        .expect("renew with a canonical caller-supplied value");
     assert_eq!(
         repo.find_executor_binding("binding-opaque-001")
             .expect("find")
             .expect("present")
             .lease_expires_at,
-        opaque.to_string(),
+        canonical.to_string(),
         "the renewed lease must round-trip byte-for-byte without normalization"
     );
     let stored: String = repo
@@ -1162,7 +1169,7 @@ fn t48_caller_supplied_lease_value_persisted_exactly() {
         )
         .expect("raw lease read");
     assert_eq!(
-        stored, opaque,
+        stored, canonical,
         "the durable stored value must equal the supplied string exactly"
     );
 }

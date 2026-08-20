@@ -203,6 +203,42 @@ pub enum StateError {
         /// What could not be decoded.
         detail: String,
     },
+    /// A timestamp was not the one canonical UTC representation.
+    CanonicalTimestampInvalid {
+        /// The rejected value, preserved exactly for diagnostics.
+        value: String,
+    },
+    /// A trusted-clock sample was structurally invalid.
+    TrustedClockSampleInvalid {
+        /// Which sample constraint failed.
+        detail: String,
+    },
+    /// A trusted-clock sample moved behind durable project time.
+    TrustedClockRegression {
+        project_id: String,
+        sample: String,
+        watermark: String,
+    },
+    /// The source or contract version changed after project time was bound.
+    TrustedClockContinuityUnbound { project_id: String },
+    /// A previously fenced sample was superseded before terminal mutation.
+    TrustedTimeSampleStale {
+        project_id: String,
+        sample: String,
+        watermark: String,
+    },
+    /// A durable trusted-time watermark could not be decoded.
+    TrustedTimeWatermarkDecodeFailed { detail: String },
+    /// A durable trusted-time watermark could not be written.
+    TrustedTimeWatermarkWriteFailed { detail: String },
+    /// Lease renewal was temporally ineligible at the current deadline.
+    ExecutorLeaseRenewalRefused {
+        binding_id: String,
+        trusted_now: String,
+        deadline: String,
+    },
+    /// Lease-expiry-specific event provenance was not exactly coherent.
+    ExecutorReleasedProvenanceInvalid { detail: String },
     /// An EventEnvelope failed structural validation before persistence.
     ///
     /// Validation accepts each supplied structural value byte-for-byte
@@ -513,6 +549,53 @@ impl fmt::Display for StateError {
             }
             StateError::ExecutorBindingDecodeFailed { detail } => {
                 write!(f, "failed to decode persisted ExecutorBinding: {detail}")
+            }
+            StateError::CanonicalTimestampInvalid { value } => write!(
+                f,
+                "timestamp {value:?} is not canonical YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ UTC"
+            ),
+            StateError::TrustedClockSampleInvalid { detail } => {
+                write!(f, "invalid TrustedClockV1 sample: {detail}")
+            }
+            StateError::TrustedClockRegression {
+                project_id,
+                sample,
+                watermark,
+            } => write!(
+                f,
+                "TRUSTED_CLOCK_REGRESSION for project {project_id:?}: sample {sample:?} is before watermark {watermark:?}"
+            ),
+            StateError::TrustedClockContinuityUnbound { project_id } => write!(
+                f,
+                "TRUSTED_CLOCK_CONTINUITY_UNBOUND for project {project_id:?}"
+            ),
+            StateError::TrustedTimeSampleStale {
+                project_id,
+                sample,
+                watermark,
+            } => write!(
+                f,
+                "TRUSTED_TIME_SAMPLE_STALE for project {project_id:?}: sample {sample:?} is before watermark {watermark:?}"
+            ),
+            StateError::TrustedTimeWatermarkDecodeFailed { detail } => {
+                write!(f, "failed to decode TrustedTimeWatermarkV1: {detail}")
+            }
+            StateError::TrustedTimeWatermarkWriteFailed { detail } => {
+                write!(f, "failed to write TrustedTimeWatermarkV1: {detail}")
+            }
+            StateError::ExecutorLeaseRenewalRefused {
+                binding_id,
+                trusted_now,
+                deadline,
+            } => write!(
+                f,
+                "lease renewal refused for binding {binding_id:?}: trusted time {trusted_now:?} is at or after current deadline {deadline:?}"
+            ),
+            StateError::ExecutorReleasedProvenanceInvalid { detail } => {
+                write!(
+                    f,
+                    "invalid EXECUTOR_RELEASED lease-expiry provenance: {detail}"
+                )
             }
             StateError::EventValidation { detail } => {
                 write!(f, "invalid EventEnvelope: {detail}")

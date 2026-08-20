@@ -25,7 +25,7 @@ use crate::executor_binding::{ExecutorBinding, ReleaseReason};
 use crate::logical_role::{LogicalRole, LogicalRoleStatus, LogicalRoleType};
 use crate::migrations;
 use crate::repository::SqliteStateRepository;
-use crate::tests::TempDir;
+use crate::tests::{TempDir, trusted_clock};
 
 /// The stable identifier of the migration-0005 partial unique index.
 const GUARD_INDEX_NAME: &str = "idx_executor_binding_role_unreleased";
@@ -75,7 +75,7 @@ fn minimal_binding(binding_id: &str, role_id: &str) -> ExecutorBinding {
         session_ref: None,
         routing_decision_id: None,
         bound_at: "2026-08-16T10:00:00.000Z".to_string(),
-        lease_expires_at: "2026-08-16T11:00:00.000Z".to_string(),
+        lease_expires_at: "2026-08-16T11:00:00.000000000Z".to_string(),
         released_at: None,
         release_reason: None,
         rehydration_completed: None,
@@ -140,10 +140,10 @@ fn named_binding_indexes(repo: &SqliteStateRepository) -> Vec<(String, String)> 
 fn t01_fresh_database_bootstraps_through_schema_7() {
     let tmp = TempDir::new("sab-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 9);
+    assert_eq!(repo.schema_version().expect("version read"), 10);
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        9,
+        10,
         "one metadata row per applied migration"
     );
     // The guard index is part of the fresh bootstrap.
@@ -163,10 +163,10 @@ fn t02_schema_version_7_reopens() {
     let tmp = TempDir::new("sab-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 9);
+        assert_eq!(repo.schema_version().expect("version read"), 10);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            9,
+            10,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -185,7 +185,7 @@ fn t03_ordinary_open_of_version_4_fails_closed() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 4,
-                supported: 9
+                supported: 10
             }
         ),
         "unexpected error: {error}"
@@ -531,8 +531,12 @@ fn t14_renew_then_second_binding_refused() {
         .expect("role create");
     repo.create_executor_binding(minimal_binding("binding-j1-001", "role-j-001"))
         .expect("binding create");
-    repo.renew_executor_binding_lease("binding-j1-001", "2026-08-16T12:00:00.000Z")
-        .expect("renew");
+    repo.renew_executor_binding_lease(
+        &trusted_clock(),
+        "binding-j1-001",
+        "2026-08-16T12:00:00.000000000Z",
+    )
+    .expect("renew");
     let error = repo
         .create_executor_binding(minimal_binding("binding-j2-001", "role-j-001"))
         .expect_err("renewal must not create another binding slot");
@@ -562,11 +566,15 @@ fn t15_renewed_lease_unchanged_by_refusal() {
     let mut renewed = minimal_binding("binding-k1-001", "role-k-001");
     repo.create_executor_binding(renewed.clone())
         .expect("binding create");
-    repo.renew_executor_binding_lease("binding-k1-001", "2026-08-16T23:00:00.000Z")
-        .expect("renew");
+    repo.renew_executor_binding_lease(
+        &trusted_clock(),
+        "binding-k1-001",
+        "2026-08-16T23:00:00.000000000Z",
+    )
+    .expect("renew");
     repo.create_executor_binding(minimal_binding("binding-k2-001", "role-k-001"))
         .expect_err("same-role conflict");
-    renewed.lease_expires_at = "2026-08-16T23:00:00.000Z".to_string();
+    renewed.lease_expires_at = "2026-08-16T23:00:00.000000000Z".to_string();
     assert_eq!(
         repo.find_executor_binding("binding-k1-001").expect("find"),
         Some(renewed),
@@ -980,8 +988,12 @@ fn t32_renewal_guarded_to_unreleased_binding() {
         .expect("role create");
     repo.create_executor_binding(minimal_binding("binding-z1-001", "role-z-001"))
         .expect("binding create");
-    repo.renew_executor_binding_lease("binding-z1-001", "2026-08-16T12:00:00.000Z")
-        .expect("renewal while unreleased");
+    repo.renew_executor_binding_lease(
+        &trusted_clock(),
+        "binding-z1-001",
+        "2026-08-16T12:00:00.000000000Z",
+    )
+    .expect("renewal while unreleased");
     repo.release_executor_binding(
         "binding-z1-001",
         "2026-08-16T12:30:00.000Z",
@@ -989,7 +1001,11 @@ fn t32_renewal_guarded_to_unreleased_binding() {
     )
     .expect("release");
     let error = repo
-        .renew_executor_binding_lease("binding-z1-001", "2026-08-16T13:00:00.000Z")
+        .renew_executor_binding_lease(
+            &trusted_clock(),
+            "binding-z1-001",
+            "2026-08-16T13:00:00.000Z",
+        )
         .expect_err("renewal after release must be refused");
     assert!(
         matches!(error, StateError::ExecutorBindingAlreadyReleased { .. }),
@@ -1014,8 +1030,12 @@ fn t33_renewal_after_release_refused() {
         ReleaseReason::AuthRequired,
     )
     .expect("release");
-    repo.renew_executor_binding_lease("binding-aa1-001", "2099-01-01T00:00:00.000Z")
-        .expect_err("no renewal after terminal release");
+    repo.renew_executor_binding_lease(
+        &trusted_clock(),
+        "binding-aa1-001",
+        "2099-01-01T00:00:00.000Z",
+    )
+    .expect_err("no renewal after terminal release");
     released.released_at = Some("2026-08-16T10:30:00.000Z".to_string());
     released.release_reason = Some(ReleaseReason::AuthRequired);
     assert_eq!(
@@ -1035,8 +1055,12 @@ fn t34_renewal_creates_no_new_row() {
         .expect("role create");
     repo.create_executor_binding(minimal_binding("binding-ab1-001", "role-ab-001"))
         .expect("binding create");
-    repo.renew_executor_binding_lease("binding-ab1-001", "2026-08-16T12:00:00.000Z")
-        .expect("renew");
+    repo.renew_executor_binding_lease(
+        &trusted_clock(),
+        "binding-ab1-001",
+        "2026-08-16T12:00:00.000000000Z",
+    )
+    .expect("renew");
     assert_eq!(
         repo.count_table_rows("executor_binding").expect("rows"),
         1,

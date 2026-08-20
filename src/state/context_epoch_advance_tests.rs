@@ -70,7 +70,7 @@ use crate::executor_binding::{ExecutorBinding, ReleaseReason};
 use crate::logical_role::{LogicalRole, LogicalRoleStatus, LogicalRoleType};
 use crate::migrations;
 use crate::repository::SqliteStateRepository;
-use crate::tests::TempDir;
+use crate::tests::{TempDir, trusted_clock};
 
 /// The opaque timestamp used by the advancement helper.
 const ADVANCED_AT: &str = "2026-08-17T10:00:00.000Z";
@@ -210,29 +210,29 @@ fn direct_exec(repo: &mut SqliteStateRepository, sql: &str, params: &[&dyn ToSql
 #[test]
 fn t01_schema_remains_version_8() {
     let (tmp, mut repo) = opened_repo("cea-t01");
-    assert_eq!(repo.schema_version().expect("version read"), 9);
+    assert_eq!(repo.schema_version().expect("version read"), 10);
     advance(&mut repo, "project-1", ContextEpochTrigger::A1Init).expect("advance");
     assert_eq!(
         repo.schema_version().expect("version read"),
-        9,
+        10,
         "advancement must not change the schema version"
     );
     drop(repo);
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("reopen");
-    assert_eq!(repo.schema_version().expect("version read"), 9);
+    assert_eq!(repo.schema_version().expect("version read"), 10);
 }
 
-// T02 — migration v9 is the exact registered chain head.
+// T02 — migration v10 is the exact registered chain head.
 #[test]
 fn t02_migration_v8_registered() {
     let registered = migrations::registered();
     assert_eq!(
         registered.len(),
-        9,
-        "exactly nine registered migrations may exist"
+        10,
+        "exactly ten registered migrations may exist"
     );
     let versions: Vec<u32> = registered.iter().map(|m| m.version).collect();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 }
 
 // T03 — the first advancement for a project with no history returns and
@@ -1036,6 +1036,7 @@ fn t36_no_current_epoch_pointer() {
         "context_rehydration_attempt",
         "context_rehydration_repository_snapshot",
         "context_rehydration_source_evidence",
+        "trusted_time_watermark",
     ] {
         assert!(
             !repo
@@ -1265,6 +1266,7 @@ fn t64_no_new_schema_object() {
         "context_rehydration_attempt",
         "context_rehydration_repository_snapshot",
         "context_rehydration_source_evidence",
+        "trusted_time_watermark",
     ];
     expected.sort_unstable();
     let tables_before = repo.list_tables().expect("tables");
@@ -1682,7 +1684,7 @@ fn t70_executor_binding_behavior_unchanged() {
     )
     .expect("release");
     let error = repo
-        .renew_executor_binding_lease("binding-1", "2027-02-02T00:00:00.000Z")
+        .renew_executor_binding_lease(&trusted_clock(), "binding-1", "2027-02-02T00:00:00.000Z")
         .expect_err("renewal after release still refused");
     assert!(
         matches!(error, StateError::ExecutorBindingAlreadyReleased { .. }),

@@ -20,8 +20,9 @@
 //! NULL to recorded (see
 //! [`SqliteStateRepository::release_executor_binding`]); every other
 //! binding field is immutable, and there is deliberately no public update,
-//! delete, or expiry-evaluation path, and no failover orchestration
-//! semantics. Creation is refused while the target role already has a
+//! delete or failover-orchestration capability. Trusted-time renewal and
+//! explicit expiry evaluation live in the bounded sibling lease module.
+//! Creation is refused while the target role already has a
 //! binding that is not conclusively fully released — enforced once as a
 //! transactional create-time pre-check (see
 //! [`SqliteStateRepository::create_executor_binding`]) and once durably by
@@ -32,12 +33,10 @@
 //! provider, model, runtime, or routing eligibility.
 //!
 //! `bound_at`, `lease_expires_at`, and `released_at` are persisted contract
-//! date-time strings, stored exactly as provided: State never inspects the
-//! wall clock, parses, compares, or evaluates them, and exposes no
-//! `is_active`/`is_expired`/`lease_due` semantics — recording a renewed
-//! `lease_expires_at` value supplied by the trusted orchestrator-core
-//! boundary is a pure persistence write, not a decision that the lease is
-//! currently unexpired. `session_ref` is an
+//! date-time strings. The generic create/release storage paths preserve
+//! them exactly; the lease module alone validates canonical trusted time,
+//! compares the current deadline, and writes a trusted renewal or explicit
+//! `LEASE_EXPIRED` release. `session_ref` is an
 //! opaque persistence reference only and is never credential storage.
 //! `rehydration_completed` is persistence data only; absence stays
 //! distinguishable from explicit `true`/`false`.
@@ -146,13 +145,10 @@ pub struct ExecutorBinding {
     /// Opaque routing-decision reference. When present: non-empty, at most
     /// [`MAX_IDENTIFIER_LENGTH`] scalar values. State never dereferences it.
     pub routing_decision_id: Option<String>,
-    /// Contract date-time string, stored as provided. Never parsed,
-    /// compared, or evaluated by State.
+    /// Contract date-time string, stored as provided by generic persistence.
     pub bound_at: String,
-    /// Contract date-time string, stored as provided. Never parsed,
-    /// compared, or evaluated by State; the only mutation is the guarded
-    /// renewal write, which records a newly supplied value without
-    /// evaluating it.
+    /// Contract date-time string, stored as provided at creation. The lease
+    /// boundary validates and compares it before expiry or renewal.
     pub lease_expires_at: String,
     /// Contract date-time string when present, stored as provided.
     pub released_at: Option<String>,
@@ -244,12 +240,11 @@ impl SqliteStateRepository {
     ///
     /// Exactly two fields change, exactly once, in one atomic transaction:
     /// `released_at` and `release_reason`. `released_at` is stored exactly
-    /// as supplied — State never reads the wall clock, generates,
-    /// parses, compares, or orders it — and `release_reason` is one of the
-    /// nine frozen reasons supplied by the caller: State never decides lease
-    /// validity or expiry, including for
-    /// [`ReleaseReason::LeaseExpired`]. Every other binding field is
-    /// immutable, the binding is never deleted or replaced, no other
+    /// as supplied — this generic path never reads the wall clock or
+    /// evaluates a deadline — and `release_reason` is one of the nine frozen
+    /// reasons supplied by the caller. The separately bounded trusted-time
+    /// expiry path reuses the same guarded write internally. Every other
+    /// binding field is immutable, the binding is never deleted or replaced, no other
     /// binding is created, and the referenced LogicalRole (including its
     /// `active_binding_id`) is never touched. Recording a release does not
     /// select, authorize, activate, or rehydrate any other executor.
@@ -279,53 +274,6 @@ impl SqliteStateRepository {
         ensure_identifier("binding_id", binding_id)?;
         ensure_non_empty("released_at", released_at)?;
         self.run_transaction(|uow| apply_release(uow.tx(), binding_id, released_at, release_reason))
-    }
-
-    /// Durably records a renewed `lease_expires_at` for exactly one
-    /// existing, non-released ExecutorBinding.
-    ///
-    /// Exactly one field changes, in one atomic transaction:
-    /// `lease_expires_at` takes the caller-supplied value. That value is an
-    /// opaque contract date-time string stored exactly as supplied — State
-    /// never reads the wall clock, generates, parses, compares, or orders
-    /// it, and never decides lease duration, validity, or expiry: the
-    /// trusted orchestrator-core boundary supplies the value after already
-    /// deciding to record a renewal, and this operation does not observe
-    /// heartbeats or schedule any later renewal or release. Every other
-    /// binding field is immutable, the binding is never deleted, replaced,
-    /// or re-created, no additional binding row appears, and the referenced
-    /// LogicalRole (including its `active_binding_id`) is never touched.
-    ///
-    /// Eligibility is terminal-state only: `released_at IS NULL AND
-    /// release_reason IS NULL`. "Non-released" is not an expiry decision —
-    /// this operation never claims the lease is currently unexpired.
-    ///
-    /// Fail-closed results:
-    ///
-    /// * an unknown `binding_id` fails with
-    ///   [`StateError::ExecutorBindingNotFound`]: renewal requires an
-    ///   already persisted binding and never fabricates one;
-    /// * a binding whose terminal release slot is occupied — released
-    ///   through this API (with any reason, including
-    ///   [`ReleaseReason::LeaseExpired`]), created already-released, or
-    ///   carrying any partial terminal shape — fails with
-    ///   [`StateError::ExecutorBindingAlreadyReleased`], leaving the
-    ///   terminal evidence and every other field untouched: renewal never
-    ///   clears, overwrites, or replaces `released_at`/`release_reason`,
-    ///   and never reopens the binding;
-    /// * an invalid input shape fails with
-    ///   [`StateError::ExecutorBindingValidation`] before any storage
-    ///   access;
-    /// * storage, transaction, and corrupt-row failures surface as explicit
-    ///   errors and never persist a partial renewal.
-    pub fn renew_executor_binding_lease(
-        &mut self,
-        binding_id: &str,
-        lease_expires_at: &str,
-    ) -> Result<(), StateError> {
-        ensure_identifier("binding_id", binding_id)?;
-        ensure_non_empty("lease_expires_at", lease_expires_at)?;
-        self.run_transaction(|uow| apply_lease_renewal(uow.tx(), binding_id, lease_expires_at))
     }
 }
 
@@ -524,7 +472,7 @@ fn role_conflict_from_backstop(
 
 /// Reads one binding row on the caller's snapshot and applies contract
 /// decoding, failing closed on any violation.
-fn read_executor_binding(
+pub(crate) fn read_executor_binding(
     conn: &Connection,
     binding_id: &str,
 ) -> Result<Option<ExecutorBinding>, StateError> {
@@ -717,7 +665,7 @@ fn validate_for_create(binding: &ExecutorBinding) -> Result<(), StateError> {
     Ok(())
 }
 
-fn ensure_identifier(field: &str, value: &str) -> Result<(), StateError> {
+pub(crate) fn ensure_identifier(field: &str, value: &str) -> Result<(), StateError> {
     ensure_non_empty(field, value)?;
     let length = value.chars().count();
     if length > MAX_IDENTIFIER_LENGTH {
