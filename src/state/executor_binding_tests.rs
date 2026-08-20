@@ -16,6 +16,7 @@
 
 use crate::error::StateError;
 use crate::executor_binding::{ExecutorBinding, ReleaseReason};
+use crate::executor_binding_single_active_tests::direct_insert_binding;
 use crate::logical_role::{LogicalRole, LogicalRoleStatus, LogicalRoleType};
 use crate::migrations;
 use crate::repository::SqliteStateRepository;
@@ -714,8 +715,23 @@ fn t24_all_nine_release_reasons_round_trip() {
         let mut binding = minimal_binding(&binding_id, "role-reasons-001");
         binding.released_at = Some("2026-08-16T09:59:00.000Z".to_string());
         binding.release_reason = Some(*reason);
-        repo.create_executor_binding(binding.clone())
-            .expect("each frozen release reason must be persistable");
+        if *reason == ReleaseReason::LeaseExpired {
+            // LEASE_EXPIRED remains a fully representable, round-trippable
+            // durable reason, but only the trusted expiry transaction may
+            // write it: public creation refuses it, so the pre-existing row
+            // is set up below the typed boundary.
+            assert!(
+                matches!(
+                    repo.create_executor_binding(binding.clone()),
+                    Err(StateError::ExecutorBindingValidation { .. })
+                ),
+                "public create must never manufacture new LEASE_EXPIRED state"
+            );
+            direct_insert_binding(&mut repo, &binding).expect("historical row reaches storage");
+        } else {
+            repo.create_executor_binding(binding.clone())
+                .expect("each frozen release reason must be persistable");
+        }
         let found = repo
             .find_executor_binding(&binding_id)
             .expect("find")
@@ -1055,3 +1071,140 @@ fn t34_failed_creation_is_atomic() {
 // (the guarded lease_expires_at-only renewal of a non-released binding);
 // the update/delete/expire absence invariant above continues to hold
 // beyond those two authorized additions.
+
+// CREATE-BYPASS — public creation is not a second semantic writer of new
+// LEASE_EXPIRED state.
+//
+// LEASE_EXPIRED is reserved to the explicit trusted lease-expiry
+// transaction, which alone applies the trusted-time fences, the deadline
+// predicate, provenance/actor/correlation validation, and the atomic
+// release + EXECUTOR_RELEASED append. Public creation must therefore refuse
+// a candidate binding already carrying that reason, before any durable
+// write, whatever `released_at` the caller supplies. The complementary
+// halves of the invariant — that the generic release path stays closed and
+// that the explicit expiry path stays fully functional and atomic — are
+// proven in `executor_binding_release_tests` and
+// `executor_binding_lease_expiry_tests`.
+#[test]
+fn create_bypass_public_create_cannot_manufacture_lease_expired_state() {
+    let tmp = TempDir::new("eb-create-bypass");
+    let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
+    repo.create_logical_role(minimal_role("role-cb-001", LogicalRoleType::RuntimeA1))
+        .expect("role create");
+
+    // CREATE-BYPASS-02 — the caller-controlled released_at carries no
+    // authority whatsoever: neither an arbitrary past nor future value, nor
+    // a missing one, can buy a new LEASE_EXPIRED row.
+    for (index, released_at) in [
+        Some("1900-01-01T00:00:00.000000000Z"),
+        Some("2099-12-31T23:59:59.999999999Z"),
+        Some("2026-08-16T09:59:00.000Z"),
+        None,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut candidate = minimal_binding(&format!("binding-cb-{index:02}"), "role-cb-001");
+        candidate.released_at = released_at.map(str::to_string);
+        candidate.release_reason = Some(ReleaseReason::LeaseExpired);
+        // CREATE-BYPASS-01 — rejected, and rejected as a validation refusal
+        // rather than a storage accident.
+        let error = repo
+            .create_executor_binding(candidate.clone())
+            .expect_err("public create must refuse new LEASE_EXPIRED state");
+        assert!(
+            matches!(error, StateError::ExecutorBindingValidation { .. }),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            repo.find_executor_binding(&candidate.binding_id)
+                .expect("find"),
+            None,
+            "the refused candidate must leave no durable row behind"
+        );
+    }
+
+    // CREATE-BYPASS-02 — no binding row of any kind was inserted.
+    assert_eq!(repo.count_table_rows("executor_binding").expect("rows"), 0);
+    // CREATE-BYPASS-03 — and no EXECUTOR_RELEASED (or any other) event.
+    assert_eq!(repo.count_table_rows("event").expect("events"), 0);
+    // CREATE-BYPASS-04 — a rejected create never creates or advances
+    // trusted-time state: only the fenced expiry path touches watermarks.
+    assert_eq!(
+        repo.count_table_rows("trusted_time_watermark")
+            .expect("watermarks"),
+        0
+    );
+    assert_eq!(
+        repo.find_trusted_time_watermark("project-1")
+            .expect("watermark"),
+        None
+    );
+
+    // CREATE-BYPASS-05 — the refusal is inert: an ordinary valid active
+    // binding for the same role still creates normally afterwards, so the
+    // rejected attempt neither consumed the role nor poisoned any state.
+    let valid = minimal_binding("binding-cb-live", "role-cb-001");
+    repo.create_executor_binding(valid.clone())
+        .expect("a normal active binding still creates after the refusal");
+    assert_eq!(
+        repo.find_executor_binding("binding-cb-live").expect("find"),
+        Some(valid)
+    );
+
+    // CREATE-BYPASS-07/08 (non-regression half) — the other eight frozen
+    // reasons keep their existing creation behavior, including the
+    // pre-released shapes the accepted baseline supports. Creation-time
+    // release semantics are narrowed for LEASE_EXPIRED only.
+    repo.create_logical_role(minimal_role("role-cb-002", LogicalRoleType::RuntimeA1))
+        .expect("role create");
+    for (index, reason) in ALL_NINE_REASONS
+        .iter()
+        .filter(|reason| **reason != ReleaseReason::LeaseExpired)
+        .enumerate()
+    {
+        let mut released = minimal_binding(&format!("binding-cb-ok-{index:02}"), "role-cb-002");
+        released.released_at = Some("2026-08-16T09:59:00.000Z".to_string());
+        released.release_reason = Some(*reason);
+        repo.create_executor_binding(released.clone())
+            .expect("non-LEASE_EXPIRED creation behavior is unchanged");
+        assert_eq!(
+            repo.find_executor_binding(&released.binding_id)
+                .expect("find"),
+            Some(released)
+        );
+    }
+}
+
+// CREATE-BYPASS-11 — exactly one semantic writer of new LEASE_EXPIRED state
+// remains in the whole State crate.
+//
+// Source-inspection invariant over all of `src/state/**` (not only the
+// binding modules), established by searching for `LeaseExpired`,
+// `LEASE_EXPIRED`, `release_reason`, `released_at`, `INSERT_BINDING_SQL`,
+// `create_executor_binding`, and `release_executor_binding`:
+//
+// * `INSERT_BINDING_SQL` (`create_executor_binding`) — the only INSERT that
+//   can write `release_reason`. `validate_for_create` now refuses a
+//   `LEASE_EXPIRED` candidate before any storage access, so this path can
+//   no longer create that state. `UnitOfWork::insert_executor_binding` is
+//   crate-private and has exactly one production caller, that same guarded
+//   `create_executor_binding`.
+// * `RELEASE_BINDING_SQL` (`apply_release`) — the only UPDATE that writes
+//   `release_reason`, reachable from exactly two callers:
+//   `release_executor_binding`, which rejects `LEASE_EXPIRED` outright, and
+//   `apply_expiry_with_fenced_time`, the explicit trusted lease-expiry
+//   transaction. The latter is the one authorized writer: TrustedClockV1 →
+//   Phase A fence → Phase B fence → current-deadline reread → expiry
+//   predicate → provenance/actor/correlation validation → LEASE_EXPIRED
+//   release plus EXECUTOR_RELEASED in one atomic transaction.
+// * `RENEW_LEASE_SQL` — writes `lease_expires_at` only, never the terminal
+//   pair, so renewal cannot produce a release of any reason.
+// * `src/state/context_rehydration.rs` — reads `release_reason` through
+//   `find_executor_binding` for projection only; it holds no binding write.
+// * `src/state/migrations/**` — v0003 declares the closed `release_reason`
+//   CHECK and v0005 the partial unique index; neither backfills, rewrites,
+//   nor converts any row, and this slice adds no migration.
+//
+// No scanner, timer, startup sweep, failover, rebind, or alternate public
+// helper exists that could write the terminal pair.

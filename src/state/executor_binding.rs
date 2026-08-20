@@ -19,8 +19,9 @@
 //! write-once terminal transition of `released_at`/`release_reason` from
 //! NULL to recorded (see
 //! [`SqliteStateRepository::release_executor_binding`]), except that
-//! `LEASE_EXPIRED` is reserved to the trusted explicit expiry transaction;
-//! every other
+//! `LEASE_EXPIRED` is reserved to the trusted explicit expiry transaction —
+//! which is equally why creation refuses a candidate binding that already
+//! carries `LEASE_EXPIRED`; every other
 //! binding field is immutable, and there is deliberately no public update,
 //! delete or failover-orchestration capability. Trusted-time renewal and
 //! explicit expiry evaluation live in the bounded sibling lease module.
@@ -198,6 +199,18 @@ impl SqliteStateRepository {
     /// deletes-and-reinserts binding history, and creating a binding never
     /// mutates the referenced LogicalRole (its `active_binding_id`,
     /// status, epoch, and identity all remain untouched).
+    ///
+    /// A candidate binding carrying `release_reason = LEASE_EXPIRED` is
+    /// refused outright with [`StateError::ExecutorBindingValidation`]
+    /// before any storage access: `LEASE_EXPIRED` is reserved to the trusted
+    /// explicit lease-expiry transaction, which is the only path authorized
+    /// to create that state, so creation can never manufacture a new
+    /// already-lease-expired binding from a caller-supplied `released_at`.
+    /// The refusal is total — no binding row, no event, and no trusted-time
+    /// state is written. Historical `LEASE_EXPIRED` rows already in storage
+    /// remain fully readable; only their creation through this API is
+    /// closed. Every other frozen release reason keeps its existing
+    /// creation behavior unchanged.
     ///
     /// Contract-level validation runs before any storage access, and the
     /// primary-key, foreign-key, and partial-unique-index constraints
@@ -664,6 +677,11 @@ fn extract_binding_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BindingRow> 
 /// invented for them, and `rehydration_completed` needs no validation
 /// beyond its `Option<bool>` type.
 fn validate_for_create(binding: &ExecutorBinding) -> Result<(), StateError> {
+    if binding.release_reason == Some(ReleaseReason::LeaseExpired) {
+        return Err(StateError::ExecutorBindingValidation {
+            detail: "LEASE_EXPIRED is reserved to the trusted lease-expiry transaction".to_string(),
+        });
+    }
     ensure_identifier("binding_id", &binding.binding_id)?;
     ensure_identifier("role_id", &binding.role_id)?;
     ensure_non_empty("provider_id", &binding.provider_id)?;

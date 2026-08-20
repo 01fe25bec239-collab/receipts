@@ -19,6 +19,7 @@ use crate::event::{
     SubjectKind,
 };
 use crate::executor_binding::{ExecutorBinding, ReleaseReason, apply_lease_renewal};
+use crate::executor_binding_single_active_tests::direct_insert_binding;
 use crate::logical_role::{LogicalRole, LogicalRoleStatus, LogicalRoleType};
 use crate::migrations;
 use crate::repository::SqliteStateRepository;
@@ -634,8 +635,12 @@ fn t25_lease_expired_released_binding_cannot_be_renewed() {
         RELEASED_AT,
         ReleaseReason::LeaseExpired,
     );
-    repo.create_executor_binding(binding.clone())
-        .expect("historical LEASE_EXPIRED binding create");
+    // Pre-existing LEASE_EXPIRED state is set up below the typed boundary:
+    // the public create path refuses to manufacture new LEASE_EXPIRED
+    // bindings, and only the trusted expiry transaction may write that
+    // state, so this row stands in for storage this API never produced.
+    direct_insert_binding(&mut repo, &binding)
+        .expect("historical LEASE_EXPIRED row reaches storage");
     let error = repo
         .renew_executor_binding_lease(&trusted_clock(), "binding-exp-001", RENEWED_LEASE)
         .expect_err("a LEASE_EXPIRED release is still terminal and must refuse renewal");

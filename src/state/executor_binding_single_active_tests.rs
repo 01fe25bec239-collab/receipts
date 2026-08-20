@@ -22,6 +22,8 @@
 
 use crate::error::StateError;
 use crate::executor_binding::{ExecutorBinding, ReleaseReason};
+use crate::executor_binding_lease_expiry::ExecutorLeaseExpiryOutcomeV1;
+use crate::executor_binding_lease_expiry_tests::{BINDING, DEADLINE, clock, request, seeded};
 use crate::logical_role::{LogicalRole, LogicalRoleStatus, LogicalRoleType};
 use crate::migrations;
 use crate::repository::SqliteStateRepository;
@@ -93,7 +95,7 @@ fn open_version_4(tmp: &TempDir) -> SqliteStateRepository {
 /// Test-only storage probe: inserts one binding row through bound-parameter
 /// SQL inside a State transaction, deliberately bypassing the typed create
 /// path so the database-level backstop can be observed on its own.
-fn direct_insert_binding(
+pub(crate) fn direct_insert_binding(
     repo: &mut SqliteStateRepository,
     binding: &ExecutorBinding,
 ) -> Result<(), StateError> {
@@ -619,22 +621,89 @@ fn t16_past_looking_lease_still_blocks() {
 // of T16. Compile-time/source-inspection invariant: see the
 // COMPILE_TIME_API_INVARIANTS block at the bottom of this module.
 
-// T18 — historical LEASE_EXPIRED rows remain readable as full terminal
-// releases and permit subsequent rebinding.
+// T18 — a LEASE_EXPIRED release permits subsequent rebinding, proven
+// through the only path authorized to create that state: the explicit
+// trusted lease-expiry transaction.
+//
+// This also carries CREATE-BYPASS-12 and CREATE-BYPASS-13: a past-deadline
+// but unreleased binding still blocks its successor, and only a successful
+// explicit expiry lifts that block — for a later, separately requested
+// create. Nothing rebinds automatically.
 #[test]
 fn t18_lease_expired_release_permits_rebind() {
-    let tmp = TempDir::new("sab-t18");
+    let (_tmp, mut repo, original) = seeded("sab-t18", DEADLINE);
+
+    // CREATE-BYPASS-12 — trusted time is already at the deadline, yet while
+    // the binding is unreleased it still blocks a successor: State never
+    // infers a release from a lease value.
+    let successor = minimal_binding("binding-m2-001", &original.role_id);
+    let blocked = repo
+        .create_executor_binding(successor.clone())
+        .expect_err("a past-deadline but unreleased binding must still block");
+    assert!(
+        matches!(
+            blocked,
+            StateError::ExecutorBindingUnreleasedConflict { .. }
+        ),
+        "unexpected error: {blocked}"
+    );
+
+    // The legitimate explicit trusted expiry releases the old binding.
+    assert_eq!(
+        repo.expire_executor_binding_lease(
+            &clock(DEADLINE),
+            request(&original, DEADLINE, "01ARZ3NDEKTSV4RRFFQ69G5FB1")
+        )
+        .expect("trusted expiry"),
+        ExecutorLeaseExpiryOutcomeV1::Released
+    );
+    let released = repo
+        .find_executor_binding(BINDING)
+        .expect("find")
+        .expect("present");
+    assert_eq!(released.released_at.as_deref(), Some(DEADLINE));
+    assert_eq!(released.release_reason, Some(ReleaseReason::LeaseExpired));
+
+    // CREATE-BYPASS-13 — and only now does a separately requested successor
+    // create succeed.
+    assert_eq!(
+        repo.count_table_rows("executor_binding").expect("rows"),
+        1,
+        "expiry itself never creates a successor"
+    );
+    repo.create_executor_binding(successor.clone())
+        .expect("a fully released binding no longer blocks its role");
+    assert_eq!(
+        repo.find_executor_binding("binding-m2-001").expect("find"),
+        Some(successor)
+    );
+}
+
+// CREATE-BYPASS-14 — pre-existing LEASE_EXPIRED rows stay fully readable
+// and non-blocking. Readability is not writability: such a row is set up
+// below the typed boundary, because the public create path no longer
+// manufactures new LEASE_EXPIRED state and no read path was removed.
+#[test]
+fn t18b_historical_lease_expired_row_remains_readable_and_non_blocking() {
+    let tmp = TempDir::new("sab-t18b");
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
     repo.create_logical_role(minimal_role("role-m-001", LogicalRoleType::RuntimeA1))
         .expect("role create");
     let mut historical = minimal_binding("binding-m1-001", "role-m-001");
     historical.released_at = Some("2026-08-16T10:30:00.000Z".to_string());
     historical.release_reason = Some(ReleaseReason::LeaseExpired);
-    repo.create_executor_binding(historical.clone())
-        .expect("historical binding create");
+    assert!(
+        matches!(
+            repo.create_executor_binding(historical.clone()),
+            Err(StateError::ExecutorBindingValidation { .. })
+        ),
+        "the public create path must not manufacture historical-looking state"
+    );
+    direct_insert_binding(&mut repo, &historical).expect("historical row reaches storage");
     assert_eq!(
         repo.find_executor_binding("binding-m1-001").expect("find"),
-        Some(historical)
+        Some(historical),
+        "a historical LEASE_EXPIRED row decodes exactly as recorded"
     );
     repo.create_executor_binding(minimal_binding("binding-m2-001", "role-m-001"))
         .expect("a historical LEASE_EXPIRED-released binding does not block");
