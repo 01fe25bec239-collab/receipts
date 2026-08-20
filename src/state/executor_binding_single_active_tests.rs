@@ -602,41 +602,42 @@ fn t16_past_looking_lease_still_blocks() {
         matches!(error, StateError::ExecutorBindingUnreleasedConflict { .. }),
         "unexpected error: {error}"
     );
-    // The explicit release is the only unlock.
-    repo.release_executor_binding(
-        "binding-l1-001",
-        "2026-08-16T10:30:00.000Z",
-        ReleaseReason::LeaseExpired,
-    )
-    .expect("release");
+    // Generic LEASE_EXPIRED cannot unlock the role.
+    assert!(matches!(
+        repo.release_executor_binding(
+            "binding-l1-001",
+            "2026-08-16T10:30:00.000Z",
+            ReleaseReason::LeaseExpired,
+        ),
+        Err(StateError::ExecutorBindingValidation { .. })
+    ));
     repo.create_executor_binding(minimal_binding("binding-l2-001", "role-l-001"))
-        .expect("explicit release unlocks rebind regardless of lease looks");
+        .expect_err("rejected generic expiry leaves the original binding active");
 }
 
 // T17 — no wall-clock comparison is used anywhere in the blocking decision
 // of T16. Compile-time/source-inspection invariant: see the
 // COMPILE_TIME_API_INVARIANTS block at the bottom of this module.
 
-// T18 — an explicit release recorded with LEASE_EXPIRED is a full terminal
-// release and permits subsequent rebinding.
+// T18 — historical LEASE_EXPIRED rows remain readable as full terminal
+// releases and permit subsequent rebinding.
 #[test]
 fn t18_lease_expired_release_permits_rebind() {
     let tmp = TempDir::new("sab-t18");
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
     repo.create_logical_role(minimal_role("role-m-001", LogicalRoleType::RuntimeA1))
         .expect("role create");
-    repo.create_executor_binding(minimal_binding("binding-m1-001", "role-m-001"))
-        .expect("binding create");
+    let mut historical = minimal_binding("binding-m1-001", "role-m-001");
+    historical.released_at = Some("2026-08-16T10:30:00.000Z".to_string());
+    historical.release_reason = Some(ReleaseReason::LeaseExpired);
+    repo.create_executor_binding(historical.clone())
+        .expect("historical binding create");
+    assert_eq!(
+        repo.find_executor_binding("binding-m1-001").expect("find"),
+        Some(historical)
+    );
     repo.create_executor_binding(minimal_binding("binding-m2-001", "role-m-001"))
-        .expect_err("blocked before release");
-    repo.release_executor_binding(
-        "binding-m1-001",
-        "2026-08-16T10:30:00.000Z",
-        ReleaseReason::LeaseExpired,
-    )
-    .expect("explicit LEASE_EXPIRED release");
-    repo.create_executor_binding(minimal_binding("binding-m2-001", "role-m-001"))
-        .expect("a durably LEASE_EXPIRED-released binding no longer blocks");
+        .expect("a historical LEASE_EXPIRED-released binding does not block");
 }
 
 // T19 — a partial terminal row carrying released_at only makes creation for
@@ -1390,9 +1391,9 @@ fn t54_backstop_failure_produces_no_partial_row() {
 //      `src/state/**` (see T17).
 // T42 — no automatic lease-expiry evaluator exists: no scheduler, timer,
 //      expiry loop, or background task appears in `src/state/**`.
-// T43 — no automatic LEASE_EXPIRED release exists: `LEASE_EXPIRED` is only
-//      a caller-supplied `ReleaseReason` recorded by the explicit
-//      `release_executor_binding` operation.
+// T43 — no automatic LEASE_EXPIRED release exists: new `LEASE_EXPIRED`
+//      transitions are recorded only by the trusted explicit expiry
+//      transaction.
 // T44 — no heartbeat/liveness system is introduced.
 // T45 — no automatic executor replacement, rebind, or failover
 //      orchestration is introduced; this slice only refuses a second

@@ -18,7 +18,9 @@
 //! [`SqliteStateRepository::renew_executor_binding_lease`]) and the single
 //! write-once terminal transition of `released_at`/`release_reason` from
 //! NULL to recorded (see
-//! [`SqliteStateRepository::release_executor_binding`]); every other
+//! [`SqliteStateRepository::release_executor_binding`]), except that
+//! `LEASE_EXPIRED` is reserved to the trusted explicit expiry transaction;
+//! every other
 //! binding field is immutable, and there is deliberately no public update,
 //! delete or failover-orchestration capability. Trusted-time renewal and
 //! explicit expiry evaluation live in the bounded sibling lease module.
@@ -241,9 +243,10 @@ impl SqliteStateRepository {
     /// Exactly two fields change, exactly once, in one atomic transaction:
     /// `released_at` and `release_reason`. `released_at` is stored exactly
     /// as supplied — this generic path never reads the wall clock or
-    /// evaluates a deadline — and `release_reason` is one of the nine frozen
-    /// reasons supplied by the caller. The separately bounded trusted-time
-    /// expiry path reuses the same guarded write internally. Every other
+    /// evaluates a deadline — and `release_reason` is one of the eight
+    /// non-`LEASE_EXPIRED` frozen reasons supplied by the caller.
+    /// `LEASE_EXPIRED` is reserved to the separately bounded trusted-time
+    /// expiry path, which reuses the same guarded write internally. Every other
     /// binding field is immutable, the binding is never deleted or replaced, no other
     /// binding is created, and the referenced LogicalRole (including its
     /// `active_binding_id`) is never touched. Recording a release does not
@@ -273,6 +276,12 @@ impl SqliteStateRepository {
     ) -> Result<(), StateError> {
         ensure_identifier("binding_id", binding_id)?;
         ensure_non_empty("released_at", released_at)?;
+        if release_reason == ReleaseReason::LeaseExpired {
+            return Err(StateError::ExecutorBindingValidation {
+                detail: "LEASE_EXPIRED is reserved to the trusted lease-expiry transaction"
+                    .to_string(),
+            });
+        }
         self.run_transaction(|uow| apply_release(uow.tx(), binding_id, released_at, release_reason))
     }
 }
@@ -486,10 +495,11 @@ pub(crate) fn read_executor_binding(
 /// Applies the one-time terminal release inside the open transaction.
 ///
 /// Crate-private; invoked by
-/// [`SqliteStateRepository::release_executor_binding`]. The full row is
-/// decoded first so corrupt persisted data fails closed before any write
-/// decision is made; the guarded UPDATE then re-enforces write-once
-/// emptiness as a durable backstop.
+/// [`SqliteStateRepository::release_executor_binding`] after its public
+/// reason guard, and by the trusted explicit lease-expiry transaction. The
+/// full row is decoded first so corrupt persisted data fails closed before
+/// any write decision is made; the guarded UPDATE then re-enforces
+/// write-once emptiness as a durable backstop.
 pub(crate) fn apply_release(
     conn: &Connection,
     binding_id: &str,

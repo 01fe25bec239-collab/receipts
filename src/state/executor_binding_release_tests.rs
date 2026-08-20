@@ -201,11 +201,12 @@ fn t03_released_read_returns_supplied_release_reason() {
     );
 }
 
-// T04 — all nine frozen release reasons can be recorded and read back
-// exactly, each with its exact durable representation.
+// T04 — all eight non-LEASE_EXPIRED frozen release reasons can be recorded
+// and read back exactly. LEASE_EXPIRED remains representable but is reserved
+// to the trusted explicit expiry transaction.
 #[test]
-fn t04_all_nine_release_reasons_recorded_and_read_exactly() {
-    let all_nine: [(ReleaseReason, &str); 9] = [
+fn t04_generic_release_accepts_eight_reasons_and_rejects_lease_expired() {
+    let generic_reasons: [(ReleaseReason, &str); 8] = [
         (ReleaseReason::RateLimited, "RATE_LIMITED"),
         (ReleaseReason::SessionExhausted, "SESSION_EXHAUSTED"),
         (ReleaseReason::AuthRequired, "AUTH_REQUIRED"),
@@ -214,19 +215,18 @@ fn t04_all_nine_release_reasons_recorded_and_read_exactly() {
         (ReleaseReason::HostSwitch, "HOST_SWITCH"),
         (ReleaseReason::UserRequest, "USER_REQUEST"),
         (ReleaseReason::Completed, "COMPLETED"),
-        (ReleaseReason::LeaseExpired, "LEASE_EXPIRED"),
     ];
     let tmp = TempDir::new("ebr-t04");
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
     repo.create_logical_role(minimal_role("role-nine-001", LogicalRoleType::RuntimeA1))
         .expect("role create");
-    for (index, (reason, durable)) in all_nine.iter().enumerate() {
+    for (index, (reason, durable)) in generic_reasons.iter().enumerate() {
         let binding_id = format!("binding-nine-{index:02}");
         let binding = minimal_binding(&binding_id, "role-nine-001");
         repo.create_executor_binding(binding.clone())
             .expect("binding create");
         repo.release_executor_binding(&binding_id, RELEASED_AT, *reason)
-            .expect("each frozen release reason must be recordable");
+            .expect("each non-LEASE_EXPIRED reason must remain recordable");
         let found = repo
             .find_executor_binding(&binding_id)
             .expect("find")
@@ -238,10 +238,28 @@ fn t04_all_nine_release_reasons_recorded_and_read_exactly() {
         );
         assert_eq!(found, with_release(binding, RELEASED_AT, *reason));
     }
+    let binding = minimal_binding("binding-nine-08", "role-nine-001");
+    repo.create_executor_binding(binding.clone())
+        .expect("binding create");
+    let error = repo
+        .release_executor_binding(
+            "binding-nine-08",
+            OTHER_RELEASED_AT,
+            ReleaseReason::LeaseExpired,
+        )
+        .expect_err("generic LEASE_EXPIRED release must be rejected");
+    assert!(matches!(
+        error,
+        StateError::ExecutorBindingValidation { .. }
+    ));
+    assert_eq!(
+        repo.find_executor_binding("binding-nine-08").expect("find"),
+        Some(binding)
+    );
     assert_eq!(
         repo.count_table_rows("executor_binding").expect("rows"),
         9,
-        "nine released bindings, one per frozen reason"
+        "eight released bindings plus the unchanged rejected expiry binding"
     );
 }
 
@@ -720,7 +738,7 @@ fn t29_schema_version_remains_exactly_7() {
         .expect("role create");
     repo.create_executor_binding(minimal_binding("binding-ver-001", "role-ver-001"))
         .expect("binding create");
-    repo.release_executor_binding("binding-ver-001", RELEASED_AT, ReleaseReason::LeaseExpired)
+    repo.release_executor_binding("binding-ver-001", RELEASED_AT, ReleaseReason::Completed)
         .expect("release");
     assert_eq!(
         repo.schema_version().expect("version read"),

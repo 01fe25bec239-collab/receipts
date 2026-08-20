@@ -109,6 +109,69 @@ fn assert_unreleased(repo: &SqliteStateRepository, event_id: &str) {
 }
 
 #[test]
+fn generic_lease_expired_is_inert_then_trusted_expiry_remains_atomic() {
+    let (_tmp, mut repo, original) = seeded("expiry-generic-bypass", DEADLINE);
+    let watermark_before = repo
+        .find_trusted_time_watermark(PROJECT)
+        .expect("watermark before");
+
+    let error = repo
+        .release_executor_binding(
+            BINDING,
+            "1900-01-01T00:00:00.000000000Z",
+            ReleaseReason::LeaseExpired,
+        )
+        .expect_err("generic LEASE_EXPIRED must fail closed");
+    assert!(matches!(
+        error,
+        StateError::ExecutorBindingValidation { .. }
+    ));
+    assert_eq!(
+        repo.find_executor_binding(BINDING).expect("find"),
+        Some(original.clone()),
+        "caller time and reason must remain non-authoritative"
+    );
+    assert_eq!(repo.count_table_rows("event").expect("events"), 0);
+    assert_eq!(
+        repo.find_trusted_time_watermark(PROJECT)
+            .expect("watermark after"),
+        watermark_before
+    );
+    assert!(matches!(
+        repo.create_executor_binding(make_binding("successor", ROLE, DEADLINE)),
+        Err(StateError::ExecutorBindingUnreleasedConflict { .. })
+    ));
+    assert_eq!(
+        repo.count_table_rows("executor_binding").expect("bindings"),
+        1
+    );
+
+    let expiry_request = request(&original, DEADLINE, EVENT_ID);
+    assert_eq!(
+        repo.expire_executor_binding_lease(&clock(DEADLINE), expiry_request.clone())
+            .expect("trusted expiry"),
+        ExecutorLeaseExpiryOutcomeV1::Released
+    );
+    let released = repo
+        .find_executor_binding(BINDING)
+        .expect("find")
+        .expect("present");
+    assert_eq!(released.released_at.as_deref(), Some(DEADLINE));
+    assert_eq!(released.release_reason, Some(ReleaseReason::LeaseExpired));
+    assert_eq!(
+        repo.find_event(EVENT_ID).expect("event"),
+        Some(expiry_request.executor_released_event)
+    );
+    assert_eq!(
+        repo.count_table_rows("executor_binding").expect("bindings"),
+        1,
+        "expiry must not create a successor binding"
+    );
+    repo.create_executor_binding(make_binding("successor", ROLE, DEADLINE))
+        .expect("separate rebind after trusted expiry");
+}
+
+#[test]
 fn expiry_predicate_release_atomicity_idempotency_and_rebind_contract() {
     let cases = [
         (

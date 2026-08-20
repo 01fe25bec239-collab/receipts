@@ -629,11 +629,13 @@ fn t25_lease_expired_released_binding_cannot_be_renewed() {
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
     repo.create_logical_role(minimal_role("role-exp-001", LogicalRoleType::RuntimeA1))
         .expect("role create");
-    let binding = minimal_binding("binding-exp-001", "role-exp-001");
+    let binding = with_release(
+        minimal_binding("binding-exp-001", "role-exp-001"),
+        RELEASED_AT,
+        ReleaseReason::LeaseExpired,
+    );
     repo.create_executor_binding(binding.clone())
-        .expect("binding create");
-    repo.release_executor_binding("binding-exp-001", RELEASED_AT, ReleaseReason::LeaseExpired)
-        .expect("release with LEASE_EXPIRED");
+        .expect("historical LEASE_EXPIRED binding create");
     let error = repo
         .renew_executor_binding_lease(&trusted_clock(), "binding-exp-001", RENEWED_LEASE)
         .expect_err("a LEASE_EXPIRED release is still terminal and must refuse renewal");
@@ -649,7 +651,7 @@ fn t25_lease_expired_released_binding_cannot_be_renewed() {
         repo.find_executor_binding("binding-exp-001")
             .expect("find")
             .expect("present"),
-        with_release(binding, RELEASED_AT, ReleaseReason::LeaseExpired),
+        binding,
         "the terminal LEASE_EXPIRED evidence must remain exactly as recorded"
     );
 }
@@ -1024,13 +1026,11 @@ fn t43_renewal_signature_is_exactly_bounded() {
     );
 }
 
-// T46 — all nine frozen ReleaseReason values still decode and round-trip
-// exactly on renewed bindings: nine bindings are each renewed and then
-// released with a distinct reason, and each reads back as the renewed
-// original plus exactly the terminal pair.
+// T46 — all eight generic release reasons still round-trip exactly after
+// renewal; generic LEASE_EXPIRED is rejected without changing the renewal.
 #[test]
-fn t46_all_nine_release_reasons_round_trip_after_renewal() {
-    let all_nine: [(ReleaseReason, &str); 9] = [
+fn t46_eight_generic_release_reasons_round_trip_after_renewal() {
+    let generic_reasons: [(ReleaseReason, &str); 8] = [
         (ReleaseReason::RateLimited, "RATE_LIMITED"),
         (ReleaseReason::SessionExhausted, "SESSION_EXHAUSTED"),
         (ReleaseReason::AuthRequired, "AUTH_REQUIRED"),
@@ -1039,13 +1039,12 @@ fn t46_all_nine_release_reasons_round_trip_after_renewal() {
         (ReleaseReason::HostSwitch, "HOST_SWITCH"),
         (ReleaseReason::UserRequest, "USER_REQUEST"),
         (ReleaseReason::Completed, "COMPLETED"),
-        (ReleaseReason::LeaseExpired, "LEASE_EXPIRED"),
     ];
     let tmp = TempDir::new("ebl-t46");
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
     repo.create_logical_role(minimal_role("role-nine-001", LogicalRoleType::RuntimeA1))
         .expect("role create");
-    for (index, (reason, durable)) in all_nine.iter().enumerate() {
+    for (index, (reason, durable)) in generic_reasons.iter().enumerate() {
         let binding_id = format!("binding-nine-{index:02}");
         let binding = minimal_binding(&binding_id, "role-nine-001");
         repo.create_executor_binding(binding.clone())
@@ -1053,7 +1052,7 @@ fn t46_all_nine_release_reasons_round_trip_after_renewal() {
         repo.renew_executor_binding_lease(&trusted_clock(), &binding_id, RENEWED_LEASE)
             .expect("renew before release");
         repo.release_executor_binding(&binding_id, RELEASED_AT, *reason)
-            .expect("each frozen release reason must remain recordable");
+            .expect("each generic release reason must remain recordable");
         let found = repo
             .find_executor_binding(&binding_id)
             .expect("find")
@@ -1072,10 +1071,25 @@ fn t46_all_nine_release_reasons_round_trip_after_renewal() {
             )
         );
     }
+    let binding = minimal_binding("binding-nine-08", "role-nine-001");
+    repo.create_executor_binding(binding.clone())
+        .expect("binding create");
+    repo.renew_executor_binding_lease(&trusted_clock(), "binding-nine-08", RENEWED_LEASE)
+        .expect("renew before rejected expiry");
+    assert!(matches!(
+        repo.release_executor_binding("binding-nine-08", RELEASED_AT, ReleaseReason::LeaseExpired,),
+        Err(StateError::ExecutorBindingValidation { .. })
+    ));
+    assert_eq!(
+        repo.find_executor_binding("binding-nine-08")
+            .expect("find")
+            .expect("present"),
+        with_renewed_lease(binding, RENEWED_LEASE)
+    );
     assert_eq!(
         repo.count_table_rows("executor_binding").expect("rows"),
         9,
-        "nine renewed-and-released bindings, one per frozen reason"
+        "eight renewed-and-released bindings plus one unchanged renewal"
     );
 }
 
