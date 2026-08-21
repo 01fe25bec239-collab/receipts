@@ -8,9 +8,15 @@ use crate::context_rehydration::{
     ArtifactMaterializer, ArtifactRefV1, BoundContextSourceRefV1, ContextRehydratedEventSupplier,
     ContextRehydrationRequest, ContextRehydrationStatus, ContextSourceBindingV1,
     ContextSourceDemand, ContextSourceTouchEvidence, ExternalSourceMaterialization,
-    RepositorySnapshotMaterializer, RepositorySnapshotRefV1, SourceDisposition,
-    SourceMaterializationFailure, StateQueryRefV1, context_rehydration_event_payload,
-    context_source_digest_v1,
+    MAX_ACTOR_REFERENCE_BYTES, MAX_AUTHORITATIVE_BINDING_CANONICAL_BYTES,
+    MAX_CORRELATION_REFERENCE_BYTES, MAX_EXTERNAL_ERROR_CAPTURE_BYTES,
+    MAX_FAILURE_DETAIL_PERSISTED_BYTES, MAX_MATERIALIZED_BYTES_PER_ATTEMPT,
+    MAX_MATERIALIZED_BYTES_PER_SOURCE, MAX_MATERIALIZER_PROVENANCE_CANONICAL_BYTES,
+    MAX_SESSION_REFERENCE_BYTES, MAX_SINGLE_SOURCE_EVIDENCE_RECORD_CANONICAL_BYTES,
+    MAX_STREAM_CHUNK_BYTES, MAX_TASK_REFERENCE_BYTES, MAX_TIMESTAMP_BYTES,
+    MAX_TRIGGER_REFERENCE_BYTES, RepositorySnapshotMaterializer, RepositorySnapshotRefV1,
+    SourceDisposition, SourceMaterializationFailure, StateQueryRefV1,
+    context_rehydration_event_payload, context_source_digest_v1,
 };
 use crate::event::{ActorKind, EventActor, EventEnvelope, EventSubject, EventType, SubjectKind};
 use crate::executor_binding::ExecutorBinding;
@@ -74,6 +80,94 @@ impl RepositorySnapshotMaterializer for RepoMaterializer {
 struct ArtifactFake {
     values: HashMap<String, Vec<u8>>,
     calls: usize,
+}
+
+struct StreamingRepoMaterializer {
+    known: bool,
+    calls: usize,
+    known_calls: usize,
+    chunk_size: usize,
+    fail_on_call: Option<usize>,
+    lengths_by_call: Vec<u64>,
+    fills_by_call: Vec<u8>,
+    materializer_id: String,
+    provenance: String,
+    materialized_at: String,
+}
+
+impl StreamingRepoMaterializer {
+    fn new(known: bool, chunk_size: usize) -> Self {
+        Self {
+            known,
+            calls: 0,
+            known_calls: 0,
+            chunk_size,
+            fail_on_call: None,
+            lengths_by_call: Vec::new(),
+            fills_by_call: Vec::new(),
+            materializer_id: "streaming-workspace-v1".to_string(),
+            provenance: "streaming-test".to_string(),
+            materialized_at: "2026-08-17T10:00:01Z".to_string(),
+        }
+    }
+
+    fn reference_length(reference: &RepositorySnapshotRefV1) -> u64 {
+        reference
+            .logical_relative_path
+            .rsplit('/')
+            .next()
+            .expect("size path")
+            .parse()
+            .expect("numeric size path")
+    }
+}
+
+impl RepositorySnapshotMaterializer for StreamingRepoMaterializer {
+    fn known_length(
+        &mut self,
+        reference: &RepositorySnapshotRefV1,
+    ) -> Result<Option<u64>, SourceMaterializationFailure> {
+        self.known_calls += 1;
+        Ok(self.known.then(|| Self::reference_length(reference)))
+    }
+
+    fn materialize(
+        &mut self,
+        reference: &RepositorySnapshotRefV1,
+        accept_chunk: &mut dyn FnMut(&[u8]) -> Result<(), SourceMaterializationFailure>,
+    ) -> Result<ExternalSourceMaterialization, SourceMaterializationFailure> {
+        self.calls += 1;
+        if self.fail_on_call == Some(self.calls) {
+            return Err(SourceMaterializationFailure {
+                code: "SOURCE_REREAD_FAILED".to_string(),
+                materializer_id: Some(self.materializer_id.clone()),
+                provenance: Some(self.provenance.clone()),
+                materialized_at: Some(self.materialized_at.clone()),
+                failure_detail: Some("bounded reread failure".to_string()),
+            });
+        }
+        let length = self
+            .lengths_by_call
+            .get(self.calls - 1)
+            .copied()
+            .unwrap_or_else(|| Self::reference_length(reference));
+        let fill = self
+            .fills_by_call
+            .get(self.calls - 1)
+            .copied()
+            .unwrap_or(b'x');
+        let mut remaining = usize::try_from(length).expect("test length fits usize");
+        while remaining != 0 {
+            let length = remaining.min(self.chunk_size);
+            accept_chunk(&vec![fill; length])?;
+            remaining -= length;
+        }
+        Ok(ExternalSourceMaterialization {
+            materializer_id: self.materializer_id.clone(),
+            provenance: self.provenance.clone(),
+            materialized_at: self.materialized_at.clone(),
+        })
+    }
 }
 
 impl ArtifactMaterializer for ArtifactFake {
@@ -620,6 +714,7 @@ fn repository_paths_are_platform_independently_fail_closed_before_materializatio
         "C:\\secret",
         "C:/secret",
         "C:secret",
+        "//server/share",
         "\\\\server\\share",
         "bad\0path",
     ]
@@ -732,6 +827,50 @@ fn malformed_state_query_parameters_fail_before_registry_execution() {
 }
 
 #[test]
+fn negative_state_query_epoch_fails_before_execution_or_materialization() {
+    let (_tmp, mut repo) = opened("negative-state-query-epoch");
+    seed(
+        &mut repo,
+        vec![source(
+            ContextSourceRefType::StateQuery,
+            "context-epoch-by-id",
+            SourceClass::Mandatory,
+        )],
+    );
+    let binding = ContextSourceBindingV1 {
+        source_ordinal: 0,
+        source_id: "query-1".to_string(),
+        source_ref: BoundContextSourceRefV1::StateQuery(StateQueryRefV1::ContextEpoch {
+            project_id: "project-1".to_string(),
+            epoch: -1,
+        }),
+    };
+    let mut repository = RepoMaterializer {
+        values: HashMap::new(),
+        calls: 0,
+    };
+    let mut artifacts = ArtifactFake {
+        values: HashMap::new(),
+        calls: 0,
+    };
+    let outcome = repo
+        .rehydrate_context(
+            request(vec![binding]),
+            &mut repository,
+            &mut artifacts,
+            &mut EventSupplier {
+                calls: 0,
+                corrupt_digest: false,
+            },
+        )
+        .expect("bounded failure");
+    assert_eq!(outcome.attempt.status, ContextRehydrationStatus::Failed);
+    assert!(outcome.attempt.source_evidence.is_empty());
+    assert_eq!(repository.calls, 0);
+    assert_eq!(artifacts.calls, 0);
+}
+
+#[test]
 fn invalid_expected_digest_persists_bounded_failure_before_materialization() {
     let (_tmp, mut repo) = opened("invalid-expected-digest");
     let mut invalid = source(
@@ -817,6 +956,81 @@ fn executor_session_mismatch_fails_before_materialization() {
         .expect("failed attempt persists");
     assert_eq!(outcome.attempt.status, ContextRehydrationStatus::Failed);
     assert_eq!(materializer.calls, 0);
+}
+
+#[test]
+fn executor_session_presence_truth_table_is_byte_exact() {
+    let cases = [
+        ("none-none", None, None, true),
+        ("some-equal", Some("session-a"), Some("session-a"), true),
+        (
+            "some-different",
+            Some("session-a"),
+            Some("session-b"),
+            false,
+        ),
+        ("some-none", Some("session-a"), None, false),
+        ("none-some", None, Some("session-b"), false),
+        ("space-exact", Some("session-a "), Some("session-a"), false),
+        ("case-exact", Some("Session-A"), Some("session-a"), false),
+        ("unicode-exact", Some("é"), Some("e\u{301}"), false),
+    ];
+    for (tag, persisted, requested, accepted) in cases {
+        let (_tmp, mut repo) = opened(tag);
+        seed(
+            &mut repo,
+            vec![source(
+                ContextSourceRefType::RepoPath,
+                "safe/path",
+                SourceClass::Mandatory,
+            )],
+        );
+        repo.create_executor_binding(ExecutorBinding {
+            binding_id: "binding-1".to_string(),
+            role_id: "role-1".to_string(),
+            provider_id: "provider".to_string(),
+            model_id: "model".to_string(),
+            runtime_id: "runtime".to_string(),
+            session_ref: persisted.map(str::to_string),
+            routing_decision_id: None,
+            bound_at: "bound".to_string(),
+            lease_expires_at: "lease".to_string(),
+            released_at: None,
+            release_reason: None,
+            rehydration_completed: None,
+        })
+        .expect("binding");
+        let mut candidate = request(vec![repo_binding(0, "source-1", "safe/path")]);
+        candidate.executor_binding_id = Some("binding-1".to_string());
+        candidate.session_reference = requested.map(str::to_string);
+        let mut materializer = RepoMaterializer {
+            values: HashMap::from([("safe/path".to_string(), Ok(b"body".to_vec()))]),
+            calls: 0,
+        };
+        let outcome = repo
+            .rehydrate_context(
+                candidate,
+                &mut materializer,
+                &mut ArtifactFake {
+                    values: HashMap::new(),
+                    calls: 0,
+                },
+                &mut EventSupplier {
+                    calls: 0,
+                    corrupt_digest: false,
+                },
+            )
+            .expect("terminal receipt");
+        assert_eq!(
+            outcome.attempt.status,
+            if accepted {
+                ContextRehydrationStatus::Succeeded
+            } else {
+                ContextRehydrationStatus::Failed
+            }
+        );
+        assert_eq!(materializer.calls, usize::from(accepted), "case {tag}");
+    }
 }
 
 struct EpochAdvancingMaterializer {
@@ -1409,4 +1623,608 @@ fn event_insert_failure_rolls_back_candidate_success_before_failed_receipt() {
             .event_type,
         EventType::GoalCreated
     );
+}
+
+#[test]
+fn second_pass_failures_are_durable_and_never_return_partial_context() {
+    for (tag, with_earlier_source, fail_on_call) in [
+        ("reread-failure", false, 2),
+        ("reread-failure-after-source", true, 3),
+    ] {
+        let (_tmp, mut repo) = opened(tag);
+        let mut sources = Vec::new();
+        let mut bindings = Vec::new();
+        if with_earlier_source {
+            sources.push(source(
+                ContextSourceRefType::RepoPath,
+                "size/4",
+                SourceClass::Mandatory,
+            ));
+            bindings.push(repo_binding(0, "source-earlier", "size/4"));
+        }
+        sources.push(source(
+            ContextSourceRefType::RepoPath,
+            "size/4",
+            SourceClass::Consumed,
+        ));
+        bindings.push(repo_binding(
+            usize::from(with_earlier_source),
+            "source-consumed",
+            "size/4",
+        ));
+        seed(&mut repo, sources);
+        let mut materializer = StreamingRepoMaterializer::new(true, MAX_STREAM_CHUNK_BYTES);
+        materializer.fail_on_call = Some(fail_on_call);
+        let mut events = EventSupplier {
+            calls: 0,
+            corrupt_digest: false,
+        };
+        let outcome = repo
+            .rehydrate_context(
+                request(bindings),
+                &mut materializer,
+                &mut ArtifactFake {
+                    values: HashMap::new(),
+                    calls: 0,
+                },
+                &mut events,
+            )
+            .expect("failed receipt persists");
+
+        assert_eq!(outcome.attempt.status, ContextRehydrationStatus::Failed);
+        assert_eq!(
+            outcome.attempt.failure_code.as_deref(),
+            Some("SOURCE_REREAD_FAILED")
+        );
+        assert!(outcome.sources.is_empty());
+        assert_eq!(events.calls, 0);
+        assert_eq!(
+            repo.find_context_rehydration_attempt("project-1", "attempt-1")
+                .expect("read")
+                .expect("durable failure")
+                .status,
+            ContextRehydrationStatus::Failed
+        );
+        assert!(
+            repo.find_event("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+                .expect("event read")
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn failed_receipt_write_failure_returns_err() {
+    let (_tmp, mut repo) = opened("failed-receipt-write-failure");
+    seed(
+        &mut repo,
+        vec![source(
+            ContextSourceRefType::RepoPath,
+            "safe/path",
+            SourceClass::Mandatory,
+        )],
+    );
+    repo.rehydrate_context(
+        request(vec![repo_binding(0, "source-1", "safe/path")]),
+        &mut RepoMaterializer {
+            values: HashMap::from([("safe/path".to_string(), Ok(b"body".to_vec()))]),
+            calls: 0,
+        },
+        &mut ArtifactFake {
+            values: HashMap::new(),
+            calls: 0,
+        },
+        &mut EventSupplier {
+            calls: 0,
+            corrupt_digest: false,
+        },
+    )
+    .expect("first terminal receipt");
+
+    let mut invalid = request(vec![repo_binding(0, "source-1", "safe/path")]);
+    invalid.session_reference = Some("x".repeat(MAX_SESSION_REFERENCE_BYTES + 1));
+    let result = repo.rehydrate_context(
+        invalid,
+        &mut RepoMaterializer {
+            values: HashMap::new(),
+            calls: 0,
+        },
+        &mut ArtifactFake {
+            values: HashMap::new(),
+            calls: 0,
+        },
+        &mut EventSupplier {
+            calls: 0,
+            corrupt_digest: false,
+        },
+    );
+    assert!(
+        result.is_err(),
+        "failed receipt collision cannot become success"
+    );
+}
+
+#[test]
+fn every_unknown_length_pass_counts_toward_the_attempt_boundary() {
+    for (tag, source_lengths, expected_status, expected_calls) in [
+        (
+            "aggregate-exact",
+            vec![MAX_MATERIALIZED_BYTES_PER_SOURCE; 2],
+            ContextRehydrationStatus::Succeeded,
+            4,
+        ),
+        (
+            "aggregate-plus-one",
+            vec![
+                MAX_MATERIALIZED_BYTES_PER_SOURCE,
+                MAX_MATERIALIZED_BYTES_PER_SOURCE,
+                1,
+            ],
+            ContextRehydrationStatus::Failed,
+            5,
+        ),
+    ] {
+        let (_tmp, mut repo) = opened(tag);
+        let sources = source_lengths
+            .iter()
+            .map(|length| {
+                source(
+                    ContextSourceRefType::RepoPath,
+                    &format!("size/{length}"),
+                    SourceClass::Mandatory,
+                )
+            })
+            .collect();
+        let bindings = source_lengths
+            .iter()
+            .enumerate()
+            .map(|(ordinal, length)| {
+                repo_binding(
+                    ordinal,
+                    &format!("source-{ordinal}"),
+                    &format!("size/{length}"),
+                )
+            })
+            .collect();
+        seed(&mut repo, sources);
+        let mut materializer = StreamingRepoMaterializer::new(false, MAX_STREAM_CHUNK_BYTES);
+        let mut events = EventSupplier {
+            calls: 0,
+            corrupt_digest: false,
+        };
+        let outcome = repo
+            .rehydrate_context(
+                request(bindings),
+                &mut materializer,
+                &mut ArtifactFake {
+                    values: HashMap::new(),
+                    calls: 0,
+                },
+                &mut events,
+            )
+            .expect("terminal outcome");
+        assert_eq!(outcome.attempt.status, expected_status);
+        assert_eq!(materializer.calls, expected_calls);
+        assert_eq!(materializer.known_calls, source_lengths.len());
+        if expected_status == ContextRehydrationStatus::Failed {
+            assert_eq!(
+                outcome.attempt.failure_code.as_deref(),
+                Some("REHYDRATION_MATERIALIZATION_TOTAL_LIMIT_EXCEEDED")
+            );
+            assert!(outcome.sources.is_empty());
+            assert_eq!(events.calls, 0);
+        } else {
+            assert_eq!(
+                source_lengths.iter().sum::<u64>() * 2,
+                MAX_MATERIALIZED_BYTES_PER_ATTEMPT
+            );
+        }
+    }
+}
+
+#[test]
+fn consumed_reread_passes_count_toward_the_attempt_boundary() {
+    for (tag, lengths, expected_status) in [
+        (
+            "reread-aggregate-exact",
+            vec![MAX_MATERIALIZED_BYTES_PER_SOURCE; 2],
+            ContextRehydrationStatus::Succeeded,
+        ),
+        (
+            "reread-aggregate-plus-one",
+            vec![
+                MAX_MATERIALIZED_BYTES_PER_SOURCE,
+                MAX_MATERIALIZED_BYTES_PER_SOURCE,
+                1,
+            ],
+            ContextRehydrationStatus::Failed,
+        ),
+    ] {
+        let (_tmp, mut repo) = opened(tag);
+        seed(
+            &mut repo,
+            lengths
+                .iter()
+                .map(|length| {
+                    source(
+                        ContextSourceRefType::RepoPath,
+                        &format!("size/{length}"),
+                        SourceClass::Consumed,
+                    )
+                })
+                .collect(),
+        );
+        let bindings = lengths
+            .iter()
+            .enumerate()
+            .map(|(ordinal, length)| {
+                repo_binding(
+                    ordinal,
+                    &format!("source-{ordinal}"),
+                    &format!("size/{length}"),
+                )
+            })
+            .collect();
+        let mut materializer = StreamingRepoMaterializer::new(true, MAX_STREAM_CHUNK_BYTES);
+        let mut events = EventSupplier {
+            calls: 0,
+            corrupt_digest: false,
+        };
+        let outcome = repo
+            .rehydrate_context(
+                request(bindings),
+                &mut materializer,
+                &mut ArtifactFake {
+                    values: HashMap::new(),
+                    calls: 0,
+                },
+                &mut events,
+            )
+            .expect("terminal outcome");
+        assert_eq!(outcome.attempt.status, expected_status);
+        assert_eq!(materializer.calls, 4);
+        if expected_status == ContextRehydrationStatus::Succeeded {
+            assert_eq!(outcome.sources.len(), 2);
+        } else {
+            assert_eq!(
+                outcome.attempt.failure_code.as_deref(),
+                Some("REHYDRATION_MATERIALIZATION_TOTAL_LIMIT_EXCEEDED")
+            );
+            assert!(outcome.sources.is_empty());
+            assert_eq!(events.calls, 0);
+        }
+    }
+}
+
+#[test]
+fn stream_chunk_and_unknown_length_source_boundaries_are_behavioral() {
+    for (tag, known, source_length, chunk_size, expected_status, expected_code) in [
+        (
+            "chunk-exact",
+            true,
+            MAX_STREAM_CHUNK_BYTES as u64,
+            MAX_STREAM_CHUNK_BYTES,
+            ContextRehydrationStatus::Succeeded,
+            None,
+        ),
+        (
+            "chunk-plus-one",
+            true,
+            (MAX_STREAM_CHUNK_BYTES + 1) as u64,
+            MAX_STREAM_CHUNK_BYTES + 1,
+            ContextRehydrationStatus::Failed,
+            Some("SOURCE_STREAM_CHUNK_SIZE_LIMIT_EXCEEDED"),
+        ),
+        (
+            "unknown-source-exact",
+            false,
+            MAX_MATERIALIZED_BYTES_PER_SOURCE,
+            MAX_STREAM_CHUNK_BYTES,
+            ContextRehydrationStatus::Succeeded,
+            None,
+        ),
+        (
+            "unknown-source-plus-one",
+            false,
+            MAX_MATERIALIZED_BYTES_PER_SOURCE + 1,
+            MAX_STREAM_CHUNK_BYTES,
+            ContextRehydrationStatus::Failed,
+            Some("SOURCE_MATERIALIZATION_SIZE_LIMIT_EXCEEDED"),
+        ),
+    ] {
+        let path = format!("size/{source_length}");
+        let (_tmp, mut repo) = opened(tag);
+        seed(
+            &mut repo,
+            vec![source(
+                ContextSourceRefType::RepoPath,
+                &path,
+                SourceClass::Mandatory,
+            )],
+        );
+        let mut materializer = StreamingRepoMaterializer::new(known, chunk_size);
+        let outcome = repo
+            .rehydrate_context(
+                request(vec![repo_binding(0, "source-1", &path)]),
+                &mut materializer,
+                &mut ArtifactFake {
+                    values: HashMap::new(),
+                    calls: 0,
+                },
+                &mut EventSupplier {
+                    calls: 0,
+                    corrupt_digest: false,
+                },
+            )
+            .expect("bounded outcome");
+        assert_eq!(outcome.attempt.status, expected_status);
+        assert_eq!(outcome.attempt.failure_code.as_deref(), expected_code);
+        assert_eq!(materializer.known_calls, 1);
+        assert!(
+            outcome.sources.is_empty() || expected_status == ContextRehydrationStatus::Succeeded
+        );
+    }
+}
+
+#[test]
+fn unknown_length_pass_instability_fails_closed() {
+    for (tag, lengths, fills) in [
+        ("unstable-length", vec![4, 5], vec![b'x', b'x']),
+        ("unstable-bytes", vec![4, 4], vec![b'x', b'y']),
+    ] {
+        let (_tmp, mut repo) = opened(tag);
+        seed(
+            &mut repo,
+            vec![source(
+                ContextSourceRefType::RepoPath,
+                "size/4",
+                SourceClass::Mandatory,
+            )],
+        );
+        let mut materializer = StreamingRepoMaterializer::new(false, MAX_STREAM_CHUNK_BYTES);
+        materializer.lengths_by_call = lengths;
+        materializer.fills_by_call = fills;
+        let mut events = EventSupplier {
+            calls: 0,
+            corrupt_digest: false,
+        };
+        let outcome = repo
+            .rehydrate_context(
+                request(vec![repo_binding(0, "source-1", "size/4")]),
+                &mut materializer,
+                &mut ArtifactFake {
+                    values: HashMap::new(),
+                    calls: 0,
+                },
+                &mut events,
+            )
+            .expect("durable failure");
+        assert_eq!(outcome.attempt.status, ContextRehydrationStatus::Failed);
+        assert_eq!(
+            outcome.attempt.failure_code.as_deref(),
+            Some("INVALID_MATERIALIZER_RESPONSE")
+        );
+        assert!(outcome.sources.is_empty());
+        assert_eq!(events.calls, 0);
+    }
+}
+
+#[test]
+fn request_external_fields_accept_exact_bounds_and_reject_the_next_byte() {
+    let fields = [
+        ("actor", MAX_ACTOR_REFERENCE_BYTES),
+        ("timestamp", MAX_TIMESTAMP_BYTES),
+        ("session", MAX_SESSION_REFERENCE_BYTES),
+        ("task", MAX_TASK_REFERENCE_BYTES),
+        ("correlation", MAX_CORRELATION_REFERENCE_BYTES),
+        ("trigger", MAX_TRIGGER_REFERENCE_BYTES),
+    ];
+    for (field, maximum) in fields {
+        for extra in 0..=1 {
+            let (_tmp, mut repo) = opened(&format!("field-{field}-{extra}"));
+            seed(
+                &mut repo,
+                vec![source(
+                    ContextSourceRefType::RepoPath,
+                    "safe/path",
+                    SourceClass::Mandatory,
+                )],
+            );
+            let value = "x".repeat(maximum + extra);
+            let mut candidate = request(vec![repo_binding(0, "source-1", "safe/path")]);
+            match field {
+                "actor" => candidate.requested_by_actor.id = Some(value),
+                "timestamp" => candidate.completed_at = value,
+                "session" => candidate.session_reference = Some(value),
+                "task" => candidate.task_id = Some(value),
+                "correlation" => candidate.correlation_reference = Some(value),
+                "trigger" => candidate.trigger_reference = Some(value),
+                _ => unreachable!(),
+            }
+            let mut materializer = RepoMaterializer {
+                values: HashMap::from([("safe/path".to_string(), Ok(b"body".to_vec()))]),
+                calls: 0,
+            };
+            let result = repo.rehydrate_context(
+                candidate,
+                &mut materializer,
+                &mut ArtifactFake {
+                    values: HashMap::new(),
+                    calls: 0,
+                },
+                &mut EventSupplier {
+                    calls: 0,
+                    corrupt_digest: false,
+                },
+            );
+            if extra == 0 {
+                assert_eq!(
+                    result.expect("exact boundary accepted").attempt.status,
+                    ContextRehydrationStatus::Succeeded,
+                    "field {field}"
+                );
+            } else {
+                assert!(result.is_err(), "field {field} boundary+1 accepted");
+            }
+            assert_eq!(materializer.calls, usize::from(extra == 0));
+        }
+    }
+}
+
+#[test]
+fn materializer_metadata_and_failure_text_boundaries_are_behavioral() {
+    for (field, maximum) in [
+        ("materializer_id", MAX_AUTHORITATIVE_BINDING_CANONICAL_BYTES),
+        ("provenance", MAX_MATERIALIZER_PROVENANCE_CANONICAL_BYTES),
+    ] {
+        for extra in 0..=1 {
+            let (_tmp, mut repo) = opened(&format!("metadata-{field}-{extra}"));
+            seed(
+                &mut repo,
+                vec![source(
+                    ContextSourceRefType::RepoPath,
+                    "size/1",
+                    SourceClass::Mandatory,
+                )],
+            );
+            let mut materializer = StreamingRepoMaterializer::new(true, 1);
+            if field == "materializer_id" {
+                materializer.materializer_id = "m".repeat(maximum + extra);
+            } else {
+                materializer.provenance = "p".repeat(maximum + extra);
+            }
+            let outcome = repo
+                .rehydrate_context(
+                    request(vec![repo_binding(0, "source-1", "size/1")]),
+                    &mut materializer,
+                    &mut ArtifactFake {
+                        values: HashMap::new(),
+                        calls: 0,
+                    },
+                    &mut EventSupplier {
+                        calls: 0,
+                        corrupt_digest: false,
+                    },
+                )
+                .expect("terminal receipt");
+            assert_eq!(
+                outcome.attempt.status,
+                if extra == 0 {
+                    ContextRehydrationStatus::Succeeded
+                } else {
+                    ContextRehydrationStatus::Failed
+                }
+            );
+        }
+    }
+
+    let exact = crate::context_rehydration::sanitize_failure_detail(
+        &"x".repeat(MAX_FAILURE_DETAIL_PERSISTED_BYTES),
+    );
+    assert_eq!(exact.len(), MAX_FAILURE_DETAIL_PERSISTED_BYTES);
+    assert!(!exact.ends_with("...[TRUNCATED]"));
+    let plus_one = crate::context_rehydration::sanitize_failure_detail(
+        &"x".repeat(MAX_FAILURE_DETAIL_PERSISTED_BYTES + 1),
+    );
+    assert_eq!(plus_one.len(), MAX_FAILURE_DETAIL_PERSISTED_BYTES);
+    assert!(plus_one.ends_with("...[TRUNCATED]"));
+    for length in [
+        MAX_EXTERNAL_ERROR_CAPTURE_BYTES,
+        MAX_EXTERNAL_ERROR_CAPTURE_BYTES + 1,
+    ] {
+        let sanitized = crate::context_rehydration::sanitize_failure_detail(&"x".repeat(length));
+        assert_eq!(sanitized.len(), MAX_FAILURE_DETAIL_PERSISTED_BYTES);
+        assert!(sanitized.ends_with("...[TRUNCATED]"));
+        assert!(std::str::from_utf8(sanitized.as_bytes()).is_ok());
+    }
+}
+
+#[test]
+fn source_evidence_canonical_record_enforces_8192_byte_boundary() {
+    let (_tmp, mut calibration_repo) = opened("evidence-boundary-calibration");
+    seed(
+        &mut calibration_repo,
+        vec![source(
+            ContextSourceRefType::RepoPath,
+            "size/1",
+            SourceClass::Mandatory,
+        )],
+    );
+    let mut calibration_materializer = StreamingRepoMaterializer::new(true, 1);
+    calibration_materializer.materializer_id =
+        "m".repeat(MAX_AUTHORITATIVE_BINDING_CANONICAL_BYTES);
+    calibration_materializer.provenance = "p".to_string();
+    let calibration = calibration_repo
+        .rehydrate_context(
+            request(vec![repo_binding(0, "source-1", "size/1")]),
+            &mut calibration_materializer,
+            &mut ArtifactFake {
+                values: HashMap::new(),
+                calls: 0,
+            },
+            &mut EventSupplier {
+                calls: 0,
+                corrupt_digest: false,
+            },
+        )
+        .expect("calibration succeeds");
+    let calibration_size =
+        serde_json_canonicalizer::to_vec(&calibration.attempt.source_evidence[0])
+            .expect("canonical evidence")
+            .len();
+    let provenance_length = MAX_SINGLE_SOURCE_EVIDENCE_RECORD_CANONICAL_BYTES
+        .checked_sub(calibration_size - 1)
+        .expect("boundary is constructible");
+    assert!(provenance_length <= MAX_MATERIALIZER_PROVENANCE_CANONICAL_BYTES);
+
+    for extra in 0..=1 {
+        let (_tmp, mut repo) = opened(&format!("evidence-boundary-{extra}"));
+        seed(
+            &mut repo,
+            vec![source(
+                ContextSourceRefType::RepoPath,
+                "size/1",
+                SourceClass::Mandatory,
+            )],
+        );
+        let mut materializer = StreamingRepoMaterializer::new(true, 1);
+        materializer.materializer_id = "m".repeat(MAX_AUTHORITATIVE_BINDING_CANONICAL_BYTES);
+        materializer.provenance = "p".repeat(provenance_length + extra);
+        let mut events = EventSupplier {
+            calls: 0,
+            corrupt_digest: false,
+        };
+        let result = repo.rehydrate_context(
+            request(vec![repo_binding(0, "source-1", "size/1")]),
+            &mut materializer,
+            &mut ArtifactFake {
+                values: HashMap::new(),
+                calls: 0,
+            },
+            &mut events,
+        );
+        if extra == 0 {
+            let outcome = result.expect("8,192-byte evidence accepted");
+            assert_eq!(outcome.attempt.status, ContextRehydrationStatus::Succeeded);
+            assert_eq!(
+                serde_json_canonicalizer::to_vec(&outcome.attempt.source_evidence[0])
+                    .expect("canonical evidence")
+                    .len(),
+                MAX_SINGLE_SOURCE_EVIDENCE_RECORD_CANONICAL_BYTES
+            );
+        } else {
+            assert!(result.is_err(), "8,193-byte evidence must be rejected");
+            assert_eq!(events.calls, 0);
+            assert!(
+                repo.find_context_rehydration_attempt("project-1", "attempt-1")
+                    .expect("attempt read")
+                    .is_none()
+            );
+            assert!(
+                repo.find_event("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+                    .expect("event read")
+                    .is_none()
+            );
+        }
+    }
 }

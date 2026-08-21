@@ -43,16 +43,9 @@ pub const MAX_FAILURE_CODE_BYTES: usize = 64;
 pub const MAX_OTHER_EXTERNAL_REFERENCE_BYTES: usize = 1_024;
 pub const MAX_EXTERNAL_ERROR_CAPTURE_BYTES: usize = 65_536;
 pub const MAX_FAILURE_DETAIL_PERSISTED_BYTES: usize = 4_096;
-pub const MAX_EVIDENCE_STRUCTURED_DEPTH: usize = 16;
-pub const MAX_EVIDENCE_OBJECT_MEMBERS: usize = 128;
-pub const MAX_EVIDENCE_ARRAY_ELEMENTS: usize = 256;
-pub const MAX_EVIDENCE_STRUCTURED_TOTAL_NODES: usize = 8_192;
-pub const MAX_EXTERNAL_STRUCTURED_REFERENCE_CANONICAL_BYTES: usize = 4_096;
 pub const MAX_STATE_QUERY_RESULT_CANONICAL_BYTES: usize = 8_388_608;
-pub const MAX_STATE_QUERY_RESULT_DEPTH: usize = 16;
 pub const MAX_STATE_QUERY_OBJECT_MEMBERS: usize = 256;
 pub const MAX_STATE_QUERY_ARRAY_ELEMENTS: usize = 4_096;
-pub const MAX_STATE_QUERY_TOTAL_NODES: usize = 65_536;
 pub const MAX_SINGLE_REPOSITORY_SNAPSHOT_REFERENCE_CANONICAL_BYTES: usize = 4_096;
 pub const MAX_REPOSITORY_RELATIVE_PATH_BYTES: usize = 1_024;
 pub const MAX_REPOSITORY_ID_BYTES: usize = 256;
@@ -590,16 +583,8 @@ impl SqliteStateRepository {
 
             let (materialization, observed_digest, mut reread_bytes) = match materialization {
                 Ok(value) => value,
-                Err(mut error) => {
-                    if validate_failure(&error).is_err() {
-                        error = SourceMaterializationFailure {
-                            code: "INVALID_MATERIALIZER_FAILURE".to_string(),
-                            materializer_id: None,
-                            provenance: None,
-                            materialized_at: None,
-                            failure_detail: None,
-                        };
-                    }
+                Err(error) => {
+                    let error = bounded_materialization_failure(error);
                     evidence.push(failed_evidence(
                         binding,
                         source,
@@ -631,13 +616,30 @@ impl SqliteStateRepository {
                 SourceClass::Consumed => touched.is_some() || changed,
             };
             if reread && reread_bytes.is_none() {
-                reread_bytes = Some(reread_source_body(
+                reread_bytes = match reread_source_body(
                     &binding.source_ref,
+                    &observed_digest,
                     repository_materializer,
                     artifact_materializer,
                     self,
                     &request,
-                )?);
+                    &mut total_materialized_bytes,
+                ) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) => {
+                        let error = bounded_materialization_failure(error);
+                        evidence.push(failed_evidence(
+                            binding,
+                            source,
+                            ordinal,
+                            &error.code,
+                            Some(&error),
+                            &request.project_id,
+                        )?);
+                        failure_code = Some(error.code);
+                        break;
+                    }
+                };
             }
             evidence.push(ContextRehydrationSourceEvidence {
                 source_id: binding.source_id.clone(),
@@ -816,11 +818,7 @@ impl SqliteStateRepository {
             if binding.role_id != request.durable_role_id {
                 return validation_failure("executor binding role mismatch");
             }
-            if let (Some(persisted), Some(requested)) = (
-                binding.session_ref.as_deref(),
-                request.session_reference.as_deref(),
-            ) && persisted.as_bytes() != requested.as_bytes()
-            {
+            if binding.session_ref.as_deref() != request.session_reference.as_deref() {
                 return validation_failure("executor binding session mismatch");
             }
         }
@@ -1275,29 +1273,37 @@ fn stream_external_source(
         ensure_total_will_fit(*attempt_total, length)?;
     }
 
-    let length = match known_length {
-        Some(length) => length,
+    let (length, count_digest) = match known_length {
+        Some(length) => (length, None),
         None => {
             let mut observed = 0_u64;
+            let mut consistency = Sha256::new();
             let mut count = |chunk: &[u8]| {
                 observed = checked_source_count(observed, chunk.len())?;
+                account_external_chunk(attempt_total, chunk.len())?;
+                consistency.update(chunk);
                 Ok(())
             };
             materialize(&mut count)?;
             ensure_total_will_fit(*attempt_total, observed)?;
-            observed
+            (observed, Some(consistency.finalize()))
         }
     };
 
     let mut hasher = source_digest_hasher(ref_type, identity, length)?;
+    let mut consistency = count_digest.as_ref().map(|_| Sha256::new());
     let mut observed = 0_u64;
     let mut body = capture_body.then(Vec::new);
     let mut accept = |chunk: &[u8]| {
         observed = checked_source_count(observed, chunk.len())?;
+        account_external_chunk(attempt_total, chunk.len())?;
         if observed > length {
             return Err(limit_failure("INVALID_MATERIALIZER_RESPONSE"));
         }
         hasher.update(chunk);
+        if let Some(value) = &mut consistency {
+            value.update(chunk);
+        }
         if let Some(bytes) = &mut body {
             bytes.extend_from_slice(chunk);
         }
@@ -1307,9 +1313,12 @@ fn stream_external_source(
     if observed != length {
         return Err(limit_failure("INVALID_MATERIALIZER_RESPONSE"));
     }
-    *attempt_total = attempt_total
-        .checked_add(length)
-        .ok_or_else(|| limit_failure("REHYDRATION_SIZE_COUNTER_OVERFLOW"))?;
+    if count_digest
+        .zip(consistency.map(|value| value.finalize()))
+        .is_some_and(|(counted, materialized)| counted != materialized)
+    {
+        return Err(limit_failure("INVALID_MATERIALIZER_RESPONSE"));
+    }
     Ok((
         metadata,
         format!("sha256:v1:{}", lowercase_hex(hasher.finalize().as_slice())),
@@ -1319,18 +1328,29 @@ fn stream_external_source(
 
 fn reread_source_body(
     source: &BoundContextSourceRefV1,
+    expected_digest: &str,
     repository_materializer: &mut impl RepositorySnapshotMaterializer,
     artifact_materializer: &mut impl ArtifactMaterializer,
     repository: &SqliteStateRepository,
     request: &ContextRehydrationRequest,
-) -> Result<Vec<u8>, StateError> {
+    attempt_total: &mut u64,
+) -> Result<Vec<u8>, SourceMaterializationFailure> {
     if let BoundContextSourceRefV1::StateQuery(query) = source {
-        return repository.execute_registered_state_query(query, request);
+        return repository
+            .execute_registered_state_query(query, request)
+            .map_err(|error| SourceMaterializationFailure {
+                code: closed_error_code(&error),
+                materializer_id: Some("state-context:state-query-registry:v1".to_string()),
+                provenance: Some(query.query_id().to_string()),
+                materialized_at: Some(request.completed_at.clone()),
+                failure_detail: Some(error.to_string()),
+            });
     }
     let mut body = Vec::new();
     let mut observed = 0_u64;
     let mut accept = |chunk: &[u8]| {
         observed = checked_source_count(observed, chunk.len())?;
+        account_external_chunk(attempt_total, chunk.len())?;
         body.extend_from_slice(chunk);
         Ok(())
     };
@@ -1343,7 +1363,13 @@ fn reread_source_body(
         }
         BoundContextSourceRefV1::StateQuery(_) => unreachable!(),
     };
-    result.map_err(|error| StateError::ContextRehydrationValidation { detail: error.code })?;
+    result?;
+    if context_source_digest_v1(source, &request.project_id, &body)
+        .map_err(|_| limit_failure("INVALID_MATERIALIZER_RESPONSE"))?
+        != expected_digest
+    {
+        return Err(limit_failure("INVALID_MATERIALIZER_RESPONSE"));
+    }
     Ok(body)
 }
 
@@ -1377,6 +1403,19 @@ fn ensure_total_will_fit(
             "REHYDRATION_MATERIALIZATION_TOTAL_LIMIT_EXCEEDED",
         ));
     }
+    Ok(())
+}
+
+fn account_external_chunk(
+    total: &mut u64,
+    chunk_len: usize,
+) -> Result<(), SourceMaterializationFailure> {
+    let chunk_len =
+        u64::try_from(chunk_len).map_err(|_| limit_failure("REHYDRATION_SIZE_COUNTER_OVERFLOW"))?;
+    ensure_total_will_fit(*total, chunk_len)?;
+    *total = total
+        .checked_add(chunk_len)
+        .ok_or_else(|| limit_failure("REHYDRATION_SIZE_COUNTER_OVERFLOW"))?;
     Ok(())
 }
 
@@ -2039,6 +2078,22 @@ fn validate_failure(value: &SourceMaterializationFailure) -> Result<(), StateErr
         ensure_bounded_evidence("provenance", provenance)?;
     }
     Ok(())
+}
+
+fn bounded_materialization_failure(
+    error: SourceMaterializationFailure,
+) -> SourceMaterializationFailure {
+    if validate_failure(&error).is_ok() {
+        error
+    } else {
+        SourceMaterializationFailure {
+            code: "INVALID_MATERIALIZER_FAILURE".to_string(),
+            materializer_id: None,
+            provenance: None,
+            materialized_at: None,
+            failure_detail: None,
+        }
+    }
 }
 
 fn ensure_bounded_evidence(field: &str, value: &str) -> Result<(), StateError> {
