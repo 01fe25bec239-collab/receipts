@@ -95,7 +95,7 @@ fn open_version_4(tmp: &TempDir) -> SqliteStateRepository {
 /// Test-only storage probe: inserts one binding row through bound-parameter
 /// SQL inside a State transaction, deliberately bypassing the typed create
 /// path so the database-level backstop can be observed on its own.
-pub(crate) fn direct_insert_binding(
+fn direct_insert_binding(
     repo: &mut SqliteStateRepository,
     binding: &ExecutorBinding,
 ) -> Result<(), StateError> {

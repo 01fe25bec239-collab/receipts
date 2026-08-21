@@ -19,7 +19,6 @@ use crate::event::{
     SubjectKind,
 };
 use crate::executor_binding::{ExecutorBinding, ReleaseReason, apply_lease_renewal};
-use crate::executor_binding_single_active_tests::direct_insert_binding;
 use crate::logical_role::{LogicalRole, LogicalRoleStatus, LogicalRoleType};
 use crate::migrations;
 use crate::repository::SqliteStateRepository;
@@ -639,8 +638,31 @@ fn t25_lease_expired_released_binding_cannot_be_renewed() {
     // the public create path refuses to manufacture new LEASE_EXPIRED
     // bindings, and only the trusted expiry transaction may write that
     // state, so this row stands in for storage this API never produced.
-    direct_insert_binding(&mut repo, &binding)
-        .expect("historical LEASE_EXPIRED row reaches storage");
+    repo.run_transaction(|uow| {
+        let values: &[&dyn rusqlite::ToSql] = &[
+            &binding.binding_id,
+            &binding.role_id,
+            &binding.provider_id,
+            &binding.model_id,
+            &binding.runtime_id,
+            &binding.session_ref,
+            &binding.routing_decision_id,
+            &binding.bound_at,
+            &binding.lease_expires_at,
+            &binding.released_at,
+            &binding.release_reason.map(ReleaseReason::as_str),
+            &binding.rehydration_completed.map(i64::from),
+        ];
+        uow.execute(
+            "INSERT INTO executor_binding (
+                binding_id, role_id, provider_id, model_id, runtime_id,
+                session_ref, routing_decision_id, bound_at, lease_expires_at,
+                released_at, release_reason, rehydration_completed
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            values,
+        )
+    })
+    .expect("historical LEASE_EXPIRED row reaches storage");
     let error = repo
         .renew_executor_binding_lease(&trusted_clock(), "binding-exp-001", RENEWED_LEASE)
         .expect_err("a LEASE_EXPIRED release is still terminal and must refuse renewal");

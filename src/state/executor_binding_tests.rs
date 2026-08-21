@@ -16,7 +16,6 @@
 
 use crate::error::StateError;
 use crate::executor_binding::{ExecutorBinding, ReleaseReason};
-use crate::executor_binding_single_active_tests::direct_insert_binding;
 use crate::logical_role::{LogicalRole, LogicalRoleStatus, LogicalRoleType};
 use crate::migrations;
 use crate::repository::SqliteStateRepository;
@@ -727,7 +726,31 @@ fn t24_all_nine_release_reasons_round_trip() {
                 ),
                 "public create must never manufacture new LEASE_EXPIRED state"
             );
-            direct_insert_binding(&mut repo, &binding).expect("historical row reaches storage");
+            repo.run_transaction(|uow| {
+                let values: &[&dyn rusqlite::ToSql] = &[
+                    &binding.binding_id,
+                    &binding.role_id,
+                    &binding.provider_id,
+                    &binding.model_id,
+                    &binding.runtime_id,
+                    &binding.session_ref,
+                    &binding.routing_decision_id,
+                    &binding.bound_at,
+                    &binding.lease_expires_at,
+                    &binding.released_at,
+                    &binding.release_reason.map(ReleaseReason::as_str),
+                    &binding.rehydration_completed.map(i64::from),
+                ];
+                uow.execute(
+                    "INSERT INTO executor_binding (
+                        binding_id, role_id, provider_id, model_id, runtime_id,
+                        session_ref, routing_decision_id, bound_at, lease_expires_at,
+                        released_at, release_reason, rehydration_completed
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    values,
+                )
+            })
+            .expect("historical row reaches storage");
         } else {
             repo.create_executor_binding(binding.clone())
                 .expect("each frozen release reason must be persistable");
