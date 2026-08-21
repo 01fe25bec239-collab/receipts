@@ -1,0 +1,2 @@
+# Clippy configuration for the State foundation crate.
+# Intentionally empty: default rules apply; no checks weakened.

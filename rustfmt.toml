@@ -1,0 +1,3 @@
+# Rustfmt configuration for the State foundation crate.
+# Standard rules for edition 2024; no checks weakened.
+edition = "2024"
