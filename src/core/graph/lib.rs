@@ -35,11 +35,15 @@ pub mod edge;
 pub mod error;
 pub mod execution_graph;
 pub mod node;
+pub mod node_state;
 
 #[cfg(test)]
 mod execution_graph_tests;
+#[cfg(test)]
+mod node_state_tests;
 
 pub use edge::{ControlKind, EdgeClass, GraphEdge, GraphEdgeRelation, PrecedenceKind};
 pub use error::{GraphError, MAX_IDENTIFIER_LENGTH};
 pub use execution_graph::ExecutionGraph;
 pub use node::{CapabilityName, GraphNode, GraphNodeKind};
+pub use node_state::{GraphNodeState, GraphNodeStateParseError};
