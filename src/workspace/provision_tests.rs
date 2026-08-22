@@ -7,173 +7,19 @@
 //! goes through explicit argv via [`std::process::Command`]; no shell
 //! strings exist anywhere. No network remote is ever configured or
 //! contacted: every operation is purely local.
+//!
+//! The throwaway-repository fixtures are shared with the teardown suite in
+//! [`crate::test_support`].
 
 use std::ffi::{OsStr, OsString};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use crate::error::WorkspaceError;
 use crate::handle::{CommitSha, WorkspaceHandle, WorkspaceIsolation, WorkspaceState};
 use crate::provision::WorkspaceProvisionRequest;
-
-/// A temporary directory removed on drop.
-struct TempDir {
-    root: PathBuf,
-}
-
-impl TempDir {
-    fn new(tag: &str) -> Self {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "receipts-workspace-test-{tag}-{}-{unique}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).expect("temporary test directory creation");
-        Self { root }
-    }
-
-    fn path(&self) -> &Path {
-        &self.root
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
-}
-
-/// A throwaway local Git repository with one seeded empty commit.
-struct TestRepo {
-    /// Owning temporary directory removed on drop (may be a parent of the
-    /// repository directory itself).
-    root: TempDir,
-    /// The directory holding the `.git` repository.
-    repo_dir: PathBuf,
-}
-
-impl TestRepo {
-    /// A repository seeded directly in its own temporary root.
-    fn new(tag: &str) -> Self {
-        Self::seeded(TempDir::new(tag), None)
-    }
-
-    /// A repository seeded one level below its temporary root, so sibling
-    /// paths (for example symlink aliases) can live next to it.
-    fn new_nested(tag: &str, repo_subdir: &str) -> Self {
-        Self::seeded(TempDir::new(tag), Some(repo_subdir))
-    }
-
-    fn seeded(root: TempDir, repo_subdir: Option<&str>) -> Self {
-        let repo_dir = match repo_subdir {
-            Some(subdir) => root.path().join(subdir),
-            None => root.path().to_path_buf(),
-        };
-        std::fs::create_dir_all(&repo_dir).expect("repository directory creation");
-        git(&repo_dir, &["init", "--quiet", "--initial-branch", "main"]);
-        git(
-            &repo_dir,
-            &["config", "user.name", "Receipts Workspace Tests"],
-        );
-        git(
-            &repo_dir,
-            &["config", "user.email", "workspace-tests@receipts.invalid"],
-        );
-        git(&repo_dir, &["config", "commit.gpgsign", "false"]);
-        git(
-            &repo_dir,
-            &["commit", "--quiet", "--allow-empty", "--message", "seed"],
-        );
-        Self { root, repo_dir }
-    }
-
-    fn path(&self) -> &Path {
-        &self.repo_dir
-    }
-
-    fn head_sha(&self) -> String {
-        stdout_trimmed(&git(self.path(), &["rev-parse", "HEAD"]))
-    }
-}
-
-fn dev_null() -> &'static Path {
-    Path::new("/dev/null")
-}
-
-/// Runs one fixture Git command with explicit argv and hermetic config.
-fn git(directory: &Path, args: &[&str]) -> Output {
-    let output = git_raw(directory, args);
-    assert!(
-        output.status.success(),
-        "fixture git command {args:?} failed: {}",
-        stderr_text(&output)
-    );
-    output
-}
-
-/// Every Git-control variable this suite may install into the process
-/// environment while other tests run in parallel. Fixture commands strip
-/// these unconditionally — a static list closes the race where a parallel
-/// test installs a hostile value after the fixture has snapshotted the
-/// current environment.
-const HOSTILE_GIT_CONTROL_KEYS: [&str; 25] = [
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_COMMON_DIR",
-    "GIT_NAMESPACE",
-    "GIT_CONFIG",
-    "GIT_CONFIG_COUNT",
-    "GIT_CONFIG_KEY_0",
-    "GIT_CONFIG_KEY_1",
-    "GIT_CONFIG_KEY_2",
-    "GIT_CONFIG_KEY_3",
-    "GIT_CONFIG_VALUE_0",
-    "GIT_CONFIG_VALUE_1",
-    "GIT_CONFIG_VALUE_2",
-    "GIT_CONFIG_VALUE_3",
-    "GIT_CONFIG_GLOBAL",
-    "GIT_CONFIG_SYSTEM",
-    "GIT_CEILING_DIRECTORIES",
-    "GIT_EXEC_PATH",
-    "GIT_SSH",
-    "GIT_SSH_COMMAND",
-    "GIT_ASKPASS",
-    "GIT_TERMINAL_PROMPT",
-];
-
-fn git_raw(directory: &Path, args: &[&str]) -> Output {
-    let mut command = Command::new("git");
-    // Fixture commands must stay immune to the hostile variables that
-    // environment tests install in this process while other tests run in
-    // parallel: no ambient Git-control variable may influence any fixture.
-    // The hermetic configuration pins are applied last so they can never be
-    // stripped by this sweep.
-    for key in HOSTILE_GIT_CONTROL_KEYS {
-        command.env_remove(key);
-    }
-    command
-        .current_dir(directory)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", dev_null())
-        .env("GIT_CONFIG_SYSTEM", dev_null())
-        .args(args)
-        .output()
-        .expect("git executable must be available for provisioning tests")
-}
-
-fn stdout_trimmed(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
-}
-
-fn stderr_text(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).trim().to_string()
-}
+use crate::test_support::{
+    TestRepo, branch_exists, git, porcelain_status, stdout_trimmed, unix_symlink, worktree_head,
+};
 
 fn valid_request(
     repo: &TestRepo,
@@ -191,26 +37,6 @@ fn valid_request(
         base_sha,
     )
     .expect("test request must pass structural validation")
-}
-
-fn branch_exists(repo: &TestRepo, branch: &str) -> bool {
-    git_raw(
-        repo.path(),
-        &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
-    )
-    .status
-    .success()
-}
-
-fn worktree_head(repo: &TestRepo, worktree_name: &str) -> String {
-    stdout_trimmed(&git(
-        &repo.path().join(worktree_name),
-        &["rev-parse", "HEAD"],
-    ))
-}
-
-fn porcelain_status(worktree: &Path) -> String {
-    stdout_trimmed(&git_raw(worktree, &["status", "--porcelain"]))
 }
 
 // T1 — a malformed or non-exact base SHA is rejected before any Git
@@ -615,10 +441,6 @@ impl Drop for HostileEnv {
             }
         }
     }
-}
-
-fn unix_symlink(target: &Path, link: &Path) {
-    std::os::unix::fs::symlink(target, link).expect("test symlink creation");
 }
 
 // T13 — provisioning through a repository root containing canonicalizable

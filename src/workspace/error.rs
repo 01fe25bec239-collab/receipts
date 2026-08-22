@@ -1,10 +1,12 @@
-//! Fail-closed error surface for Workspace-Execution provisioning.
+//! Fail-closed error surface for Workspace-Execution provisioning and
+//! teardown.
 
 use std::fmt;
 
 /// Errors produced by the Workspace-Execution foundation.
 ///
-/// Every failure mode of provisioning a task worktree surfaces as an
+/// Every failure mode of provisioning a task worktree — and every failure
+/// mode of tearing a provisioned worktree down again — surfaces as an
 /// explicit error; a failed or ambiguous operation is never converted into
 /// a successful [`WorkspaceHandle`](crate::handle::WorkspaceHandle).
 #[derive(Debug)]
@@ -122,6 +124,86 @@ pub enum WorkspaceError {
         /// The rejected path and the underlying resolution failure.
         detail: String,
     },
+    /// Teardown was invoked on a handle whose lifecycle state is outside
+    /// this slice's single frozen transition (`PROVISIONED` → `TORN_DOWN`).
+    ///
+    /// Teardown never silently succeeds for an already-torn-down or any
+    /// other non-provisioned handle; such requests fail closed.
+    TeardownUnsupportedState {
+        /// The unsupported lifecycle state carried by the handle.
+        state: &'static str,
+    },
+    /// A handle presented to teardown carries no verified HEAD evidence,
+    /// so no exact expectation could be established.
+    TeardownHeadEvidenceMissing,
+    /// The registered worktree checkout path could not be resolved to its
+    /// canonical (realpath) location before teardown verification, so the
+    /// worktree's identity could not be proven.
+    WorktreeUnresolvable {
+        /// The rejected path and the underlying resolution failure.
+        detail: String,
+    },
+    /// The supplied worktree is not a registered worktree of the supplied
+    /// repository, or its registered identity disagrees with the handle.
+    TeardownWorktreeNotRegistered {
+        /// What was expected and what Git actually reports as registered.
+        detail: String,
+    },
+    /// The worktree's checked-out branch differs from the handle's branch.
+    TeardownBranchMismatch {
+        /// The branch recorded in the workspace handle.
+        expected_branch: String,
+        /// The branch (or detached/no-branch marker) Git reports for the
+        /// registered worktree.
+        observed: String,
+    },
+    /// The worktree's current HEAD could not be read during teardown.
+    TeardownHeadUnavailable {
+        /// Exit status/stderr of the failed read, or a description of why
+        /// the reported value is not an acceptable commit SHA.
+        detail: String,
+    },
+    /// The worktree's current HEAD differs from the handle's verified head
+    /// evidence. The worktree has changed since provisioning; it is left
+    /// fully intact for later recovery rather than removed under stale
+    /// evidence.
+    TeardownHeadMismatch {
+        /// The verified head evidence carried by the handle.
+        expected: String,
+        /// The HEAD actually observed in the worktree.
+        observed: String,
+    },
+    /// The worktree was not clean per `git status --porcelain` immediately
+    /// before removal. Tracked modifications, staged modifications, and
+    /// untracked files all count. Nothing is removed in this case.
+    TeardownWorktreeDirty {
+        /// The non-empty porcelain status output.
+        status: String,
+    },
+    /// After the removal command exited successfully, the worktree was
+    /// still registered with the repository — removal did not take effect
+    /// verifiably, so success is refused.
+    TeardownRegistrationVerificationFailed {
+        /// What remained registered after removal.
+        detail: String,
+    },
+    /// The retained task branch disappeared during teardown. Branch
+    /// retention is a required property; its absence fails closed instead
+    /// of being recreated (which would hide evidence corruption).
+    TeardownRetainedBranchMissing {
+        /// The branch that must remain.
+        branch: String,
+    },
+    /// The retained task branch no longer resolves to the exact commit
+    /// observed and verified immediately before teardown.
+    TeardownRetainedBranchShaMismatch {
+        /// The retained branch whose target was re-verified.
+        branch: String,
+        /// The exact commit observed immediately before teardown.
+        expected: String,
+        /// What the branch resolves to now.
+        observed: String,
+    },
 }
 
 impl fmt::Display for WorkspaceError {
@@ -177,6 +259,57 @@ impl fmt::Display for WorkspaceError {
             WorkspaceError::SubprocessCwdUnresolvable { operation, detail } => write!(
                 f,
                 "working directory for {operation} could not be canonicalized before execution: {detail}"
+            ),
+            WorkspaceError::TeardownUnsupportedState { state } => write!(
+                f,
+                "teardown supports only handles in the PROVISIONED state; the supplied handle is in the {state} state"
+            ),
+            WorkspaceError::TeardownHeadEvidenceMissing => write!(
+                f,
+                "the supplied workspace handle carries no verified HEAD evidence, so teardown could not establish an exact expectation"
+            ),
+            WorkspaceError::WorktreeUnresolvable { detail } => write!(
+                f,
+                "registered worktree could not be resolved to a canonical path for verification: {detail}"
+            ),
+            WorkspaceError::TeardownWorktreeNotRegistered { detail } => write!(
+                f,
+                "supplied worktree is not registered with the supplied repository: {detail}"
+            ),
+            WorkspaceError::TeardownBranchMismatch {
+                expected_branch,
+                observed,
+            } => write!(
+                f,
+                "worktree checkout is on {observed:?} instead of the handle's branch {expected_branch:?}; refusing to remove it"
+            ),
+            WorkspaceError::TeardownHeadUnavailable { detail } => write!(
+                f,
+                "worktree HEAD could not be read during teardown: {detail}"
+            ),
+            WorkspaceError::TeardownHeadMismatch { expected, observed } => write!(
+                f,
+                "worktree HEAD {observed} does not equal the handle's verified head evidence {expected}; the worktree has changed since provisioning and is left intact"
+            ),
+            WorkspaceError::TeardownWorktreeDirty { status } => write!(
+                f,
+                "worktree is not clean according to git status --porcelain immediately before removal: {status}"
+            ),
+            WorkspaceError::TeardownRegistrationVerificationFailed { detail } => write!(
+                f,
+                "worktree removal did not verifiably take effect: {detail}"
+            ),
+            WorkspaceError::TeardownRetainedBranchMissing { branch } => write!(
+                f,
+                "retained branch {branch:?} disappeared during teardown; failing closed instead of recreating it"
+            ),
+            WorkspaceError::TeardownRetainedBranchShaMismatch {
+                branch,
+                expected,
+                observed,
+            } => write!(
+                f,
+                "retained branch {branch:?} resolves to {observed} instead of the verified commit {expected}"
             ),
         }
     }
