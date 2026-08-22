@@ -210,6 +210,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "receipts-orchestration"
+version = "0.1.0"
+
+[[package]]
+name = "receipts-runtime-adapters"
+version = "0.1.0"
+
+[[package]]
 name = "receipts-state"
 version = "0.1.0"
 dependencies = [
@@ -219,6 +227,10 @@ dependencies = [
  "sha2",
  "tokio",
 ]
+
+[[package]]
+name = "receipts-workspace-execution"
+version = "0.1.0"
 
 [[package]]
 name = "rsqlite-vfs"
