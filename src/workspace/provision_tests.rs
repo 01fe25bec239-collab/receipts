@@ -8,9 +8,11 @@
 //! strings exist anywhere. No network remote is ever configured or
 //! contacted: every operation is purely local.
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use crate::error::WorkspaceError;
 use crate::handle::{CommitSha, WorkspaceHandle, WorkspaceIsolation, WorkspaceState};
@@ -46,34 +48,50 @@ impl Drop for TempDir {
 
 /// A throwaway local Git repository with one seeded empty commit.
 struct TestRepo {
+    /// Owning temporary directory removed on drop (may be a parent of the
+    /// repository directory itself).
     root: TempDir,
+    /// The directory holding the `.git` repository.
+    repo_dir: PathBuf,
 }
 
 impl TestRepo {
+    /// A repository seeded directly in its own temporary root.
     fn new(tag: &str) -> Self {
-        let root = TempDir::new(tag);
+        Self::seeded(TempDir::new(tag), None)
+    }
+
+    /// A repository seeded one level below its temporary root, so sibling
+    /// paths (for example symlink aliases) can live next to it.
+    fn new_nested(tag: &str, repo_subdir: &str) -> Self {
+        Self::seeded(TempDir::new(tag), Some(repo_subdir))
+    }
+
+    fn seeded(root: TempDir, repo_subdir: Option<&str>) -> Self {
+        let repo_dir = match repo_subdir {
+            Some(subdir) => root.path().join(subdir),
+            None => root.path().to_path_buf(),
+        };
+        std::fs::create_dir_all(&repo_dir).expect("repository directory creation");
+        git(&repo_dir, &["init", "--quiet", "--initial-branch", "main"]);
         git(
-            root.path(),
-            &["init", "--quiet", "--initial-branch", "main"],
-        );
-        git(
-            root.path(),
+            &repo_dir,
             &["config", "user.name", "Receipts Workspace Tests"],
         );
         git(
-            root.path(),
+            &repo_dir,
             &["config", "user.email", "workspace-tests@receipts.invalid"],
         );
-        git(root.path(), &["config", "commit.gpgsign", "false"]);
+        git(&repo_dir, &["config", "commit.gpgsign", "false"]);
         git(
-            root.path(),
+            &repo_dir,
             &["commit", "--quiet", "--allow-empty", "--message", "seed"],
         );
-        Self { root }
+        Self { root, repo_dir }
     }
 
     fn path(&self) -> &Path {
-        self.root.path()
+        &self.repo_dir
     }
 
     fn head_sha(&self) -> String {
@@ -96,8 +114,50 @@ fn git(directory: &Path, args: &[&str]) -> Output {
     output
 }
 
+/// Every Git-control variable this suite may install into the process
+/// environment while other tests run in parallel. Fixture commands strip
+/// these unconditionally — a static list closes the race where a parallel
+/// test installs a hostile value after the fixture has snapshotted the
+/// current environment.
+const HOSTILE_GIT_CONTROL_KEYS: [&str; 25] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_CONFIG",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_KEY_0",
+    "GIT_CONFIG_KEY_1",
+    "GIT_CONFIG_KEY_2",
+    "GIT_CONFIG_KEY_3",
+    "GIT_CONFIG_VALUE_0",
+    "GIT_CONFIG_VALUE_1",
+    "GIT_CONFIG_VALUE_2",
+    "GIT_CONFIG_VALUE_3",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_EXEC_PATH",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_ASKPASS",
+    "GIT_TERMINAL_PROMPT",
+];
+
 fn git_raw(directory: &Path, args: &[&str]) -> Output {
-    Command::new("git")
+    let mut command = Command::new("git");
+    // Fixture commands must stay immune to the hostile variables that
+    // environment tests install in this process while other tests run in
+    // parallel: no ambient Git-control variable may influence any fixture.
+    // The hermetic configuration pins are applied last so they can never be
+    // stripped by this sweep.
+    for key in HOSTILE_GIT_CONTROL_KEYS {
+        command.env_remove(key);
+    }
+    command
         .current_dir(directory)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", dev_null())
@@ -506,4 +566,410 @@ fn t12_existing_content_at_worktree_path_is_rejected() {
         dir_error,
         WorkspaceError::InvalidWorktreePath { .. }
     ));
+}
+
+/// Serializes every test that temporarily installs variables into this
+/// process's environment, so no two such tests ever mutate concurrently.
+static HOSTILE_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Installs hostile variables in this test process's environment while
+/// holding [`HOSTILE_ENV_LOCK`], and restores the previous values on drop —
+/// including during panic unwinding.
+struct HostileEnv {
+    _lock: MutexGuard<'static, ()>,
+    saved: Vec<(&'static str, Option<OsString>)>,
+}
+
+impl HostileEnv {
+    fn install(variables: &[(&'static str, &str)]) -> Self {
+        let lock = HOSTILE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved = variables
+            .iter()
+            .map(|(key, _)| (*key, std::env::var_os(key)))
+            .collect();
+        for (key, value) in variables {
+            // SAFETY: all environment mutation in this test binary happens
+            // while holding HOSTILE_ENV_LOCK, so no other mutating thread
+            // runs concurrently; unrelated parallel tests only read the
+            // environment when spawning fixture processes.
+            unsafe { std::env::set_var(key, value) };
+        }
+        Self { _lock: lock, saved }
+    }
+}
+
+impl Drop for HostileEnv {
+    fn drop(&mut self) {
+        for (key, original) in std::mem::take(&mut self.saved) {
+            match original {
+                Some(value) => {
+                    // SAFETY: see HostileEnv::install.
+                    unsafe { std::env::set_var(key, value) };
+                }
+                None => {
+                    // SAFETY: see HostileEnv::install.
+                    unsafe { std::env::remove_var(key) };
+                }
+            }
+        }
+    }
+}
+
+fn unix_symlink(target: &Path, link: &Path) {
+    std::os::unix::fs::symlink(target, link).expect("test symlink creation");
+}
+
+// T13 — provisioning through a repository root containing canonicalizable
+// path indirection executes against the canonical repository; a root that
+// cannot be canonicalized fails closed before any Git command runs.
+#[test]
+fn t13_provisioning_through_path_indirection_targets_canonical_repository() {
+    let repo = TestRepo::new_nested("wt-t13", "real-repo");
+    let base_sha = repo.head_sha();
+    let alias = repo.root.path().join("alias-to-repo");
+    unix_symlink(repo.path(), &alias);
+
+    let request = WorkspaceProvisionRequest::new(
+        alias.as_path(),
+        "ws-canonical-root",
+        None,
+        "task/canonical-root",
+        repo.path().join("the worktree"),
+        &base_sha,
+    )
+    .expect("indirected root must pass structural validation");
+    request
+        .provision()
+        .expect("provisioning through a canonicalizable root must succeed");
+
+    assert!(
+        branch_exists(&repo, "task/canonical-root"),
+        "branch must exist in the physical repository"
+    );
+    assert_eq!(worktree_head(&repo, "the worktree"), base_sha);
+
+    let missing_root = repo.root.path().join("does-not-exist");
+    let error = WorkspaceProvisionRequest::new(
+        missing_root.as_path(),
+        "ws-unresolvable-root",
+        None,
+        "task/unresolvable-root",
+        repo.path().join("unreachable worktree"),
+        &base_sha,
+    )
+    .expect("request must pass structural validation")
+    .provision()
+    .expect_err("an unresolvable repository root must fail closed");
+    assert!(
+        matches!(error, WorkspaceError::RepositoryRootUnresolvable { .. }),
+        "unexpected error: {error:?}"
+    );
+    assert!(!repo.path().join("unreachable worktree").exists());
+}
+
+// T14 — after worktree creation, HEAD/status verification operates from the
+// canonicalized created-worktree path, while the frozen handle contract
+// still reports the validated absolute path that was requested.
+#[test]
+fn t14_worktree_verification_operates_from_canonical_worktree_path() {
+    let repo = TestRepo::new("wt-t14");
+    std::fs::create_dir_all(repo.path().join("direct-parent"))
+        .expect("create physical parent directory");
+    unix_symlink(
+        &repo.path().join("direct-parent"),
+        &repo.path().join("linked-parent"),
+    );
+    let base_sha = repo.head_sha();
+
+    let requested = repo.path().join("linked-parent").join("the worktree");
+    let request = WorkspaceProvisionRequest::new(
+        repo.path(),
+        "ws-canonical-wt",
+        None,
+        "task/canonical-wt",
+        requested.clone(),
+        &base_sha,
+    )
+    .expect("indirected worktree path must pass structural validation");
+    let handle = request
+        .provision()
+        .expect("verification through the canonical worktree path must succeed");
+
+    assert_eq!(
+        handle.worktree_path(),
+        requested,
+        "frozen handle semantics carry the validated requested path"
+    );
+    assert_eq!(
+        stdout_trimmed(&git(
+            &repo.path().join("direct-parent/the worktree"),
+            &["rev-parse", "HEAD"]
+        )),
+        base_sha
+    );
+    assert_eq!(
+        porcelain_status(&repo.path().join("direct-parent/the worktree")),
+        ""
+    );
+
+    let canonical_parent =
+        crate::git::subprocess_cwd(&repo.path().join("linked-parent"), "boundary probe")
+            .expect("symlinked directory must resolve");
+    assert_eq!(
+        canonical_parent,
+        std::fs::canonicalize(repo.path().join("direct-parent")).expect("physical parent")
+    );
+}
+
+// T15 — a hostile parent-process GIT_DIR cannot redirect provisioning away
+// from the explicitly supplied canonical repository.
+#[test]
+fn t15_hostile_parent_git_dir_cannot_redirect_provisioning() {
+    let repo = TestRepo::new("wt-t15");
+    let base_sha = repo.head_sha();
+    let request = valid_request(
+        &repo,
+        "ws-hostile-git-dir",
+        "task/hostile-git-dir",
+        "the worktree",
+        &base_sha,
+    );
+    let handle;
+    {
+        let _hostile = HostileEnv::install(&[(
+            "GIT_DIR",
+            repo.path().join("hostile.git").to_str().expect("utf-8"),
+        )]);
+        handle = request
+            .provision()
+            .expect("hostile parent GIT_DIR must not redirect provisioning");
+    }
+    assert_eq!(handle.base_sha().as_str(), base_sha);
+    assert_eq!(handle.branch(), "task/hostile-git-dir");
+    assert_eq!(worktree_head(&repo, "the worktree"), base_sha);
+}
+
+// T16 — a hostile parent-process GIT_WORK_TREE cannot redirect execution.
+#[test]
+fn t16_hostile_parent_git_work_tree_cannot_redirect_provisioning() {
+    let repo = TestRepo::new("wt-t16");
+    let base_sha = repo.head_sha();
+    let request = valid_request(
+        &repo,
+        "ws-hostile-work-tree",
+        "task/hostile-work-tree",
+        "the worktree",
+        &base_sha,
+    );
+    let handle;
+    {
+        let _hostile = HostileEnv::install(&[(
+            "GIT_WORK_TREE",
+            repo.path().join("hostile-tree").to_str().expect("utf-8"),
+        )]);
+        handle = request
+            .provision()
+            .expect("hostile parent GIT_WORK_TREE must not redirect provisioning");
+    }
+    assert_eq!(handle.base_sha().as_str(), base_sha);
+    assert_eq!(worktree_head(&repo, "the worktree"), base_sha);
+}
+
+// T17 — a hostile parent-process GIT_INDEX_FILE does not affect
+// provisioning.
+#[test]
+fn t17_hostile_parent_git_index_file_does_not_affect_provisioning() {
+    let repo = TestRepo::new("wt-t17");
+    let base_sha = repo.head_sha();
+    let request = valid_request(
+        &repo,
+        "ws-hostile-index",
+        "task/hostile-index",
+        "the worktree",
+        &base_sha,
+    );
+    let handle;
+    {
+        let _hostile = HostileEnv::install(&[(
+            "GIT_INDEX_FILE",
+            repo.path().join("hostile-index").to_str().expect("utf-8"),
+        )]);
+        handle = request
+            .provision()
+            .expect("hostile parent GIT_INDEX_FILE must not affect provisioning");
+    }
+    assert_eq!(handle.base_sha().as_str(), base_sha);
+    assert_eq!(worktree_head(&repo, "the worktree"), base_sha);
+}
+
+// T18 — hostile ambient Git configuration environment values are blocked:
+// none of them reach the child, and provisioning remains deterministic.
+#[test]
+fn t18_hostile_git_config_environment_does_not_affect_provisioning() {
+    let repo = TestRepo::new("wt-t18");
+    let base_sha = repo.head_sha();
+    let request = valid_request(
+        &repo,
+        "ws-hostile-config",
+        "task/hostile-config",
+        "the worktree",
+        &base_sha,
+    );
+    let handle;
+    {
+        let _hostile = HostileEnv::install(&[
+            ("GIT_CONFIG", "/nonexistent/hostile-config"),
+            ("GIT_CONFIG_COUNT", "2"),
+            ("GIT_CONFIG_KEY_0", "user.name"),
+            ("GIT_CONFIG_VALUE_0", "Hostile Actor"),
+            ("GIT_CONFIG_KEY_1", "core.hooksPath"),
+            ("GIT_CONFIG_VALUE_1", "/nonexistent/hooks"),
+            ("GIT_CONFIG_GLOBAL", "/nonexistent/global-config"),
+            ("GIT_CONFIG_SYSTEM", "/nonexistent/system-config"),
+            (
+                "GIT_CEILING_DIRECTORIES",
+                repo.root.path().to_str().expect("utf-8"),
+            ),
+            (
+                "GIT_EXEC_PATH",
+                repo.path().join("hostile-exec").to_str().expect("utf-8"),
+            ),
+        ]);
+        handle = request
+            .provision()
+            .expect("hostile Git config environment must not affect provisioning");
+    }
+    assert_eq!(handle.base_sha().as_str(), base_sha);
+    assert_eq!(worktree_head(&repo, "the worktree"), base_sha);
+}
+
+// T19 — production execution resolves one absolute, canonical, executable
+// `git` binary (never an unqualified "git" lookup), and the fully prepared
+// child command carries exactly the documented allowlisted environment.
+#[test]
+fn t19_production_git_execution_is_absolute_canonical_and_allowlisted() {
+    let repo = TestRepo::new("wt-t19");
+
+    let resolved =
+        crate::git::resolved_git_executable().expect("git executable must resolve on this host");
+    assert!(resolved.is_absolute(), "resolved git must be absolute");
+    assert_eq!(resolved.file_name(), Some(OsStr::new("git")));
+    let metadata = std::fs::metadata(resolved).expect("resolved git must exist");
+    assert!(metadata.is_file(), "resolved git must be a regular file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_ne!(
+            metadata.permissions().mode() & 0o111,
+            0,
+            "resolved git must be executable"
+        );
+    }
+    assert_eq!(
+        resolved,
+        std::fs::canonicalize(resolved).expect("resolved git must already be canonical"),
+        "resolved git must be free of symlink indirection"
+    );
+
+    let command = crate::git::prepared_command(
+        repo.path(),
+        "boundary inspection",
+        &[OsStr::new("status"), OsStr::new("--porcelain")],
+    )
+    .expect("command preparation must succeed");
+    assert_eq!(
+        command.get_program(),
+        resolved.as_os_str(),
+        "child program must be the absolute resolved git binary"
+    );
+    assert_eq!(
+        command.get_current_dir(),
+        Some(
+            std::fs::canonicalize(repo.path())
+                .expect("repository directory")
+                .as_path()
+        ),
+        "child working directory must be canonical"
+    );
+    let argv: Vec<OsString> = command
+        .get_args()
+        .map(|argument| argument.to_os_string())
+        .collect();
+    assert_eq!(
+        argv,
+        vec![OsString::from("status"), OsString::from("--porcelain")],
+        "arguments must travel as distinct verbatim argv entries"
+    );
+
+    let child_environment: Vec<(String, String)> = command
+        .get_envs()
+        .map(|(key, value)| {
+            (
+                key.to_string_lossy().into_owned(),
+                value.map(|value| value.to_string_lossy().into_owned()),
+            )
+        })
+        .map(|(key, value)| (key, value.unwrap_or_default()))
+        .collect();
+    assert_eq!(
+        child_environment.len(),
+        2,
+        "only the documented allowlist may be present: {child_environment:?}"
+    );
+    assert!(child_environment.contains(&("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string())));
+    assert!(
+        child_environment.contains(&("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string()))
+    );
+    const FORBIDDEN_KEYS: [&str; 16] = [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_CONFIG",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_EXEC_PATH",
+        "GIT_SSH",
+        "GIT_SSH_COMMAND",
+        "GIT_ASKPASS",
+        "GIT_TERMINAL_PROMPT",
+    ];
+    for key in FORBIDDEN_KEYS {
+        assert!(
+            !child_environment.iter().any(|(name, _)| name == key),
+            "{key} must never reach the child environment"
+        );
+    }
+}
+
+// T21 — the subprocess-CWD boundary fails closed on paths that cannot be
+// canonicalized (missing directories, dangling links), never falling back
+// to the lexical input.
+#[test]
+fn t21_subprocess_cwd_boundary_fails_closed_on_unresolvable_paths() {
+    let repo = TestRepo::new("wt-t21");
+
+    let canonical =
+        crate::git::subprocess_cwd(repo.path(), "boundary probe").expect("existing directory");
+    assert_eq!(
+        canonical,
+        std::fs::canonicalize(repo.path()).expect("canonical form of existing directory")
+    );
+
+    let missing = repo.path().join("missing-directory");
+    unix_symlink(&missing, &repo.path().join("dangling-link"));
+    for unresolvable in [missing, repo.path().join("dangling-link")] {
+        let error = crate::git::subprocess_cwd(&unresolvable, "boundary probe")
+            .expect_err("unresolvable directories must fail closed");
+        assert!(
+            matches!(error, WorkspaceError::SubprocessCwdUnresolvable { .. }),
+            "unexpected error: {error:?}"
+        );
+    }
 }

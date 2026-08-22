@@ -1,11 +1,15 @@
 //! Local Git branch/worktree provisioning for task workspaces.
 //!
 //! [`WorkspaceProvisionRequest::provision`] executes the frozen flow:
-//! validate inputs, verify the base commit exists, create the branch from
-//! that exact commit, add the worktree, require the resulting HEAD to equal
-//! the base SHA, require a clean `git status --porcelain`, and only then
-//! return a [`WorkspaceHandle`](crate::handle::WorkspaceHandle) in the
-//! `PROVISIONED` state.
+//! validate inputs, resolve the repository root to its canonical (realpath)
+//! location, verify the base commit exists, create the branch from that
+//! exact commit, add the worktree, resolve the created worktree directory
+//! canonically, require the resulting HEAD to equal the base SHA, require a
+//! clean `git status --porcelain`, and only then return a
+//! [`WorkspaceHandle`](crate::handle::WorkspaceHandle) in the `PROVISIONED`
+//! state. All Git execution goes through the hardened argv-only boundary in
+//! [`crate::git`]: absolute resolved executable, canonical working
+//! directories, and an allowlisted child environment.
 //!
 //! No remote operation is performed at any step: no credential handling,
 //! no fetch, no push, no remote publication, and no force-push exist here.
@@ -122,7 +126,19 @@ impl WorkspaceProvisionRequest {
     /// and recovery are outside this slice's scope. A failed or ambiguous
     /// operation is never converted into a successful handle.
     pub fn provision(&self) -> Result<WorkspaceHandle, WorkspaceError> {
-        let root = &*self.repository_root;
+        // Step 0: resolve the requested repository root to its canonical
+        // (realpath) filesystem location before any Git command runs, so
+        // every subprocess operates from the repository's true location
+        // rather than any caller-supplied alias. Failure fails closed.
+        let root = std::fs::canonicalize(&self.repository_root).map_err(|error| {
+            WorkspaceError::RepositoryRootUnresolvable {
+                detail: format!(
+                    "{:?} could not be canonicalized: {error}",
+                    self.repository_root.display()
+                ),
+            }
+        })?;
+        let root = &root;
 
         // Step 1: the requested base must identify an existing Git commit.
         // This also proves the repository root is a usable Git repository.
@@ -184,10 +200,24 @@ impl WorkspaceProvisionRequest {
         )?
         .require_success("add worktree")?;
 
-        // Step 4: read the resulting worktree HEAD and require it to equal
-        // the requested base SHA exactly.
+        // Step 4: resolve the freshly created worktree directory to its
+        // canonical (realpath) location and run all subsequent verification
+        // from there, so HEAD/status inspection is anchored to the true
+        // filesystem target rather than any lexical alias of it. Failure
+        // fails closed and never yields a handle.
+        let created_worktree = std::fs::canonicalize(&self.worktree_path).map_err(|error| {
+            WorkspaceError::CreatedWorktreeUnresolvable {
+                detail: format!(
+                    "{:?} could not be canonicalized: {error}",
+                    self.worktree_path.display()
+                ),
+            }
+        })?;
+
+        // Step 5: read the resulting worktree HEAD from its canonical path
+        // and require it to equal the requested base SHA exactly.
         let head = git::capture(
-            &self.worktree_path,
+            &created_worktree,
             "read worktree HEAD",
             &[OsStr::new("rev-parse"), OsStr::new("HEAD")],
         )?;
@@ -204,11 +234,11 @@ impl WorkspaceProvisionRequest {
             });
         }
 
-        // Step 5: the newly provisioned worktree must be clean per Git
-        // porcelain status. Any output — including untracked entries —
-        // fails closed.
+        // Step 6: the newly provisioned worktree must be clean per Git
+        // porcelain status, inspected from its canonical path. Any output —
+        // including untracked entries — fails closed.
         let status = git::capture(
-            &self.worktree_path,
+            &created_worktree,
             "inspect worktree status",
             &[OsStr::new("status"), OsStr::new("--porcelain")],
         )?;
@@ -219,7 +249,10 @@ impl WorkspaceProvisionRequest {
             });
         }
 
-        // All validation succeeded; only now may a handle exist.
+        // All validation succeeded; only now may a handle exist. The frozen
+        // handle contract carries the validated absolute path the caller
+        // requested; canonical (realpath) resolution above is an execution-
+        // boundary detail, not a change to observable handle semantics.
         Ok(WorkspaceHandle::provisioned(
             self.workspace_id.clone(),
             self.task_id.clone(),

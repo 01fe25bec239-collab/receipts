@@ -27,11 +27,16 @@
 //! Isolation semantics are frozen as [`WorkspaceIsolation`]: a Git worktree
 //! provides workspace isolation only. It is NOT a security sandbox.
 //!
-//! All Git execution uses explicit argv through [`std::process::Command`].
-//! No shell command string exists anywhere in this crate; untrusted values
-//! travel only as individual process arguments or path values. No remote
-//! operation is implemented: no credential handling, no fetch, no push,
-//! no remote publication, no force-push.
+//! All Git execution uses explicit argv through [`std::process::Command`]
+//! behind the hardened boundary in the `git` module: the child program is
+//! one absolute, canonically resolved `git` executable (never an
+//! unqualified `"git"` PATH lookup), every subprocess working directory is
+//! a canonicalized (realpath) location, and children inherit nothing from
+//! the parent environment except a fixed, documented allowlist of two
+//! non-sensitive entries. No shell command string exists anywhere in this
+//! crate; untrusted values travel only as individual process arguments or
+//! path values. No remote operation is implemented: no credential handling,
+//! no fetch, no push, no remote publication, no force-push.
 
 pub mod error;
 pub mod git;

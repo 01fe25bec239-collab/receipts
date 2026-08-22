@@ -88,6 +88,40 @@ pub enum WorkspaceError {
         /// The non-empty porcelain status output.
         status: String,
     },
+    /// No executable `git` binary could be located at an absolute,
+    /// canonical filesystem path.
+    ///
+    /// Provisioning never spawns an unqualified `git` lookup; resolution
+    /// fails closed before any subprocess exists.
+    GitExecutableUnavailable {
+        /// Where the resolver searched and what went wrong.
+        detail: String,
+    },
+    /// The repository root could not be resolved to its canonical
+    /// (realpath) filesystem location before any Git command ran.
+    RepositoryRootUnresolvable {
+        /// The rejected root path and the underlying resolution failure.
+        detail: String,
+    },
+    /// The newly created worktree directory could not be resolved to its
+    /// canonical (realpath) location after `git worktree add` succeeded, so
+    /// post-provision verification refused to proceed.
+    CreatedWorktreeUnresolvable {
+        /// The created-worktree path and the underlying resolution failure.
+        detail: String,
+    },
+    /// A filesystem path about to become the working directory of a Git
+    /// subprocess could not be canonicalized at the execution boundary.
+    ///
+    /// Defense in depth for the frozen realpath-CWD requirement: every
+    /// production invocation passes through this check even if a future
+    /// call site forwards a lexical path.
+    SubprocessCwdUnresolvable {
+        /// Provisioning step that attempted the invocation.
+        operation: &'static str,
+        /// The rejected path and the underlying resolution failure.
+        detail: String,
+    },
 }
 
 impl fmt::Display for WorkspaceError {
@@ -127,6 +161,22 @@ impl fmt::Display for WorkspaceError {
             WorkspaceError::WorktreeNotClean { status } => write!(
                 f,
                 "newly provisioned worktree is not clean according to git status --porcelain: {status}"
+            ),
+            WorkspaceError::GitExecutableUnavailable { detail } => write!(
+                f,
+                "no executable git binary could be resolved at an absolute canonical path: {detail}"
+            ),
+            WorkspaceError::RepositoryRootUnresolvable { detail } => write!(
+                f,
+                "repository root could not be resolved to a canonical path: {detail}"
+            ),
+            WorkspaceError::CreatedWorktreeUnresolvable { detail } => write!(
+                f,
+                "created worktree could not be resolved to a canonical path for verification: {detail}"
+            ),
+            WorkspaceError::SubprocessCwdUnresolvable { operation, detail } => write!(
+                f,
+                "working directory for {operation} could not be canonicalized before execution: {detail}"
             ),
         }
     }
