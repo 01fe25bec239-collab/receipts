@@ -12,6 +12,13 @@ publish = false
 [lib]
 path = "src/state/lib.rs"
 
+[workspace]
+members = [
+    "crates/receipts-orchestration",
+    "crates/receipts-runtime-adapters",
+    "crates/receipts-workspace-execution",
+]
+
 [dependencies]
 rusqlite = { version = "=0.40.1", features = ["bundled"] }
 serde = { version = "=1.0.229", features = ["derive"] }
