@@ -1,0 +1,13 @@
+# BUILD-A3 host-integration slice manifest (BUILD-A1 temporary Cargo authority).
+# Interface-only crate: zero dependencies, zero features.
+[package]
+name = "receipts-host-integration"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+publish = false
+
+# Product source for this task lives under src/hosts/** only; the lib target
+# is pointed there so no crate topology is defined for other managers.
+[lib]
+path = "../../src/hosts/lib.rs"
