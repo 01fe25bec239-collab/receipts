@@ -37,6 +37,7 @@ pub mod execution_graph;
 pub mod node;
 pub mod node_state;
 pub mod node_state_transition;
+pub mod rejected_repair_transition;
 pub mod review_verdict_transition;
 
 #[cfg(test)]
@@ -45,6 +46,8 @@ mod execution_graph_tests;
 mod node_state_tests;
 #[cfg(test)]
 mod node_state_transition_tests;
+#[cfg(test)]
+mod rejected_repair_transition_tests;
 #[cfg(test)]
 mod review_verdict_transition_tests;
 
@@ -56,6 +59,10 @@ pub use node_state::{GraphNodeState, GraphNodeStateParseError};
 pub use node_state_transition::{
     AUTHORIZED_PREFIX_TRANSITIONS, GraphNodeStateTransitionError, PREFIX_STATES, is_prefix_state,
     validate_prefix_transition,
+};
+pub use rejected_repair_transition::{
+    AUTHORIZED_REJECTED_REPAIR_TRANSITIONS, RejectedRepairTransitionError,
+    validate_rejected_repair_transition,
 };
 pub use review_verdict_transition::{
     AUTHORIZED_REVIEW_VERDICT_TRANSITIONS, ReviewVerdictTransitionError,
