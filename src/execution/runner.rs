@@ -7,6 +7,18 @@
 //! lexical string comparison — to lie at or inside the canonical workspace
 //! root.
 //!
+//! [`run_with_timeout`] executes the same validated request under an
+//! explicitly supplied orchestrator-owned [`ProcessTimeoutPolicy`]: the
+//! identical spawn boundary and validations are reused (there is no less-
+//! safe duplicate launcher), monitoring uses the monotonic clock, and an
+//! expired deadline triggers the frozen lifecycle sequence — graceful
+//! termination (`SIGTERM` semantics), a bounded termination grace, then a
+//! forced kill only if the child is still running, followed by a verified
+//! final reap. A timed-out process can therefore never be silently
+//! reported as an ordinary successful completion; the returned
+//! [`ProcessRunOutcome`] carries the typed
+//! [`ProcessTermination`] classification.
+//!
 //! Frozen security properties of this slice:
 //!
 //! * **Absolute executable only.** The caller supplies an absolute path;
@@ -41,9 +53,8 @@
 //! The runner waits normally for the child. A child that exits non-zero is
 //! a successful runner invocation reported as typed [`ProcessRunOutcome`]
 //! metadata, never an error; [`ExecutionError`] is reserved for validation
-//! failures plus the typed spawn/wait boundaries. There is no timeout, no
-//! terminate/kill handling, no retry, and no detach in this slice; those
-//! belong to later runner slices.
+//! failures plus the typed spawn/wait/control boundaries. Output capture,
+//! digests, checkpoints, and recovery remain later runner slices.
 //!
 //! The workspace boundary provides workspace isolation only. It is NOT a
 //! security sandbox: nothing here prevents a contained child from reaching
@@ -52,14 +63,32 @@
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::process::{Child, ExitStatus};
 use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 use crate::execution::error::ExecutionError;
 use crate::execution::outcome::ProcessRunOutcome;
+#[cfg(unix)]
+use crate::execution::outcome::ProcessTermination;
 use crate::execution::request::ProcessRunRequest;
+#[cfg(unix)]
+use crate::execution::timeout::ProcessTimeoutPolicy;
+#[cfg(unix)]
+use crate::execution::unix_signal::{SignalDelivery, deliver_sigterm};
 
 /// Common local shell basenames rejected at executable validation.
 const SHELL_BASENAMES: [&str; 6] = ["sh", "bash", "zsh", "fish", "dash", "ksh"];
+
+/// Private bounded-polling cadence for child-state observation. An
+/// implementation detail of the timed path: monitoring sleeps at most this
+/// long between observations and never beyond the remaining deadline, so
+/// the runner never busy-spins and never overshoots a deadline by more
+/// than one short poll.
+#[cfg(unix)]
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Runs one validated process request to completion and returns its exit
 /// metadata.
@@ -84,6 +113,304 @@ pub fn run(request: &ProcessRunRequest) -> Result<ProcessRunOutcome, ExecutionEr
     let status = child.wait().map_err(wait_failed)?;
 
     Ok(ProcessRunOutcome::new(status.success(), status.code()))
+}
+
+/// Runs one validated process request under an explicitly supplied
+/// orchestrator-owned timeout policy and returns typed lifecycle metadata.
+///
+/// The bounded path reuses exactly the same validation foundation as the
+/// unbounded [`run`] — absolute canonical executable, common-shell
+/// rejection, realpath workspace containment, empty child environment,
+/// null stdio — so no less-safe duplicate launcher exists. The only
+/// difference is lifecycle control after spawn:
+///
+/// 1. monitor the child with the monotonic clock (`Instant`) using a
+///    small bounded polling cadence that never sleeps past the deadline;
+/// 2. if the child exits before the deadline, return an ordinary
+///    [`ProcessTermination::Completed`] outcome — non-zero exits
+///    included;
+/// 3. at the deadline, observe once more so an already-finished child is
+///    never needlessly terminated;
+/// 4. deliver graceful termination (`SIGTERM` semantics on Unix);
+/// 5. wait at most the policy's termination grace for the child to exit,
+///    reaping it if it does;
+/// 6. force kill only a child still running after grace, then reap it.
+///
+/// A timed-out outcome always reports `success() == false` plus the exact
+/// [`ProcessTermination`] classification, so a timed-out process can never
+/// be silently reported as an ordinary successful completion. Every
+/// control-boundary failure — graceful delivery, forced kill, final reap —
+/// fails closed as its own typed error after best-effort cleanup; cleanup
+/// success never masks the original failure.
+///
+/// On platforms where graceful termination cannot be implemented with the
+/// same guarantees, this fails closed with
+/// [`ExecutionError::UnsupportedTimeoutPlatform`] before any child exists
+/// rather than degrading graceful termination into an immediate force
+/// kill.
+#[cfg(unix)]
+pub fn run_with_timeout(
+    request: &ProcessRunRequest,
+    policy: &ProcessTimeoutPolicy,
+) -> Result<ProcessRunOutcome, ExecutionError> {
+    // Deadline arithmetic happens first: it is pure, cheap, and fails
+    // closed before any filesystem or process resource is touched.
+    let deadline = checked_deadline(Instant::now(), policy.run_timeout(), "run_timeout")?;
+
+    let executable = validated_executable(request.executable())?;
+    let cwd = validated_workspace_cwd(request.workspace_root(), request.cwd())?;
+
+    let mut command = prepared_command(&executable, &cwd);
+    command.args(request.arguments());
+
+    let mut child = command.spawn().map_err(spawn_failed)?;
+
+    match await_child_until(&mut child, deadline)? {
+        Awaited::Exited(status) => Ok(ProcessRunOutcome::new(status.success(), status.code())),
+        Awaited::DeadlineReached => enforce_timeout(child, policy),
+    }
+}
+
+/// Fails closed on platforms without the graceful-termination guarantee.
+#[cfg(not(unix))]
+pub fn run_with_timeout(
+    request: &ProcessRunRequest,
+    policy: &ProcessTimeoutPolicy,
+) -> Result<ProcessRunOutcome, ExecutionError> {
+    let _ = (request, policy);
+    Err(ExecutionError::UnsupportedTimeoutPlatform)
+}
+
+/// Internal result of monitoring a child up to a monotonic deadline.
+#[cfg(unix)]
+enum Awaited {
+    /// The child exited on its own before the deadline.
+    Exited(ExitStatus),
+    /// The deadline expired with the child last observed still running.
+    DeadlineReached,
+}
+
+/// Monitors `child` until it exits or `deadline` passes, whichever comes
+/// first.
+///
+/// Polling cadence: observe child state, compute the remaining time from
+/// the monotonic clock, sleep for the smaller of the private poll
+/// interval and the remainder. No busy-spin; no overshoot beyond one short
+/// poll. One final observation happens after the loop so a child that has
+/// already completed at the boundary is not needlessly terminated.
+#[cfg(unix)]
+fn await_child_until(child: &mut Child, deadline: Instant) -> Result<Awaited, ExecutionError> {
+    loop {
+        if let Some(status) = child.try_wait().map_err(wait_failed)? {
+            return Ok(Awaited::Exited(status));
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        if remaining.is_zero() {
+            break;
+        }
+        std::thread::sleep(POLL_INTERVAL.min(remaining));
+    }
+
+    if let Some(status) = child.try_wait().map_err(wait_failed)? {
+        return Ok(Awaited::Exited(status));
+    }
+    Ok(Awaited::DeadlineReached)
+}
+
+/// Implements the frozen terminate → bounded grace → force-kill → final-
+/// reap sequence for a child observed still running at the run deadline.
+#[cfg(unix)]
+fn enforce_timeout(
+    mut child: Child,
+    policy: &ProcessTimeoutPolicy,
+) -> Result<ProcessRunOutcome, ExecutionError> {
+    match deliver_sigterm(child.id()) {
+        SignalDelivery::Delivered => {}
+        SignalDelivery::AlreadyExited => {
+            // The child vanished between the last observation and signal
+            // delivery. Reap and classify truthfully: the deadline did
+            // expire, but no force kill was ever needed.
+            let status = child.wait().map_err(final_wait_failed)?;
+            return Ok(timed_out_outcome(
+                ProcessTermination::TimedOutGracefullyTerminated,
+                status,
+            ));
+        }
+        SignalDelivery::Failed { detail } => {
+            return Err(graceful_termination_failed_with_cleanup(child, detail));
+        }
+    }
+
+    let grace_deadline = checked_deadline(
+        Instant::now(),
+        policy.termination_grace(),
+        "termination_grace",
+    )?;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Ok(timed_out_outcome(
+                    ProcessTermination::TimedOutGracefullyTerminated,
+                    status,
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => return Err(grace_wait_failed(error)),
+        }
+        let Some(remaining) = grace_deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        if remaining.is_zero() {
+            break;
+        }
+        std::thread::sleep(POLL_INTERVAL.min(remaining));
+    }
+
+    // Final state check before forcing: never force-kill a child that has
+    // already exited during the grace window.
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            return Ok(timed_out_outcome(
+                ProcessTermination::TimedOutGracefullyTerminated,
+                status,
+            ));
+        }
+        Ok(None) => {}
+        Err(error) => return Err(grace_wait_failed(error)),
+    }
+
+    // Force kill. On Unix this is SIGKILL semantics against the direct
+    // runner-owned child.
+    if let Err(kill_error) = child.kill() {
+        // Distinguish a genuine kill-delivery failure from a child that
+        // raced past this exact window and exited on its own. Only a
+        // verified exit status may be reported as an outcome; anything
+        // else fails closed.
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Verified: the child exited concurrently after graceful
+                // termination had been delivered — no force kill was
+                // actually required.
+                return Ok(timed_out_outcome(
+                    ProcessTermination::TimedOutGracefullyTerminated,
+                    status,
+                ));
+            }
+            Ok(None) => return Err(force_kill_failed(kill_error, None)),
+            Err(observe_error) => return Err(force_kill_failed(kill_error, Some(observe_error))),
+        }
+    }
+
+    // Verified final reap: the timed-out API must not report success while
+    // the runner-owned child remains unwaited.
+    let status = child.wait().map_err(final_wait_failed)?;
+    Ok(timed_out_outcome(
+        ProcessTermination::TimedOutForceKilled,
+        status,
+    ))
+}
+
+/// Computes a monotonic deadline with checked arithmetic. If adding the
+/// policy interval to the current monotonic reading cannot be represented,
+/// there is no honest deadline and the run fails closed instead of
+/// wrapping into a shorter or inverted effective policy.
+pub(crate) fn checked_deadline(
+    base: Instant,
+    interval: Duration,
+    label: &'static str,
+) -> Result<Instant, ExecutionError> {
+    base.checked_add(interval)
+        .ok_or_else(|| ExecutionError::TimeoutDeadlineOverflow {
+            detail: format!(
+                "{label} interval {interval:?} added to the current monotonic reading cannot be \
+                 represented; refusing to substitute a wrapped or silently different deadline"
+            ),
+        })
+}
+
+/// Best-effort orphan safety after graceful-termination delivery failed:
+/// the original failure stays primary, but the runner-owned child is not
+/// casually abandoned while cleanup is still possible. Cleanup evidence is
+/// appended to the reported detail and never converts the outcome into
+/// success.
+#[cfg(unix)]
+fn graceful_termination_failed_with_cleanup(
+    mut child: Child,
+    delivery_detail: String,
+) -> ExecutionError {
+    let mut detail = delivery_detail;
+    match child.try_wait() {
+        Ok(Some(_)) => {
+            detail.push_str("; best-effort cleanup: the child had already exited and was reaped");
+        }
+        Ok(None) => match child.kill() {
+            Ok(()) => match child.wait() {
+                Ok(_) => {
+                    detail.push_str("; best-effort cleanup: forced kill and reap succeeded");
+                }
+                Err(reap_error) => detail.push_str(&format!(
+                    "; best-effort cleanup reap also failed: {reap_error}"
+                )),
+            },
+            Err(kill_error) => detail.push_str(&format!(
+                "; best-effort cleanup force kill also failed: {kill_error}"
+            )),
+        },
+        Err(observe_error) => detail.push_str(&format!(
+            "; best-effort cleanup observation also failed: {observe_error}"
+        )),
+    }
+    ExecutionError::GracefulTerminationFailed { detail }
+}
+
+/// Maps a forced-kill delivery failure into its typed error, preserving
+/// any follow-up observation failure so neither boundary is silently
+/// ignored. The child, if any, is left to the caller's knowledge: no
+/// verified exit status existed at this boundary.
+#[cfg(unix)]
+pub(crate) fn force_kill_failed(
+    kill_error: std::io::Error,
+    observe_error: Option<std::io::Error>,
+) -> ExecutionError {
+    let mut detail = format!("SIGKILL delivery to the runner-owned child failed: {kill_error}");
+    if let Some(observe_error) = observe_error {
+        detail.push_str(&format!(
+            "; follow-up state observation also failed: {observe_error}"
+        ));
+    } else {
+        detail.push_str("; follow-up state observation found the child still unwaited");
+    }
+    ExecutionError::ForceKillFailed { detail }
+}
+
+/// Maps an observation failure inside the bounded termination-grace window
+/// into its typed error — a materially different lifecycle boundary from
+/// the plain pre-deadline wait, because graceful termination has already
+/// been delivered when this can occur.
+#[cfg(unix)]
+pub(crate) fn grace_wait_failed(error: std::io::Error) -> ExecutionError {
+    ExecutionError::TimeoutGraceWaitFailed {
+        detail: error.to_string(),
+    }
+}
+
+/// Maps a failure to reap the child after forced kill into its typed
+/// error, kept distinct from kill-delivery failures so neither boundary is
+/// silently ignored.
+#[cfg(unix)]
+pub(crate) fn final_wait_failed(error: std::io::Error) -> ExecutionError {
+    ExecutionError::TimeoutFinalWaitFailed {
+        detail: error.to_string(),
+    }
+}
+
+/// Assembles the typed outcome for one timed-out run from the reaped
+/// child's exit status.
+#[cfg(unix)]
+fn timed_out_outcome(termination: ProcessTermination, status: ExitStatus) -> ProcessRunOutcome {
+    ProcessRunOutcome::new_timed_out(termination, status.code())
 }
 
 /// Maps an `std::io::Error` from [`Command::spawn`] into the typed

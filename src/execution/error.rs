@@ -113,6 +113,59 @@ pub enum ExecutionError {
         /// Underlying wait failure detail.
         detail: String,
     },
+    /// A timeout policy value could not satisfy the frozen bounded-run
+    /// sequence (for example a zero run timeout or a zero termination
+    /// grace). Refused at construction; never silently clamped.
+    InvalidTimeoutPolicy {
+        /// The rejected policy value and why it cannot be honored.
+        detail: String,
+    },
+    /// Adding a policy interval to the monotonic clock reading cannot be
+    /// represented, so no honest deadline exists. Fails closed instead of
+    /// wrapping or silently changing the effective policy.
+    TimeoutDeadlineOverflow {
+        /// Which deadline overflowed and by what interval.
+        detail: String,
+    },
+    /// Bounded execution is not supported on this platform with the same
+    /// frozen guarantees. Fails closed before any child exists rather than
+    /// silently degrading graceful termination into an immediate force
+    /// kill.
+    UnsupportedTimeoutPlatform,
+    /// Graceful (`SIGTERM`) termination of a timed-out child could not be
+    /// delivered through the runner-owned termination boundary.
+    ///
+    /// Distinct from [`ExecutionError::ForceKillFailed`]: this failure
+    /// happened at the graceful step, before any force-kill decision.
+    /// Best-effort cleanup evidence is preserved in the detail without
+    /// ever converting the outcome into success.
+    GracefulTerminationFailed {
+        /// Underlying delivery failure plus best-effort cleanup evidence.
+        detail: String,
+    },
+    /// Observing the child during the bounded termination-grace window
+    /// failed after graceful termination had already been delivered.
+    ///
+    /// Distinct from [`ExecutionError::ProcessWaitFailed`]: the child has
+    /// been signaled and the lifecycle decision now depends on this
+    /// observation.
+    TimeoutGraceWaitFailed {
+        /// Underlying observation failure detail.
+        detail: String,
+    },
+    /// Forced kill of a still-running timed-out child could not be
+    /// delivered. Never reported as a successful forced-kill timeout.
+    ForceKillFailed {
+        /// Underlying delivery failure plus best-effort cleanup evidence.
+        detail: String,
+    },
+    /// Reaping the child after a successful forced kill failed, so no
+    /// verified final state exists. Fails closed rather than returning a
+    /// timed-out outcome while the runner-owned child remains unwaited.
+    TimeoutFinalWaitFailed {
+        /// Underlying final-wait failure detail.
+        detail: String,
+    },
 }
 
 impl fmt::Display for ExecutionError {
@@ -176,6 +229,39 @@ impl fmt::Display for ExecutionError {
             ExecutionError::ProcessWaitFailed { detail } => {
                 write!(f, "failed while waiting for child process: {detail}")
             }
+            ExecutionError::InvalidTimeoutPolicy { detail } => {
+                write!(f, "invalid timeout policy: {detail}")
+            }
+            ExecutionError::TimeoutDeadlineOverflow { detail } => write!(
+                f,
+                "timeout deadline cannot be represented on the monotonic clock: {detail}"
+            ),
+            ExecutionError::UnsupportedTimeoutPlatform => write!(
+                f,
+                "bounded execution with graceful termination is not supported on this platform; \
+                 refusing to degrade graceful termination into an immediate force kill"
+            ),
+            ExecutionError::GracefulTerminationFailed { detail } => {
+                write!(
+                    f,
+                    "graceful termination of the timed-out child failed: {detail}"
+                )
+            }
+            ExecutionError::TimeoutGraceWaitFailed { detail } => write!(
+                f,
+                "failed while observing the child during the bounded termination grace window: \
+                 {detail}"
+            ),
+            ExecutionError::ForceKillFailed { detail } => {
+                write!(
+                    f,
+                    "forced kill of the still-running timed-out child failed: {detail}"
+                )
+            }
+            ExecutionError::TimeoutFinalWaitFailed { detail } => write!(
+                f,
+                "failed while reaping the child after forced kill: {detail}"
+            ),
         }
     }
 }
