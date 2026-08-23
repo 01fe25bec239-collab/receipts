@@ -53,6 +53,14 @@ pub mod handle;
 pub mod provision;
 pub mod teardown;
 
+/// Argv-only local process-runner foundation owned by the execution layer.
+///
+/// Wired through a path-qualified module so this package root stays
+/// `src/workspace/lib.rs` (Cargo files are immutable) while ownership of
+/// all execution source and tests remains under `src/execution/**`.
+#[path = "../execution/lib.rs"]
+pub mod execution;
+
 #[cfg(test)]
 mod provision_tests;
 #[cfg(test)]
