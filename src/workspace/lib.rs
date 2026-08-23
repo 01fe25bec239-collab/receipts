@@ -1,8 +1,9 @@
 //! Workspace-Execution foundation for the Receipts orchestration core.
 //!
-//! This crate implements the first bounded slice of `M-WORK-1`: local Git
-//! branch/worktree provisioning for task workspaces and the typed
-//! [`WorkspaceHandle`] that proves a successful provisioning.
+//! This crate implements the first bounded slices of `M-WORK-1`: local Git
+//! branch/worktree provisioning for task workspaces, the typed
+//! [`WorkspaceHandle`] that proves a successful provisioning, and the
+//! narrow verified teardown of a provisioned worktree.
 //!
 //! The successful provisioning flow is strictly ordered:
 //!
@@ -21,8 +22,16 @@
 //! unexpected HEAD, dirty resulting worktree — surfaces as an explicit
 //! [`WorkspaceError`]. A failed or ambiguous operation is never converted
 //! into a successful handle. Failed provisioning leaves any partially
-//! created Git artifacts in place: teardown, orphan detection, and crash
-//! recovery are later milestones outside this slice.
+//! created Git artifacts in place: orphan detection and crash recovery are
+//! later milestones outside this slice.
+//!
+//! The teardown slice ([`WorkspaceTeardownRequest`]) performs the frozen
+//! cleanup contract for an accepted workspace: after full identity,
+//! evidence, and cleanliness verification the registered worktree checkout
+//! is removed without any force flag while the task branch is retained —
+//! with every commit it carries — until workstream integration consumes
+//! it. Whether a workspace should be torn down is a caller-side policy
+//! decision; this crate only executes the verified local removal.
 //!
 //! Isolation semantics are frozen as [`WorkspaceIsolation`]: a Git worktree
 //! provides workspace isolation only. It is NOT a security sandbox.
@@ -42,10 +51,16 @@ pub mod error;
 pub mod git;
 pub mod handle;
 pub mod provision;
+pub mod teardown;
 
 #[cfg(test)]
 mod provision_tests;
+#[cfg(test)]
+mod teardown_tests;
+#[cfg(test)]
+mod test_support;
 
 pub use error::WorkspaceError;
 pub use handle::{CommitSha, WorkspaceHandle, WorkspaceIsolation, WorkspaceState};
 pub use provision::{WorkspaceProvisionRequest, validate_branch_name};
+pub use teardown::WorkspaceTeardownRequest;

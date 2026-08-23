@@ -40,9 +40,11 @@ impl CommitSha {
 
 /// Frozen WorkspaceHandle state vocabulary.
 ///
-/// This slice creates only `PROVISIONED` handles; every transition out of
-/// that state belongs to later milestones outside this crate's current
-/// scope. No new values may ever be invented.
+/// This slice creates `PROVISIONED` handles and performs exactly one
+/// lifecycle transition out of them: `PROVISIONED` → `TORN_DOWN` after a
+/// fully verified worktree teardown. Every other transition belongs to
+/// later milestones outside this crate's current scope. No new values may
+/// ever be invented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WorkspaceState {
@@ -140,6 +142,27 @@ impl WorkspaceHandle {
         }
     }
 
+    /// Derives the handle for a successfully completed teardown.
+    ///
+    /// This is the only transition this slice performs: `PROVISIONED` →
+    /// `TORN_DOWN`. Every immutable identity field (`workspace_id`,
+    /// `task_id`, `branch`, `worktree_path`, `base_sha`, `isolation`) is
+    /// preserved verbatim, and the verified head becomes the exact commit
+    /// observed and verified immediately before removal — never a
+    /// fabricated value.
+    pub(crate) fn torn_down(prior: &Self, verified_head: CommitSha) -> Self {
+        Self {
+            workspace_id: prior.workspace_id.clone(),
+            branch: prior.branch.clone(),
+            worktree_path: prior.worktree_path.clone(),
+            head_sha: Some(verified_head),
+            base_sha: prior.base_sha.clone(),
+            state: WorkspaceState::TornDown,
+            isolation: prior.isolation,
+            task_id: prior.task_id.clone(),
+        }
+    }
+
     /// The durable workspace identity supplied by the caller.
     pub fn workspace_id(&self) -> &str {
         &self.workspace_id
@@ -165,12 +188,15 @@ impl WorkspaceHandle {
         &self.base_sha
     }
 
-    /// The verified worktree head; equals `base_sha` after provisioning.
+    /// The verified worktree head; equals `base_sha` after provisioning
+    /// and the exact commit observed immediately before teardown after a
+    /// successful teardown.
     pub fn head_sha(&self) -> Option<&CommitSha> {
         self.head_sha.as_ref()
     }
 
-    /// The frozen lifecycle state, always `PROVISIONED` in this slice.
+    /// The frozen lifecycle state: `PROVISIONED` after provisioning,
+    /// `TORN_DOWN` after a fully verified teardown.
     pub fn state(&self) -> WorkspaceState {
         self.state
     }
