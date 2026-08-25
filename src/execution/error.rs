@@ -166,6 +166,16 @@ pub enum ExecutionError {
         /// Underlying final-wait failure detail.
         detail: String,
     },
+    /// The spawned attempt could not be given a dedicated, safely
+    /// signalable process group owned by this invocation, so the frozen
+    /// no-orphan timeout contract could not be guaranteed. Fails closed:
+    /// the just-spawned child receives best-effort direct-handle cleanup
+    /// and the run reports this error instead of proceeding unowned.
+    ProcessGroupOwnershipFailed {
+        /// Why ownership could not be established plus best-effort cleanup
+        /// evidence.
+        detail: String,
+    },
 }
 
 impl fmt::Display for ExecutionError {
@@ -261,6 +271,11 @@ impl fmt::Display for ExecutionError {
             ExecutionError::TimeoutFinalWaitFailed { detail } => write!(
                 f,
                 "failed while reaping the child after forced kill: {detail}"
+            ),
+            ExecutionError::ProcessGroupOwnershipFailed { detail } => write!(
+                f,
+                "the spawned attempt could not be given a dedicated, safely signalable process \
+                 group owned by this invocation: {detail}"
             ),
         }
     }

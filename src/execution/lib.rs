@@ -31,12 +31,13 @@
 //! Bounded execution ([`run_with_timeout`]) extends the same validated
 //! spawn foundation with an explicitly supplied orchestrator-owned
 //! [`ProcessTimeoutPolicy`]: monotonic deadline monitoring, graceful
-//! termination (`SIGTERM` semantics), a bounded termination grace, a
-//! forced kill only if the child is still running afterward, and a
-//! verified final reap. A timed-out run is classified in the typed
-//! [`ProcessTermination`] outcome and can never be silently reported as an
-//! ordinary successful completion. No default timeout exists: the
-//! unbounded [`run`] API keeps its accepted semantics.
+//! termination (`SIGTERM`) of the attempt's own dedicated process group,
+//! a bounded termination grace, a forced `SIGKILL` of that group only if
+//! any attempt-owned member survives it, and a verified final reap that
+//! proves no attempt-owned descendant remains. A timed-out run is
+//! classified in the typed [`ProcessTermination`] outcome and can never be
+//! silently reported as an ordinary successful completion. No default
+//! timeout exists: the unbounded [`run`] API keeps its accepted semantics.
 //!
 //! Deliberately excluded here (later runner slices): output capture,
 //! digests, checkpoints, recovery. Also excluded by architecture: sandbox
@@ -48,7 +49,6 @@ mod error;
 mod outcome;
 mod request;
 mod runner;
-#[cfg(unix)]
 mod timeout;
 #[cfg(unix)]
 mod unix_signal;
@@ -57,10 +57,12 @@ pub use error::ExecutionError;
 pub use outcome::{ProcessRunOutcome, ProcessTermination};
 pub use request::ProcessRunRequest;
 pub use runner::{run, run_with_timeout};
-#[cfg(unix)]
 pub use timeout::ProcessTimeoutPolicy;
 
 #[cfg(test)]
 mod execution_tests;
-#[cfg(test)]
+// The timeout suite exercises Unix process-group machinery directly
+// (probe pids/pgids recorded by runner-owned children); on other targets
+// the public boundary is the fail-closed stub above.
+#[cfg(all(test, unix))]
 mod timeout_tests;

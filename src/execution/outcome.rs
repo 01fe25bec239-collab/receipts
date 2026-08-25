@@ -13,12 +13,15 @@ pub enum ProcessTermination {
     /// A non-zero exit is still an ordinary completion — it is normal
     /// runner output, not an error and not a timeout.
     Completed,
-    /// The run deadline expired; the child was asked to terminate
-    /// gracefully (`SIGTERM` semantics) and exited within the bounded
+    /// The run deadline expired; the attempt-owned process group was asked
+    /// to terminate gracefully (`SIGTERM`) and every member — the direct
+    /// child and any descendants it spawned — exited within the bounded
     /// termination grace. No force kill was required.
     TimedOutGracefullyTerminated,
-    /// The run deadline expired; the child was still running after the
-    /// bounded termination grace expired and had to be force-killed.
+    /// The run deadline expired; at least one attempt-owned process — the
+    /// direct child or a descendant — was still alive after the bounded
+    /// termination grace expired and the whole owned process group had to
+    /// be force-killed.
     TimedOutForceKilled,
 }
 
@@ -86,6 +89,7 @@ impl ProcessRunOutcome {
     ///
     /// `success` is forced to `false`: a run that had to be terminated by
     /// policy is never reported as an ordinary successful completion.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn new_timed_out(termination: ProcessTermination, exit_code: Option<i32>) -> Self {
         debug_assert!(termination.is_timed_out());
         Self {
