@@ -25,25 +25,44 @@
 //!
 //! The result is typed exit-status metadata ([`ProcessRunOutcome`]): a
 //! child exiting non-zero is normal runner output, never an error.
-//! [`ExecutionError`] covers validation failures plus the distinct spawn
-//! and wait boundaries.
+//! [`ExecutionError`] covers validation failures plus the distinct spawn,
+//! wait, and process-control boundaries.
 //!
-//! Deliberately excluded here (later runner slices): timeouts, terminate/
-//! kill handling, output capture, digests, checkpoints, recovery. Also
-//! excluded by architecture: sandbox enforcement of any kind. The
-//! workspace boundary provides workspace isolation only — it is NOT a
-//! security sandbox; filesystem, network, and process isolation belong to
-//! the runtime/host sandbox layer.
+//! Bounded execution ([`run_with_timeout`]) extends the same validated
+//! spawn foundation with an explicitly supplied orchestrator-owned
+//! [`ProcessTimeoutPolicy`]: monotonic deadline monitoring, graceful
+//! termination (`SIGTERM`) of the attempt's own dedicated process group,
+//! a bounded termination grace, a forced `SIGKILL` of that group only if
+//! any attempt-owned member survives it, and a verified final reap that
+//! proves no attempt-owned descendant remains. A timed-out run is
+//! classified in the typed [`ProcessTermination`] outcome and can never be
+//! silently reported as an ordinary successful completion. No default
+//! timeout exists: the unbounded [`run`] API keeps its accepted semantics.
+//!
+//! Deliberately excluded here (later runner slices): output capture,
+//! digests, checkpoints, recovery. Also excluded by architecture: sandbox
+//! enforcement of any kind. The workspace boundary provides workspace
+//! isolation only — it is NOT a security sandbox; filesystem, network,
+//! and process isolation belong to the runtime/host sandbox layer.
 
 mod error;
 mod outcome;
 mod request;
 mod runner;
+mod timeout;
+#[cfg(unix)]
+mod unix_signal;
 
 pub use error::ExecutionError;
-pub use outcome::ProcessRunOutcome;
+pub use outcome::{ProcessRunOutcome, ProcessTermination};
 pub use request::ProcessRunRequest;
-pub use runner::run;
+pub use runner::{run, run_with_timeout};
+pub use timeout::ProcessTimeoutPolicy;
 
 #[cfg(test)]
 mod execution_tests;
+// The timeout suite exercises Unix process-group machinery directly
+// (probe pids/pgids recorded by runner-owned children); on other targets
+// the public boundary is the fail-closed stub above.
+#[cfg(all(test, unix))]
+mod timeout_tests;

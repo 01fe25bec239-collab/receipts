@@ -1,0 +1,1039 @@
+//! Tests for the bounded timeout/terminate/grace/kill lifecycle.
+//!
+//! Every behavioral proof runs a real child through the public bounded
+//! runner. Controlled long-running children are this very test binary
+//! acting as ignored probe helpers, coordinated through local filesystem
+//! markers (a pid file written before a ready file) — no shells, no output
+//! capture, no signaling of arbitrary pids. Liveness/reaping evidence uses
+//! the zero-signal `kill(pid, 0)` probe against pids the runner-owned
+//! child itself recorded, never against unrelated processes.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use super::runner::{
+    checked_deadline, force_kill_failed_with_cleanup, grace_wait_failed_with_cleanup,
+};
+use crate::execution::unix_signal::{
+    GroupPresence, GroupSignalDelivery, OwnedProcessGroup, caller_process_group,
+    classify_group_kill_result, classify_group_presence, process_alive, recorded_group_is_empty,
+};
+use crate::execution::{
+    ExecutionError, ProcessRunOutcome, ProcessRunRequest, ProcessTermination, ProcessTimeoutPolicy,
+    run, run_with_timeout,
+};
+
+/// How long every controlled probe child would keep running if the
+/// timeout machinery failed to act. Assertions compare elapsed wall time
+/// against generous bounds far below this value.
+const PROBE_SLEEP: Duration = Duration::from_secs(60);
+
+/// Generous upper bound for any bounded run in this suite: far above what
+/// deadline + grace + scheduling overhead could ever need on a loaded CI
+/// host, yet far below [`PROBE_SLEEP`], so an unbounded leak could never
+/// pass.
+const BOUNDED_RUN_UPPER_BOUND: Duration = Duration::from_secs(20);
+
+/// A temporary directory removed on drop.
+struct TempDir {
+    root: PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "receipts-timeout-test-{tag}-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("temporary test directory creation");
+        Self { root }
+    }
+
+    fn path(&self) -> &Path {
+        &self.root
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn first_existing(candidates: &[&str]) -> PathBuf {
+    candidates
+        .iter()
+        .map(Path::new)
+        .find(|candidate| candidate.is_file())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| panic!("expected one of {candidates:?} to exist on this platform"))
+}
+
+fn bounded_request(
+    executable: impl Into<PathBuf>,
+    arguments: &[&str],
+    workspace_root: &Path,
+    cwd: &Path,
+) -> ProcessRunRequest {
+    ProcessRunRequest::new(executable, arguments.iter().copied(), workspace_root, cwd)
+        .expect("structural request construction")
+}
+
+fn policy(run_timeout: Duration, termination_grace: Duration) -> ProcessTimeoutPolicy {
+    ProcessTimeoutPolicy::new(run_timeout, termination_grace)
+        .expect("valid timeout policy for test")
+}
+
+/// Runs one of this binary's ignored probe helpers through the public
+/// bounded runner with the given policy.
+fn run_probe_bounded(
+    probe_name: &str,
+    workspace_root: &Path,
+    run_timeout: Duration,
+    termination_grace: Duration,
+) -> (ProcessRunOutcome, Duration) {
+    let started = Instant::now();
+    let outcome = run_with_timeout(
+        &bounded_request(
+            std::env::current_exe().expect("current test executable path"),
+            &[probe_name, "--ignored"],
+            workspace_root,
+            workspace_root,
+        ),
+        &policy(run_timeout, termination_grace),
+    )
+    .expect("bounded run should produce typed metadata, not an error");
+    (outcome, started.elapsed())
+}
+
+/// Waits until the probe child's marker file exists, failing closed if the
+/// child never became ready.
+fn await_marker(workspace_root: &Path, marker: &str) {
+    let marker_path = workspace_root.join(marker);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !marker_path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "probe child never wrote its {marker} marker; host is stalled beyond all test budgets"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Reads one recorded marker value (a pid or pgid written by a
+/// runner-owned probe child).
+fn recorded_value(workspace_root: &Path, marker: &str) -> u32 {
+    await_marker(workspace_root, marker);
+    fs::read_to_string(workspace_root.join(marker))
+        .expect("marker readable")
+        .trim()
+        .parse()
+        .expect("recorded marker value parses")
+}
+
+/// Reads the runner-owned probe child's recorded pid.
+fn recorded_pid(workspace_root: &Path) -> u32 {
+    recorded_value(workspace_root, "pid")
+}
+
+/// Spawns one of this binary's ignored probes as a direct no-shell child
+/// of the current process and waits until its ready marker exists. The
+/// spawned process inherits the caller's process group — exactly how
+/// descendants join an attempt-owned group in production. The handle is
+/// deliberately never reaped: the descendant must outlive this helper, and
+/// the probe parent itself dies before the descendant in every scenario
+/// this suite exercises, so the kernel reparents and reaps it.
+#[allow(clippy::zombie_processes)]
+fn spawn_and_await_descendant_probe(probe_name: &str) {
+    let executable = std::env::current_exe().expect("current test executable path");
+    let descendant = std::process::Command::new(executable)
+        .args([probe_name, "--ignored"])
+        .spawn()
+        .expect("descendant probe spawn");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !Path::new("descendant-ready").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "descendant probe {probe_name} never became ready"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Keep the handle alive (without reaping) until this function ends;
+    // dropping it does not terminate the descendant.
+    let _ = descendant.id();
+}
+
+/// Polls until the zero-signal probe reports the recorded pid gone,
+/// failing closed if it survives every test budget. Absorbs the short
+/// reparenting/reaping window between a process's death and its final
+/// disappearance from the process table.
+fn await_process_death(pid: u32, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while process_alive(pid) {
+        assert!(
+            Instant::now() < deadline,
+            "{what} ({pid}) is still live or unreaped beyond every test budget"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Polls until the kernel reports the attempt-owned process group empty.
+fn await_group_empty(pgid: u32, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if recorded_group_is_empty(pgid) == Some(true) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: owned process group -{pgid} still has members beyond every test budget"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+// --- Controlled child helpers ------------------------------------------
+//
+// Never executed by the parent suite; the bounded runner re-invokes this
+// same test binary filtered onto exactly one probe. Each probe records its
+// pid before publishing the ready marker so the parent can afterwards
+// prove what happened to the exact runner-owned process. All three are
+// exercised by substantive parent tests below.
+
+/// Default SIGTERM disposition: exits when gracefully terminated.
+#[test]
+#[ignore]
+fn execution_timeout_probe_child_ready_then_sleep_long() {
+    let cwd = std::env::current_dir().expect("probe working directory");
+    fs::write(cwd.join("pid"), std::process::id().to_string()).expect("pid marker");
+    fs::write(cwd.join("ready"), b"ready").expect("ready marker");
+    std::thread::sleep(PROBE_SLEEP);
+}
+
+/// Ignores SIGTERM deliberately, so only the forced-kill step can end it.
+#[test]
+#[ignore]
+fn execution_timeout_probe_child_ignores_sigterm_then_sleep_long() {
+    #[cfg(unix)]
+    unsafe {
+        // Test-side only: install SIG_IGN for SIGTERM via the historic
+        // signal(2) entry point. No shell, no dependency; the constant
+        // SIG_IGN is fixed by POSIX.
+        unsafe extern "C" {
+            fn signal(signum: std::os::raw::c_int, handler: usize) -> usize;
+        }
+        const SIGTERM: std::os::raw::c_int = 15;
+        const SIG_IGN: usize = 1;
+        signal(SIGTERM, SIG_IGN);
+    }
+
+    let cwd = std::env::current_dir().expect("probe working directory");
+    fs::write(cwd.join("pid"), std::process::id().to_string()).expect("pid marker");
+    fs::write(cwd.join("ready"), b"ready").expect("ready marker");
+    std::thread::sleep(PROBE_SLEEP);
+}
+
+/// Verifies the timed path leaks no ambient environment: any inherited
+/// variable makes it exit 13 before its deadline instead of surviving to
+/// graceful termination.
+#[test]
+#[ignore]
+fn execution_timeout_probe_child_assert_empty_env_then_ready_and_sleep_long() {
+    if std::env::vars_os().next().is_some() {
+        std::process::exit(13);
+    }
+    let cwd = std::env::current_dir().expect("probe working directory");
+    fs::write(cwd.join("pid"), std::process::id().to_string()).expect("pid marker");
+    fs::write(cwd.join("ready"), b"ready").expect("ready marker");
+    std::thread::sleep(PROBE_SLEEP);
+}
+
+// --- Process-group ownership probes (repair regression) ------------------
+//
+// The following five ignored probes exist to prove the no-orphan
+// invariant: the timed child leads a dedicated process group, descendants
+// it creates inherit that group, and timeout termination reaches every
+// member. Coordination uses only pid/pgid/ready marker files under the
+// attempt's working directory — no sleeps, no shells.
+
+/// Records its pid, its own process group, and readiness before sleeping;
+/// lets the parent prove the timed child leads a dedicated group.
+#[test]
+#[ignore]
+fn execution_timeout_probe_child_records_own_process_group_then_sleep_long() {
+    let cwd = std::env::current_dir().expect("probe working directory");
+    fs::write(cwd.join("pid"), std::process::id().to_string()).expect("pid marker");
+    fs::write(cwd.join("pgid"), caller_process_group().to_string()).expect("pgid marker");
+    fs::write(cwd.join("ready"), b"ready").expect("ready marker");
+    std::thread::sleep(PROBE_SLEEP);
+}
+
+/// Long-lived descendant with default SIGTERM disposition; records its own
+/// pid before publishing its ready marker.
+#[test]
+#[ignore]
+fn execution_timeout_probe_descendant_ready_then_sleep_long() {
+    let cwd = std::env::current_dir().expect("probe working directory");
+    fs::write(cwd.join("descendant-pid"), std::process::id().to_string())
+        .expect("descendant pid marker");
+    fs::write(cwd.join("descendant-ready"), b"ready").expect("descendant ready marker");
+    std::thread::sleep(PROBE_SLEEP);
+}
+
+/// Long-lived descendant that ignores SIGTERM deliberately, so only a
+/// forced process-group SIGKILL can end it.
+#[test]
+#[ignore]
+fn execution_timeout_probe_descendant_ignores_sigterm_then_sleep_long() {
+    #[cfg(unix)]
+    unsafe {
+        // Test-side only: install SIG_IGN for SIGTERM via the historic
+        // signal(2) entry point. No shell, no dependency; the constant
+        // SIG_IGN is fixed by POSIX.
+        unsafe extern "C" {
+            fn signal(signum: std::os::raw::c_int, handler: usize) -> usize;
+        }
+        const SIGTERM: std::os::raw::c_int = 15;
+        const SIG_IGN: usize = 1;
+        signal(SIGTERM, SIG_IGN);
+    }
+
+    let cwd = std::env::current_dir().expect("probe working directory");
+    fs::write(cwd.join("descendant-pid"), std::process::id().to_string())
+        .expect("descendant pid marker");
+    fs::write(cwd.join("descendant-ready"), b"ready").expect("descendant ready marker");
+    std::thread::sleep(PROBE_SLEEP);
+}
+
+/// Timed parent that spawns one graceful descendant before becoming
+/// ready: both belong to the attempt-owned process group.
+#[test]
+#[ignore]
+fn execution_timeout_probe_parent_of_graceful_descendant_then_sleep_long() {
+    spawn_and_await_descendant_probe("execution_timeout_probe_descendant_ready_then_sleep_long");
+    let cwd = std::env::current_dir().expect("probe working directory");
+    fs::write(cwd.join("attempt-pid"), std::process::id().to_string()).expect("attempt pid marker");
+    fs::write(cwd.join("attempt-pgid"), caller_process_group().to_string())
+        .expect("attempt pgid marker");
+    fs::write(cwd.join("ready"), b"ready").expect("ready marker");
+    std::thread::sleep(PROBE_SLEEP);
+}
+
+/// Timed parent that spawns one SIGTERM-ignoring descendant before
+/// becoming ready: the direct parent dies from SIGTERM while the
+/// descendant survives into the force-kill step.
+#[test]
+#[ignore]
+fn execution_timeout_probe_parent_of_sigterm_ignoring_descendant_then_sleep_long() {
+    spawn_and_await_descendant_probe(
+        "execution_timeout_probe_descendant_ignores_sigterm_then_sleep_long",
+    );
+    let cwd = std::env::current_dir().expect("probe working directory");
+    fs::write(cwd.join("attempt-pid"), std::process::id().to_string()).expect("attempt pid marker");
+    fs::write(cwd.join("attempt-pgid"), caller_process_group().to_string())
+        .expect("attempt pgid marker");
+    fs::write(cwd.join("ready"), b"ready").expect("ready marker");
+    std::thread::sleep(PROBE_SLEEP);
+}
+
+// --- Policy validation (T10 / T11) ---------------------------------------
+
+#[test]
+fn to01_zero_run_timeout_is_refused_without_spawning() {
+    let error = ProcessTimeoutPolicy::new(Duration::ZERO, Duration::from_secs(1))
+        .expect_err("zero run timeout must be refused");
+    assert!(matches!(error, ExecutionError::InvalidTimeoutPolicy { .. }));
+    assert!(error.to_string().contains("run_timeout"));
+}
+
+#[test]
+fn to02_zero_termination_grace_is_refused_without_spawning() {
+    let error = ProcessTimeoutPolicy::new(Duration::from_secs(1), Duration::ZERO)
+        .expect_err("zero termination grace must be refused");
+    assert!(matches!(error, ExecutionError::InvalidTimeoutPolicy { .. }));
+    assert!(error.to_string().contains("termination_grace"));
+
+    // Valid policies expose their immutable intervals unchanged.
+    let valid = policy(Duration::from_millis(250), Duration::from_millis(125));
+    assert_eq!(valid.run_timeout(), Duration::from_millis(250));
+    assert_eq!(valid.termination_grace(), Duration::from_millis(125));
+}
+
+// --- Ordinary completion under a generous policy (T1 / T2) ----------------
+
+#[test]
+fn to03_normal_success_before_deadline_is_ordinary_completion() {
+    let workspace = TempDir::new("to03");
+    let outcome = run_with_timeout(
+        &bounded_request(
+            first_existing(&["/usr/bin/true", "/bin/true"]),
+            &[],
+            workspace.path(),
+            workspace.path(),
+        ),
+        &policy(Duration::from_secs(30), Duration::from_secs(1)),
+    )
+    .expect("fast successful child completes ordinarily");
+
+    assert_eq!(outcome.termination(), ProcessTermination::Completed);
+    assert!(!outcome.timed_out());
+    assert!(!outcome.forced_kill_required());
+    assert!(outcome.success());
+    assert_eq!(outcome.exit_code(), Some(0));
+}
+
+#[test]
+fn to04_nonzero_exit_before_deadline_stays_ordinary_not_timed_out() {
+    let workspace = TempDir::new("to04");
+    let outcome = run_with_timeout(
+        &bounded_request(
+            first_existing(&["/usr/bin/false", "/bin/false"]),
+            &[],
+            workspace.path(),
+            workspace.path(),
+        ),
+        &policy(Duration::from_secs(30), Duration::from_secs(1)),
+    )
+    .expect("fast non-zero child is ordinary runner output");
+
+    assert_eq!(outcome.termination(), ProcessTermination::Completed);
+    assert!(!outcome.timed_out());
+    assert!(!outcome.forced_kill_required());
+    assert!(!outcome.success());
+    assert_eq!(outcome.exit_code(), Some(1));
+}
+
+// --- Actual timeout: graceful termination (T3 / T4 / T8) ------------------
+
+#[test]
+fn to05_deadline_expiry_terminates_gracefully_without_force() {
+    let workspace = TempDir::new("to05");
+    let run_timeout = Duration::from_millis(600);
+    let (outcome, elapsed) = run_probe_bounded(
+        "execution_timeout_probe_child_ready_then_sleep_long",
+        workspace.path(),
+        run_timeout,
+        Duration::from_millis(750),
+    );
+
+    // Typed timeout classification: never an ordinary completion, never a
+    // forced kill, never reported successful.
+    assert_eq!(
+        outcome.termination(),
+        ProcessTermination::TimedOutGracefullyTerminated
+    );
+    assert!(outcome.timed_out());
+    assert!(!outcome.forced_kill_required());
+    assert!(!outcome.success());
+    // Signal-terminated children carry no numeric exit code, which keeps
+    // them unmistakable from an ordinary pre-deadline completion.
+    assert_eq!(outcome.exit_code(), None);
+
+    // Monotonic deadline was honored and the total run stayed far below
+    // the child's own long duration (T6 evidence for the graceful path).
+    assert!(
+        elapsed >= run_timeout,
+        "runner returned before the configured deadline elapsed: {elapsed:?}"
+    );
+    assert!(
+        elapsed < BOUNDED_RUN_UPPER_BOUND,
+        "bounded run approached the child's full duration: {elapsed:?}"
+    );
+}
+
+// --- Forced kill after ignored graceful termination (T5 / T9) -------------
+
+#[test]
+fn to06_sigterm_ignoring_child_is_force_killed_after_bounded_grace() {
+    let workspace = TempDir::new("to06");
+    let run_timeout = Duration::from_millis(600);
+    let grace = Duration::from_millis(600);
+    let (outcome, elapsed) = run_probe_bounded(
+        "execution_timeout_probe_child_ignores_sigterm_then_sleep_long",
+        workspace.path(),
+        run_timeout,
+        grace,
+    );
+
+    assert_eq!(
+        outcome.termination(),
+        ProcessTermination::TimedOutForceKilled
+    );
+    assert!(outcome.timed_out());
+    assert!(outcome.forced_kill_required());
+    // A forced kill must never be confusable with an ordinary non-zero
+    // exit: no numeric code exists and success is refused outright.
+    assert_eq!(outcome.exit_code(), None);
+    assert!(!outcome.success());
+
+    assert!(elapsed >= run_timeout);
+    assert!(
+        elapsed < BOUNDED_RUN_UPPER_BOUND,
+        "forced-kill run approached the child's full duration: {elapsed:?}"
+    );
+
+    // The force-killed child was reaped, not merely signaled (see to07).
+    let pid = recorded_pid(workspace.path());
+    assert_ne!(pid, std::process::id());
+    assert!(
+        !process_alive(pid),
+        "force-killed child {pid} remains live or unreaped after the bounded run returned"
+    );
+}
+
+// --- Final reap proof (T7) -------------------------------------------------
+
+#[test]
+fn to07_gracefully_terminated_child_is_reaped_before_return() {
+    let workspace = TempDir::new("to07");
+    let (outcome, _) = run_probe_bounded(
+        "execution_timeout_probe_child_ready_then_sleep_long",
+        workspace.path(),
+        Duration::from_millis(500),
+        Duration::from_millis(500),
+    );
+    assert_eq!(
+        outcome.termination(),
+        ProcessTermination::TimedOutGracefullyTerminated
+    );
+
+    let pid = recorded_pid(workspace.path());
+
+    // Control: the probe technique discriminates live processes, and the
+    // recorded pid genuinely belonged to another process.
+    assert!(process_alive(std::process::id()));
+    assert_ne!(pid, std::process::id());
+
+    // A killed-but-unreaped child would remain a zombie of this test
+    // process and therefore still answer the zero-signal probe; only a
+    // fully reaped child answers "no such process".
+    assert!(
+        !process_alive(pid),
+        "runner-owned child {pid} is still live or an unreaped zombie after the bounded run \
+         returned"
+    );
+}
+
+// --- Empty environment through the timed path (T13) ------------------------
+
+#[test]
+fn to08_timed_path_preserves_empty_child_environment() {
+    let workspace = TempDir::new("to08");
+    let (outcome, _) = run_probe_bounded(
+        "execution_timeout_probe_child_assert_empty_env_then_ready_and_sleep_long",
+        workspace.path(),
+        Duration::from_millis(600),
+        Duration::from_millis(500),
+    );
+
+    // The probe survives to the deadline (graceful classification) only if
+    // it observed an empty environment; any leaked variable would have
+    // produced an ordinary exit 13 completion instead.
+    assert_eq!(
+        outcome.termination(),
+        ProcessTermination::TimedOutGracefullyTerminated,
+        "timed-path child gained ambient environment or died unexpectedly: {outcome:?}"
+    );
+    assert!(outcome.timed_out());
+    assert!(!outcome.success());
+}
+
+// --- Preserved validation boundaries on the timed path (T14 / T15) ---------
+
+#[test]
+fn to09_timed_path_preserves_symlink_cwd_escape_rejection() {
+    let base = TempDir::new("to09");
+    let workspace = base.path().join("ws");
+    let outside = base.path().join("outside");
+    fs::create_dir_all(&workspace).expect("workspace directory creation");
+    fs::create_dir_all(&outside).expect("outside directory creation");
+    let link = workspace.join("inside-link");
+    std::os::unix::fs::symlink(&outside, &link).expect("test symlink creation");
+
+    let error = run_with_timeout(
+        &bounded_request(
+            first_existing(&["/usr/bin/true", "/bin/true"]),
+            &[],
+            &workspace,
+            &link,
+        ),
+        &policy(Duration::from_secs(5), Duration::from_secs(1)),
+    )
+    .expect_err("symlink escape must fail closed on the timed path too");
+    assert!(
+        matches!(error, ExecutionError::CwdOutsideWorkspace { .. }),
+        "expected CwdOutsideWorkspace, got: {error:?}"
+    );
+}
+
+#[test]
+fn to10_timed_path_preserves_shell_executable_rejection() {
+    let workspace = TempDir::new("to10");
+    let error = run_with_timeout(
+        &bounded_request("/bin/sh", &[], workspace.path(), workspace.path()),
+        &policy(Duration::from_secs(5), Duration::from_secs(1)),
+    )
+    .expect_err("shell executables must stay rejected before timeout machinery");
+    assert!(
+        matches!(error, ExecutionError::ShellExecutableRejected { .. }),
+        "expected ShellExecutableRejected, got: {error:?}"
+    );
+}
+
+// --- Deadline arithmetic fails closed (T12) --------------------------------
+
+#[test]
+fn to11_monotonic_deadline_overflow_fails_closed() {
+    // Helper-level deterministic proof: adding an unrepresentable interval
+    // to the monotonic clock yields the typed overflow error.
+    let error = checked_deadline(Instant::now(), Duration::MAX, "run_timeout")
+        .expect_err("Duration::MAX cannot be added to a nonzero monotonic reading");
+    assert!(matches!(
+        error,
+        ExecutionError::TimeoutDeadlineOverflow { .. }
+    ));
+
+    // End-to-end: the overflow is detected before any filesystem or
+    // process resource is touched, even though the request itself names a
+    // nonexistent executable.
+    let workspace = TempDir::new("to11");
+    let error = run_with_timeout(
+        &bounded_request(
+            workspace.path().join("never-spawned"),
+            &[],
+            workspace.path(),
+            workspace.path(),
+        ),
+        &policy(Duration::from_secs(u64::MAX), Duration::from_secs(1)),
+    )
+    .expect_err("unrepresentable deadline must fail closed");
+    assert!(matches!(
+        error,
+        ExecutionError::TimeoutDeadlineOverflow { .. }
+    ));
+}
+
+// --- No output capture on the timed path (T16) ------------------------------
+
+#[test]
+fn to12_timed_outcome_is_pure_exit_metadata_no_capture() {
+    let workspace = TempDir::new("to12");
+    // The child writes payloads to both stdout and stderr; both streams
+    // are null at the boundary and the entire result equals plain exit
+    // metadata — nothing else exists on the type to inspect.
+    let outcome = run_with_timeout(
+        &bounded_request(
+            first_existing(&["/bin/echo", "/usr/bin/echo"]),
+            &["stdout-payload", "stderr-payload"],
+            workspace.path(),
+            workspace.path(),
+        ),
+        &policy(Duration::from_secs(30), Duration::from_secs(1)),
+    )
+    .expect("echoing child completes ordinarily");
+    assert_eq!(outcome, ProcessRunOutcome::new(true, Some(0)));
+
+    // Timed-out outcomes likewise carry no captured payload and are never
+    // reported successful.
+    let timed = ProcessRunOutcome::new_timed_out(
+        ProcessTermination::TimedOutGracefullyTerminated,
+        Some(143),
+    );
+    assert!(!timed.success());
+    assert!(timed.timed_out());
+    assert!(!timed.forced_kill_required());
+    let forced = ProcessRunOutcome::new_timed_out(ProcessTermination::TimedOutForceKilled, None);
+    assert!(forced.forced_kill_required());
+    assert_ne!(timed, forced);
+}
+
+// --- Unbounded run() compatibility (T17) ------------------------------------
+
+#[test]
+fn to13_plain_run_has_no_hidden_default_deadline() {
+    let workspace = TempDir::new("to13");
+    let started = Instant::now();
+    let outcome = run(&bounded_request(
+        first_existing(&["/bin/sleep", "/usr/bin/sleep"]),
+        &["2"],
+        workspace.path(),
+        workspace.path(),
+    ))
+    .expect("the accepted unbounded API still runs children without a hidden deadline");
+    let elapsed = started.elapsed();
+
+    assert_eq!(outcome.termination(), ProcessTermination::Completed);
+    assert!(!outcome.timed_out());
+    assert!(outcome.success());
+    // The child genuinely ran past any plausible hidden default deadline.
+    assert!(elapsed >= Duration::from_secs(2));
+    assert_eq!(outcome.exit_code(), Some(0));
+}
+
+// --- Error mapping coverage (T18) --------------------------------------------
+
+#[test]
+fn to14_control_boundary_errors_are_typed_and_fail_closed() {
+    let boom = || std::io::Error::other("boom");
+
+    // Pure typed mappings stay distinct per lifecycle boundary.
+    let spawn_wait = super::runner::spawn_failed(boom());
+    let plain_wait = super::runner::wait_failed(boom());
+    let final_wait = super::runner::final_wait_failed(boom());
+    let unsupported = ExecutionError::UnsupportedTimeoutPlatform;
+
+    assert!(matches!(
+        spawn_wait,
+        ExecutionError::ProcessSpawnFailed { .. }
+    ));
+    assert!(matches!(
+        plain_wait,
+        ExecutionError::ProcessWaitFailed { .. }
+    ));
+    assert!(matches!(
+        final_wait,
+        ExecutionError::TimeoutFinalWaitFailed { .. }
+    ));
+
+    // Every boundary renders distinctly so callers never have to parse
+    // ambiguity out of an error string.
+    let rendered = [
+        spawn_wait.to_string(),
+        plain_wait.to_string(),
+        final_wait.to_string(),
+        unsupported.to_string(),
+    ];
+    for (index, message) in rendered.iter().enumerate() {
+        assert!(!message.is_empty());
+        assert!(
+            rendered[..index].iter().all(|earlier| earlier != message),
+            "distinct boundaries must render distinctly"
+        );
+    }
+}
+
+#[test]
+fn to15_group_signal_and_presence_classification_tables() {
+    // Pure errno tables: no process is ever signaled by this test.
+
+    // Signal delivery classification against an owned group.
+    assert_eq!(
+        classify_group_kill_result(0, None, 4242, "graceful SIGTERM"),
+        GroupSignalDelivery::Delivered
+    );
+    // ESRCH: every group member had already exited — never a failure.
+    assert_eq!(
+        classify_group_kill_result(-1, Some(3), 4242, "graceful SIGTERM"),
+        GroupSignalDelivery::GroupAlreadyGone
+    );
+    let failed_perm = classify_group_kill_result(-1, Some(1), 4242, "forced SIGKILL");
+    let failed_other = classify_group_kill_result(-1, None, 4242, "forced SIGKILL");
+    assert!(matches!(failed_perm, GroupSignalDelivery::Failed { .. }));
+    assert!(matches!(failed_other, GroupSignalDelivery::Failed { .. }));
+    match (failed_perm, failed_other) {
+        (
+            GroupSignalDelivery::Failed { detail: first },
+            GroupSignalDelivery::Failed { detail: second },
+        ) => {
+            assert_ne!(first, second);
+            assert!(first.contains("-4242"));
+            assert!(first.contains("SIGKILL"));
+        }
+        _ => unreachable!("both classified as failures above"),
+    }
+
+    // Presence probing distinguishes empty from occupied from unknown,
+    // and EPERM (exists but not signalable by us) counts as OCCUPIED.
+    assert_eq!(
+        classify_group_presence(0, None, 4242),
+        GroupPresence::HasMembers
+    );
+    assert_eq!(
+        classify_group_presence(-1, Some(3), 4242),
+        GroupPresence::Empty
+    );
+    assert_eq!(
+        classify_group_presence(-1, Some(1), 4242),
+        GroupPresence::HasMembers
+    );
+    match classify_group_presence(-1, Some(22), 4242) {
+        GroupPresence::Unknown { detail } => {
+            assert!(detail.contains("-4242"));
+            assert!(detail.contains("22"));
+        }
+        other => panic!("unexpected errno must classify as unknown, got: {other:?}"),
+    }
+}
+
+// --- Repair regression matrix ---------------------------------------------
+//
+// R1/R7: dedicated attempt-owned group, caller untouched.
+// R3/R4/R5: descendants cannot survive timeout return; ignoring SIGTERM
+// forces group-level SIGKILL and forced classification.
+// R6: whole-group graceful termination classifies gracefully.
+// R8: PID/PGID safety guards refuse unsafe targets fail-closed.
+// R9: grace-wait failures clean up without hiding the primary error.
+
+#[test]
+fn tg01_timed_child_leads_dedicated_process_group_distinct_from_caller() {
+    let workspace = TempDir::new("tg01");
+    let caller_group_before = caller_process_group();
+    assert!(caller_group_before > 0, "caller pgid must be positive");
+
+    let run_timeout = Duration::from_millis(500);
+    let (outcome, elapsed) = run_probe_bounded(
+        "execution_timeout_probe_child_records_own_process_group_then_sleep_long",
+        workspace.path(),
+        run_timeout,
+        Duration::from_millis(750),
+    );
+    assert_eq!(
+        outcome.termination(),
+        ProcessTermination::TimedOutGracefullyTerminated
+    );
+
+    let child_pid = recorded_value(workspace.path(), "pid");
+    let child_pgid = recorded_value(workspace.path(), "pgid");
+
+    // The timed child leads its own fresh group (pgid == its pid)…
+    assert_eq!(
+        child_pgid, child_pid,
+        "the timed child must lead its own process group"
+    );
+    // …which is demonstrably distinct from the caller's process group.
+    let caller_unsigned = u32::try_from(caller_group_before).expect("caller pgid positive");
+    assert_ne!(
+        child_pgid, caller_unsigned,
+        "the attempt-owned group must not be the caller's group"
+    );
+
+    assert!(elapsed >= run_timeout);
+    // The caller/test harness stays alive with its group untouched.
+    assert!(process_alive(std::process::id()));
+    assert_eq!(caller_process_group(), caller_group_before);
+
+    // The direct child was fully reaped and its group no longer exists.
+    await_process_death(child_pid, "timed probe child");
+    await_group_empty(child_pgid, "tg01");
+}
+
+#[test]
+fn tg02_whole_group_graceful_termination_classifies_gracefully_without_orphans() {
+    let workspace = TempDir::new("tg02");
+    let caller_group_before = caller_process_group();
+
+    let run_timeout = Duration::from_millis(600);
+    let (outcome, elapsed) = run_probe_bounded(
+        "execution_timeout_probe_parent_of_graceful_descendant_then_sleep_long",
+        workspace.path(),
+        run_timeout,
+        Duration::from_millis(1000),
+    );
+
+    // Parent AND descendant both honored SIGTERM during grace: graceful
+    // classification with no force kill anywhere in the attempt tree.
+    assert_eq!(
+        outcome.termination(),
+        ProcessTermination::TimedOutGracefullyTerminated
+    );
+    assert!(outcome.timed_out());
+    assert!(!outcome.forced_kill_required());
+    assert!(!outcome.success());
+    assert_eq!(outcome.exit_code(), None);
+    assert!(elapsed >= run_timeout);
+    assert!(
+        elapsed < BOUNDED_RUN_UPPER_BOUND,
+        "bounded run approached the probes' full duration: {elapsed:?}"
+    );
+
+    let attempt_pid = recorded_value(workspace.path(), "attempt-pid");
+    let attempt_pgid = recorded_value(workspace.path(), "attempt-pgid");
+    let descendant_pid = recorded_value(workspace.path(), "descendant-pid");
+    assert_ne!(attempt_pid, std::process::id());
+
+    // Direct child reaped, descendant gone, owned group empty.
+    await_process_death(attempt_pid, "timed attempt child");
+    await_process_death(descendant_pid, "graceful attempt descendant");
+    await_group_empty(attempt_pgid, "tg02");
+
+    // Caller alive; caller group untouched and provably different.
+    assert!(process_alive(std::process::id()));
+    assert_eq!(caller_process_group(), caller_group_before);
+    let caller_unsigned = u32::try_from(caller_group_before).expect("caller pgid positive");
+    assert_ne!(attempt_pgid, caller_unsigned);
+}
+
+#[test]
+fn tg03_sigterm_ignoring_descendant_triggers_group_sigkill_and_forced_classification() {
+    let workspace = TempDir::new("tg03");
+    let caller_group_before = caller_process_group();
+
+    let run_timeout = Duration::from_millis(600);
+    let grace = Duration::from_millis(600);
+    let (outcome, elapsed) = run_probe_bounded(
+        "execution_timeout_probe_parent_of_sigterm_ignoring_descendant_then_sleep_long",
+        workspace.path(),
+        run_timeout,
+        grace,
+    );
+
+    // The DIRECT child exited from the graceful SIGTERM, but the
+    // descendant ignored it — the classification must still be forced,
+    // because attempt cleanup required the group-level SIGKILL.
+    assert_eq!(
+        outcome.termination(),
+        ProcessTermination::TimedOutForceKilled
+    );
+    assert!(outcome.timed_out());
+    assert!(outcome.forced_kill_required());
+    assert!(!outcome.success());
+    assert_eq!(outcome.exit_code(), None);
+    assert!(elapsed >= run_timeout);
+    assert!(
+        elapsed < BOUNDED_RUN_UPPER_BOUND,
+        "forced group-kill run approached the probes' full duration: {elapsed:?}"
+    );
+
+    let attempt_pid = recorded_value(workspace.path(), "attempt-pid");
+    let attempt_pgid = recorded_value(workspace.path(), "attempt-pgid");
+    let descendant_pid = recorded_value(workspace.path(), "descendant-pid");
+    assert_ne!(attempt_pid, std::process::id());
+
+    // No attempt-owned member survives the return: direct child reaped,
+    // the SIGTERM-ignoring descendant dead, owned group empty.
+    await_process_death(attempt_pid, "timed attempt child");
+    await_process_death(descendant_pid, "SIGTERM-ignoring descendant");
+    await_group_empty(attempt_pgid, "tg03");
+
+    // Caller alive; caller group untouched and provably different.
+    assert!(process_alive(std::process::id()));
+    assert_eq!(caller_process_group(), caller_group_before);
+    let caller_unsigned = u32::try_from(caller_group_before).expect("caller pgid positive");
+    assert_ne!(attempt_pgid, caller_unsigned);
+}
+
+/// Spawns one controlled `sleep` child in its own fresh process group,
+/// mirroring the production spawn shape narrowly, for exercising typed
+/// cleanup helpers against real process state.
+fn spawn_controlled_group_child() -> (std::process::Child, OwnedProcessGroup, u32) {
+    use std::os::unix::process::CommandExt;
+    let executable = first_existing(&["/bin/sleep", "/usr/bin/sleep"]);
+    let mut command = std::process::Command::new(executable);
+    command.arg("30");
+    command.process_group(0);
+    let child = command.spawn().expect("controlled cleanup-test child");
+    let pid = child.id();
+    let group =
+        OwnedProcessGroup::from_child_pid(pid).expect("fresh child certifies as an owned group");
+    (child, group, pid)
+}
+
+#[test]
+fn tg05_grace_wait_failure_cleanup_preserves_primary_error_within_bounded_cleanup() {
+    let (child, group, pid) = spawn_controlled_group_child();
+    let original = std::io::Error::other("synthetic grace observation failure");
+
+    let error = grace_wait_failed_with_cleanup(child, group, original);
+
+    match &error {
+        ExecutionError::TimeoutGraceWaitFailed { detail } => {
+            // The primary grace-wait error leads and is never hidden or
+            // replaced by cleanup evidence.
+            assert!(
+                detail.starts_with("grace-window observation failed"),
+                "primary error must stay primary: {detail}"
+            );
+            assert!(detail.contains("synthetic grace observation failure"));
+            // Bounded best-effort cleanup was attempted and evidenced;
+            // nothing claims successful timeout metadata anywhere.
+            assert!(detail.contains("best-effort cleanup"));
+            assert!(
+                detail.contains("SIGKILL delivered") || detail.contains("already empty"),
+                "group cleanup evidence missing: {detail}"
+            );
+            assert!(
+                detail.contains("direct child was reaped"),
+                "reap evidence missing: {detail}"
+            );
+            assert!(!detail.contains("TimedOut"));
+        }
+        other => panic!("expected TimeoutGraceWaitFailed, got: {other:?}"),
+    }
+
+    // The best-effort cleanup really happened: the controlled child was
+    // forced down inside its own fresh group and reaped.
+    assert_ne!(pid, std::process::id());
+    await_process_death(pid, "grace-wait cleanup child");
+}
+
+#[test]
+fn tg06_force_kill_delivery_failure_preserves_evidence_and_attempts_bounded_cleanup() {
+    let (child, group, pid) = spawn_controlled_group_child();
+
+    let error = force_kill_failed_with_cleanup(
+        child,
+        group,
+        "synthetic SIGKILL delivery refusal".to_string(),
+    );
+
+    match &error {
+        ExecutionError::ForceKillFailed { detail } => {
+            // Original delivery failure preserved as primary evidence.
+            assert!(
+                detail.contains("synthetic SIGKILL delivery refusal"),
+                "primary failure must stay primary: {detail}"
+            );
+            assert!(detail.contains(&format!("-{}", group.raw())));
+            // One bounded best-effort retry plus direct-child reap were
+            // attempted, and follow-up group evidence is preserved. No Ok
+            // outcome can ever be fabricated from this path.
+            assert!(detail.contains("retry SIGKILL reached the owned group"));
+            assert!(detail.contains("direct child was reaped"));
+            assert!(detail.contains("follow-up evidence"));
+            assert!(detail.contains("observed empty after failure"));
+        }
+        other => panic!("expected ForceKillFailed, got: {other:?}"),
+    }
+
+    assert_ne!(pid, std::process::id());
+    await_process_death(pid, "force-kill-failure cleanup child");
+}
+
+#[test]
+fn tg04_owned_group_guards_reject_unsafe_targets_fail_closed() {
+    // Zero would reach the caller's entire process group under
+    // kill(0, ...) / kill(-0, ...): refused outright.
+    assert_eq!(OwnedProcessGroup::from_child_pid(0), None);
+    // One is the kernel-wide broadcast form under kill(-1, ...): refused.
+    assert_eq!(OwnedProcessGroup::from_child_pid(1), None);
+    // The caller's live process group must never become a signaling
+    // target, however the value arrived.
+    let caller = caller_process_group();
+    assert!(caller > 0);
+    let caller_unsigned = u32::try_from(caller).expect("caller pgid positive");
+    assert_eq!(OwnedProcessGroup::from_child_pid(caller_unsigned), None);
+    // Values outside pid_t fail closed instead of converting lossily.
+    // Negative arbitrary values are unrepresentable at the type boundary
+    // (u32 input), closing that door by construction.
+    assert_eq!(OwnedProcessGroup::from_child_pid(0x8000_0000), None);
+    // A plausible freshly created dedicated group certifies intact and
+    // never aliases the caller's group.
+    let candidate = caller_unsigned ^ 0x4000_0000;
+    assert_ne!(candidate, caller_unsigned);
+    assert!(candidate > 1);
+    let certified =
+        OwnedProcessGroup::from_child_pid(candidate).expect("plausible fresh group certifies");
+    assert_eq!(
+        certified.raw(),
+        i32::try_from(candidate).expect("candidate fits pid_t")
+    );
+
+    // The test-only emptiness probe likewise refuses implausible ids
+    // rather than guessing about group state.
+    assert_eq!(recorded_group_is_empty(0), None);
+    assert_eq!(recorded_group_is_empty(u32::MAX), None);
+}
