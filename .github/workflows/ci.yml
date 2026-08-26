@@ -1,0 +1,80 @@
+name: Repository CI
+
+# CI only. No deployment, no release, no publication, no repository writes.
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+# PR: newer commits supersede obsolete runs for the same PR.
+# main: keyed on the exact integrated commit, so evidence for a previously
+# integrated SHA is never cancelled by a newer one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('sha-{0}', github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  rust-validation:
+    name: rust-validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # The exact source commit this evidence binds to (never the synthetic
+      # pull_request merge commit).
+      CI_TESTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      CI_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+    steps:
+      - name: Checkout tested commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.CI_TESTED_SHA }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Verify commit provenance
+        run: |
+          set -euo pipefail
+          echo "CI_TESTED_SHA=${CI_TESTED_SHA}"
+          echo "CI_BASE_SHA=${CI_BASE_SHA}"
+          test -n "${CI_TESTED_SHA}"
+          test "$(git rev-parse HEAD)" = "${CI_TESTED_SHA}"
+          # Fail closed when the event supplies no honest base commit.
+          case "${CI_BASE_SHA}" in
+            "" | *[!0-9a-f]* ) echo "::error::missing or malformed CI_BASE_SHA"; exit 1 ;;
+            0000000000000000000000000000000000000000 )
+              echo "::error::event supplied a null base SHA; cannot validate a committed range"
+              exit 1 ;;
+          esac
+          git cat-file -e "${CI_BASE_SHA}^{commit}"
+
+      - name: Toolchain evidence
+        run: |
+          set -euo pipefail
+          # Repository authority is rust-toolchain.toml; nothing here overrides it.
+          rustup show active-toolchain
+          rustup component add rustfmt clippy
+          rustc --version --verbose
+          cargo --version
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo check
+        run: cargo check --workspace --locked
+
+      - name: cargo test
+        run: cargo test --workspace --locked
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Whitespace check over the tested range
+        run: git diff --check "${CI_BASE_SHA}" "${CI_TESTED_SHA}"
