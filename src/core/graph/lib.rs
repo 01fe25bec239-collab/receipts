@@ -38,6 +38,7 @@ pub mod node;
 pub mod node_state;
 pub mod node_state_transition;
 pub mod rejected_repair_transition;
+pub mod repair_completion_transition;
 pub mod review_verdict_transition;
 
 #[cfg(test)]
@@ -48,6 +49,8 @@ mod node_state_tests;
 mod node_state_transition_tests;
 #[cfg(test)]
 mod rejected_repair_transition_tests;
+#[cfg(test)]
+mod repair_completion_transition_tests;
 #[cfg(test)]
 mod review_verdict_transition_tests;
 
@@ -63,6 +66,10 @@ pub use node_state_transition::{
 pub use rejected_repair_transition::{
     AUTHORIZED_REJECTED_REPAIR_TRANSITIONS, RejectedRepairTransitionError,
     validate_rejected_repair_transition,
+};
+pub use repair_completion_transition::{
+    AUTHORIZED_REPAIR_COMPLETION_TRANSITIONS, RepairCompletionTransitionError,
+    validate_repair_completion_transition,
 };
 pub use review_verdict_transition::{
     AUTHORIZED_REVIEW_VERDICT_TRANSITIONS, ReviewVerdictTransitionError,
