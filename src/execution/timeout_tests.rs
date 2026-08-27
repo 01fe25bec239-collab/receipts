@@ -16,8 +16,9 @@ use super::runner::{
     checked_deadline, force_kill_failed_with_cleanup, grace_wait_failed_with_cleanup,
 };
 use crate::execution::unix_signal::{
-    GroupPresence, GroupSignalDelivery, OwnedProcessGroup, caller_process_group,
-    classify_group_kill_result, classify_group_presence, process_alive, recorded_group_is_empty,
+    GroupPresence, GroupSignalDelivery, LeaderState, OwnedProcessGroup, caller_process_group,
+    classify_group_kill_result, classify_group_presence, observe_leader_without_reaping,
+    process_alive, recorded_group_is_empty,
 };
 use crate::execution::{
     ExecutionError, ProcessRunOutcome, ProcessRunRequest, ProcessTermination, ProcessTimeoutPolicy,
@@ -930,6 +931,32 @@ fn spawn_controlled_group_child() -> (std::process::Child, OwnedProcessGroup, u3
     let group =
         OwnedProcessGroup::from_child_pid(pid).expect("fresh child certifies as an owned group");
     (child, group, pid)
+}
+
+#[test]
+fn tg05a_non_reaping_exit_observation_preserves_the_waitable_leader() {
+    use std::os::unix::process::CommandExt;
+    let executable = first_existing(&["/usr/bin/true", "/bin/true"]);
+    let mut command = std::process::Command::new(executable);
+    command.process_group(0);
+    let mut child = command.spawn().expect("controlled observation child");
+    let pid = child.id();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while observe_leader_without_reaping(pid).expect("waitid WNOWAIT observation")
+        != LeaderState::Exited
+    {
+        assert!(Instant::now() < deadline, "controlled child did not exit");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        process_alive(pid),
+        "WNOWAIT must leave the exited leader waitable and unreaped"
+    );
+    child.wait().expect("final controlled-child reap");
+    assert!(
+        !process_alive(pid),
+        "Child::wait must perform the final reap"
+    );
 }
 
 #[test]

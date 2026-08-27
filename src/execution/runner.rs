@@ -92,8 +92,9 @@ use crate::execution::request::ProcessRunRequest;
 use crate::execution::timeout::ProcessTimeoutPolicy;
 #[cfg(unix)]
 use crate::execution::unix_signal::{
-    GroupPresence, GroupSignalDelivery, OwnedProcessGroup, deliver_group_sigkill,
-    deliver_group_sigterm, group_presence,
+    GroupPresence, GroupSignalDelivery, LeaderState, OwnedProcessGroup, deliver_group_sigkill,
+    deliver_group_sigterm, group_presence, live_group_members_excluding_leader,
+    observe_leader_without_reaping,
 };
 
 /// Common local shell basenames rejected at executable validation.
@@ -135,6 +136,32 @@ pub(crate) const CAPTURE_TEST_FAIL_FORCE_KILL: u8 = 1;
 pub(crate) const CAPTURE_TEST_FAIL_WAIT: u8 = 2;
 #[cfg(all(test, unix))]
 pub(crate) const CAPTURE_TEST_FAIL_STDOUT_READ: u8 = 4;
+
+#[cfg(all(test, unix))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimeoutLifecycleEvent {
+    GroupSigterm,
+    GroupSigkill,
+    LeaderReaped,
+    GroupEmptyVerified,
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static TIMEOUT_LIFECYCLE_EVENTS: std::cell::RefCell<Vec<TimeoutLifecycleEvent>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn take_timeout_lifecycle_events() -> Vec<TimeoutLifecycleEvent> {
+    TIMEOUT_LIFECYCLE_EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()))
+}
+
+#[cfg(all(test, unix))]
+fn record_timeout_lifecycle_event(event: TimeoutLifecycleEvent) {
+    TIMEOUT_LIFECYCLE_EVENTS.with(|events| events.borrow_mut().push(event));
+}
 
 /// Thread-local fault injection keeps parallel tests isolated and never
 /// changes the public API or production process-control path.
@@ -200,12 +227,13 @@ pub fn run(request: &ProcessRunRequest) -> Result<ProcessRunOutcome, ExecutionEr
 ///    never needlessly terminated;
 /// 4. deliver graceful termination (`SIGTERM`) to the attempt-owned
 ///    process group;
-/// 5. wait at most the policy's termination grace for BOTH the direct
-///    child to be reaped AND the owned group to become empty — a direct
-///    child exit alone never proves cleanup while descendants survive;
+/// 5. wait at most the policy's termination grace, observing direct-child
+///    exit without reaping its process-group leader and separately checking
+///    for live descendants;
 /// 6. if any attempt-owned member survives past grace, force kill the
-///    owned process group (`SIGKILL`), reap the direct child, and verify
-///    within a strictly bounded window that no member remains;
+///    owned process group (`SIGKILL`) while the leader remains unreaped;
+///    only after all group signaling is finished, reap the direct child and
+///    verify within a strictly bounded window that no member remains;
 /// 7. classify truthfully: [`ProcessTermination::TimedOutForceKilled`]
 ///    whenever any attempt-owned member required the force step,
 ///    regardless of how the direct child itself exited.
@@ -794,6 +822,20 @@ fn capture_deliver_group_sigkill(group: OwnedProcessGroup) -> GroupSignalDeliver
             detail: "injected forced SIGKILL delivery failure".to_string(),
         };
     }
+    timeout_deliver_group_sigkill(group)
+}
+
+#[cfg(unix)]
+fn timeout_deliver_group_sigterm(group: OwnedProcessGroup) -> GroupSignalDelivery {
+    #[cfg(test)]
+    record_timeout_lifecycle_event(TimeoutLifecycleEvent::GroupSigterm);
+    deliver_group_sigterm(group)
+}
+
+#[cfg(unix)]
+fn timeout_deliver_group_sigkill(group: OwnedProcessGroup) -> GroupSignalDelivery {
+    #[cfg(test)]
+    record_timeout_lifecycle_event(TimeoutLifecycleEvent::GroupSigkill);
     deliver_group_sigkill(group)
 }
 
@@ -804,12 +846,13 @@ fn capture_deliver_group_sigkill(group: OwnedProcessGroup) -> GroupSignalDeliver
 /// cleaned up.
 #[cfg(unix)]
 fn enforce_timeout(
-    mut child: Child,
+    child: Child,
     group: OwnedProcessGroup,
     policy: &ProcessTimeoutPolicy,
 ) -> Result<ProcessRunOutcome, ExecutionError> {
+    let leader = child.id();
     // Step 1 — graceful SIGTERM to the whole attempt-owned group.
-    match deliver_group_sigterm(group) {
+    match timeout_deliver_group_sigterm(group) {
         GroupSignalDelivery::Delivered => {}
         // Unreachable while this handle's unreaped child zombie still
         // belongs to the group; falling through is truthful anyway — the
@@ -822,31 +865,29 @@ fn enforce_timeout(
         }
     }
 
-    // Step 2 — bounded termination grace: complete only when BOTH the
-    // direct child has been reaped AND the attempt-owned group is empty.
+    // Step 2 — bounded termination grace. `waitid(..., WNOWAIT)` observes
+    // direct-child exit without reaping the process-group leader; live
+    // membership is inspected separately so the leader zombie does not
+    // manufacture a force kill. The unreaped leader remains the ownership
+    // anchor until every potentially required group signal is finished.
     let grace_deadline = checked_deadline(
         Instant::now(),
         policy.termination_grace(),
         "termination_grace",
     )?;
-    let mut reaped_status: Option<ExitStatus> = None;
     loop {
-        if reaped_status.is_none() {
-            match child.try_wait() {
-                Ok(Some(status)) => reaped_status = Some(status),
-                Ok(None) => {}
-                Err(error) => return Err(grace_wait_failed_with_cleanup(child, group, error)),
+        match observe_leader_without_reaping(leader) {
+            Ok(LeaderState::Exited)
+                if live_group_members_excluding_leader(group, leader) == GroupPresence::Empty =>
+            {
+                return finish_timeout_after_signaling(
+                    child,
+                    group,
+                    ProcessTermination::TimedOutGracefullyTerminated,
+                );
             }
-        }
-        if let Some(status) = reaped_status
-            && group_presence(group) == GroupPresence::Empty
-        {
-            // Every attempt-owned member terminated during the
-            // graceful interval; nothing required forcing.
-            return Ok(timed_out_outcome(
-                ProcessTermination::TimedOutGracefullyTerminated,
-                status,
-            ));
+            Ok(_) => {}
+            Err(error) => return Err(grace_wait_failed_with_cleanup(child, group, error)),
         }
         let Some(remaining) = grace_deadline.checked_duration_since(Instant::now()) else {
             break;
@@ -857,71 +898,60 @@ fn enforce_timeout(
         std::thread::sleep(POLL_INTERVAL.min(remaining));
     }
 
-    // Step 3 — final cleanup-state observation before any force decision:
-    // never force when the whole attempt-owned group already terminated.
-    if reaped_status.is_none() {
-        match child.try_wait() {
-            Ok(Some(status)) => reaped_status = Some(status),
-            Ok(None) => {}
-            Err(error) => return Err(grace_wait_failed_with_cleanup(child, group, error)),
+    // Step 3 — one final non-reaping observation before deciding whether
+    // the still-owned group needs force.
+    match observe_leader_without_reaping(leader) {
+        Ok(LeaderState::Exited)
+            if live_group_members_excluding_leader(group, leader) == GroupPresence::Empty =>
+        {
+            return finish_timeout_after_signaling(
+                child,
+                group,
+                ProcessTermination::TimedOutGracefullyTerminated,
+            );
         }
-    }
-    if group_presence(group) == GroupPresence::Empty {
-        // The group emptied at the very end of grace. The direct child's
-        // zombie would keep the group occupied, so an unreaped handle here
-        // is contradictory; reap it and classify truthfully — no member
-        // ever required SIGKILL.
-        let status = match reaped_status {
-            Some(status) => status,
-            None => child.wait().map_err(final_wait_failed)?,
-        };
-        return Ok(timed_out_outcome(
-            ProcessTermination::TimedOutGracefullyTerminated,
-            status,
-        ));
+        Ok(_) => {}
+        Err(error) => return Err(grace_wait_failed_with_cleanup(child, group, error)),
     }
 
     // Step 4 — forced kill of the OWNED GROUP (never the caller's group):
     // some attempt-owned member survived graceful termination.
-    let forced_kill_delivered = match capture_deliver_group_sigkill(group) {
-        GroupSignalDelivery::Delivered => true,
+    let termination = match capture_deliver_group_sigkill(group) {
+        GroupSignalDelivery::Delivered => ProcessTermination::TimedOutForceKilled,
         // Every member vanished between observation and delivery; nothing
         // actually required the force step. Verification and reap below
         // still run before any outcome is produced.
-        GroupSignalDelivery::GroupAlreadyGone => false,
+        GroupSignalDelivery::GroupAlreadyGone => ProcessTermination::TimedOutGracefullyTerminated,
         GroupSignalDelivery::Failed { detail } => {
             return Err(force_kill_failed_with_cleanup(child, group, detail));
         }
     };
 
-    // Step 5 — reap the direct child first: its zombie membership would
-    // otherwise keep the owned group occupied for verification.
-    let status = child.wait().map_err(final_wait_failed)?;
+    finish_timeout_after_signaling(child, group, termination)
+}
 
-    // Step 6 — bounded verification that no attempt-owned descendant
-    // remains. Only after this proof may a timed-out outcome be returned.
+/// Reaps only after the state machine has irrevocably finished group
+/// signaling, then verifies emptiness without attempting stale-PGID repair.
+#[cfg(unix)]
+fn finish_timeout_after_signaling(
+    mut child: Child,
+    group: OwnedProcessGroup,
+    termination: ProcessTermination,
+) -> Result<ProcessRunOutcome, ExecutionError> {
+    let status = child.wait().map_err(final_wait_failed)?;
+    #[cfg(test)]
+    record_timeout_lifecycle_event(TimeoutLifecycleEvent::LeaderReaped);
     if !await_group_empty(group, GROUP_TEARDOWN_VERIFY_WINDOW) {
         return Err(ExecutionError::ForceKillFailed {
             detail: format!(
-                "the attempt-owned process group -{} kept surviving members beyond the bounded \
-                 teardown verification window after forced SIGKILL; the direct child was reaped, \
-                 but timeout ownership cannot be reported clean",
+                "the attempt-owned process group -{} still had members after the leader was reaped; ownership was released, so no further group signal was attempted",
                 group.raw()
             ),
         });
     }
-
-    // Step 7 — classification is group-aware: any member requiring the
-    // force step yields TimedOutForceKilled even when the direct child
-    // itself exited gracefully.
-    Ok(timed_out_outcome(
-        if forced_kill_delivered {
-            ProcessTermination::TimedOutForceKilled
-        } else {
-            ProcessTermination::TimedOutGracefullyTerminated
-        },
-        status,
-    ))
+    #[cfg(test)]
+    record_timeout_lifecycle_event(TimeoutLifecycleEvent::GroupEmptyVerified);
+    Ok(timed_out_outcome(termination, status))
 }
 
 /// Polls the zero-signal presence probe until the owned group is empty or
@@ -1029,7 +1059,7 @@ fn graceful_termination_failed_with_cleanup(
     delivery_detail: String,
 ) -> ExecutionError {
     let mut detail = delivery_detail;
-    match deliver_group_sigkill(group) {
+    match timeout_deliver_group_sigkill(group) {
         GroupSignalDelivery::Delivered => {
             detail.push_str(
                 "; best-effort cleanup: forced SIGKILL delivered to the attempt-owned process \
@@ -1081,7 +1111,7 @@ pub(crate) fn force_kill_failed_with_cleanup(
         "SIGKILL delivery to the attempt-owned process group -{} failed: {delivery_detail}",
         group.raw()
     );
-    match deliver_group_sigkill(group) {
+    match timeout_deliver_group_sigkill(group) {
         GroupSignalDelivery::Delivered => {
             detail.push_str("; best-effort cleanup: retry SIGKILL reached the owned group");
         }
@@ -1137,7 +1167,7 @@ pub(crate) fn grace_wait_failed_with_cleanup(
     observe_error: std::io::Error,
 ) -> ExecutionError {
     let mut detail = format!("grace-window observation failed: {observe_error}");
-    match deliver_group_sigkill(group) {
+    match timeout_deliver_group_sigkill(group) {
         GroupSignalDelivery::Delivered => {
             detail.push_str(
                 "; best-effort cleanup: forced SIGKILL delivered to the attempt-owned process \

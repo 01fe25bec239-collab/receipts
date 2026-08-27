@@ -24,8 +24,9 @@ use std::time::{Duration, Instant};
 use super::capture::{BoundedStreamRetention, CaptureFault, drain_to_eof};
 use super::runner::{
     CAPTURE_TEST_FAIL_FORCE_KILL, CAPTURE_TEST_FAIL_STDOUT_READ, CAPTURE_TEST_FAIL_WAIT,
-    bounded_reader_completion_failure_for_test, capture_fault_failed, frozen_retention,
-    inject_capture_test_faults, retention_allocation_failed,
+    TimeoutLifecycleEvent, bounded_reader_completion_failure_for_test, capture_fault_failed,
+    frozen_retention, inject_capture_test_faults, retention_allocation_failed,
+    take_timeout_lifecycle_events,
 };
 use crate::execution::unix_signal::{caller_process_group, process_alive, recorded_group_is_empty};
 use crate::execution::{
@@ -949,6 +950,7 @@ fn c17_sigterm_ignoring_descendant_inheriting_the_captured_pipes_is_force_killed
 
 #[test]
 fn direct_child_completion_with_cooperative_pipe_holder_is_a_truthful_timeout() {
+    let _ = take_timeout_lifecycle_events();
     let (workspace, captured) = run_descendant_capture(
         "repair-cooperative-pipe-holder",
         "execution_capture_probe_exiting_parent_of_graceful_pipe_holder",
@@ -959,6 +961,7 @@ fn direct_child_completion_with_cooperative_pipe_holder_is_a_truthful_timeout() 
     );
     assert!(captured.outcome().timed_out());
     assert!(!captured.outcome().forced_kill_required());
+    assert_timeout_lifecycle_order(take_timeout_lifecycle_events(), false);
     await_group_empty(
         recorded_value(workspace.path(), "attempt-pgid"),
         "repair cooperative pipe holder",
@@ -967,6 +970,7 @@ fn direct_child_completion_with_cooperative_pipe_holder_is_a_truthful_timeout() 
 
 #[test]
 fn direct_child_completion_with_ignoring_pipe_holder_requires_force_kill() {
+    let _ = take_timeout_lifecycle_events();
     let (workspace, captured) = run_descendant_capture(
         "repair-ignoring-pipe-holder",
         "execution_capture_probe_exiting_parent_of_ignoring_pipe_holder",
@@ -977,9 +981,46 @@ fn direct_child_completion_with_ignoring_pipe_holder_requires_force_kill() {
     );
     assert!(captured.outcome().timed_out());
     assert!(captured.outcome().forced_kill_required());
+    assert_timeout_lifecycle_order(take_timeout_lifecycle_events(), true);
     await_group_empty(
         recorded_value(workspace.path(), "attempt-pgid"),
         "repair ignoring pipe holder",
+    );
+}
+
+fn assert_timeout_lifecycle_order(events: Vec<TimeoutLifecycleEvent>, forced: bool) {
+    let reap = events
+        .iter()
+        .position(|event| *event == TimeoutLifecycleEvent::LeaderReaped)
+        .expect("timeout lifecycle must record leader reap");
+    let sigterm = events
+        .iter()
+        .position(|event| *event == TimeoutLifecycleEvent::GroupSigterm)
+        .expect("timeout lifecycle must record group SIGTERM");
+    assert!(
+        sigterm < reap,
+        "SIGTERM must precede leader reap: {events:?}"
+    );
+    for (index, event) in events.iter().enumerate() {
+        if matches!(
+            event,
+            TimeoutLifecycleEvent::GroupSigterm | TimeoutLifecycleEvent::GroupSigkill
+        ) {
+            assert!(
+                index < reap,
+                "no group signal may follow leader reap: {events:?}"
+            );
+        }
+    }
+    assert_eq!(
+        events.contains(&TimeoutLifecycleEvent::GroupSigkill),
+        forced,
+        "force classification and signal ordering must agree: {events:?}"
+    );
+    assert_eq!(
+        events.last(),
+        Some(&TimeoutLifecycleEvent::GroupEmptyVerified),
+        "group emptiness must be verified after reap: {events:?}"
     );
 }
 
