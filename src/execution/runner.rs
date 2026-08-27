@@ -81,9 +81,9 @@ use std::process::{Command, Stdio};
 // shared by every target so its fail-closed contract stays inspectable.
 use std::time::{Duration, Instant};
 
-use crate::execution::capture::{BoundedStreamRetention, CaptureFault, drain_to_eof};
+use crate::execution::capture::{BoundedStreamRetention, CaptureFault};
 #[cfg(unix)]
-use crate::execution::capture::{CapturedProcessRun, CapturedStream};
+use crate::execution::capture::{CapturedProcessRun, CapturedStream, drain_to_eof};
 use crate::execution::error::ExecutionError;
 use crate::execution::outcome::ProcessRunOutcome;
 #[cfg(unix)]
@@ -117,6 +117,41 @@ const GROUP_TEARDOWN_VERIFY_WINDOW: Duration = Duration::from_secs(5);
 /// typed-failure cleanup paths.
 #[cfg(unix)]
 const CLEANUP_REAP_WINDOW: Duration = Duration::from_secs(2);
+
+/// Bounded post-cleanup proof that capture readers reached EOF. Group
+/// teardown closes every attempt-owned writer, so this is verification, not
+/// a second user-visible run timeout.
+#[cfg(unix)]
+const CAPTURE_READER_VERIFY_WINDOW: Duration = Duration::from_secs(2);
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static CAPTURE_TEST_FAULTS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, unix))]
+pub(crate) const CAPTURE_TEST_FAIL_FORCE_KILL: u8 = 1;
+#[cfg(all(test, unix))]
+pub(crate) const CAPTURE_TEST_FAIL_WAIT: u8 = 2;
+#[cfg(all(test, unix))]
+pub(crate) const CAPTURE_TEST_FAIL_STDOUT_READ: u8 = 4;
+
+/// Thread-local fault injection keeps parallel tests isolated and never
+/// changes the public API or production process-control path.
+#[cfg(all(test, unix))]
+pub(crate) struct CaptureTestFaultGuard(u8);
+
+#[cfg(all(test, unix))]
+impl Drop for CaptureTestFaultGuard {
+    fn drop(&mut self) {
+        CAPTURE_TEST_FAULTS.set(self.0);
+    }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn inject_capture_test_faults(faults: u8) -> CaptureTestFaultGuard {
+    CaptureTestFaultGuard(CAPTURE_TEST_FAULTS.replace(faults))
+}
 
 /// Runs one validated process request to completion and returns its exit
 /// metadata.
@@ -270,10 +305,13 @@ const STDERR: &str = "stderr";
 /// 6. take both pipe handles immediately and start one dedicated reader
 ///    thread per stream, so the two pipes drain **concurrently** and
 ///    neither can block the child by filling while the other is read;
-/// 7. monitor the timeout lifecycle exactly as [`run_with_timeout`] does;
-/// 8. only after the attempt-owned process group has been cleaned up —
-///    which closes every descendant's pipe writer — join the readers;
-/// 9. assemble the typed capture result.
+/// 7. preserve the unreaped direct child while waiting for both readers to
+///    reach EOF under the original run deadline;
+/// 8. after both readers finish, observe the child under that same deadline;
+/// 9. if either condition misses the deadline, run the accepted owned-group
+///    timeout lifecycle, then verify reader completion within a private
+///    bounded cleanup window;
+/// 10. assemble the typed capture result.
 ///
 /// Each reader keeps consuming past the retention limit through EOF: the
 /// limit bounds retained memory, never bytes taken from the pipe. Bytes a
@@ -323,31 +361,37 @@ pub fn run_with_timeout_and_capture(
 
     // Both pipe handles are taken promptly, before any waiting happens.
     let Some(child_stdout) = child.stdout.take() else {
-        return Err(capture_setup_failed(child, group, |detail| {
+        return Err(capture_failure_after_spawn(
+            child,
+            group,
             ExecutionError::CaptureStreamUnavailable {
                 stream: STDOUT,
-                detail,
-            }
-        }));
+                detail: "the spawned child exposed no stdout pipe".to_string(),
+            },
+        ));
     };
     let Some(child_stderr) = child.stderr.take() else {
-        return Err(capture_setup_failed(child, group, |detail| {
+        return Err(capture_failure_after_spawn(
+            child,
+            group,
             ExecutionError::CaptureStreamUnavailable {
                 stream: STDERR,
-                detail,
-            }
-        }));
+                detail: "the spawned child exposed no stderr pipe".to_string(),
+            },
+        ));
     };
 
     let stdout_reader = match spawn_reader(STDOUT, child_stdout, stdout_retention) {
         Ok(handle) => handle,
         Err(error) => {
-            return Err(capture_setup_failed(child, group, |detail| {
+            return Err(capture_failure_after_spawn(
+                child,
+                group,
                 ExecutionError::CaptureReaderStartFailed {
                     stream: STDOUT,
-                    detail: format!("{error}; {detail}"),
-                }
-            }));
+                    detail: error.to_string(),
+                },
+            ));
         }
     };
     let stderr_reader = match spawn_reader(STDERR, child_stderr, stderr_retention) {
@@ -357,34 +401,80 @@ pub fn run_with_timeout_and_capture(
             // closes its writers, so it ends on its own and is detached
             // rather than joined while the primary failure is reported.
             drop(stdout_reader);
-            return Err(capture_setup_failed(child, group, |detail| {
+            return Err(capture_failure_after_spawn(
+                child,
+                group,
                 ExecutionError::CaptureReaderStartFailed {
                     stream: STDERR,
-                    detail: format!("{error}; {detail}"),
+                    detail: error.to_string(),
+                },
+            ));
+        }
+    };
+
+    let mut stdout_reader = Some(stdout_reader);
+    let mut stderr_reader = Some(stderr_reader);
+    let mut stdout = None;
+    let mut stderr = None;
+
+    // Reader EOF is part of captured-run completion. Do not call try_wait
+    // here: it reaps an exited leader and would leave only a stale numeric
+    // PGID if an inherited writer kept either reader pending.
+    loop {
+        if stdout.is_none() {
+            match take_finished_reader(STDOUT, &mut stdout_reader) {
+                Ok(captured) => stdout = captured,
+                Err(error) => {
+                    return Err(capture_failure_after_spawn(child, group, error));
                 }
-            }));
+            }
         }
+        if stderr.is_none() {
+            match take_finished_reader(STDERR, &mut stderr_reader) {
+                Ok(captured) => stderr = captured,
+                Err(error) => {
+                    return Err(capture_failure_after_spawn(child, group, error));
+                }
+            }
+        }
+        if stdout.is_some() && stderr.is_some() {
+            break;
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            let outcome = enforce_timeout(child, group, policy)?;
+            let (stdout, stderr) = finish_readers_bounded(
+                stdout_reader,
+                stderr_reader,
+                stdout,
+                stderr,
+                CAPTURE_READER_VERIFY_WINDOW,
+            )?;
+            return Ok(CapturedProcessRun::new(outcome, stdout, stderr));
+        };
+        if remaining.is_zero() {
+            let outcome = enforce_timeout(child, group, policy)?;
+            let (stdout, stderr) = finish_readers_bounded(
+                stdout_reader,
+                stderr_reader,
+                stdout,
+                stderr,
+                CAPTURE_READER_VERIFY_WINDOW,
+            )?;
+            return Ok(CapturedProcessRun::new(outcome, stdout, stderr));
+        }
+        std::thread::sleep(POLL_INTERVAL.min(remaining));
+    }
+
+    // EOF alone is not child completion: a child may close both streams and
+    // continue running. Observe it only now, under the original deadline.
+    let outcome = match await_captured_child_until(&mut child, deadline) {
+        Ok(Awaited::Exited(status)) => ProcessRunOutcome::new(status.success(), status.code()),
+        Ok(Awaited::DeadlineReached) => enforce_timeout(child, group, policy)?,
+        Err(error) => return Err(capture_failure_after_spawn(child, group, error)),
     };
 
-    let outcome = match await_child_until(&mut child, deadline)? {
-        Awaited::Exited(status) => {
-            // The direct child is gone, but an inherited descendant may
-            // still hold a pipe writer open. Waiting for EOF is therefore
-            // bounded by the same run deadline; past it the attempt-owned
-            // group is force-closed so joining can never hang.
-            await_readers_or_close_group(&stdout_reader, &stderr_reader, group, deadline);
-            ProcessRunOutcome::new(status.success(), status.code())
-        }
-        // Group cleanup happens first on purpose: it closes every
-        // descendant's pipe writer, so the readers below cannot be blocked
-        // on a pipe that nobody will ever close. A control failure here is
-        // the primary failure and is returned without joining — the
-        // detached readers end when their pipes close.
-        Awaited::DeadlineReached => enforce_timeout(child, group, policy)?,
-    };
-
-    let stdout = join_reader(STDOUT, stdout_reader)?;
-    let stderr = join_reader(STDERR, stderr_reader)?;
+    let stdout = stdout.expect("both captures were proven complete");
+    let stderr = stderr.expect("both captures were proven complete");
 
     Ok(CapturedProcessRun::new(outcome, stdout, stderr))
 }
@@ -457,6 +547,17 @@ fn spawn_reader(
     source: impl std::io::Read + Send + 'static,
     mut retention: BoundedStreamRetention,
 ) -> std::io::Result<ReaderHandle> {
+    #[cfg(test)]
+    if stream == STDOUT && take_capture_test_fault(CAPTURE_TEST_FAIL_STDOUT_READ) {
+        return std::thread::Builder::new()
+            .name(format!("receipts-capture-{stream}"))
+            .spawn(move || {
+                drop((source, retention));
+                Err(CaptureFault::Read(std::io::Error::other(
+                    "injected stdout capture read failure",
+                )))
+            });
+    }
     std::thread::Builder::new()
         .name(format!("receipts-capture-{stream}"))
         .spawn(move || drain_to_eof(source, &mut retention).map(|()| retention))
@@ -493,70 +594,129 @@ fn reader_panic_detail(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-/// Waits, bounded by the run deadline, for both readers to reach EOF after
-/// the direct child has already exited.
-///
-/// A descendant that inherited the pipes can keep a writer open after the
-/// direct child is gone; joining unconditionally would then block forever.
-/// At the deadline the attempt-owned group is force-closed, which shuts
-/// every remaining writer and makes the subsequent join bounded.
+/// Takes and joins a reader only after `is_finished` proves joining cannot
+/// block. `None` means the reader is still draining.
 #[cfg(unix)]
-fn await_readers_or_close_group(
-    stdout_reader: &ReaderHandle,
-    stderr_reader: &ReaderHandle,
-    group: OwnedProcessGroup,
-    deadline: Instant,
-) {
+fn take_finished_reader(
+    stream: &'static str,
+    handle: &mut Option<ReaderHandle>,
+) -> Result<Option<CapturedStream>, ExecutionError> {
+    if !handle.as_ref().is_some_and(ReaderHandle::is_finished) {
+        return Ok(None);
+    }
+    join_reader(stream, handle.take().expect("finished reader is present")).map(Some)
+}
+
+/// After successful group cleanup, proves both readers reached EOF within a
+/// private bounded verification window and joins only proven-finished
+/// handles. No path can block indefinitely on `JoinHandle::join`.
+#[cfg(unix)]
+fn finish_readers_bounded(
+    mut stdout_reader: Option<ReaderHandle>,
+    mut stderr_reader: Option<ReaderHandle>,
+    mut stdout: Option<CapturedStream>,
+    mut stderr: Option<CapturedStream>,
+    window: Duration,
+) -> Result<(CapturedStream, CapturedStream), ExecutionError> {
+    let deadline = checked_deadline(Instant::now(), window, "capture reader verification")?;
     loop {
-        if stdout_reader.is_finished() && stderr_reader.is_finished() {
-            return;
+        if stdout.is_none() {
+            stdout = take_finished_reader(STDOUT, &mut stdout_reader)?;
+        }
+        if stderr.is_none() {
+            stderr = take_finished_reader(STDERR, &mut stderr_reader)?;
+        }
+        if stdout.is_some() && stderr.is_some() {
+            return Ok((
+                stdout.take().expect("stdout capture is complete"),
+                stderr.take().expect("stderr capture is complete"),
+            ));
         }
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            break;
+            return Err(reader_completion_timed_out(
+                if stdout.is_none() { STDOUT } else { STDERR },
+                window,
+            ));
         };
         if remaining.is_zero() {
-            break;
+            return Err(reader_completion_timed_out(
+                if stdout.is_none() { STDOUT } else { STDERR },
+                window,
+            ));
         }
         std::thread::sleep(POLL_INTERVAL.min(remaining));
     }
-    // Force-close only: the direct child was already reaped before this
-    // point, so no timeout classification is being revised here — the
-    // owned group is closed purely so the readers can reach EOF.
-    let _ = deliver_group_sigkill(group);
 }
 
-/// Fail-closed cleanup for a capture-infrastructure failure discovered
-/// after the child was already spawned.
-///
-/// The capture failure stays primary — it is the actual first failure —
-/// while the live attempt is never abandoned: the attempt-owned group is
-/// force-killed and the direct child reaped within strictly bounded
-/// windows, and that evidence is appended to the reported detail.
 #[cfg(unix)]
-fn capture_setup_failed(
-    mut child: Child,
+fn reader_completion_timed_out(stream: &'static str, window: Duration) -> ExecutionError {
+    ExecutionError::CaptureReaderFailed {
+        stream,
+        detail: format!(
+            "the reader did not reach EOF within the bounded {window:?} post-cleanup verification window"
+        ),
+    }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn bounded_reader_completion_failure_for_test(window: Duration) -> ExecutionError {
+    let stdout_retention = frozen_retention(STDOUT).expect("test stdout retention");
+    let stderr_retention = frozen_retention(STDERR).expect("test stderr retention");
+    let (release, blocked) = std::sync::mpsc::sync_channel::<()>(0);
+    let stdout_reader = std::thread::spawn(move || {
+        let _ = blocked.recv();
+        Ok(stdout_retention)
+    });
+    let stderr_reader = std::thread::spawn(move || Ok(stderr_retention));
+    let error =
+        finish_readers_bounded(Some(stdout_reader), Some(stderr_reader), None, None, window)
+            .expect_err("blocked reader must exceed verification window");
+    drop(release);
+    error
+}
+
+/// Central failure precedence for every post-spawn capture/setup/observation
+/// error: process containment failure wins; otherwise the original capture
+/// error is returned unchanged.
+#[cfg(unix)]
+fn capture_failure_after_spawn(
+    child: Child,
     group: OwnedProcessGroup,
-    build: impl FnOnce(String) -> ExecutionError,
+    primary: ExecutionError,
 ) -> ExecutionError {
-    let mut detail = String::from("best-effort cleanup of the live attempt");
-    match deliver_group_sigkill(group) {
-        GroupSignalDelivery::Delivered => {
-            detail.push_str(": forced SIGKILL delivered to the attempt-owned process group");
-        }
-        GroupSignalDelivery::GroupAlreadyGone => {
-            detail.push_str(": the attempt-owned process group was already empty");
-        }
-        GroupSignalDelivery::Failed { detail: failed } => {
-            detail.push_str(&format!(": group SIGKILL also failed: {failed}"));
+    match cleanup_owned_attempt(child, group) {
+        Ok(()) => primary,
+        Err(control_error) => control_error,
+    }
+}
+
+/// Bounded, fail-closed cleanup for one still-owned captured attempt.
+#[cfg(unix)]
+fn cleanup_owned_attempt(mut child: Child, group: OwnedProcessGroup) -> Result<(), ExecutionError> {
+    match capture_deliver_group_sigkill(group) {
+        GroupSignalDelivery::Delivered | GroupSignalDelivery::GroupAlreadyGone => {}
+        GroupSignalDelivery::Failed { detail } => {
+            return Err(force_kill_failed_with_cleanup(child, group, detail));
         }
     }
     match bounded_child_reap(&mut child) {
-        Ok(Some(_)) => detail.push_str("; the direct child was reaped"),
-        Ok(None) => detail
-            .push_str("; the direct child remained unreaped within the bounded cleanup window"),
-        Err(reap_error) => detail.push_str(&format!("; cleanup reap also failed: {reap_error}")),
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Err(ExecutionError::TimeoutFinalWaitFailed {
+                detail: "the direct child remained unreaped beyond the bounded capture-failure cleanup window".to_string(),
+            });
+        }
+        Err(error) => return Err(final_wait_failed(error)),
     }
-    build(detail)
+    if !await_group_empty(group, GROUP_TEARDOWN_VERIFY_WINDOW) {
+        return Err(ExecutionError::ForceKillFailed {
+            detail: format!(
+                "the attempt-owned process group -{} was not proven empty after bounded capture-failure cleanup",
+                group.raw()
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Internal result of monitoring a child up to a monotonic deadline.
@@ -595,6 +755,46 @@ fn await_child_until(child: &mut Child, deadline: Instant) -> Result<Awaited, Ex
         return Ok(Awaited::Exited(status));
     }
     Ok(Awaited::DeadlineReached)
+}
+
+/// Captured-path observation boundary with private deterministic fault
+/// injection. Production delegates directly to the shared timed waiter.
+#[cfg(unix)]
+fn await_captured_child_until(
+    child: &mut Child,
+    deadline: Instant,
+) -> Result<Awaited, ExecutionError> {
+    #[cfg(test)]
+    if take_capture_test_fault(CAPTURE_TEST_FAIL_WAIT) {
+        return Err(wait_failed(std::io::Error::other(
+            "injected captured child observation failure",
+        )));
+    }
+    await_child_until(child, deadline)
+}
+
+#[cfg(all(test, unix))]
+fn take_capture_test_fault(fault: u8) -> bool {
+    CAPTURE_TEST_FAULTS.with(|faults| {
+        let current = faults.get();
+        if current & fault == 0 {
+            false
+        } else {
+            faults.set(current & !fault);
+            true
+        }
+    })
+}
+
+#[cfg(unix)]
+fn capture_deliver_group_sigkill(group: OwnedProcessGroup) -> GroupSignalDelivery {
+    #[cfg(test)]
+    if take_capture_test_fault(CAPTURE_TEST_FAIL_FORCE_KILL) {
+        return GroupSignalDelivery::Failed {
+            detail: "injected forced SIGKILL delivery failure".to_string(),
+        };
+    }
+    deliver_group_sigkill(group)
 }
 
 /// Implements the frozen terminate → bounded grace → force-kill → verify →
@@ -683,7 +883,7 @@ fn enforce_timeout(
 
     // Step 4 — forced kill of the OWNED GROUP (never the caller's group):
     // some attempt-owned member survived graceful termination.
-    let forced_kill_delivered = match deliver_group_sigkill(group) {
+    let forced_kill_delivered = match capture_deliver_group_sigkill(group) {
         GroupSignalDelivery::Delivered => true,
         // Every member vanished between observation and delivery; nothing
         // actually required the force step. Verification and reap below

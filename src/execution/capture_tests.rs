@@ -22,7 +22,11 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use super::capture::{BoundedStreamRetention, CaptureFault, drain_to_eof};
-use super::runner::{capture_fault_failed, frozen_retention, retention_allocation_failed};
+use super::runner::{
+    CAPTURE_TEST_FAIL_FORCE_KILL, CAPTURE_TEST_FAIL_STDOUT_READ, CAPTURE_TEST_FAIL_WAIT,
+    bounded_reader_completion_failure_for_test, capture_fault_failed, frozen_retention,
+    inject_capture_test_faults, retention_allocation_failed,
+};
 use crate::execution::unix_signal::{caller_process_group, process_alive, recorded_group_is_empty};
 use crate::execution::{
     CapturedProcessRun, CapturedStream, ExecutionError, ProcessRunRequest, ProcessTermination,
@@ -516,6 +520,52 @@ fn execution_capture_probe_parent_of_sigterm_ignoring_emitting_descendant() {
     emitting_parent_body();
 }
 
+/// Direct child exits successfully after starting a cooperative descendant
+/// that keeps both captured writers open.
+#[test]
+#[ignore]
+fn execution_capture_probe_exiting_parent_of_graceful_pipe_holder() {
+    exiting_parent_body("execution_capture_probe_descendant_emitting_then_sleep_long");
+}
+
+/// Direct child exits successfully after starting a SIGTERM-ignoring
+/// descendant that keeps both captured writers open.
+#[test]
+#[ignore]
+fn execution_capture_probe_exiting_parent_of_ignoring_pipe_holder() {
+    exiting_parent_body(
+        "execution_capture_probe_descendant_ignores_sigterm_emitting_then_sleep_long",
+    );
+}
+
+fn exiting_parent_body(descendant_probe: &str) -> ! {
+    spawn_and_await_emitting_descendant(descendant_probe);
+    let cwd = std::env::current_dir().expect("probe working directory");
+    fs::write(cwd.join("attempt-pid"), std::process::id().to_string()).expect("attempt pid marker");
+    fs::write(cwd.join("attempt-pgid"), caller_process_group().to_string())
+        .expect("attempt pgid marker");
+    std::process::exit(0)
+}
+
+/// Closes both capture descriptors while remaining alive, proving reader EOF
+/// alone does not complete a captured run.
+#[test]
+#[ignore]
+fn execution_capture_probe_close_streams_then_sleep() {
+    let cwd = std::env::current_dir().expect("probe working directory");
+    fs::write(cwd.join("attempt-pid"), std::process::id().to_string()).expect("attempt pid marker");
+    fs::write(cwd.join("attempt-pgid"), caller_process_group().to_string())
+        .expect("attempt pgid marker");
+    unsafe {
+        unsafe extern "C" {
+            fn close(fd: std::os::raw::c_int) -> std::os::raw::c_int;
+        }
+        let _ = close(1);
+        let _ = close(2);
+    }
+    std::thread::sleep(PROBE_SLEEP);
+}
+
 fn emitting_parent_body() {
     let cwd = std::env::current_dir().expect("probe working directory");
     fs::write(cwd.join("attempt-pid"), std::process::id().to_string()).expect("attempt pid marker");
@@ -893,6 +943,138 @@ fn c17_sigterm_ignoring_descendant_inheriting_the_captured_pipes_is_force_killed
         "C17: a SIGTERM-ignoring member forces the owned group kill"
     );
     assert!(captured.outcome().forced_kill_required());
+}
+
+// --- Repair regressions: complete capture is part of completion ---------
+
+#[test]
+fn direct_child_completion_with_cooperative_pipe_holder_is_a_truthful_timeout() {
+    let (workspace, captured) = run_descendant_capture(
+        "repair-cooperative-pipe-holder",
+        "execution_capture_probe_exiting_parent_of_graceful_pipe_holder",
+    );
+    assert_eq!(
+        captured.outcome().termination(),
+        ProcessTermination::TimedOutGracefullyTerminated
+    );
+    assert!(captured.outcome().timed_out());
+    assert!(!captured.outcome().forced_kill_required());
+    await_group_empty(
+        recorded_value(workspace.path(), "attempt-pgid"),
+        "repair cooperative pipe holder",
+    );
+}
+
+#[test]
+fn direct_child_completion_with_ignoring_pipe_holder_requires_force_kill() {
+    let (workspace, captured) = run_descendant_capture(
+        "repair-ignoring-pipe-holder",
+        "execution_capture_probe_exiting_parent_of_ignoring_pipe_holder",
+    );
+    assert_eq!(
+        captured.outcome().termination(),
+        ProcessTermination::TimedOutForceKilled
+    );
+    assert!(captured.outcome().timed_out());
+    assert!(captured.outcome().forced_kill_required());
+    await_group_empty(
+        recorded_value(workspace.path(), "attempt-pgid"),
+        "repair ignoring pipe holder",
+    );
+}
+
+#[test]
+fn injected_force_kill_failure_is_typed_and_never_joins_unfinished_readers() {
+    let workspace = TempDir::new("repair-force-failure");
+    let _fault = inject_capture_test_faults(CAPTURE_TEST_FAIL_FORCE_KILL);
+    let started = Instant::now();
+    let error = run_with_timeout_and_capture(
+        &request(
+            std::env::current_exe().expect("current test executable path"),
+            workspace.path(),
+            &[
+                "execution_capture_probe_exiting_parent_of_ignoring_pipe_holder",
+                "--ignored",
+            ],
+        ),
+        &policy(Duration::from_millis(200), Duration::from_millis(100)),
+    )
+    .expect_err("injected force delivery failure must fail closed");
+    assert!(matches!(error, ExecutionError::ForceKillFailed { .. }));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    await_process_death(
+        recorded_value(workspace.path(), "descendant-pid"),
+        "force-failure descendant",
+    );
+    await_group_empty(
+        recorded_value(workspace.path(), "attempt-pgid"),
+        "force-failure attempt",
+    );
+}
+
+#[test]
+fn post_spawn_wait_failure_cleans_the_owned_attempt_before_returning() {
+    let workspace = TempDir::new("repair-wait-failure");
+    let _fault = inject_capture_test_faults(CAPTURE_TEST_FAIL_WAIT);
+    let started = Instant::now();
+    let error = run_with_timeout_and_capture(
+        &request(
+            std::env::current_exe().expect("current test executable path"),
+            workspace.path(),
+            &[
+                "execution_capture_probe_close_streams_then_sleep",
+                "--ignored",
+            ],
+        ),
+        &policy(Duration::from_secs(5), Duration::from_secs(1)),
+    )
+    .expect_err("injected post-spawn observation failure must surface");
+    assert!(matches!(error, ExecutionError::ProcessWaitFailed { .. }));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    await_process_death(
+        recorded_value(workspace.path(), "attempt-pid"),
+        "wait-failure attempt",
+    );
+    await_group_empty(
+        recorded_value(workspace.path(), "attempt-pgid"),
+        "wait-failure attempt",
+    );
+}
+
+#[test]
+fn process_control_failure_wins_over_capture_failure() {
+    let workspace = TempDir::new("repair-precedence");
+    let _fault =
+        inject_capture_test_faults(CAPTURE_TEST_FAIL_STDOUT_READ | CAPTURE_TEST_FAIL_FORCE_KILL);
+    let started = Instant::now();
+    let error = run_with_timeout_and_capture(
+        &request(
+            std::env::current_exe().expect("current test executable path"),
+            workspace.path(),
+            &[
+                "execution_capture_probe_emit_then_keep_emitting",
+                "--ignored",
+            ],
+        ),
+        &policy(Duration::from_secs(5), Duration::from_secs(1)),
+    )
+    .expect_err("cleanup failure must supersede the injected capture failure");
+    assert!(matches!(error, ExecutionError::ForceKillFailed { .. }));
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[test]
+fn reader_completion_verification_is_strictly_bounded() {
+    let started = Instant::now();
+    let error = bounded_reader_completion_failure_for_test(Duration::from_millis(50));
+    assert!(matches!(
+        error,
+        ExecutionError::CaptureReaderFailed {
+            stream: "stdout",
+            ..
+        }
+    ));
+    assert!(started.elapsed() < Duration::from_secs(1));
 }
 
 // --- The uncaptured APIs keep their accepted behavior --------------------
