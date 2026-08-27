@@ -176,6 +176,59 @@ pub enum ExecutionError {
         /// evidence.
         detail: String,
     },
+    /// Bounded output retention could not be established, so the frozen
+    /// capture bound could not be honored. Raised before any child is
+    /// spawned: capture buffers are allocated fallibly up front precisely
+    /// so this failure never leaves a live attempt behind.
+    CaptureRetentionAllocationFailed {
+        /// Which retention buffer could not be reserved and why.
+        detail: String,
+    },
+    /// A captured child was spawned but the expected pipe for one stream
+    /// was not present, so that stream could never be drained to EOF.
+    ///
+    /// Fails closed rather than reporting a complete `total_bytes` for a
+    /// stream that was never read.
+    CaptureStreamUnavailable {
+        /// `"stdout"` or `"stderr"` — never collapsed into one opaque
+        /// stream identity, so the failing pipe stays diagnosable.
+        stream: &'static str,
+        /// Best-effort cleanup evidence for the just-spawned attempt.
+        detail: String,
+    },
+    /// The dedicated reader for one stream could not be started, so
+    /// concurrent draining of both pipes could not be guaranteed.
+    CaptureReaderStartFailed {
+        /// `"stdout"` or `"stderr"`.
+        stream: &'static str,
+        /// Underlying thread-start failure plus cleanup evidence.
+        detail: String,
+    },
+    /// Reading one stream's pipe failed before EOF was reached.
+    CaptureReadFailed {
+        /// `"stdout"` or `"stderr"`.
+        stream: &'static str,
+        /// Underlying read failure detail.
+        detail: String,
+    },
+    /// One stream's dedicated reader ended abnormally (panic or an
+    /// unobservable join result), so no verified drained state exists.
+    CaptureReaderFailed {
+        /// `"stdout"` or `"stderr"`.
+        stream: &'static str,
+        /// What was observed at the join boundary.
+        detail: String,
+    },
+    /// Counting the bytes drained from one stream would overflow `u64`.
+    ///
+    /// Refused outright: a wrapped or saturated total would silently
+    /// misreport how much the child actually produced.
+    CaptureTotalByteOverflow {
+        /// `"stdout"` or `"stderr"`.
+        stream: &'static str,
+        /// The counted total and the chunk that could not be added.
+        detail: String,
+    },
 }
 
 impl fmt::Display for ExecutionError {
@@ -276,6 +329,34 @@ impl fmt::Display for ExecutionError {
                 f,
                 "the spawned attempt could not be given a dedicated, safely signalable process \
                  group owned by this invocation: {detail}"
+            ),
+            ExecutionError::CaptureRetentionAllocationFailed { detail } => write!(
+                f,
+                "bounded output retention could not be allocated, so the frozen capture bound \
+                 could not be honored: {detail}"
+            ),
+            ExecutionError::CaptureStreamUnavailable { stream, detail } => write!(
+                f,
+                "the captured child exposed no {stream} pipe, so {stream} could not be drained to \
+                 EOF: {detail}"
+            ),
+            ExecutionError::CaptureReaderStartFailed { stream, detail } => write!(
+                f,
+                "the dedicated {stream} reader could not be started, so both pipes could not be \
+                 drained concurrently: {detail}"
+            ),
+            ExecutionError::CaptureReadFailed { stream, detail } => {
+                write!(f, "reading the child's {stream} pipe failed: {detail}")
+            }
+            ExecutionError::CaptureReaderFailed { stream, detail } => write!(
+                f,
+                "the dedicated {stream} reader ended abnormally, so no verified drained state \
+                 exists: {detail}"
+            ),
+            ExecutionError::CaptureTotalByteOverflow { stream, detail } => write!(
+                f,
+                "counting the bytes drained from {stream} would overflow; refusing to report a \
+                 wrapped or saturated total: {detail}"
             ),
         }
     }
