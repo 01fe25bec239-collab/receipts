@@ -52,10 +52,28 @@ mod tests {
         (FailureClass::Unknown, "UNKNOWN"),
     ];
 
+    fn assert_failure_class_exhaustive(value: FailureClass) {
+        match value {
+            FailureClass::RateLimited
+            | FailureClass::SessionExhausted
+            | FailureClass::AuthRequired
+            | FailureClass::ProviderDown
+            | FailureClass::Timeout
+            | FailureClass::SandboxDenied
+            | FailureClass::SafetyCheckPending
+            | FailureClass::PolicyBlocked
+            | FailureClass::RuntimeCrash
+            | FailureClass::InvalidOutput
+            | FailureClass::UserCancelled
+            | FailureClass::Unknown => {}
+        }
+    }
+
     #[test]
     fn frozen_vocabulary_and_canonical_strings_are_exact() {
         assert_eq!(FROZEN.len(), 12);
         for (value, canonical) in FROZEN {
+            assert_failure_class_exhaustive(value);
             assert_eq!(value.as_str(), canonical);
         }
     }
