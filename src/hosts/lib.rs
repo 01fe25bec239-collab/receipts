@@ -32,6 +32,7 @@ pub mod adapter;
 pub mod host_detection;
 pub mod host_id;
 pub mod normalized_host_event;
+pub mod normalized_host_event_source_class;
 
 #[cfg(test)]
 mod adapter_tests;
@@ -45,7 +46,11 @@ mod host_id_tests;
 #[cfg(test)]
 mod normalized_host_event_tests;
 
+#[cfg(test)]
+mod normalized_host_event_source_class_tests;
+
 pub use adapter::HostAdapter;
 pub use host_detection::{HostDetectionError, HostDetectionSignals, resolve_host};
 pub use host_id::HostId;
 pub use normalized_host_event::{NormalizedHostEventConfidence, NormalizedHostEventType};
+pub use normalized_host_event_source_class::NormalizedHostEventSourceClass;
