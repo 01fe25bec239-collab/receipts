@@ -997,14 +997,25 @@ fn assert_timeout_lifecycle_order(events: Vec<TimeoutLifecycleEvent>, forced: bo
         .iter()
         .position(|event| *event == TimeoutLifecycleEvent::GroupSigterm)
         .expect("timeout lifecycle must record group SIGTERM");
+    let sigstop = events
+        .iter()
+        .position(|event| *event == TimeoutLifecycleEvent::GroupSigstop)
+        .expect("timeout lifecycle must record group SIGSTOP");
+    let quiescent = events
+        .iter()
+        .position(|event| *event == TimeoutLifecycleEvent::GroupQuiescent)
+        .expect("timeout lifecycle must record group quiescence");
     assert!(
         sigterm < reap,
         "SIGTERM must precede leader reap: {events:?}"
     );
+    assert!(sigterm < sigstop && sigstop < quiescent && quiescent < reap);
     for (index, event) in events.iter().enumerate() {
         if matches!(
             event,
-            TimeoutLifecycleEvent::GroupSigterm | TimeoutLifecycleEvent::GroupSigkill
+            TimeoutLifecycleEvent::GroupSigterm
+                | TimeoutLifecycleEvent::GroupSigstop
+                | TimeoutLifecycleEvent::GroupSigkill
         ) {
             assert!(
                 index < reap,

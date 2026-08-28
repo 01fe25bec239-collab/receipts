@@ -1,4 +1,4 @@
-//! Narrow Unix attempt-owned process-group control (SIGTERM/SIGKILL only).
+//! Narrow Unix attempt-owned process-group control (SIGTERM/SIGSTOP/SIGKILL only).
 //!
 //! This is the smallest OS mechanism that satisfies the frozen
 //! terminate-then-bounded-kill contract including its no-orphan invariant:
@@ -29,9 +29,13 @@
 pub(crate) mod unix {
     use std::os::raw::{c_int, c_uint, c_void};
 
-    // POSIX fixes these values for every supported Unix target; they are
-    // not platform-variable.
+    // SIGTERM/SIGKILL are fixed here across supported targets; SIGSTOP uses
+    // the target values published by Darwin and Linux/Android headers.
     const SIGTERM: c_int = 15;
+    #[cfg(target_vendor = "apple")]
+    const SIGSTOP: c_int = 17;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const SIGSTOP: c_int = 19;
     const SIGKILL: c_int = 9;
     /// `ESRCH` — no such process: the target had already exited.
     const ESRCH: c_int = 3;
@@ -239,6 +243,22 @@ pub(crate) mod unix {
         signal_owned_group(group, SIGTERM, "graceful SIGTERM")
     }
 
+    /// Uncatchable `SIGSTOP` used only as the post-grace quiescence barrier.
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    pub(crate) fn deliver_group_sigstop(group: OwnedProcessGroup) -> GroupSignalDelivery {
+        signal_owned_group(group, SIGSTOP, "quiescence SIGSTOP")
+    }
+
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+    pub(crate) fn deliver_group_sigstop(group: OwnedProcessGroup) -> GroupSignalDelivery {
+        GroupSignalDelivery::Failed {
+            detail: format!(
+                "quiescence SIGSTOP is unavailable for owned process group -{} on this Unix target",
+                group.raw()
+            ),
+        }
+    }
+
     /// `SIGKILL` to the owned process group: the forced-termination step.
     pub(crate) fn deliver_group_sigkill(group: OwnedProcessGroup) -> GroupSignalDelivery {
         signal_owned_group(group, SIGKILL, "forced SIGKILL")
@@ -255,6 +275,16 @@ pub(crate) mod unix {
         Empty,
         /// Membership could not be determined. Callers must treat this as
         /// potentially occupied — cleanup proceeds, never assumes success.
+        Unknown { detail: String },
+    }
+
+    /// One process-table observation made after group `SIGSTOP` delivery.
+    /// PID sets are sorted so two confirmations can establish a fixed point.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum GroupQuiescence {
+        Empty,
+        AllStopped(Vec<u32>),
+        Mutable,
         Unknown { detail: String },
     }
 
@@ -304,15 +334,16 @@ pub(crate) mod unix {
         classify_group_presence(ret, errno, unsigned_pgid)
     }
 
-    /// Whether any live member other than an already-exited group leader
-    /// remains. This is used only while that unreaped leader still anchors
-    /// ownership; [`group_presence`] remains the final post-reap proof.
+    /// Observes live/stopped membership while the unreaped leader still
+    /// anchors ownership. The leader may be excluded after its exit has
+    /// already been established non-reapingly.
     #[cfg(target_vendor = "apple")]
-    pub(crate) fn live_group_members_excluding_leader(
+    pub(crate) fn group_quiescence(
         group: OwnedProcessGroup,
-        leader: u32,
-    ) -> GroupPresence {
+        excluded_leader: Option<u32>,
+    ) -> GroupQuiescence {
         const PROC_PIDT_SHORTBSDINFO: c_int = 13;
+        const SSTOP: u32 = 4;
         const SZOMB: u32 = 5;
 
         #[repr(C)]
@@ -342,7 +373,7 @@ pub(crate) mod unix {
             let count =
                 unsafe { proc_listpgrppids(group.raw(), pids.as_mut_ptr().cast(), byte_capacity) };
             if count < 0 {
-                return GroupPresence::Unknown {
+                return GroupQuiescence::Unknown {
                     detail: format!(
                         "live-member listing for owned process group -{} failed: {}",
                         group.raw(),
@@ -355,8 +386,9 @@ pub(crate) mod unix {
                 capacity = capacity.saturating_mul(2);
                 continue;
             }
+            let mut stopped = Vec::new();
             for pid in pids.into_iter().take(count) {
-                if pid <= 0 || u32::try_from(pid).ok() == Some(leader) {
+                if pid <= 0 || u32::try_from(pid).ok() == excluded_leader {
                     continue;
                 }
                 let mut info = ProcBsdShortInfo {
@@ -385,21 +417,37 @@ pub(crate) mod unix {
                         size,
                     )
                 };
+                let read_errno = if read != size {
+                    std::io::Error::last_os_error().raw_os_error()
+                } else {
+                    None
+                };
                 if read == size && info.status != SZOMB {
-                    return GroupPresence::HasMembers;
+                    if info.status != SSTOP {
+                        return GroupQuiescence::Mutable;
+                    }
+                    stopped.push(info.pid);
+                }
+                if read_errno == Some(ESRCH) {
+                    continue;
                 }
                 if read != size && unsafe { kill(pid, 0) } == 0 {
-                    return GroupPresence::Unknown {
+                    return GroupQuiescence::Unknown {
                         detail: format!(
-                            "process {pid} remained in owned group {} but its live state could not be inspected",
-                            group.raw()
+                            "process {pid} remained in owned group {} but its live state could not be inspected (errno {read_errno:?})",
+                            group.raw(),
                         ),
                     };
                 }
             }
-            return GroupPresence::Empty;
+            stopped.sort_unstable();
+            return if stopped.is_empty() {
+                GroupQuiescence::Empty
+            } else {
+                GroupQuiescence::AllStopped(stopped)
+            };
         }
-        GroupPresence::Unknown {
+        GroupQuiescence::Unknown {
             detail: format!(
                 "live-member listing for owned process group -{} did not fit a bounded snapshot",
                 group.raw()
@@ -408,21 +456,22 @@ pub(crate) mod unix {
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    pub(crate) fn live_group_members_excluding_leader(
+    pub(crate) fn group_quiescence(
         group: OwnedProcessGroup,
-        leader: u32,
-    ) -> GroupPresence {
+        excluded_leader: Option<u32>,
+    ) -> GroupQuiescence {
         let entries = match std::fs::read_dir("/proc") {
             Ok(entries) => entries,
             Err(error) => {
-                return GroupPresence::Unknown {
+                return GroupQuiescence::Unknown {
                     detail: format!("cannot inspect /proc for owned-group membership: {error}"),
                 };
             }
         };
+        let mut stopped = Vec::new();
         for entry in entries {
             let Ok(entry) = entry else {
-                return GroupPresence::Unknown {
+                return GroupQuiescence::Unknown {
                     detail: "cannot enumerate /proc for owned-group membership".to_string(),
                 };
             };
@@ -433,20 +482,20 @@ pub(crate) mod unix {
             else {
                 continue;
             };
-            if pid == leader {
+            if Some(pid) == excluded_leader {
                 continue;
             }
             let stat = match std::fs::read_to_string(entry.path().join("stat")) {
                 Ok(stat) => stat,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => {
-                    return GroupPresence::Unknown {
+                    return GroupQuiescence::Unknown {
                         detail: format!("cannot inspect /proc/{pid}/stat: {error}"),
                     };
                 }
             };
             let Some((_, fields)) = stat.rsplit_once(") ") else {
-                return GroupPresence::Unknown {
+                return GroupQuiescence::Unknown {
                     detail: format!("cannot parse /proc/{pid}/stat"),
                 };
             };
@@ -455,18 +504,26 @@ pub(crate) mod unix {
             let _ppid = fields.next();
             let pgrp = fields.next().and_then(|value| value.parse::<c_int>().ok());
             if pgrp == Some(group.raw()) && state != Some("Z") {
-                return GroupPresence::HasMembers;
+                if !matches!(state, Some("T" | "t")) {
+                    return GroupQuiescence::Mutable;
+                }
+                stopped.push(pid);
             }
         }
-        GroupPresence::Empty
+        stopped.sort_unstable();
+        if stopped.is_empty() {
+            GroupQuiescence::Empty
+        } else {
+            GroupQuiescence::AllStopped(stopped)
+        }
     }
 
     #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
-    pub(crate) fn live_group_members_excluding_leader(
+    pub(crate) fn group_quiescence(
         group: OwnedProcessGroup,
-        _leader: u32,
-    ) -> GroupPresence {
-        GroupPresence::Unknown {
+        _excluded_leader: Option<u32>,
+    ) -> GroupQuiescence {
+        GroupQuiescence::Unknown {
             detail: format!(
                 "live-member inspection is unavailable for owned process group -{} on this Unix target",
                 group.raw()
@@ -513,9 +570,9 @@ pub(crate) mod unix {
 
 #[cfg(unix)]
 pub(crate) use unix::{
-    GroupPresence, GroupSignalDelivery, LeaderState, OwnedProcessGroup, deliver_group_sigkill,
-    deliver_group_sigterm, group_presence, live_group_members_excluding_leader,
-    observe_leader_without_reaping,
+    GroupPresence, GroupQuiescence, GroupSignalDelivery, LeaderState, OwnedProcessGroup,
+    deliver_group_sigkill, deliver_group_sigstop, deliver_group_sigterm, group_presence,
+    group_quiescence, observe_leader_without_reaping,
 };
 // Classifier tables and zero-signal probes are exercised directly by the
 // timeout suite; production flow reaches them through the helpers above.

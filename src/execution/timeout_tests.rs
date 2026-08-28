@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::runner::{
-    checked_deadline, force_kill_failed_with_cleanup, grace_wait_failed_with_cleanup,
+    TimeoutLifecycleEvent, checked_deadline, force_kill_failed_with_cleanup,
+    grace_wait_failed_with_cleanup, take_timeout_lifecycle_events,
 };
 use crate::execution::unix_signal::{
     GroupPresence, GroupSignalDelivery, LeaderState, OwnedProcessGroup, caller_process_group,
@@ -341,6 +342,61 @@ fn execution_timeout_probe_parent_of_sigterm_ignoring_descendant_then_sleep_long
     std::thread::sleep(PROBE_SLEEP);
 }
 
+/// Short-lived churn leaf. Its SIGTERM ignore disposition is inherited from
+/// the churn parent across exec, so it can survive into the quiescence race.
+#[test]
+#[ignore]
+fn execution_timeout_probe_churn_leaf() {
+    std::thread::sleep(Duration::from_millis(40));
+}
+
+/// Repeatedly replaces descendants across the grace boundary. A fork can be
+/// in flight when the runner delivers `SIGSTOP`; the production fixed-point
+/// barrier must still stop and discover the resulting group member.
+#[test]
+#[ignore]
+fn execution_timeout_probe_descendant_churns_after_sigterm() {
+    #[cfg(unix)]
+    unsafe {
+        unsafe extern "C" {
+            fn signal(signum: std::os::raw::c_int, handler: usize) -> usize;
+        }
+        const SIGTERM: std::os::raw::c_int = 15;
+        const SIG_IGN: usize = 1;
+        signal(SIGTERM, SIG_IGN);
+    }
+
+    let cwd = std::env::current_dir().expect("probe working directory");
+    fs::write(cwd.join("churn-pid"), std::process::id().to_string()).expect("churn pid marker");
+    fs::write(cwd.join("descendant-ready"), b"ready").expect("churn ready marker");
+    let executable = std::env::current_exe().expect("current test executable path");
+    let mut children = Vec::new();
+    loop {
+        children.retain_mut(|child: &mut std::process::Child| {
+            child.try_wait().expect("churn child observation").is_none()
+        });
+        children.push(
+            std::process::Command::new(&executable)
+                .args(["execution_timeout_probe_churn_leaf", "--ignored"])
+                .spawn()
+                .expect("churn leaf spawn"),
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+#[ignore]
+fn execution_timeout_probe_parent_of_churning_descendant() {
+    spawn_and_await_descendant_probe("execution_timeout_probe_descendant_churns_after_sigterm");
+    let cwd = std::env::current_dir().expect("probe working directory");
+    fs::write(cwd.join("attempt-pid"), std::process::id().to_string()).expect("attempt pid marker");
+    fs::write(cwd.join("attempt-pgid"), caller_process_group().to_string())
+        .expect("attempt pgid marker");
+    fs::write(cwd.join("ready"), b"ready").expect("ready marker");
+    std::thread::sleep(PROBE_SLEEP);
+}
+
 // --- Policy validation (T10 / T11) ---------------------------------------
 
 #[test]
@@ -616,6 +672,35 @@ fn to11_monotonic_deadline_overflow_fails_closed() {
         error,
         ExecutionError::TimeoutDeadlineOverflow { .. }
     ));
+}
+
+#[test]
+fn to11a_extreme_termination_grace_is_rejected_before_spawn() {
+    let workspace = TempDir::new("to11a");
+    let caller_group = caller_process_group();
+    let started = Instant::now();
+    let error = run_with_timeout(
+        &bounded_request(
+            std::env::current_exe().expect("current test executable path"),
+            &[
+                "execution_timeout_probe_parent_of_sigterm_ignoring_descendant_then_sleep_long",
+                "--ignored",
+            ],
+            workspace.path(),
+            workspace.path(),
+        ),
+        &policy(Duration::from_millis(100), Duration::MAX),
+    )
+    .expect_err("unrepresentable termination grace must fail before spawn");
+
+    assert!(matches!(
+        error,
+        ExecutionError::TimeoutDeadlineOverflow { .. }
+    ));
+    assert!(!workspace.path().join("ready").exists());
+    assert!(!workspace.path().join("descendant-pid").exists());
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(caller_process_group(), caller_group);
 }
 
 // --- No output capture on the timed path (T16) ------------------------------
@@ -915,6 +1000,65 @@ fn tg03_sigterm_ignoring_descendant_triggers_group_sigkill_and_forced_classifica
     assert_eq!(caller_process_group(), caller_group_before);
     let caller_unsigned = u32::try_from(caller_group_before).expect("caller pgid positive");
     assert_ne!(attempt_pgid, caller_unsigned);
+}
+
+#[test]
+fn tg03a_churning_descendants_are_quiesced_before_leader_reap() {
+    let workspace = TempDir::new("tg03a");
+    let caller_group = caller_process_group();
+    let _ = take_timeout_lifecycle_events();
+
+    let (outcome, elapsed) = run_probe_bounded(
+        "execution_timeout_probe_parent_of_churning_descendant",
+        workspace.path(),
+        Duration::from_millis(500),
+        Duration::from_millis(400),
+    );
+    assert_eq!(
+        outcome.termination(),
+        ProcessTermination::TimedOutForceKilled
+    );
+    assert!(elapsed < BOUNDED_RUN_UPPER_BOUND);
+
+    let attempt_pgid = recorded_value(workspace.path(), "attempt-pgid");
+    await_process_death(
+        recorded_value(workspace.path(), "attempt-pid"),
+        "churn leader",
+    );
+    await_process_death(
+        recorded_value(workspace.path(), "churn-pid"),
+        "churn descendant",
+    );
+    await_group_empty(attempt_pgid, "tg03a fork race");
+    assert_eq!(caller_process_group(), caller_group);
+
+    let events = take_timeout_lifecycle_events();
+    let position = |event| {
+        events
+            .iter()
+            .position(|candidate| *candidate == event)
+            .unwrap_or_else(|| panic!("missing {event:?} in {events:?}"))
+    };
+    assert!(
+        position(TimeoutLifecycleEvent::GroupSigterm)
+            < position(TimeoutLifecycleEvent::GroupSigstop)
+    );
+    assert!(
+        position(TimeoutLifecycleEvent::GroupSigstop)
+            < position(TimeoutLifecycleEvent::GroupQuiescent)
+    );
+    assert!(
+        position(TimeoutLifecycleEvent::GroupQuiescent)
+            < position(TimeoutLifecycleEvent::GroupSigkill)
+    );
+    assert!(
+        position(TimeoutLifecycleEvent::GroupSigkill)
+            < position(TimeoutLifecycleEvent::LeaderReaped)
+    );
+    assert!(
+        position(TimeoutLifecycleEvent::LeaderReaped)
+            < position(TimeoutLifecycleEvent::GroupEmptyVerified)
+    );
 }
 
 /// Spawns one controlled `sleep` child in its own fresh process group,

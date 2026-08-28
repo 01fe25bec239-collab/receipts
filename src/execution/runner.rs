@@ -92,9 +92,9 @@ use crate::execution::request::ProcessRunRequest;
 use crate::execution::timeout::ProcessTimeoutPolicy;
 #[cfg(unix)]
 use crate::execution::unix_signal::{
-    GroupPresence, GroupSignalDelivery, LeaderState, OwnedProcessGroup, deliver_group_sigkill,
-    deliver_group_sigterm, group_presence, live_group_members_excluding_leader,
-    observe_leader_without_reaping,
+    GroupPresence, GroupQuiescence, GroupSignalDelivery, LeaderState, OwnedProcessGroup,
+    deliver_group_sigkill, deliver_group_sigstop, deliver_group_sigterm, group_presence,
+    group_quiescence, observe_leader_without_reaping,
 };
 
 /// Common local shell basenames rejected at executable validation.
@@ -119,6 +119,11 @@ const GROUP_TEARDOWN_VERIFY_WINDOW: Duration = Duration::from_secs(5);
 #[cfg(unix)]
 const CLEANUP_REAP_WINDOW: Duration = Duration::from_secs(2);
 
+/// Private fail-closed window for proving that post-grace `SIGSTOP` has
+/// reached a stable process-group fixed point.
+#[cfg(unix)]
+const GROUP_QUIESCENCE_VERIFY_WINDOW: Duration = Duration::from_secs(1);
+
 /// Bounded post-cleanup proof that capture readers reached EOF. Group
 /// teardown closes every attempt-owned writer, so this is verification, not
 /// a second user-visible run timeout.
@@ -141,6 +146,8 @@ pub(crate) const CAPTURE_TEST_FAIL_STDOUT_READ: u8 = 4;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TimeoutLifecycleEvent {
     GroupSigterm,
+    GroupSigstop,
+    GroupQuiescent,
     GroupSigkill,
     LeaderReaped,
     GroupEmptyVerified,
@@ -257,7 +264,7 @@ pub fn run_with_timeout(
 ) -> Result<ProcessRunOutcome, ExecutionError> {
     // Deadline arithmetic happens first: it is pure, cheap, and fails
     // closed before any filesystem or process resource is touched.
-    let deadline = checked_deadline(Instant::now(), policy.run_timeout(), "run_timeout")?;
+    let deadline = validated_run_deadline(policy)?;
 
     let executable = validated_executable(request.executable())?;
     let cwd = validated_workspace_cwd(request.workspace_root(), request.cwd())?;
@@ -361,7 +368,7 @@ pub fn run_with_timeout_and_capture(
     request: &ProcessRunRequest,
     policy: &ProcessTimeoutPolicy,
 ) -> Result<CapturedProcessRun, ExecutionError> {
-    let deadline = checked_deadline(Instant::now(), policy.run_timeout(), "run_timeout")?;
+    let deadline = validated_run_deadline(policy)?;
 
     let executable = validated_executable(request.executable())?;
     let cwd = validated_workspace_cwd(request.workspace_root(), request.cwd())?;
@@ -833,10 +840,106 @@ fn timeout_deliver_group_sigterm(group: OwnedProcessGroup) -> GroupSignalDeliver
 }
 
 #[cfg(unix)]
+fn timeout_deliver_group_sigstop(group: OwnedProcessGroup) -> GroupSignalDelivery {
+    #[cfg(test)]
+    record_timeout_lifecycle_event(TimeoutLifecycleEvent::GroupSigstop);
+    deliver_group_sigstop(group)
+}
+
+#[cfg(unix)]
 fn timeout_deliver_group_sigkill(group: OwnedProcessGroup) -> GroupSignalDelivery {
     #[cfg(test)]
     record_timeout_lifecycle_event(TimeoutLifecycleEvent::GroupSigkill);
     deliver_group_sigkill(group)
+}
+
+/// Proves both public policy intervals representable before any child is
+/// spawned. The grace loop itself uses elapsed time, so no fallible deadline
+/// arithmetic remains after ownership begins.
+#[cfg(unix)]
+fn validated_run_deadline(policy: &ProcessTimeoutPolicy) -> Result<Instant, ExecutionError> {
+    let now = Instant::now();
+    let deadline = checked_deadline(now, policy.run_timeout(), "run_timeout")?;
+    checked_deadline(now, policy.termination_grace(), "termination_grace")?;
+    Ok(deadline)
+}
+
+/// Stops group mutation and confirms the same stopped membership twice,
+/// reaffirming `SIGSTOP` between observations. Once an observation contains
+/// only stopped members, those members cannot fork; the reaffirmed signal
+/// also catches a child created immediately before its parent stopped. The
+/// matching second snapshot is therefore a stable ownership-release point.
+#[cfg(unix)]
+fn quiesce_owned_group(group: OwnedProcessGroup, leader: u32) -> Result<bool, String> {
+    match timeout_deliver_group_sigstop(group) {
+        GroupSignalDelivery::Delivered | GroupSignalDelivery::GroupAlreadyGone => {}
+        GroupSignalDelivery::Failed { detail } => {
+            if matches!(
+                observe_leader_without_reaping(leader),
+                Ok(LeaderState::Exited)
+            ) && group_quiescence(group, Some(leader)) == GroupQuiescence::Empty
+            {
+                #[cfg(test)]
+                record_timeout_lifecycle_event(TimeoutLifecycleEvent::GroupQuiescent);
+                return Ok(false);
+            }
+            return Err(detail);
+        }
+    }
+
+    let started = Instant::now();
+    let mut previous = None;
+    let mut last_issue = None;
+    loop {
+        let snapshot = match group_quiescence(group, Some(leader)) {
+            GroupQuiescence::Empty => Some(Vec::new()),
+            GroupQuiescence::AllStopped(pids) => Some(pids),
+            GroupQuiescence::Mutable => {
+                previous = None;
+                last_issue = Some("a live group member had not stopped".to_string());
+                None
+            }
+            GroupQuiescence::Unknown { detail } => {
+                previous = None;
+                last_issue = Some(detail);
+                None
+            }
+        };
+
+        if let Some(snapshot) = snapshot {
+            if previous.as_ref() == Some(&snapshot) {
+                #[cfg(test)]
+                record_timeout_lifecycle_event(TimeoutLifecycleEvent::GroupQuiescent);
+                return Ok(!snapshot.is_empty());
+            }
+            previous = Some(snapshot);
+        }
+
+        if started.elapsed() >= GROUP_QUIESCENCE_VERIFY_WINDOW {
+            return Err(format!(
+                "owned process group -{} did not reach a stable stopped state within {:?}: {}",
+                group.raw(),
+                GROUP_QUIESCENCE_VERIFY_WINDOW,
+                last_issue.as_deref().unwrap_or("membership kept changing")
+            ));
+        }
+        match timeout_deliver_group_sigstop(group) {
+            GroupSignalDelivery::Delivered | GroupSignalDelivery::GroupAlreadyGone => {}
+            GroupSignalDelivery::Failed { detail } => {
+                if matches!(
+                    observe_leader_without_reaping(leader),
+                    Ok(LeaderState::Exited)
+                ) && group_quiescence(group, Some(leader)) == GroupQuiescence::Empty
+                {
+                    #[cfg(test)]
+                    record_timeout_lifecycle_event(TimeoutLifecycleEvent::GroupQuiescent);
+                    return Ok(false);
+                }
+                return Err(detail);
+            }
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
 }
 
 /// Implements the frozen terminate → bounded grace → force-kill → verify →
@@ -865,57 +968,44 @@ fn enforce_timeout(
         }
     }
 
-    // Step 2 — bounded termination grace. `waitid(..., WNOWAIT)` observes
-    // direct-child exit without reaping the process-group leader; live
-    // membership is inspected separately so the leader zombie does not
-    // manufacture a force kill. The unreaped leader remains the ownership
-    // anchor until every potentially required group signal is finished.
-    let grace_deadline = checked_deadline(
-        Instant::now(),
-        policy.termination_grace(),
-        "termination_grace",
-    )?;
+    // Step 2 — the complete bounded grace opportunity. Elapsed-duration
+    // accounting cannot overflow and performs no fallible arithmetic after
+    // spawn. The leader remains unreaped throughout.
+    let grace_started = Instant::now();
     loop {
-        match observe_leader_without_reaping(leader) {
-            Ok(LeaderState::Exited)
-                if live_group_members_excluding_leader(group, leader) == GroupPresence::Empty =>
-            {
-                return finish_timeout_after_signaling(
-                    child,
-                    group,
-                    ProcessTermination::TimedOutGracefullyTerminated,
-                );
-            }
-            Ok(_) => {}
-            Err(error) => return Err(grace_wait_failed_with_cleanup(child, group, error)),
+        if let Err(error) = observe_leader_without_reaping(leader) {
+            return Err(grace_wait_failed_with_cleanup(child, group, error));
         }
-        let Some(remaining) = grace_deadline.checked_duration_since(Instant::now()) else {
-            break;
-        };
-        if remaining.is_zero() {
+        let elapsed = grace_started.elapsed();
+        if elapsed >= policy.termination_grace() {
             break;
         }
-        std::thread::sleep(POLL_INTERVAL.min(remaining));
+        std::thread::sleep(POLL_INTERVAL.min(policy.termination_grace().saturating_sub(elapsed)));
     }
 
-    // Step 3 — one final non-reaping observation before deciding whether
-    // the still-owned group needs force.
-    match observe_leader_without_reaping(leader) {
-        Ok(LeaderState::Exited)
-            if live_group_members_excluding_leader(group, leader) == GroupPresence::Empty =>
-        {
-            return finish_timeout_after_signaling(
-                child,
-                group,
-                ProcessTermination::TimedOutGracefullyTerminated,
-            );
-        }
-        Ok(_) => {}
+    // Step 3 — freeze ordinary process-tree mutation before the final
+    // descendant decision. No pre-quiescence process-table snapshot is
+    // authoritative. Any barrier failure is force-cleaned while the leader
+    // still anchors ownership.
+    let leader_survived = match observe_leader_without_reaping(leader) {
+        Ok(LeaderState::Running) => true,
+        Ok(LeaderState::Exited) => false,
         Err(error) => return Err(grace_wait_failed_with_cleanup(child, group, error)),
+    };
+    let has_live_descendants = match quiesce_owned_group(group, leader) {
+        Ok(has_live_descendants) => has_live_descendants,
+        Err(detail) => return Err(quiescence_failed_with_cleanup(child, group, detail)),
+    };
+    if !leader_survived && !has_live_descendants {
+        return finish_timeout_after_signaling(
+            child,
+            group,
+            ProcessTermination::TimedOutGracefullyTerminated,
+        );
     }
 
-    // Step 4 — forced kill of the OWNED GROUP (never the caller's group):
-    // some attempt-owned member survived graceful termination.
+    // Step 4 — at least one quiesced attempt-owned process survived grace.
+    // Kill the group while the unreaped leader still anchors ownership.
     let termination = match capture_deliver_group_sigkill(group) {
         GroupSignalDelivery::Delivered => ProcessTermination::TimedOutForceKilled,
         // Every member vanished between observation and delivery; nothing
@@ -1094,6 +1184,47 @@ fn graceful_termination_failed_with_cleanup(
         }
     }
     ExecutionError::GracefulTerminationFailed { detail }
+}
+
+/// Reports a failed quiescence proof only after bounded force cleanup while
+/// the unreaped leader still anchors the group.
+#[cfg(unix)]
+fn quiescence_failed_with_cleanup(
+    mut child: Child,
+    group: OwnedProcessGroup,
+    failure: String,
+) -> ExecutionError {
+    let mut detail = format!(
+        "process-group quiescence failed for owned group -{}: {failure}",
+        group.raw()
+    );
+    match timeout_deliver_group_sigkill(group) {
+        GroupSignalDelivery::Delivered => {
+            detail.push_str("; forced SIGKILL delivered before ownership release");
+        }
+        GroupSignalDelivery::GroupAlreadyGone => {
+            detail.push_str("; the owned group was already empty");
+        }
+        GroupSignalDelivery::Failed { detail: failed } => {
+            return force_kill_failed_with_cleanup(
+                child,
+                group,
+                format!("{detail}; cleanup SIGKILL also failed: {failed}"),
+            );
+        }
+    }
+    match bounded_child_reap(&mut child) {
+        Ok(Some(_)) => detail.push_str("; the direct child was reaped"),
+        Ok(None) => detail
+            .push_str("; the direct child remained unreaped within the bounded cleanup window"),
+        Err(error) => detail.push_str(&format!("; cleanup reap also failed: {error}")),
+    }
+    if await_group_empty(group, GROUP_TEARDOWN_VERIFY_WINDOW) {
+        detail.push_str("; the owned group was verified empty");
+    } else {
+        detail.push_str("; the owned group was not proven empty after bounded cleanup");
+    }
+    ExecutionError::ForceKillFailed { detail }
 }
 
 /// Typed force-kill failure after group `SIGKILL` delivery failed: the
