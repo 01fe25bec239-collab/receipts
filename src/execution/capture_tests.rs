@@ -23,10 +23,10 @@ use std::time::{Duration, Instant};
 
 use super::capture::{BoundedStreamRetention, CaptureFault, drain_to_eof};
 use super::runner::{
-    CAPTURE_TEST_FAIL_FORCE_KILL, CAPTURE_TEST_FAIL_STDOUT_READ, CAPTURE_TEST_FAIL_WAIT,
-    TimeoutLifecycleEvent, bounded_reader_completion_failure_for_test, capture_fault_failed,
-    frozen_retention, inject_capture_test_faults, retention_allocation_failed,
-    take_timeout_lifecycle_events,
+    CAPTURE_TEST_FAIL_FORCE_KILL, CAPTURE_TEST_FAIL_SIGCONT, CAPTURE_TEST_FAIL_STDOUT_READ,
+    CAPTURE_TEST_FAIL_WAIT, CAPTURE_TEST_FORCE_COMPLETION_BARRIER, TimeoutLifecycleEvent,
+    bounded_reader_completion_failure_for_test, capture_fault_failed, frozen_retention,
+    inject_capture_test_faults, retention_allocation_failed, take_timeout_lifecycle_events,
 };
 use crate::execution::unix_signal::{caller_process_group, process_alive, recorded_group_is_empty};
 use crate::execution::{
@@ -373,6 +373,16 @@ fn ignore_sigterm() {
     }
 }
 
+fn close_capture_fds() {
+    unsafe {
+        unsafe extern "C" {
+            fn close(fd: std::os::raw::c_int) -> std::os::raw::c_int;
+        }
+        let _ = close(1);
+        let _ = close(2);
+    }
+}
+
 /// Spawns one of this binary's ignored probes as a direct no-shell child of
 /// the current process, inheriting this process's stdout and stderr — which
 /// is exactly how a descendant joins an attempt-owned group and an
@@ -557,14 +567,88 @@ fn execution_capture_probe_close_streams_then_sleep() {
     fs::write(cwd.join("attempt-pid"), std::process::id().to_string()).expect("attempt pid marker");
     fs::write(cwd.join("attempt-pgid"), caller_process_group().to_string())
         .expect("attempt pgid marker");
-    unsafe {
-        unsafe extern "C" {
-            fn close(fd: std::os::raw::c_int) -> std::os::raw::c_int;
-        }
-        let _ = close(1);
-        let _ = close(2);
-    }
+    close_capture_fds();
     std::thread::sleep(PROBE_SLEEP);
+}
+
+/// Direct leader exits after a descendant has joined the owned group and
+/// closed both inherited capture descriptors.
+#[test]
+#[ignore]
+fn execution_capture_probe_exiting_parent_of_closed_fd_descendant() {
+    let cwd = std::env::current_dir().expect("probe working directory");
+    let descendant = if fs::read_to_string(cwd.join("descendant-kind"))
+        .is_ok_and(|kind| kind.trim() == "churn")
+    {
+        "execution_capture_probe_closed_fd_churn_descendant"
+    } else {
+        "execution_capture_probe_closed_fd_descendant"
+    };
+    spawn_and_await_emitting_descendant(descendant);
+    fs::write(cwd.join("attempt-pid"), std::process::id().to_string()).expect("attempt pid marker");
+    fs::write(cwd.join("attempt-pgid"), caller_process_group().to_string())
+        .expect("attempt pgid marker");
+    std::process::exit(0)
+}
+
+#[test]
+#[ignore]
+fn execution_capture_probe_closed_fd_descendant() {
+    let cwd = std::env::current_dir().expect("probe working directory");
+    if fs::read_to_string(cwd.join("descendant-mode")).is_ok_and(|mode| mode.trim() == "ignore") {
+        ignore_sigterm();
+    }
+    fs::write(cwd.join("descendant-pid"), std::process::id().to_string())
+        .expect("descendant pid marker");
+    fs::write(cwd.join("descendant-ready"), b"ready").expect("descendant ready marker");
+    close_capture_fds();
+    fs::write(cwd.join("capture-fds-closed"), b"closed").expect("closed marker");
+
+    let sleep = Duration::from_millis(spec_value("descendant-sleep-ms", 60_000) as u64);
+    let started = Instant::now();
+    let mut progress = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(cwd.join("descendant-progress"))
+        .expect("progress marker");
+    while started.elapsed() < sleep {
+        progress.write_all(b"x").expect("progress append");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+#[ignore]
+fn execution_capture_probe_closed_fd_churn_descendant() {
+    let cwd = std::env::current_dir().expect("probe working directory");
+    fs::write(cwd.join("descendant-pid"), std::process::id().to_string())
+        .expect("descendant pid marker");
+    fs::write(cwd.join("descendant-ready"), b"ready").expect("descendant ready marker");
+    close_capture_fds();
+    fs::write(cwd.join("capture-fds-closed"), b"closed").expect("closed marker");
+    let executable = std::env::current_exe().expect("current test executable path");
+    let deadline = Instant::now() + PROBE_SLEEP;
+    let mut progress = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(cwd.join("descendant-progress"))
+        .expect("churn progress marker");
+    while Instant::now() < deadline {
+        let mut leaf = std::process::Command::new(&executable)
+            .args(["execution_capture_probe_short_churn_leaf", "--ignored"])
+            .spawn()
+            .expect("churn leaf spawn");
+        while leaf.try_wait().expect("churn leaf observation").is_none() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        progress.write_all(b"x").expect("churn progress append");
+    }
+}
+
+#[test]
+#[ignore]
+fn execution_capture_probe_short_churn_leaf() {
+    std::thread::sleep(Duration::from_millis(15));
 }
 
 fn emitting_parent_body() {
@@ -947,6 +1031,234 @@ fn c17_sigterm_ignoring_descendant_inheriting_the_captured_pipes_is_force_killed
 }
 
 // --- Repair regressions: complete capture is part of completion ---------
+
+fn run_closed_fd_descendant(
+    tag: &str,
+    mode: &str,
+    sleep_ms: u64,
+    run_timeout: Duration,
+    faults: u8,
+) -> (
+    TempDir,
+    Result<CapturedProcessRun, ExecutionError>,
+    Duration,
+) {
+    let workspace = TempDir::new(tag);
+    fs::write(workspace.path().join("descendant-mode"), mode).expect("descendant mode");
+    fs::write(
+        workspace.path().join("descendant-sleep-ms"),
+        sleep_ms.to_string(),
+    )
+    .expect("descendant sleep");
+    let _fault = inject_capture_test_faults(faults);
+    let started = Instant::now();
+    let result = run_with_timeout_and_capture(
+        &request(
+            std::env::current_exe().expect("current test executable path"),
+            workspace.path(),
+            &[
+                "execution_capture_probe_exiting_parent_of_closed_fd_descendant",
+                "--ignored",
+            ],
+        ),
+        &policy(run_timeout, Duration::from_millis(400)),
+    );
+    let elapsed = started.elapsed();
+    await_marker(workspace.path(), "capture-fds-closed");
+    (workspace, result, elapsed)
+}
+
+fn assert_closed_fd_attempt_clean(workspace: &TempDir, tag: &str) {
+    let attempt_pid = recorded_value(workspace.path(), "attempt-pid");
+    let attempt_pgid = recorded_value(workspace.path(), "attempt-pgid");
+    let descendant_pid = recorded_value(workspace.path(), "descendant-pid");
+    assert_eq!(attempt_pid, attempt_pgid, "{tag}: owned leader");
+    assert_ne!(attempt_pgid as std::os::raw::c_int, caller_process_group());
+    await_process_death(attempt_pid, &format!("{tag} leader"));
+    await_process_death(descendant_pid, &format!("{tag} descendant"));
+    await_group_empty(attempt_pgid, tag);
+}
+
+#[test]
+fn closed_fd_cooperative_descendant_times_out_gracefully() {
+    let caller_group = caller_process_group();
+    let (workspace, captured, elapsed) = run_closed_fd_descendant(
+        "closed-fd-cooperative",
+        "cooperative",
+        60_000,
+        Duration::from_millis(300),
+        0,
+    );
+    let captured = captured.expect("cooperative closed-fd capture");
+    assert_eq!(
+        captured.outcome().termination(),
+        ProcessTermination::TimedOutGracefullyTerminated
+    );
+    assert!(captured.outcome().timed_out());
+    assert!(!captured.outcome().forced_kill_required());
+    assert!(elapsed >= Duration::from_millis(250));
+    assert_closed_fd_attempt_clean(&workspace, "closed-fd cooperative");
+    assert_eq!(caller_process_group(), caller_group);
+}
+
+#[test]
+fn closed_fd_sigterm_ignoring_descendant_is_force_killed() {
+    let (workspace, captured, _) = run_closed_fd_descendant(
+        "closed-fd-ignoring",
+        "ignore",
+        60_000,
+        Duration::from_millis(300),
+        0,
+    );
+    let captured = captured.expect("ignoring closed-fd capture");
+    assert_eq!(
+        captured.outcome().termination(),
+        ProcessTermination::TimedOutForceKilled
+    );
+    assert!(captured.outcome().timed_out());
+    assert!(captured.outcome().forced_kill_required());
+    assert_closed_fd_attempt_clean(&workspace, "closed-fd ignoring");
+}
+
+#[test]
+fn closed_fd_descendant_self_exit_before_deadline_completes_early() {
+    let (workspace, captured, elapsed) = run_closed_fd_descendant(
+        "closed-fd-self-exit",
+        "cooperative",
+        180,
+        Duration::from_secs(3),
+        0,
+    );
+    let captured = captured.expect("self-exiting closed-fd capture");
+    assert_eq!(
+        captured.outcome().termination(),
+        ProcessTermination::Completed
+    );
+    assert!(!captured.outcome().timed_out());
+    assert!(elapsed >= Duration::from_millis(120));
+    assert!(elapsed < Duration::from_secs(2));
+    assert_closed_fd_attempt_clean(&workspace, "closed-fd self-exit");
+}
+
+#[test]
+fn no_descendant_capture_completes_well_before_deadline() {
+    let workspace = TempDir::new("early-normal-completion");
+    let started = Instant::now();
+    let captured = run_with_timeout_and_capture(
+        &request(
+            first_existing(&["/usr/bin/true", "/bin/true"]),
+            workspace.path(),
+            &[],
+        ),
+        &policy(Duration::from_secs(5), Duration::from_secs(1)),
+    )
+    .expect("ordinary captured completion");
+    assert_eq!(
+        captured.outcome().termination(),
+        ProcessTermination::Completed
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn predeadline_completion_barrier_resumes_race_found_live_group() {
+    let _ = take_timeout_lifecycle_events();
+    let caller_group = caller_process_group();
+    let (workspace, captured, _) = run_closed_fd_descendant(
+        "preddeadline-resume",
+        "cooperative",
+        60_000,
+        Duration::from_millis(500),
+        CAPTURE_TEST_FORCE_COMPLETION_BARRIER,
+    );
+    let captured = captured.expect("resumed attempt reaches truthful timeout");
+    assert_eq!(
+        captured.outcome().termination(),
+        ProcessTermination::TimedOutGracefullyTerminated
+    );
+    let events = take_timeout_lifecycle_events();
+    let stop = events
+        .iter()
+        .position(|event| *event == TimeoutLifecycleEvent::GroupSigstop)
+        .expect("completion barrier SIGSTOP");
+    let quiescent = events
+        .iter()
+        .position(|event| *event == TimeoutLifecycleEvent::GroupQuiescent)
+        .expect("completion barrier fixed point");
+    let resume = events
+        .iter()
+        .position(|event| *event == TimeoutLifecycleEvent::GroupSigcont)
+        .expect("completion barrier SIGCONT");
+    let reap = events
+        .iter()
+        .position(|event| *event == TimeoutLifecycleEvent::LeaderReaped)
+        .expect("eventual leader reap");
+    assert!(
+        stop < quiescent && quiescent < resume && resume < reap,
+        "{events:?}"
+    );
+    assert!(
+        fs::metadata(workspace.path().join("descendant-progress"))
+            .expect("resume progress")
+            .len()
+            > 1,
+        "the descendant must execute after the completion barrier resumes it"
+    );
+    assert_closed_fd_attempt_clean(&workspace, "preddeadline resume");
+    assert_eq!(caller_process_group(), caller_group);
+}
+
+#[test]
+fn predeadline_fork_churn_barrier_never_false_completes() {
+    let workspace = TempDir::new("preddeadline-fork-churn");
+    fs::write(workspace.path().join("descendant-kind"), "churn").expect("churn kind");
+    let _fault = inject_capture_test_faults(CAPTURE_TEST_FORCE_COMPLETION_BARRIER);
+    let (captured, _) = run_probe_captured(
+        "execution_capture_probe_exiting_parent_of_closed_fd_descendant",
+        workspace.path(),
+        &policy(Duration::from_millis(500), Duration::from_millis(400)),
+    );
+    assert_ne!(
+        captured.outcome().termination(),
+        ProcessTermination::Completed
+    );
+    assert_closed_fd_attempt_clean(&workspace, "preddeadline fork churn");
+}
+
+#[test]
+fn predeadline_sigcont_failure_force_cleans_before_leader_reap() {
+    let _ = take_timeout_lifecycle_events();
+    let (workspace, result, elapsed) = run_closed_fd_descendant(
+        "preddeadline-sigcont-failure",
+        "ignore",
+        60_000,
+        Duration::from_secs(3),
+        CAPTURE_TEST_FORCE_COMPLETION_BARRIER | CAPTURE_TEST_FAIL_SIGCONT,
+    );
+    assert!(matches!(
+        result,
+        Err(ExecutionError::ForceKillFailed { .. })
+    ));
+    assert!(elapsed < Duration::from_secs(2));
+    let events = take_timeout_lifecycle_events();
+    let resume = events
+        .iter()
+        .position(|event| *event == TimeoutLifecycleEvent::GroupSigcont)
+        .expect("attempted SIGCONT");
+    let kill = events
+        .iter()
+        .position(|event| *event == TimeoutLifecycleEvent::GroupSigkill)
+        .expect("fail-closed SIGKILL");
+    let reap = events
+        .iter()
+        .position(|event| *event == TimeoutLifecycleEvent::LeaderReaped)
+        .expect("cleanup leader reap");
+    assert!(
+        resume < kill && kill < reap,
+        "cleanup signaling must precede leader reap: {events:?}"
+    );
+    assert_closed_fd_attempt_clean(&workspace, "preddeadline SIGCONT failure");
+}
 
 #[test]
 fn direct_child_completion_with_cooperative_pipe_holder_is_a_truthful_timeout() {

@@ -93,8 +93,8 @@ use crate::execution::timeout::ProcessTimeoutPolicy;
 #[cfg(unix)]
 use crate::execution::unix_signal::{
     GroupPresence, GroupQuiescence, GroupSignalDelivery, LeaderState, OwnedProcessGroup,
-    deliver_group_sigkill, deliver_group_sigstop, deliver_group_sigterm, group_presence,
-    group_quiescence, observe_leader_without_reaping,
+    deliver_group_sigcont, deliver_group_sigkill, deliver_group_sigstop, deliver_group_sigterm,
+    group_presence, group_quiescence, observe_leader_without_reaping,
 };
 
 /// Common local shell basenames rejected at executable validation.
@@ -141,6 +141,10 @@ pub(crate) const CAPTURE_TEST_FAIL_FORCE_KILL: u8 = 1;
 pub(crate) const CAPTURE_TEST_FAIL_WAIT: u8 = 2;
 #[cfg(all(test, unix))]
 pub(crate) const CAPTURE_TEST_FAIL_STDOUT_READ: u8 = 4;
+#[cfg(all(test, unix))]
+pub(crate) const CAPTURE_TEST_FAIL_SIGCONT: u8 = 8;
+#[cfg(all(test, unix))]
+pub(crate) const CAPTURE_TEST_FORCE_COMPLETION_BARRIER: u8 = 16;
 
 #[cfg(all(test, unix))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,6 +152,7 @@ pub(crate) enum TimeoutLifecycleEvent {
     GroupSigterm,
     GroupSigstop,
     GroupQuiescent,
+    GroupSigcont,
     GroupSigkill,
     LeaderReaped,
     GroupEmptyVerified,
@@ -342,8 +347,9 @@ const STDERR: &str = "stderr";
 ///    neither can block the child by filling while the other is read;
 /// 7. preserve the unreaped direct child while waiting for both readers to
 ///    reach EOF under the original run deadline;
-/// 8. after both readers finish, observe the child under that same deadline;
-/// 9. if either condition misses the deadline, run the accepted owned-group
+/// 8. after both readers finish, non-reapingly observe the leader and prove
+///    the owned group has no live descendants under that same deadline;
+/// 9. if any completion condition misses the deadline, run the accepted owned-group
 ///    timeout lifecycle, then verify reader completion within a private
 ///    bounded cleanup window;
 /// 10. assemble the typed capture result.
@@ -502,7 +508,7 @@ pub fn run_with_timeout_and_capture(
 
     // EOF alone is not child completion: a child may close both streams and
     // continue running. Observe it only now, under the original deadline.
-    let outcome = match await_captured_child_until(&mut child, deadline) {
+    let outcome = match await_captured_child_until(&mut child, group, deadline) {
         Ok(Awaited::Exited(status)) => ProcessRunOutcome::new(status.success(), status.code()),
         Ok(Awaited::DeadlineReached) => enforce_timeout(child, group, policy)?,
         Err(error) => return Err(capture_failure_after_spawn(child, group, error)),
@@ -735,7 +741,10 @@ fn cleanup_owned_attempt(mut child: Child, group: OwnedProcessGroup) -> Result<(
         }
     }
     match bounded_child_reap(&mut child) {
-        Ok(Some(_)) => {}
+        Ok(Some(_)) => {
+            #[cfg(test)]
+            record_timeout_lifecycle_event(TimeoutLifecycleEvent::LeaderReaped);
+        }
         Ok(None) => {
             return Err(ExecutionError::TimeoutFinalWaitFailed {
                 detail: "the direct child remained unreaped beyond the bounded capture-failure cleanup window".to_string(),
@@ -797,6 +806,7 @@ fn await_child_until(child: &mut Child, deadline: Instant) -> Result<Awaited, Ex
 #[cfg(unix)]
 fn await_captured_child_until(
     child: &mut Child,
+    group: OwnedProcessGroup,
     deadline: Instant,
 ) -> Result<Awaited, ExecutionError> {
     #[cfg(test)]
@@ -805,7 +815,61 @@ fn await_captured_child_until(
             "injected captured child observation failure",
         )));
     }
-    await_child_until(child, deadline)
+    let leader = child.id();
+    loop {
+        if observe_leader_without_reaping(leader).map_err(wait_failed)? == LeaderState::Exited {
+            #[cfg(test)]
+            let preliminary = if take_capture_test_fault(CAPTURE_TEST_FORCE_COMPLETION_BARRIER) {
+                GroupQuiescence::Empty
+            } else {
+                group_quiescence(group, Some(leader))
+            };
+            #[cfg(not(test))]
+            let preliminary = group_quiescence(group, Some(leader));
+            match preliminary {
+                GroupQuiescence::Empty => match quiesce_owned_group(group, leader) {
+                    Ok(false) => {
+                        if Instant::now() >= deadline {
+                            return Ok(Awaited::DeadlineReached);
+                        }
+                        let status = child.wait().map_err(wait_failed)?;
+                        #[cfg(test)]
+                        record_timeout_lifecycle_event(TimeoutLifecycleEvent::LeaderReaped);
+                        if !await_group_empty(group, GROUP_TEARDOWN_VERIFY_WINDOW) {
+                            return Err(ExecutionError::ForceKillFailed {
+                                detail: format!(
+                                    "the attempt-owned process group -{} was not proven empty after captured completion",
+                                    group.raw()
+                                ),
+                            });
+                        }
+                        #[cfg(test)]
+                        record_timeout_lifecycle_event(TimeoutLifecycleEvent::GroupEmptyVerified);
+                        return Ok(Awaited::Exited(status));
+                    }
+                    Ok(true) => match capture_deliver_group_sigcont(group) {
+                        GroupSignalDelivery::Delivered | GroupSignalDelivery::GroupAlreadyGone => {}
+                        GroupSignalDelivery::Failed { detail } => {
+                            return Err(ExecutionError::ForceKillFailed { detail });
+                        }
+                    },
+                    Err(detail) => return Err(ExecutionError::ForceKillFailed { detail }),
+                },
+                GroupQuiescence::Mutable | GroupQuiescence::AllStopped(_) => {}
+                GroupQuiescence::Unknown { detail } => {
+                    return Err(wait_failed(std::io::Error::other(detail)));
+                }
+            }
+        }
+
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Ok(Awaited::DeadlineReached);
+        };
+        if remaining.is_zero() {
+            return Ok(Awaited::DeadlineReached);
+        }
+        std::thread::sleep(POLL_INTERVAL.min(remaining));
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -844,6 +908,19 @@ fn timeout_deliver_group_sigstop(group: OwnedProcessGroup) -> GroupSignalDeliver
     #[cfg(test)]
     record_timeout_lifecycle_event(TimeoutLifecycleEvent::GroupSigstop);
     deliver_group_sigstop(group)
+}
+
+#[cfg(unix)]
+fn capture_deliver_group_sigcont(group: OwnedProcessGroup) -> GroupSignalDelivery {
+    #[cfg(test)]
+    record_timeout_lifecycle_event(TimeoutLifecycleEvent::GroupSigcont);
+    #[cfg(test)]
+    if take_capture_test_fault(CAPTURE_TEST_FAIL_SIGCONT) {
+        return GroupSignalDelivery::Failed {
+            detail: "injected completion-verification SIGCONT delivery failure".to_string(),
+        };
+    }
+    deliver_group_sigcont(group)
 }
 
 #[cfg(unix)]

@@ -1,4 +1,4 @@
-//! Narrow Unix attempt-owned process-group control (SIGTERM/SIGSTOP/SIGKILL only).
+//! Narrow Unix attempt-owned process-group control (SIGTERM/SIGSTOP/SIGCONT/SIGKILL only).
 //!
 //! This is the smallest OS mechanism that satisfies the frozen
 //! terminate-then-bounded-kill contract including its no-orphan invariant:
@@ -29,13 +29,18 @@
 pub(crate) mod unix {
     use std::os::raw::{c_int, c_uint, c_void};
 
-    // SIGTERM/SIGKILL are fixed here across supported targets; SIGSTOP uses
-    // the target values published by Darwin and Linux/Android headers.
+    // SIGTERM/SIGKILL are fixed here across supported targets; SIGSTOP and
+    // SIGCONT use the target values published by Darwin and Linux/Android
+    // headers.
     const SIGTERM: c_int = 15;
     #[cfg(target_vendor = "apple")]
     const SIGSTOP: c_int = 17;
     #[cfg(any(target_os = "linux", target_os = "android"))]
     const SIGSTOP: c_int = 19;
+    #[cfg(target_vendor = "apple")]
+    const SIGCONT: c_int = 19;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const SIGCONT: c_int = 18;
     const SIGKILL: c_int = 9;
     /// `ESRCH` — no such process: the target had already exited.
     const ESRCH: c_int = 3;
@@ -243,10 +248,27 @@ pub(crate) mod unix {
         signal_owned_group(group, SIGTERM, "graceful SIGTERM")
     }
 
-    /// Uncatchable `SIGSTOP` used only as the post-grace quiescence barrier.
+    /// Uncatchable `SIGSTOP` used only as a completion/cleanup quiescence barrier.
     #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
     pub(crate) fn deliver_group_sigstop(group: OwnedProcessGroup) -> GroupSignalDelivery {
         signal_owned_group(group, SIGSTOP, "quiescence SIGSTOP")
+    }
+
+    /// Resumes an owned group only after a pre-deadline completion probe
+    /// temporarily stopped it and found a live member.
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    pub(crate) fn deliver_group_sigcont(group: OwnedProcessGroup) -> GroupSignalDelivery {
+        signal_owned_group(group, SIGCONT, "completion-verification SIGCONT")
+    }
+
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+    pub(crate) fn deliver_group_sigcont(group: OwnedProcessGroup) -> GroupSignalDelivery {
+        GroupSignalDelivery::Failed {
+            detail: format!(
+                "completion-verification SIGCONT is unavailable for owned process group -{} on this Unix target",
+                group.raw()
+            ),
+        }
     }
 
     #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
@@ -571,8 +593,8 @@ pub(crate) mod unix {
 #[cfg(unix)]
 pub(crate) use unix::{
     GroupPresence, GroupQuiescence, GroupSignalDelivery, LeaderState, OwnedProcessGroup,
-    deliver_group_sigkill, deliver_group_sigstop, deliver_group_sigterm, group_presence,
-    group_quiescence, observe_leader_without_reaping,
+    deliver_group_sigcont, deliver_group_sigkill, deliver_group_sigstop, deliver_group_sigterm,
+    group_presence, group_quiescence, observe_leader_without_reaping,
 };
 // Classifier tables and zero-signal probes are exercised directly by the
 // timeout suite; production flow reaches them through the helpers above.
