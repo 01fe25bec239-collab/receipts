@@ -14,16 +14,22 @@ use std::time::{Duration, Instant};
 
 use super::runner::{
     TimeoutLifecycleEvent, checked_deadline, force_kill_failed_with_cleanup,
-    grace_wait_failed_with_cleanup, take_timeout_lifecycle_events,
+    grace_wait_failed_with_cleanup, inject_unsupported_timeout_platform,
+    take_timeout_lifecycle_events,
 };
 use crate::execution::unix_signal::{
-    GroupPresence, GroupSignalDelivery, LeaderState, OwnedProcessGroup, caller_process_group,
-    classify_group_kill_result, classify_group_presence, observe_leader_without_reaping,
-    process_alive, recorded_group_is_empty,
+    GroupPresence, GroupSignalDelivery, LeaderState, OwnedProcessGroup, TimeoutSignalClass,
+    caller_process_group, classify_group_kill_result, classify_group_presence,
+    observe_leader_without_reaping, process_alive, recorded_group_is_empty,
+    timeout_platform_supported, timeout_signal_numbers_for,
+};
+use crate::execution::unix_signal::{
+    GroupQuiescence, PidGroupObservation, classify_pid_group_observation,
+    inaccessible_pid_quiescence,
 };
 use crate::execution::{
     ExecutionError, ProcessRunOutcome, ProcessRunRequest, ProcessTermination, ProcessTimeoutPolicy,
-    run, run_with_timeout,
+    run, run_with_timeout, run_with_timeout_and_capture,
 };
 
 /// How long every controlled probe child would keep running if the
@@ -36,6 +42,12 @@ const PROBE_SLEEP: Duration = Duration::from_secs(60);
 /// host, yet far below [`PROBE_SLEEP`], so an unbounded leak could never
 /// pass.
 const BOUNDED_RUN_UPPER_BOUND: Duration = Duration::from_secs(20);
+
+/// Independent safety ceiling for the deliberately hostile churn helper.
+/// The substantive test needs less than two seconds through quiescence;
+/// five seconds preserves that pressure while bounding a broken runner.
+const CHURN_SAFETY_WINDOW: Duration = Duration::from_secs(5);
+const CHURN_SETTLE_WINDOW: Duration = Duration::from_secs(1);
 
 /// A temporary directory removed on drop.
 struct TempDir {
@@ -371,18 +383,31 @@ fn execution_timeout_probe_descendant_churns_after_sigterm() {
     fs::write(cwd.join("descendant-ready"), b"ready").expect("churn ready marker");
     let executable = std::env::current_exe().expect("current test executable path");
     let mut children = Vec::new();
-    loop {
+    let deadline = Instant::now() + CHURN_SAFETY_WINDOW;
+    while Instant::now() < deadline {
         children.retain_mut(|child: &mut std::process::Child| {
             child.try_wait().expect("churn child observation").is_none()
         });
         children.push(
             std::process::Command::new(&executable)
                 .args(["execution_timeout_probe_churn_leaf", "--ignored"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .spawn()
                 .expect("churn leaf spawn"),
         );
         std::thread::sleep(Duration::from_millis(1));
     }
+
+    let settle_deadline = Instant::now() + CHURN_SETTLE_WINDOW;
+    while !children.is_empty() && Instant::now() < settle_deadline {
+        children.retain_mut(|child| child.try_wait().expect("churn child reap").is_none());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        children.is_empty(),
+        "churn leaves did not settle within the safety window"
+    );
 }
 
 #[test]
@@ -398,6 +423,105 @@ fn execution_timeout_probe_parent_of_churning_descendant() {
 }
 
 // --- Policy validation (T10 / T11) ---------------------------------------
+
+#[test]
+fn unsupported_timeout_platform_refuses_uncaptured_spawn() {
+    let workspace = TempDir::new("unsupported-plain");
+    let request = bounded_request(
+        std::env::current_exe().expect("current test executable path"),
+        &[
+            "execution_timeout_probe_child_ready_then_sleep_long",
+            "--ignored",
+        ],
+        workspace.path(),
+        workspace.path(),
+    );
+    let _guard = inject_unsupported_timeout_platform();
+    let error = run_with_timeout(
+        &request,
+        &policy(Duration::from_secs(30), Duration::from_secs(1)),
+    )
+    .expect_err("unsupported timeout capability must fail before spawn");
+
+    assert!(matches!(error, ExecutionError::UnsupportedTimeoutPlatform));
+    assert!(!workspace.path().join("ready").exists());
+    assert!(!workspace.path().join("pid").exists());
+}
+
+#[test]
+fn unsupported_timeout_platform_refuses_captured_spawn() {
+    let workspace = TempDir::new("unsupported-capture");
+    let request = bounded_request(
+        std::env::current_exe().expect("current test executable path"),
+        &[
+            "execution_timeout_probe_child_ready_then_sleep_long",
+            "--ignored",
+        ],
+        workspace.path(),
+        workspace.path(),
+    );
+    let _guard = inject_unsupported_timeout_platform();
+    let error = run_with_timeout_and_capture(
+        &request,
+        &policy(Duration::from_secs(30), Duration::from_secs(1)),
+    )
+    .expect_err("unsupported capture capability must fail before spawn");
+
+    assert!(matches!(error, ExecutionError::UnsupportedTimeoutPlatform));
+    assert!(!workspace.path().join("ready").exists());
+    assert!(!workspace.path().join("pid").exists());
+}
+
+#[test]
+fn timeout_signal_mapping_capability_is_explicit_and_fail_closed() {
+    let apple = timeout_signal_numbers_for(TimeoutSignalClass::Apple)
+        .expect("supported Apple signal mapping");
+    assert_eq!((apple.stop, apple.cont), (17, 19));
+
+    let linux_android = timeout_signal_numbers_for(TimeoutSignalClass::LinuxAndroidCommon)
+        .expect("supported Linux/Android signal mapping");
+    assert_eq!((linux_android.stop, linux_android.cont), (19, 18));
+
+    assert_eq!(
+        timeout_signal_numbers_for(TimeoutSignalClass::Unsupported),
+        None
+    );
+    assert!(timeout_platform_supported());
+}
+
+#[test]
+fn inaccessible_proc_pid_uses_independent_group_membership_fail_closed() {
+    let permission_denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    let owned_pgid = 4242;
+
+    let unrelated = classify_pid_group_observation(4343, None, owned_pgid);
+    assert_eq!(unrelated, PidGroupObservation::Other);
+    assert_eq!(
+        inaccessible_pid_quiescence(7, &permission_denied, unrelated),
+        None
+    );
+
+    let owned = classify_pid_group_observation(owned_pgid, None, owned_pgid);
+    assert_eq!(owned, PidGroupObservation::Owned);
+    assert!(matches!(
+        inaccessible_pid_quiescence(8, &permission_denied, owned),
+        Some(GroupQuiescence::Unknown { .. })
+    ));
+
+    let gone = classify_pid_group_observation(-1, Some(3), owned_pgid);
+    assert_eq!(gone, PidGroupObservation::Gone);
+    assert_eq!(
+        inaccessible_pid_quiescence(9, &permission_denied, gone),
+        None
+    );
+
+    let ambiguous = classify_pid_group_observation(-1, Some(1), owned_pgid);
+    assert!(matches!(ambiguous, PidGroupObservation::Unknown { .. }));
+    assert!(matches!(
+        inaccessible_pid_quiescence(10, &permission_denied, ambiguous),
+        Some(GroupQuiescence::Unknown { .. })
+    ));
+}
 
 #[test]
 fn to01_zero_run_timeout_is_refused_without_spawning() {
@@ -1008,6 +1132,12 @@ fn tg03a_churning_descendants_are_quiesced_before_leader_reap() {
     let caller_group = caller_process_group();
     let _ = take_timeout_lifecycle_events();
 
+    assert!(
+        CHURN_SAFETY_WINDOW
+            > Duration::from_millis(500) + Duration::from_millis(400) + Duration::from_secs(1),
+        "the helper safety ceiling must outlast deadline, grace, and quiescence"
+    );
+
     let (outcome, elapsed) = run_probe_bounded(
         "execution_timeout_probe_parent_of_churning_descendant",
         workspace.path(),
@@ -1059,6 +1189,40 @@ fn tg03a_churning_descendants_are_quiesced_before_leader_reap() {
         position(TimeoutLifecycleEvent::LeaderReaped)
             < position(TimeoutLifecycleEvent::GroupEmptyVerified)
     );
+}
+
+#[test]
+fn tg03b_churn_helper_has_finite_independent_wall_clock_bound() {
+    let workspace = TempDir::new("tg03b");
+    let started = Instant::now();
+    let mut child =
+        std::process::Command::new(std::env::current_exe().expect("current test executable path"))
+            .args([
+                "execution_timeout_probe_descendant_churns_after_sigterm",
+                "--ignored",
+            ])
+            .current_dir(workspace.path())
+            .spawn()
+            .expect("bounded churn helper spawn");
+    await_marker(workspace.path(), "descendant-ready");
+
+    let deadline =
+        Instant::now() + CHURN_SAFETY_WINDOW + CHURN_SETTLE_WINDOW + Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("bounded churn helper observation") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("churn helper exceeded its independent wall-clock bound");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    assert!(status.success(), "bounded churn helper failed: {status:?}");
+    assert!(started.elapsed() >= CHURN_SAFETY_WINDOW);
+    assert!(started.elapsed() < BOUNDED_RUN_UPPER_BOUND);
 }
 
 /// Spawns one controlled `sleep` child in its own fresh process group,
