@@ -20,11 +20,11 @@ use super::runner::{
 use crate::execution::unix_signal::{
     GroupPresence, GroupSignalDelivery, LeaderState, OwnedProcessGroup, TimeoutSignalClass,
     caller_process_group, classify_group_kill_result, classify_group_presence,
-    observe_leader_without_reaping, process_alive, recorded_group_is_empty,
+    deliver_group_sigkill, observe_leader_without_reaping, process_alive, recorded_group_is_empty,
     timeout_platform_supported, timeout_signal_numbers_for,
 };
 use crate::execution::unix_signal::{
-    GroupQuiescence, PidGroupObservation, classify_pid_group_observation,
+    GroupQuiescence, PidGroupObservation, classify_pid_group_observation, group_quiescence,
     inaccessible_pid_quiescence,
 };
 use crate::execution::{
@@ -359,6 +359,21 @@ fn execution_timeout_probe_parent_of_sigterm_ignoring_descendant_then_sleep_long
 #[test]
 #[ignore]
 fn execution_timeout_probe_churn_leaf() {
+    if std::env::var_os("RECEIPTS_RECORD_CHURN_LEAF").is_some() {
+        let cwd = std::env::current_dir().expect("churn leaf working directory");
+        fs::write(cwd.join("churn-leaf-pid"), std::process::id().to_string())
+            .expect("churn leaf pid marker");
+        fs::write(
+            cwd.join("churn-leaf-pgid"),
+            caller_process_group().to_string(),
+        )
+        .expect("churn leaf pgid marker");
+        fs::write(cwd.join("churn-leaf-ready"), b"ready").expect("churn leaf ready marker");
+        if std::env::var_os("RECEIPTS_HOLD_RECORDED_CHURN_LEAF").is_some() {
+            std::thread::sleep(PROBE_SLEEP);
+            return;
+        }
+    }
     std::thread::sleep(Duration::from_millis(40));
 }
 
@@ -380,6 +395,8 @@ fn execution_timeout_probe_descendant_churns_after_sigterm() {
 
     let cwd = std::env::current_dir().expect("probe working directory");
     fs::write(cwd.join("churn-pid"), std::process::id().to_string()).expect("churn pid marker");
+    fs::write(cwd.join("churn-pgid"), caller_process_group().to_string())
+        .expect("churn pgid marker");
     fs::write(cwd.join("descendant-ready"), b"ready").expect("churn ready marker");
     let executable = std::env::current_exe().expect("current test executable path");
     let mut children = Vec::new();
@@ -388,14 +405,19 @@ fn execution_timeout_probe_descendant_churns_after_sigterm() {
         children.retain_mut(|child: &mut std::process::Child| {
             child.try_wait().expect("churn child observation").is_none()
         });
-        children.push(
-            std::process::Command::new(&executable)
-                .args(["execution_timeout_probe_churn_leaf", "--ignored"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .expect("churn leaf spawn"),
-        );
+        let mut command = std::process::Command::new(&executable);
+        command
+            .args(["execution_timeout_probe_churn_leaf", "--ignored"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if children.is_empty() && !cwd.join("churn-leaf-ready").exists() {
+            command.env("RECEIPTS_RECORD_CHURN_LEAF", "1");
+        }
+        children.push(command.spawn().expect("churn leaf spawn"));
+        if std::env::var_os("RECEIPTS_FAIL_CHURN_HELPER_AFTER_LEAF").is_some() {
+            await_marker(&cwd, "churn-leaf-ready");
+            std::process::exit(23);
+        }
         std::thread::sleep(Duration::from_millis(1));
     }
 
@@ -1193,36 +1215,177 @@ fn tg03a_churning_descendants_are_quiesced_before_leader_reap() {
 
 #[test]
 fn tg03b_churn_helper_has_finite_independent_wall_clock_bound() {
-    let workspace = TempDir::new("tg03b");
-    let started = Instant::now();
-    let mut child =
-        std::process::Command::new(std::env::current_exe().expect("current test executable path"))
-            .args([
-                "execution_timeout_probe_descendant_churns_after_sigterm",
-                "--ignored",
-            ])
-            .current_dir(workspace.path())
-            .spawn()
-            .expect("bounded churn helper spawn");
-    await_marker(workspace.path(), "descendant-ready");
+    for _ in 0..5 {
+        let workspace = TempDir::new("tg03b");
+        let outcome = run_churn_helper(&workspace, false, false);
+        assert!(!outcome.timed_out);
+        assert!(
+            outcome.status.success(),
+            "bounded churn helper failed: {:?}",
+            outcome.status
+        );
+        let elapsed = outcome.elapsed;
+        assert!(elapsed >= CHURN_SAFETY_WINDOW);
+        assert!(elapsed < BOUNDED_RUN_UPPER_BOUND);
+    }
+}
 
-    let deadline =
-        Instant::now() + CHURN_SAFETY_WINDOW + CHURN_SETTLE_WINDOW + Duration::from_secs(2);
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("bounded churn helper observation") {
-            break status;
+struct ChurnHelperOutcome {
+    status: std::process::ExitStatus,
+    elapsed: Duration,
+    timed_out: bool,
+}
+
+/// Runs the churn helper in a fresh group and always kills that complete
+/// group before reaping its leader. `force_timeout` enters cleanup with a
+/// live recorded leaf; `fail_after_leaf` makes the helper exit 23 first.
+fn run_churn_helper(
+    workspace: &TempDir,
+    force_timeout: bool,
+    fail_after_leaf: bool,
+) -> ChurnHelperOutcome {
+    use std::os::unix::process::CommandExt;
+
+    let caller_group = caller_process_group();
+    let started = Instant::now();
+    let mut command =
+        std::process::Command::new(std::env::current_exe().expect("current test executable path"));
+    command
+        .args([
+            "execution_timeout_probe_descendant_churns_after_sigterm",
+            "--ignored",
+        ])
+        .current_dir(workspace.path())
+        .env_remove("RECEIPTS_RECORD_CHURN_LEAF")
+        .env_remove("RECEIPTS_HOLD_RECORDED_CHURN_LEAF")
+        .env_remove("RECEIPTS_FAIL_CHURN_HELPER_AFTER_LEAF");
+    command.process_group(0);
+    if force_timeout || fail_after_leaf {
+        command.env("RECEIPTS_HOLD_RECORDED_CHURN_LEAF", "1");
+    }
+    if fail_after_leaf {
+        command.env("RECEIPTS_FAIL_CHURN_HELPER_AFTER_LEAF", "1");
+    }
+
+    let mut child = command.spawn().expect("bounded churn helper spawn");
+    let helper_pid = child.id();
+    let group = OwnedProcessGroup::from_child_pid(helper_pid)
+        .expect("fresh churn helper certifies as an owned group");
+    assert_ne!(group.raw(), caller_group);
+
+    let ready_deadline = Instant::now() + Duration::from_secs(5);
+    while (!workspace.path().join("descendant-ready").exists()
+        || !workspace.path().join("churn-leaf-ready").exists())
+        && Instant::now() < ready_deadline
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let ready = workspace.path().join("descendant-ready").exists()
+        && workspace.path().join("churn-leaf-ready").exists();
+    let deadline = if force_timeout {
+        Instant::now()
+    } else {
+        started + CHURN_SAFETY_WINDOW + CHURN_SETTLE_WINDOW + Duration::from_secs(2)
+    };
+    let timed_out = loop {
+        if observe_leader_without_reaping(helper_pid).expect("non-reaping churn helper observation")
+            == LeaderState::Exited
+        {
+            break false;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("churn helper exceeded its independent wall-clock bound");
+            break true;
         }
         std::thread::sleep(Duration::from_millis(10));
     };
 
-    assert!(status.success(), "bounded churn helper failed: {status:?}");
-    assert!(started.elapsed() >= CHURN_SAFETY_WINDOW);
-    assert!(started.elapsed() < BOUNDED_RUN_UPPER_BOUND);
+    let group_has_live_members =
+        timed_out || group_quiescence(group, Some(helper_pid)) != GroupQuiescence::Empty;
+    if group_has_live_members {
+        match deliver_group_sigkill(group) {
+            GroupSignalDelivery::Delivered | GroupSignalDelivery::GroupAlreadyGone => {}
+            GroupSignalDelivery::Failed { detail } => {
+                let error = force_kill_failed_with_cleanup(child, group, detail);
+                await_process_death(helper_pid, "direct churn helper after signal failure");
+                if ready {
+                    await_process_death(
+                        recorded_value(workspace.path(), "churn-leaf-pid"),
+                        "recorded churn leaf after signal failure",
+                    );
+                }
+                await_group_empty(
+                    u32::try_from(group.raw()).expect("owned group stays positive"),
+                    "churn helper signal-failure cleanup",
+                );
+                assert_eq!(caller_process_group(), caller_group);
+                panic!("churn helper cleanup failed: {error}")
+            }
+        }
+    }
+    let exit_deadline = Instant::now() + Duration::from_secs(5);
+    while observe_leader_without_reaping(helper_pid)
+        .expect("post-SIGKILL non-reaping churn helper observation")
+        != LeaderState::Exited
+    {
+        assert!(
+            Instant::now() < exit_deadline,
+            "churn helper did not exit within its cleanup deadline"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let status = child.wait().expect("final churn helper reap");
+
+    assert!(
+        ready,
+        "churn helper did not publish readiness before cleanup"
+    );
+    let helper_pgid = recorded_value(workspace.path(), "churn-pgid");
+    let leaf_pid = recorded_value(workspace.path(), "churn-leaf-pid");
+    let leaf_pgid = recorded_value(workspace.path(), "churn-leaf-pgid");
+    assert_eq!(helper_pgid, helper_pid);
+    assert_eq!(leaf_pgid, helper_pid);
+    await_process_death(helper_pid, "direct churn helper");
+    await_process_death(leaf_pid, "recorded churn leaf");
+    await_group_empty(helper_pgid, "churn helper cleanup");
+    assert_eq!(caller_process_group(), caller_group);
+
+    ChurnHelperOutcome {
+        status,
+        elapsed: started.elapsed(),
+        timed_out,
+    }
+}
+
+#[test]
+fn tg03c_churn_helper_timeout_cleans_complete_owned_group() {
+    let workspace = TempDir::new("tg03c");
+    let outcome = run_churn_helper(&workspace, true, false);
+    assert!(outcome.timed_out, "forced timeout must be reported");
+    let report = std::panic::catch_unwind(|| {
+        panic!("churn helper exceeded its independent wall-clock bound")
+    });
+    assert!(report.is_err());
+}
+
+#[test]
+fn tg03d_churn_helper_non_success_cleans_group_before_panic() {
+    for _ in 0..10 {
+        let workspace = TempDir::new("tg03d");
+        let outcome = run_churn_helper(&workspace, false, true);
+        assert!(!outcome.timed_out);
+        assert!(
+            !outcome.status.success(),
+            "forced-failure helper must report non-success after cleanup"
+        );
+        let report = std::panic::catch_unwind(|| {
+            assert!(
+                outcome.status.success(),
+                "bounded churn helper failed: {:?}",
+                outcome.status
+            );
+        });
+        assert!(report.is_err());
+    }
 }
 
 /// Spawns one controlled `sleep` child in its own fresh process group,
