@@ -39,12 +39,25 @@
 //! silently reported as an ordinary successful completion. No default
 //! timeout exists: the unbounded [`run`] API keeps its accepted semantics.
 //!
-//! Deliberately excluded here (later runner slices): output capture,
-//! digests, checkpoints, recovery. Also excluded by architecture: sandbox
-//! enforcement of any kind. The workspace boundary provides workspace
+//! Bounded output capture ([`run_with_timeout_and_capture`]) adds separate
+//! stdout and stderr retention to that same timed lifecycle: each stream is
+//! drained to EOF by its own dedicated reader (so neither pipe can deadlock
+//! the child), every drained byte is counted with checked `u64` arithmetic,
+//! and retention is a fixed `HEAD_TAIL` bound — the exact first
+//! [`STREAM_HEAD_RETENTION_BYTES`] bytes plus the exact last
+//! [`STREAM_TAIL_RETENTION_BYTES`] bytes, with nothing synthetic inserted
+//! between them. Retention buffers are reserved fallibly before the child
+//! exists, so a bound that cannot be honored fails closed with nothing
+//! spawned. [`run`] and [`run_with_timeout`] keep their accepted null-stdio
+//! behavior: capture is opt-in through the new API only.
+//!
+//! Deliberately excluded here (later runner slices): output digests,
+//! durable output storage, checkpoints, recovery. Also excluded by
+//! architecture: sandbox enforcement of any kind. The workspace boundary provides workspace
 //! isolation only — it is NOT a security sandbox; filesystem, network,
 //! and process isolation belong to the runtime/host sandbox layer.
 
+mod capture;
 mod error;
 mod outcome;
 mod request;
@@ -53,10 +66,14 @@ mod timeout;
 #[cfg(unix)]
 mod unix_signal;
 
+pub use capture::{
+    CapturedProcessRun, CapturedStream, STREAM_CAPTURE_LIMIT_BYTES, STREAM_HEAD_RETENTION_BYTES,
+    STREAM_TAIL_RETENTION_BYTES,
+};
 pub use error::ExecutionError;
 pub use outcome::{ProcessRunOutcome, ProcessTermination};
 pub use request::ProcessRunRequest;
-pub use runner::{run, run_with_timeout};
+pub use runner::{run, run_with_timeout, run_with_timeout_and_capture};
 pub use timeout::ProcessTimeoutPolicy;
 
 #[cfg(test)]
@@ -66,3 +83,7 @@ mod execution_tests;
 // the public boundary is the fail-closed stub above.
 #[cfg(all(test, unix))]
 mod timeout_tests;
+// The capture suite drives real children through the bounded capturing
+// runner and needs the same Unix process-group machinery.
+#[cfg(all(test, unix))]
+mod capture_tests;
