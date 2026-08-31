@@ -149,6 +149,19 @@ fn recorded_value(workspace_root: &Path, marker: &str) -> u32 {
         .expect("recorded marker value parses")
 }
 
+fn try_recorded_value(workspace_root: &Path, marker: &str) -> Result<u32, String> {
+    let path = workspace_root.join(marker);
+    let value = fs::read_to_string(&path)
+        .map_err(|error| format!("could not read marker {}: {error}", path.display()))?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!("marker {} was empty", path.display()));
+    }
+    value
+        .parse::<u32>()
+        .map_err(|error| format!("marker {} was not a valid u32: {error}", path.display()))
+}
+
 /// Reads the runner-owned probe child's recorded pid.
 fn recorded_pid(workspace_root: &Path) -> u32 {
     recorded_value(workspace_root, "pid")
@@ -362,8 +375,21 @@ fn execution_timeout_probe_parent_of_sigterm_ignoring_descendant_then_sleep_long
 fn execution_timeout_probe_churn_leaf() {
     if std::env::var_os("RECEIPTS_RECORD_CHURN_LEAF").is_some() {
         let cwd = std::env::current_dir().expect("churn leaf working directory");
-        fs::write(cwd.join("churn-leaf-pid"), std::process::id().to_string())
-            .expect("churn leaf pid marker");
+        fs::write(
+            cwd.join("churn-leaf-control-pid"),
+            std::process::id().to_string(),
+        )
+        .expect("churn leaf control pid marker");
+        if std::env::var_os("RECEIPTS_CHURN_LEAF_PID_DIRECTORY").is_some() {
+            fs::create_dir(cwd.join("churn-leaf-pid")).expect("churn leaf pid marker directory");
+        } else {
+            let value = if std::env::var_os("RECEIPTS_MALFORM_CHURN_LEAF_PID").is_some() {
+                "not-a-pid".to_string()
+            } else {
+                std::process::id().to_string()
+            };
+            fs::write(cwd.join("churn-leaf-pid"), value).expect("churn leaf pid marker");
+        }
         fs::write(
             cwd.join("churn-leaf-pgid"),
             caller_process_group().to_string(),
@@ -1260,6 +1286,8 @@ enum ChurnHelperFault {
     Ownership,
     Release,
     Readiness,
+    MalformedLeafMarker,
+    UnreadableLeafMarker,
 }
 
 #[derive(Debug)]
@@ -1286,6 +1314,7 @@ enum ChurnCleanupEvidence {
 #[derive(Debug)]
 struct ChurnHelperFailure {
     primary: String,
+    marker_error: Option<String>,
     cleanup: Result<ChurnCleanupEvidence, String>,
     helper_pid: u32,
     leaf_alive_before_cleanup: Option<bool>,
@@ -1293,16 +1322,21 @@ struct ChurnHelperFailure {
 
 impl std::fmt::Display for ChurnHelperFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let marker_error = self
+            .marker_error
+            .as_deref()
+            .map(|error| format!("; marker evidence: {error}"))
+            .unwrap_or_default();
         match &self.cleanup {
             Ok(evidence) => write!(
                 formatter,
-                "primary: {}; cleanup: PASS ({evidence:?})",
-                self.primary
+                "primary: {}{marker_error}; cleanup: PASS ({evidence:?})",
+                self.primary,
             ),
             Err(cleanup) => write!(
                 formatter,
-                "SAFETY-CRITICAL CLEANUP FAILURE: {cleanup}; primary: {}",
-                self.primary
+                "SAFETY-CRITICAL CLEANUP FAILURE: {cleanup}; primary: {}{marker_error}",
+                self.primary,
             ),
         }
     }
@@ -1505,16 +1539,37 @@ fn run_churn_helper(
         .env_remove("RECEIPTS_HOLD_RECORDED_CHURN_LEAF")
         .env_remove("RECEIPTS_FAIL_CHURN_HELPER_AFTER_LEAF")
         .env_remove("RECEIPTS_SUPPRESS_CHURN_LEAF_READY")
+        .env_remove("RECEIPTS_MALFORM_CHURN_LEAF_PID")
+        .env_remove("RECEIPTS_CHURN_LEAF_PID_DIRECTORY")
         .env("RECEIPTS_CHURN_START_BARRIER", "1");
     command.process_group(0);
-    if force_timeout || fail_after_leaf || fault == ChurnHelperFault::Readiness {
+    if force_timeout
+        || fail_after_leaf
+        || matches!(
+            fault,
+            ChurnHelperFault::Readiness
+                | ChurnHelperFault::MalformedLeafMarker
+                | ChurnHelperFault::UnreadableLeafMarker
+        )
+    {
         command.env("RECEIPTS_HOLD_RECORDED_CHURN_LEAF", "1");
     }
     if fail_after_leaf {
         command.env("RECEIPTS_FAIL_CHURN_HELPER_AFTER_LEAF", "1");
     }
-    if fault == ChurnHelperFault::Readiness {
+    if matches!(
+        fault,
+        ChurnHelperFault::Readiness
+            | ChurnHelperFault::MalformedLeafMarker
+            | ChurnHelperFault::UnreadableLeafMarker
+    ) {
         command.env("RECEIPTS_SUPPRESS_CHURN_LEAF_READY", "1");
+    }
+    if fault == ChurnHelperFault::MalformedLeafMarker {
+        command.env("RECEIPTS_MALFORM_CHURN_LEAF_PID", "1");
+    }
+    if fault == ChurnHelperFault::UnreadableLeafMarker {
+        command.env("RECEIPTS_CHURN_LEAF_PID_DIRECTORY", "1");
     }
 
     let mut child = command.spawn().expect("bounded churn helper spawn");
@@ -1526,6 +1581,7 @@ fn run_churn_helper(
     ) {
         return Err(ChurnHelperFailure {
             primary: "churn helper did not reach its pre-leaf ownership barrier".to_string(),
+            marker_error: None,
             cleanup: cleanup_blocked_churn_helper(&mut child, caller_group),
             helper_pid,
             leaf_alive_before_cleanup: None,
@@ -1539,6 +1595,7 @@ fn run_churn_helper(
     let Some(group) = group else {
         return Err(ChurnHelperFailure {
             primary: "churn helper process-group ownership was not established".to_string(),
+            marker_error: None,
             cleanup: cleanup_blocked_churn_helper(&mut child, caller_group),
             helper_pid,
             leaf_alive_before_cleanup: None,
@@ -1547,6 +1604,7 @@ fn run_churn_helper(
     if group.raw() == caller_group {
         return Err(ChurnHelperFailure {
             primary: "churn helper group unexpectedly matched the caller group".to_string(),
+            marker_error: None,
             cleanup: cleanup_blocked_churn_helper(&mut child, caller_group),
             helper_pid,
             leaf_alive_before_cleanup: None,
@@ -1557,6 +1615,7 @@ fn run_churn_helper(
     {
         return Err(ChurnHelperFailure {
             primary: format!("could not prepare release-failure condition: {error}"),
+            marker_error: None,
             cleanup: cleanup_owned_churn_helper_failure(&mut child, group, caller_group)
                 .map(ChurnCleanupEvidence::Owned),
             helper_pid,
@@ -1569,6 +1628,7 @@ fn run_churn_helper(
     ) {
         return Err(ChurnHelperFailure {
             primary: format!("could not release owned churn helper: {error}"),
+            marker_error: None,
             cleanup: cleanup_owned_churn_helper_failure(&mut child, group, caller_group)
                 .map(ChurnCleanupEvidence::Owned),
             helper_pid,
@@ -1584,13 +1644,30 @@ fn run_churn_helper(
         started + CHURN_SAFETY_WINDOW + CHURN_SETTLE_WINDOW + Duration::from_secs(2)
     };
     let mut primary = (!ready).then(|| "churn helper did not publish leaf readiness".to_string());
-    let leaf_alive_before_cleanup = if fault == ChurnHelperFault::Readiness
-        && marker_appears_within(workspace.path(), "churn-leaf-pid", Duration::from_secs(1))
-    {
-        Some(process_alive(recorded_value(
-            workspace.path(),
-            "churn-leaf-pid",
-        )))
+    let mut marker_error = None;
+    let leaf_alive_before_cleanup = if matches!(
+        fault,
+        ChurnHelperFault::Readiness
+            | ChurnHelperFault::MalformedLeafMarker
+            | ChurnHelperFault::UnreadableLeafMarker
+    ) {
+        match try_recorded_value(workspace.path(), "churn-leaf-pid") {
+            Ok(pid) => Some(process_alive(pid)),
+            Err(marker_read_error) => {
+                match try_recorded_value(workspace.path(), "churn-leaf-control-pid") {
+                    Ok(pid) => {
+                        marker_error = Some(marker_read_error);
+                        Some(process_alive(pid))
+                    }
+                    Err(error) => {
+                        marker_error = Some(format!(
+                            "{marker_read_error}; independent leaf evidence failed: {error}"
+                        ));
+                        None
+                    }
+                }
+            }
+        }
     } else {
         None
     };
@@ -1629,6 +1706,7 @@ fn run_churn_helper(
         let cleanup = cleanup_owned_churn_helper_failure(&mut child, group, caller_group);
         return Err(ChurnHelperFailure {
             primary,
+            marker_error,
             cleanup: cleanup.map(ChurnCleanupEvidence::Owned),
             helper_pid,
             leaf_alive_before_cleanup,
@@ -1642,6 +1720,7 @@ fn run_churn_helper(
         let cleanup = cleanup_owned_churn_helper_failure(&mut child, group, caller_group);
         return Err(ChurnHelperFailure {
             primary: "churn helper descendants were not quiescent after leader exit".to_string(),
+            marker_error,
             cleanup: cleanup.map(ChurnCleanupEvidence::Owned),
             helper_pid,
             leaf_alive_before_cleanup,
@@ -1652,6 +1731,7 @@ fn run_churn_helper(
         Err(detail) => {
             return Err(ChurnHelperFailure {
                 primary: "owned churn-helper cleanup failed".to_string(),
+                marker_error,
                 cleanup: Err(detail),
                 helper_pid,
                 leaf_alive_before_cleanup,
@@ -1829,6 +1909,7 @@ fn tg03i_post_release_readiness_failure_contains_live_leaf() {
             .expect_err("suppressed post-release readiness must fail after containment");
 
         assert!(failure.primary.contains("did not publish leaf readiness"));
+        assert!(failure.marker_error.is_none());
         assert_eq!(failure.leaf_alive_before_cleanup, Some(true));
         let leaf_pid = recorded_value(workspace.path(), "churn-leaf-pid");
         let helper_pgid = recorded_value(workspace.path(), "churn-pgid");
@@ -1843,6 +1924,55 @@ fn tg03i_post_release_readiness_failure_contains_live_leaf() {
         assert!(!process_alive(leaf_pid));
         await_group_empty(helper_pgid, "post-release readiness-failure cleanup");
         assert_eq!(caller_process_group(), caller_group);
+    }
+}
+
+fn assert_leaf_marker_failure_contained(fault: ChurnHelperFault, expected_error: &str, tag: &str) {
+    let workspace = TempDir::new(tag);
+    let caller_group = caller_process_group();
+    let failure = run_churn_helper(&workspace, false, false, fault)
+        .expect_err("leaf marker failure must be reported after containment");
+
+    assert!(failure.primary.contains("did not publish leaf readiness"));
+    assert!(
+        failure
+            .marker_error
+            .as_deref()
+            .is_some_and(|error| error.contains(expected_error))
+    );
+    assert_eq!(failure.leaf_alive_before_cleanup, Some(true));
+    let leaf_pid = recorded_value(workspace.path(), "churn-leaf-control-pid");
+    let cleanup = match failure.cleanup {
+        Ok(ChurnCleanupEvidence::Owned(cleanup)) => cleanup,
+        other => panic!("leaf marker failure lacked owned cleanup evidence: {other:?}"),
+    };
+    assert_owned_churn_cleanup(&cleanup);
+    assert!(cleanup.group_sigkill_delivered);
+    assert!(!process_alive(failure.helper_pid));
+    assert!(!process_alive(leaf_pid));
+    await_group_empty(failure.helper_pid, "leaf-marker-failure cleanup");
+    assert_eq!(caller_process_group(), caller_group);
+}
+
+#[test]
+fn tg03j_malformed_leaf_marker_contains_live_group_before_reporting() {
+    for _ in 0..10 {
+        assert_leaf_marker_failure_contained(
+            ChurnHelperFault::MalformedLeafMarker,
+            "was not a valid u32",
+            "tg03j",
+        );
+    }
+}
+
+#[test]
+fn tg03k_unreadable_leaf_marker_contains_live_group_before_reporting() {
+    for _ in 0..10 {
+        assert_leaf_marker_failure_contained(
+            ChurnHelperFault::UnreadableLeafMarker,
+            "could not read marker",
+            "tg03k",
+        );
     }
 }
 
