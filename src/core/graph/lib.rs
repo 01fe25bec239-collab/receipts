@@ -31,6 +31,7 @@
 //!   execution, workspace manipulation, State-Context writes, or
 //!   model/provider routing.
 
+pub mod accepted_integration_transition;
 pub mod edge;
 pub mod error;
 pub mod execution_graph;
@@ -42,6 +43,8 @@ pub mod rejected_repair_transition;
 pub mod repair_completion_transition;
 pub mod review_verdict_transition;
 
+#[cfg(test)]
+mod accepted_integration_transition_tests;
 #[cfg(test)]
 mod execution_graph_tests;
 #[cfg(test)]
@@ -57,6 +60,10 @@ mod repair_completion_transition_tests;
 #[cfg(test)]
 mod review_verdict_transition_tests;
 
+pub use accepted_integration_transition::{
+    AUTHORIZED_ACCEPTED_INTEGRATION_TRANSITIONS, AcceptedIntegrationTransitionError,
+    validate_accepted_integration_transition,
+};
 pub use edge::{ControlKind, EdgeClass, GraphEdge, GraphEdgeRelation, PrecedenceKind};
 pub use error::{GraphError, MAX_IDENTIFIER_LENGTH};
 pub use execution_graph::ExecutionGraph;
