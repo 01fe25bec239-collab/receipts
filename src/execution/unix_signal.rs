@@ -7,8 +7,8 @@
 //! timeout boundary. Rust's [`std::process::Child::kill`] reaches only one
 //! pid, so genuine graceful and forced group termination requires
 //! delivering signals with `kill(2)` directly. No shell exists here and no
-//! dependency is added — platform-gated `kill(2)`/`getpgrp(2)` declarations
-//! with the POSIX-fixed signal numbers and errnos this slice needs.
+//! dependency is added — platform-gated process-control declarations with
+//! signal numbers selected only for architectures whose mappings are known.
 //!
 //! Safety invariants enforced here, all fail-closed:
 //!
@@ -29,23 +29,91 @@
 pub(crate) mod unix {
     use std::os::raw::{c_int, c_uint, c_void};
 
-    // SIGTERM/SIGKILL are fixed here across supported targets; SIGSTOP and
-    // SIGCONT use the target values published by Darwin and Linux/Android
-    // headers.
+    // SIGTERM/SIGKILL are fixed across the supported targets below. SIGSTOP
+    // and SIGCONT are selected through the same capability model that gates
+    // timed spawning, so an unknown architecture can never receive a guessed
+    // signal number.
     const SIGTERM: c_int = 15;
-    #[cfg(target_vendor = "apple")]
-    const SIGSTOP: c_int = 17;
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    const SIGSTOP: c_int = 19;
-    #[cfg(target_vendor = "apple")]
-    const SIGCONT: c_int = 19;
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    const SIGCONT: c_int = 18;
     const SIGKILL: c_int = 9;
     /// `ESRCH` — no such process: the target had already exited.
     const ESRCH: c_int = 3;
     /// `EPERM` — the target exists but the signal could not be delivered.
     const EPERM: c_int = 1;
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum TimeoutSignalClass {
+        Apple,
+        LinuxAndroidCommon,
+        Unsupported,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct TimeoutSignalNumbers {
+        pub(crate) stop: c_int,
+        pub(crate) cont: c_int,
+    }
+
+    pub(crate) const fn timeout_signal_numbers_for(
+        class: TimeoutSignalClass,
+    ) -> Option<TimeoutSignalNumbers> {
+        match class {
+            TimeoutSignalClass::Apple => Some(TimeoutSignalNumbers { stop: 17, cont: 19 }),
+            TimeoutSignalClass::LinuxAndroidCommon => {
+                Some(TimeoutSignalNumbers { stop: 19, cont: 18 })
+            }
+            TimeoutSignalClass::Unsupported => None,
+        }
+    }
+
+    const CURRENT_TIMEOUT_SIGNAL_CLASS: TimeoutSignalClass = {
+        #[cfg(all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        {
+            TimeoutSignalClass::Apple
+        }
+        #[cfg(all(
+            any(target_os = "linux", target_os = "android"),
+            any(
+                target_arch = "x86",
+                target_arch = "x86_64",
+                target_arch = "arm",
+                target_arch = "aarch64"
+            )
+        ))]
+        {
+            TimeoutSignalClass::LinuxAndroidCommon
+        }
+        #[cfg(not(any(
+            all(
+                target_os = "macos",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ),
+            all(
+                any(target_os = "linux", target_os = "android"),
+                any(
+                    target_arch = "x86",
+                    target_arch = "x86_64",
+                    target_arch = "arm",
+                    target_arch = "aarch64"
+                )
+            )
+        )))]
+        {
+            TimeoutSignalClass::Unsupported
+        }
+    };
+
+    pub(crate) const fn timeout_signal_numbers() -> Option<TimeoutSignalNumbers> {
+        timeout_signal_numbers_for(CURRENT_TIMEOUT_SIGNAL_CLASS)
+    }
+
+    /// Authoritative pre-spawn truth for the complete timeout lifecycle.
+    pub(crate) const fn timeout_platform_supported() -> bool {
+        timeout_signal_numbers().is_some()
+    }
 
     const P_PID: c_uint = 1;
     const WNOHANG: c_int = 1;
@@ -58,6 +126,8 @@ pub(crate) mod unix {
     unsafe extern "C" {
         fn kill(pid: c_int, sig: c_int) -> c_int;
         fn getpgrp() -> c_int;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        fn getpgid(pid: c_int) -> c_int;
         #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
         fn waitid(idtype: c_uint, id: c_uint, infop: *mut c_void, options: c_int) -> c_int;
     }
@@ -249,35 +319,31 @@ pub(crate) mod unix {
     }
 
     /// Uncatchable `SIGSTOP` used only as a completion/cleanup quiescence barrier.
-    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
     pub(crate) fn deliver_group_sigstop(group: OwnedProcessGroup) -> GroupSignalDelivery {
-        signal_owned_group(group, SIGSTOP, "quiescence SIGSTOP")
+        match timeout_signal_numbers() {
+            Some(signals) => signal_owned_group(group, signals.stop, "quiescence SIGSTOP"),
+            None => GroupSignalDelivery::Failed {
+                detail: format!(
+                    "quiescence SIGSTOP is unavailable for owned process group -{} on this Unix target",
+                    group.raw()
+                ),
+            },
+        }
     }
 
     /// Resumes an owned group only after a pre-deadline completion probe
     /// temporarily stopped it and found a live member.
-    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
     pub(crate) fn deliver_group_sigcont(group: OwnedProcessGroup) -> GroupSignalDelivery {
-        signal_owned_group(group, SIGCONT, "completion-verification SIGCONT")
-    }
-
-    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
-    pub(crate) fn deliver_group_sigcont(group: OwnedProcessGroup) -> GroupSignalDelivery {
-        GroupSignalDelivery::Failed {
-            detail: format!(
-                "completion-verification SIGCONT is unavailable for owned process group -{} on this Unix target",
-                group.raw()
-            ),
-        }
-    }
-
-    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
-    pub(crate) fn deliver_group_sigstop(group: OwnedProcessGroup) -> GroupSignalDelivery {
-        GroupSignalDelivery::Failed {
-            detail: format!(
-                "quiescence SIGSTOP is unavailable for owned process group -{} on this Unix target",
-                group.raw()
-            ),
+        match timeout_signal_numbers() {
+            Some(signals) => {
+                signal_owned_group(group, signals.cont, "completion-verification SIGCONT")
+            }
+            None => GroupSignalDelivery::Failed {
+                detail: format!(
+                    "completion-verification SIGCONT is unavailable for owned process group -{} on this Unix target",
+                    group.raw()
+                ),
+            },
         }
     }
 
@@ -308,6 +374,74 @@ pub(crate) mod unix {
         AllStopped(Vec<u32>),
         Mutable,
         Unknown { detail: String },
+    }
+
+    #[cfg(any(test, target_os = "linux", target_os = "android"))]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum PidGroupObservation {
+        Owned,
+        Other,
+        Gone,
+        Unknown { detail: String },
+    }
+
+    #[cfg(any(test, target_os = "linux", target_os = "android"))]
+    pub(crate) fn classify_pid_group_observation(
+        ret: c_int,
+        errno: Option<c_int>,
+        owned_pgid: c_int,
+    ) -> PidGroupObservation {
+        if ret == owned_pgid {
+            return PidGroupObservation::Owned;
+        }
+        if ret > 0 {
+            return PidGroupObservation::Other;
+        }
+        if ret == -1 && errno == Some(ESRCH) {
+            return PidGroupObservation::Gone;
+        }
+        PidGroupObservation::Unknown {
+            detail: format!(
+                "getpgid returned {ret} with errno {errno:?} while checking owned process group {owned_pgid}"
+            ),
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn observe_pid_group(pid: u32, group: OwnedProcessGroup) -> PidGroupObservation {
+        let Ok(pid) = c_int::try_from(pid) else {
+            return PidGroupObservation::Unknown {
+                detail: format!("pid {pid} does not fit pid_t"),
+            };
+        };
+        let ret = unsafe { getpgid(pid) };
+        let errno = if ret == -1 {
+            std::io::Error::last_os_error().raw_os_error()
+        } else {
+            None
+        };
+        classify_pid_group_observation(ret, errno, group.raw())
+    }
+
+    #[cfg(any(test, target_os = "linux", target_os = "android"))]
+    pub(crate) fn inaccessible_pid_quiescence(
+        pid: u32,
+        error: &std::io::Error,
+        observation: PidGroupObservation,
+    ) -> Option<GroupQuiescence> {
+        match observation {
+            PidGroupObservation::Other | PidGroupObservation::Gone => None,
+            PidGroupObservation::Owned => Some(GroupQuiescence::Unknown {
+                detail: format!(
+                    "process {pid} may belong to the owned group but /proc/{pid}/stat is inaccessible: {error}"
+                ),
+            }),
+            PidGroupObservation::Unknown { detail } => Some(GroupQuiescence::Unknown {
+                detail: format!(
+                    "cannot determine whether inaccessible /proc/{pid}/stat belongs to the owned group: {error}; {detail}"
+                ),
+            }),
+        }
     }
 
     /// Pure classification of one raw zero-signal probe result against an
@@ -403,6 +537,9 @@ pub(crate) mod unix {
                     ),
                 };
             }
+            // Apple's wrapper returns PID elements, not the underlying
+            // proc_listpids byte count. Dividing by sizeof(c_int) here would
+            // undercount group members.
             let count = usize::try_from(count).unwrap_or(0);
             if count >= capacity {
                 capacity = capacity.saturating_mul(2);
@@ -511,9 +648,10 @@ pub(crate) mod unix {
                 Ok(stat) => stat,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => {
-                    return GroupQuiescence::Unknown {
-                        detail: format!("cannot inspect /proc/{pid}/stat: {error}"),
-                    };
+                    match inaccessible_pid_quiescence(pid, &error, observe_pid_group(pid, group)) {
+                        Some(unknown) => return unknown,
+                        None => continue,
+                    }
                 }
             };
             let Some((_, fields)) = stat.rsplit_once(") ") else {
@@ -594,12 +732,16 @@ pub(crate) mod unix {
 pub(crate) use unix::{
     GroupPresence, GroupQuiescence, GroupSignalDelivery, LeaderState, OwnedProcessGroup,
     deliver_group_sigcont, deliver_group_sigkill, deliver_group_sigstop, deliver_group_sigterm,
-    group_presence, group_quiescence, observe_leader_without_reaping,
+    group_presence, group_quiescence, observe_leader_without_reaping, timeout_platform_supported,
 };
 // Classifier tables and zero-signal probes are exercised directly by the
 // timeout suite; production flow reaches them through the helpers above.
 #[cfg(all(unix, test))]
 pub(crate) use unix::{
-    caller_process_group, classify_group_kill_result, classify_group_presence, process_alive,
-    recorded_group_is_empty,
+    PidGroupObservation, classify_pid_group_observation, inaccessible_pid_quiescence,
+};
+#[cfg(all(unix, test))]
+pub(crate) use unix::{
+    TimeoutSignalClass, caller_process_group, classify_group_kill_result, classify_group_presence,
+    process_alive, recorded_group_is_empty, timeout_signal_numbers_for,
 };

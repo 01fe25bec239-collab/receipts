@@ -14,16 +14,22 @@ use std::time::{Duration, Instant};
 
 use super::runner::{
     TimeoutLifecycleEvent, checked_deadline, force_kill_failed_with_cleanup,
-    grace_wait_failed_with_cleanup, take_timeout_lifecycle_events,
+    grace_wait_failed_with_cleanup, inject_unsupported_timeout_platform,
+    take_timeout_lifecycle_events,
 };
 use crate::execution::unix_signal::{
-    GroupPresence, GroupSignalDelivery, LeaderState, OwnedProcessGroup, caller_process_group,
-    classify_group_kill_result, classify_group_presence, observe_leader_without_reaping,
-    process_alive, recorded_group_is_empty,
+    GroupPresence, GroupSignalDelivery, LeaderState, OwnedProcessGroup, TimeoutSignalClass,
+    caller_process_group, classify_group_kill_result, classify_group_presence,
+    deliver_group_sigkill, observe_leader_without_reaping, process_alive, recorded_group_is_empty,
+    timeout_platform_supported, timeout_signal_numbers_for,
+};
+use crate::execution::unix_signal::{
+    GroupQuiescence, PidGroupObservation, classify_pid_group_observation, group_quiescence,
+    inaccessible_pid_quiescence,
 };
 use crate::execution::{
     ExecutionError, ProcessRunOutcome, ProcessRunRequest, ProcessTermination, ProcessTimeoutPolicy,
-    run, run_with_timeout,
+    run, run_with_timeout, run_with_timeout_and_capture,
 };
 
 /// How long every controlled probe child would keep running if the
@@ -36,6 +42,13 @@ const PROBE_SLEEP: Duration = Duration::from_secs(60);
 /// host, yet far below [`PROBE_SLEEP`], so an unbounded leak could never
 /// pass.
 const BOUNDED_RUN_UPPER_BOUND: Duration = Duration::from_secs(20);
+
+/// Independent safety ceiling for the deliberately hostile churn helper.
+/// The substantive test needs less than two seconds through quiescence;
+/// five seconds preserves that pressure while bounding a broken runner.
+const CHURN_SAFETY_WINDOW: Duration = Duration::from_secs(5);
+const CHURN_SETTLE_WINDOW: Duration = Duration::from_secs(1);
+const CHURN_START_TOKEN: &[u8] = b"receipts-churn-start-v1";
 
 /// A temporary directory removed on drop.
 struct TempDir {
@@ -134,6 +147,19 @@ fn recorded_value(workspace_root: &Path, marker: &str) -> u32 {
         .trim()
         .parse()
         .expect("recorded marker value parses")
+}
+
+fn try_recorded_value(workspace_root: &Path, marker: &str) -> Result<u32, String> {
+    let path = workspace_root.join(marker);
+    let value = fs::read_to_string(&path)
+        .map_err(|error| format!("could not read marker {}: {error}", path.display()))?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!("marker {} was empty", path.display()));
+    }
+    value
+        .parse::<u32>()
+        .map_err(|error| format!("marker {} was not a valid u32: {error}", path.display()))
 }
 
 /// Reads the runner-owned probe child's recorded pid.
@@ -347,6 +373,36 @@ fn execution_timeout_probe_parent_of_sigterm_ignoring_descendant_then_sleep_long
 #[test]
 #[ignore]
 fn execution_timeout_probe_churn_leaf() {
+    if std::env::var_os("RECEIPTS_RECORD_CHURN_LEAF").is_some() {
+        let cwd = std::env::current_dir().expect("churn leaf working directory");
+        fs::write(
+            cwd.join("churn-leaf-control-pid"),
+            std::process::id().to_string(),
+        )
+        .expect("churn leaf control pid marker");
+        if std::env::var_os("RECEIPTS_CHURN_LEAF_PID_DIRECTORY").is_some() {
+            fs::create_dir(cwd.join("churn-leaf-pid")).expect("churn leaf pid marker directory");
+        } else {
+            let value = if std::env::var_os("RECEIPTS_MALFORM_CHURN_LEAF_PID").is_some() {
+                "not-a-pid".to_string()
+            } else {
+                std::process::id().to_string()
+            };
+            fs::write(cwd.join("churn-leaf-pid"), value).expect("churn leaf pid marker");
+        }
+        fs::write(
+            cwd.join("churn-leaf-pgid"),
+            caller_process_group().to_string(),
+        )
+        .expect("churn leaf pgid marker");
+        if std::env::var_os("RECEIPTS_SUPPRESS_CHURN_LEAF_READY").is_none() {
+            fs::write(cwd.join("churn-leaf-ready"), b"ready").expect("churn leaf ready marker");
+        }
+        if std::env::var_os("RECEIPTS_HOLD_RECORDED_CHURN_LEAF").is_some() {
+            std::thread::sleep(PROBE_SLEEP);
+            return;
+        }
+    }
     std::thread::sleep(Duration::from_millis(40));
 }
 
@@ -367,22 +423,52 @@ fn execution_timeout_probe_descendant_churns_after_sigterm() {
     }
 
     let cwd = std::env::current_dir().expect("probe working directory");
+    if std::env::var_os("RECEIPTS_CHURN_START_BARRIER").is_some() {
+        fs::write(cwd.join("churn-helper-ready"), b"ready").expect("churn helper barrier marker");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !churn_start_released(&cwd.join("churn-helper-start")) {
+            if Instant::now() >= deadline {
+                std::process::exit(24);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
     fs::write(cwd.join("churn-pid"), std::process::id().to_string()).expect("churn pid marker");
+    fs::write(cwd.join("churn-pgid"), caller_process_group().to_string())
+        .expect("churn pgid marker");
     fs::write(cwd.join("descendant-ready"), b"ready").expect("churn ready marker");
     let executable = std::env::current_exe().expect("current test executable path");
     let mut children = Vec::new();
-    loop {
+    let deadline = Instant::now() + CHURN_SAFETY_WINDOW;
+    while Instant::now() < deadline {
         children.retain_mut(|child: &mut std::process::Child| {
             child.try_wait().expect("churn child observation").is_none()
         });
-        children.push(
-            std::process::Command::new(&executable)
-                .args(["execution_timeout_probe_churn_leaf", "--ignored"])
-                .spawn()
-                .expect("churn leaf spawn"),
-        );
+        let mut command = std::process::Command::new(&executable);
+        command
+            .args(["execution_timeout_probe_churn_leaf", "--ignored"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if children.is_empty() && !cwd.join("churn-leaf-ready").exists() {
+            command.env("RECEIPTS_RECORD_CHURN_LEAF", "1");
+        }
+        children.push(command.spawn().expect("churn leaf spawn"));
+        if std::env::var_os("RECEIPTS_FAIL_CHURN_HELPER_AFTER_LEAF").is_some() {
+            await_marker(&cwd, "churn-leaf-ready");
+            std::process::exit(23);
+        }
         std::thread::sleep(Duration::from_millis(1));
     }
+
+    let settle_deadline = Instant::now() + CHURN_SETTLE_WINDOW;
+    while !children.is_empty() && Instant::now() < settle_deadline {
+        children.retain_mut(|child| child.try_wait().expect("churn child reap").is_none());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        children.is_empty(),
+        "churn leaves did not settle within the safety window"
+    );
 }
 
 #[test]
@@ -398,6 +484,105 @@ fn execution_timeout_probe_parent_of_churning_descendant() {
 }
 
 // --- Policy validation (T10 / T11) ---------------------------------------
+
+#[test]
+fn unsupported_timeout_platform_refuses_uncaptured_spawn() {
+    let workspace = TempDir::new("unsupported-plain");
+    let request = bounded_request(
+        std::env::current_exe().expect("current test executable path"),
+        &[
+            "execution_timeout_probe_child_ready_then_sleep_long",
+            "--ignored",
+        ],
+        workspace.path(),
+        workspace.path(),
+    );
+    let _guard = inject_unsupported_timeout_platform();
+    let error = run_with_timeout(
+        &request,
+        &policy(Duration::from_secs(30), Duration::from_secs(1)),
+    )
+    .expect_err("unsupported timeout capability must fail before spawn");
+
+    assert!(matches!(error, ExecutionError::UnsupportedTimeoutPlatform));
+    assert!(!workspace.path().join("ready").exists());
+    assert!(!workspace.path().join("pid").exists());
+}
+
+#[test]
+fn unsupported_timeout_platform_refuses_captured_spawn() {
+    let workspace = TempDir::new("unsupported-capture");
+    let request = bounded_request(
+        std::env::current_exe().expect("current test executable path"),
+        &[
+            "execution_timeout_probe_child_ready_then_sleep_long",
+            "--ignored",
+        ],
+        workspace.path(),
+        workspace.path(),
+    );
+    let _guard = inject_unsupported_timeout_platform();
+    let error = run_with_timeout_and_capture(
+        &request,
+        &policy(Duration::from_secs(30), Duration::from_secs(1)),
+    )
+    .expect_err("unsupported capture capability must fail before spawn");
+
+    assert!(matches!(error, ExecutionError::UnsupportedTimeoutPlatform));
+    assert!(!workspace.path().join("ready").exists());
+    assert!(!workspace.path().join("pid").exists());
+}
+
+#[test]
+fn timeout_signal_mapping_capability_is_explicit_and_fail_closed() {
+    let apple = timeout_signal_numbers_for(TimeoutSignalClass::Apple)
+        .expect("supported Apple signal mapping");
+    assert_eq!((apple.stop, apple.cont), (17, 19));
+
+    let linux_android = timeout_signal_numbers_for(TimeoutSignalClass::LinuxAndroidCommon)
+        .expect("supported Linux/Android signal mapping");
+    assert_eq!((linux_android.stop, linux_android.cont), (19, 18));
+
+    assert_eq!(
+        timeout_signal_numbers_for(TimeoutSignalClass::Unsupported),
+        None
+    );
+    assert!(timeout_platform_supported());
+}
+
+#[test]
+fn inaccessible_proc_pid_uses_independent_group_membership_fail_closed() {
+    let permission_denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    let owned_pgid = 4242;
+
+    let unrelated = classify_pid_group_observation(4343, None, owned_pgid);
+    assert_eq!(unrelated, PidGroupObservation::Other);
+    assert_eq!(
+        inaccessible_pid_quiescence(7, &permission_denied, unrelated),
+        None
+    );
+
+    let owned = classify_pid_group_observation(owned_pgid, None, owned_pgid);
+    assert_eq!(owned, PidGroupObservation::Owned);
+    assert!(matches!(
+        inaccessible_pid_quiescence(8, &permission_denied, owned),
+        Some(GroupQuiescence::Unknown { .. })
+    ));
+
+    let gone = classify_pid_group_observation(-1, Some(3), owned_pgid);
+    assert_eq!(gone, PidGroupObservation::Gone);
+    assert_eq!(
+        inaccessible_pid_quiescence(9, &permission_denied, gone),
+        None
+    );
+
+    let ambiguous = classify_pid_group_observation(-1, Some(1), owned_pgid);
+    assert!(matches!(ambiguous, PidGroupObservation::Unknown { .. }));
+    assert!(matches!(
+        inaccessible_pid_quiescence(10, &permission_denied, ambiguous),
+        Some(GroupQuiescence::Unknown { .. })
+    ));
+}
 
 #[test]
 fn to01_zero_run_timeout_is_refused_without_spawning() {
@@ -1008,6 +1193,12 @@ fn tg03a_churning_descendants_are_quiesced_before_leader_reap() {
     let caller_group = caller_process_group();
     let _ = take_timeout_lifecycle_events();
 
+    assert!(
+        CHURN_SAFETY_WINDOW
+            > Duration::from_millis(500) + Duration::from_millis(400) + Duration::from_secs(1),
+        "the helper safety ceiling must outlast deadline, grace, and quiescence"
+    );
+
     let (outcome, elapsed) = run_probe_bounded(
         "execution_timeout_probe_parent_of_churning_descendant",
         workspace.path(),
@@ -1059,6 +1250,730 @@ fn tg03a_churning_descendants_are_quiesced_before_leader_reap() {
         position(TimeoutLifecycleEvent::LeaderReaped)
             < position(TimeoutLifecycleEvent::GroupEmptyVerified)
     );
+}
+
+#[test]
+fn tg03b_churn_helper_has_finite_independent_wall_clock_bound() {
+    for _ in 0..5 {
+        let workspace = TempDir::new("tg03b");
+        let outcome = run_churn_helper(&workspace, false, false, ChurnHelperFault::None)
+            .unwrap_or_else(|failure| panic!("bounded churn helper failed: {failure}"));
+        assert!(!outcome.timed_out);
+        assert!(
+            outcome.cleanup.status.success(),
+            "bounded churn helper failed: {:?}",
+            outcome.cleanup.status
+        );
+        assert_owned_churn_cleanup(&outcome.cleanup);
+        assert!(!outcome.cleanup.group_sigkill_delivered);
+        let elapsed = outcome.elapsed;
+        assert!(elapsed >= CHURN_SAFETY_WINDOW);
+        assert!(elapsed < BOUNDED_RUN_UPPER_BOUND);
+    }
+}
+
+#[derive(Debug)]
+struct ChurnHelperOutcome {
+    cleanup: OwnedChurnCleanupEvidence,
+    elapsed: Duration,
+    timed_out: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChurnHelperFault {
+    None,
+    Observation,
+    Ownership,
+    Release,
+    Readiness,
+    MalformedLeafMarker,
+    UnreadableLeafMarker,
+}
+
+#[derive(Debug)]
+struct OwnedChurnCleanupEvidence {
+    status: std::process::ExitStatus,
+    group_signaling_complete: bool,
+    group_sigkill_delivered: bool,
+    future_group_signals: bool,
+    helper_reaped: bool,
+    group_empty: bool,
+    caller_pgid_preserved: bool,
+}
+
+#[derive(Debug)]
+enum ChurnCleanupEvidence {
+    Owned(OwnedChurnCleanupEvidence),
+    PreOwnership {
+        status: std::process::ExitStatus,
+        helper_reaped: bool,
+        caller_pgid_preserved: bool,
+    },
+}
+
+#[derive(Debug)]
+struct ChurnHelperFailure {
+    primary: String,
+    marker_error: Option<String>,
+    cleanup: Result<ChurnCleanupEvidence, String>,
+    helper_pid: u32,
+    leaf_alive_before_cleanup: Option<bool>,
+}
+
+impl std::fmt::Display for ChurnHelperFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let marker_error = self
+            .marker_error
+            .as_deref()
+            .map(|error| format!("; marker evidence: {error}"))
+            .unwrap_or_default();
+        match &self.cleanup {
+            Ok(evidence) => write!(
+                formatter,
+                "primary: {}{marker_error}; cleanup: PASS ({evidence:?})",
+                self.primary,
+            ),
+            Err(cleanup) => write!(
+                formatter,
+                "SAFETY-CRITICAL CLEANUP FAILURE: {cleanup}; primary: {}{marker_error}",
+                self.primary,
+            ),
+        }
+    }
+}
+
+fn assert_owned_churn_cleanup(cleanup: &OwnedChurnCleanupEvidence) {
+    assert!(cleanup.group_signaling_complete);
+    assert!(!cleanup.future_group_signals);
+    assert!(cleanup.helper_reaped);
+    assert!(cleanup.group_empty);
+    assert!(cleanup.caller_pgid_preserved);
+}
+
+fn marker_appears_within(workspace: &Path, marker: &str, window: Duration) -> bool {
+    let Some(deadline) = Instant::now().checked_add(window) else {
+        return false;
+    };
+    while !workspace.join(marker).exists() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    true
+}
+
+fn churn_start_released(path: &Path) -> bool {
+    matches!(fs::read(path), Ok(contents) if contents == CHURN_START_TOKEN)
+}
+
+fn bounded_reap_churn_helper(
+    child: &mut std::process::Child,
+) -> Result<std::process::ExitStatus, String> {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(5))
+        .ok_or_else(|| "could not represent direct-helper reap deadline".to_string())?;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("direct-helper reap failed: {error}")),
+        }
+        if Instant::now() >= deadline {
+            return Err("direct helper remained unreaped beyond cleanup deadline".to_string());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn recorded_group_empties_within(pgid: u32, window: Duration) -> bool {
+    let Some(deadline) = Instant::now().checked_add(window) else {
+        return false;
+    };
+    loop {
+        if recorded_group_is_empty(pgid) == Some(true) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn finish_owned_churn_helper_cleanup(
+    child: &mut std::process::Child,
+    group: OwnedProcessGroup,
+    caller_group: std::os::raw::c_int,
+    group_sigkill_delivered: bool,
+    mut failures: Vec<String>,
+) -> Result<OwnedChurnCleanupEvidence, String> {
+    let group_signaling_complete = failures.is_empty();
+
+    // No group signal may occur below this point: Child::try_wait may reap.
+    let status = match bounded_reap_churn_helper(child) {
+        Ok(status) => Some(status),
+        Err(error) => {
+            failures.push(error);
+            None
+        }
+    };
+    let group_empty = recorded_group_empties_within(group.raw() as u32, Duration::from_secs(10));
+    if !group_empty {
+        failures.push(format!(
+            "owned process group -{} was not proven empty after direct-helper reap",
+            group.raw()
+        ));
+    }
+    let caller_pgid_preserved = caller_process_group() == caller_group;
+    if !caller_pgid_preserved {
+        failures.push(format!(
+            "caller process group changed from {caller_group} to {}",
+            caller_process_group()
+        ));
+    }
+
+    if failures.is_empty() {
+        Ok(OwnedChurnCleanupEvidence {
+            status: status.expect("successful cleanup includes a reaped status"),
+            group_signaling_complete,
+            group_sigkill_delivered,
+            future_group_signals: false,
+            helper_reaped: true,
+            group_empty,
+            caller_pgid_preserved,
+        })
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+/// Force-contains a validated helper-owned group before boundedly reaping its
+/// leader. No membership observation may skip this failure-path SIGKILL, and
+/// no group signal may occur after this function begins direct-child reaping.
+fn cleanup_owned_churn_helper_failure(
+    child: &mut std::process::Child,
+    group: OwnedProcessGroup,
+    caller_group: std::os::raw::c_int,
+) -> Result<OwnedChurnCleanupEvidence, String> {
+    let mut failures = Vec::new();
+    let group_sigkill_delivered = match deliver_group_sigkill(group) {
+        GroupSignalDelivery::Delivered | GroupSignalDelivery::GroupAlreadyGone => true,
+        GroupSignalDelivery::Failed { detail } => {
+            failures.push(format!("initial owned-group SIGKILL failed: {detail}"));
+            match deliver_group_sigkill(group) {
+                GroupSignalDelivery::Delivered | GroupSignalDelivery::GroupAlreadyGone => true,
+                GroupSignalDelivery::Failed { detail } => {
+                    failures.push(format!("owned-group SIGKILL retry failed: {detail}"));
+                    false
+                }
+            }
+        }
+    };
+
+    finish_owned_churn_helper_cleanup(
+        child,
+        group,
+        caller_group,
+        group_sigkill_delivered,
+        failures,
+    )
+}
+
+fn cleanup_blocked_churn_helper(
+    child: &mut std::process::Child,
+    caller_group: std::os::raw::c_int,
+) -> Result<ChurnCleanupEvidence, String> {
+    let mut failures = Vec::new();
+    if let Err(error) = child.kill() {
+        failures.push(format!("direct-helper kill failed: {error}"));
+    }
+    let status = match bounded_reap_churn_helper(child) {
+        Ok(status) => Some(status),
+        Err(error) => {
+            failures.push(error);
+            None
+        }
+    };
+    let caller_pgid_preserved = caller_process_group() == caller_group;
+    if !caller_pgid_preserved {
+        failures.push(format!(
+            "caller process group changed from {caller_group} to {}",
+            caller_process_group()
+        ));
+    }
+    if failures.is_empty() {
+        Ok(ChurnCleanupEvidence::PreOwnership {
+            status: status.expect("successful cleanup includes a reaped status"),
+            helper_reaped: true,
+            caller_pgid_preserved,
+        })
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+/// Runs the churn helper in a fresh group. Failure paths contain the complete
+/// group before reaping; normal success first proves leader exit and group
+/// quiescence while the leader remains waitable.
+fn run_churn_helper(
+    workspace: &TempDir,
+    force_timeout: bool,
+    fail_after_leaf: bool,
+    fault: ChurnHelperFault,
+) -> Result<ChurnHelperOutcome, ChurnHelperFailure> {
+    use std::os::unix::process::CommandExt;
+
+    let caller_group = caller_process_group();
+    let started = Instant::now();
+    let mut command =
+        std::process::Command::new(std::env::current_exe().expect("current test executable path"));
+    command
+        .args([
+            "execution_timeout_probe_descendant_churns_after_sigterm",
+            "--ignored",
+        ])
+        .current_dir(workspace.path())
+        .env_remove("RECEIPTS_RECORD_CHURN_LEAF")
+        .env_remove("RECEIPTS_HOLD_RECORDED_CHURN_LEAF")
+        .env_remove("RECEIPTS_FAIL_CHURN_HELPER_AFTER_LEAF")
+        .env_remove("RECEIPTS_SUPPRESS_CHURN_LEAF_READY")
+        .env_remove("RECEIPTS_MALFORM_CHURN_LEAF_PID")
+        .env_remove("RECEIPTS_CHURN_LEAF_PID_DIRECTORY")
+        .env("RECEIPTS_CHURN_START_BARRIER", "1");
+    command.process_group(0);
+    if force_timeout
+        || fail_after_leaf
+        || matches!(
+            fault,
+            ChurnHelperFault::Readiness
+                | ChurnHelperFault::MalformedLeafMarker
+                | ChurnHelperFault::UnreadableLeafMarker
+        )
+    {
+        command.env("RECEIPTS_HOLD_RECORDED_CHURN_LEAF", "1");
+    }
+    if fail_after_leaf {
+        command.env("RECEIPTS_FAIL_CHURN_HELPER_AFTER_LEAF", "1");
+    }
+    if matches!(
+        fault,
+        ChurnHelperFault::Readiness
+            | ChurnHelperFault::MalformedLeafMarker
+            | ChurnHelperFault::UnreadableLeafMarker
+    ) {
+        command.env("RECEIPTS_SUPPRESS_CHURN_LEAF_READY", "1");
+    }
+    if fault == ChurnHelperFault::MalformedLeafMarker {
+        command.env("RECEIPTS_MALFORM_CHURN_LEAF_PID", "1");
+    }
+    if fault == ChurnHelperFault::UnreadableLeafMarker {
+        command.env("RECEIPTS_CHURN_LEAF_PID_DIRECTORY", "1");
+    }
+
+    let mut child = command.spawn().expect("bounded churn helper spawn");
+    let helper_pid = child.id();
+    if !marker_appears_within(
+        workspace.path(),
+        "churn-helper-ready",
+        Duration::from_secs(5),
+    ) {
+        return Err(ChurnHelperFailure {
+            primary: "churn helper did not reach its pre-leaf ownership barrier".to_string(),
+            marker_error: None,
+            cleanup: cleanup_blocked_churn_helper(&mut child, caller_group),
+            helper_pid,
+            leaf_alive_before_cleanup: None,
+        });
+    }
+    let group = if fault == ChurnHelperFault::Ownership {
+        None
+    } else {
+        OwnedProcessGroup::from_child_pid(helper_pid)
+    };
+    let Some(group) = group else {
+        return Err(ChurnHelperFailure {
+            primary: "churn helper process-group ownership was not established".to_string(),
+            marker_error: None,
+            cleanup: cleanup_blocked_churn_helper(&mut child, caller_group),
+            helper_pid,
+            leaf_alive_before_cleanup: None,
+        });
+    };
+    if group.raw() == caller_group {
+        return Err(ChurnHelperFailure {
+            primary: "churn helper group unexpectedly matched the caller group".to_string(),
+            marker_error: None,
+            cleanup: cleanup_blocked_churn_helper(&mut child, caller_group),
+            helper_pid,
+            leaf_alive_before_cleanup: None,
+        });
+    }
+    if fault == ChurnHelperFault::Release
+        && let Err(error) = fs::create_dir(workspace.path().join("churn-helper-start"))
+    {
+        return Err(ChurnHelperFailure {
+            primary: format!("could not prepare release-failure condition: {error}"),
+            marker_error: None,
+            cleanup: cleanup_owned_churn_helper_failure(&mut child, group, caller_group)
+                .map(ChurnCleanupEvidence::Owned),
+            helper_pid,
+            leaf_alive_before_cleanup: None,
+        });
+    }
+    if let Err(error) = fs::write(
+        workspace.path().join("churn-helper-start"),
+        CHURN_START_TOKEN,
+    ) {
+        return Err(ChurnHelperFailure {
+            primary: format!("could not release owned churn helper: {error}"),
+            marker_error: None,
+            cleanup: cleanup_owned_churn_helper_failure(&mut child, group, caller_group)
+                .map(ChurnCleanupEvidence::Owned),
+            helper_pid,
+            leaf_alive_before_cleanup: None,
+        });
+    }
+
+    let ready = marker_appears_within(workspace.path(), "descendant-ready", Duration::from_secs(5))
+        && marker_appears_within(workspace.path(), "churn-leaf-ready", Duration::from_secs(5));
+    let deadline = if force_timeout {
+        Instant::now()
+    } else {
+        started + CHURN_SAFETY_WINDOW + CHURN_SETTLE_WINDOW + Duration::from_secs(2)
+    };
+    let mut primary = (!ready).then(|| "churn helper did not publish leaf readiness".to_string());
+    let mut marker_error = None;
+    let leaf_alive_before_cleanup = if matches!(
+        fault,
+        ChurnHelperFault::Readiness
+            | ChurnHelperFault::MalformedLeafMarker
+            | ChurnHelperFault::UnreadableLeafMarker
+    ) {
+        match try_recorded_value(workspace.path(), "churn-leaf-pid") {
+            Ok(pid) => Some(process_alive(pid)),
+            Err(marker_read_error) => {
+                match try_recorded_value(workspace.path(), "churn-leaf-control-pid") {
+                    Ok(pid) => {
+                        marker_error = Some(marker_read_error);
+                        Some(process_alive(pid))
+                    }
+                    Err(error) => {
+                        marker_error = Some(format!(
+                            "{marker_read_error}; independent leaf evidence failed: {error}"
+                        ));
+                        None
+                    }
+                }
+            }
+        }
+    } else {
+        None
+    };
+    let mut observation_fault_pending = fault == ChurnHelperFault::Observation;
+    let mut leader_exited = false;
+    let timed_out = loop {
+        if primary.is_some() {
+            break false;
+        }
+        let observation = if observation_fault_pending {
+            observation_fault_pending = false;
+            Err(std::io::Error::other(
+                "synthetic live-leader observation failure",
+            ))
+        } else {
+            observe_leader_without_reaping(helper_pid)
+        };
+        match observation {
+            Ok(LeaderState::Exited) => {
+                leader_exited = true;
+                break false;
+            }
+            Ok(LeaderState::Running) => {}
+            Err(error) => {
+                primary = Some(format!("leader observation failed: {error}"));
+                break false;
+            }
+        }
+        if Instant::now() >= deadline {
+            break true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    if let Some(primary) = primary {
+        let cleanup = cleanup_owned_churn_helper_failure(&mut child, group, caller_group);
+        return Err(ChurnHelperFailure {
+            primary,
+            marker_error,
+            cleanup: cleanup.map(ChurnCleanupEvidence::Owned),
+            helper_pid,
+            leaf_alive_before_cleanup,
+        });
+    }
+    let cleanup = if timed_out || fail_after_leaf {
+        cleanup_owned_churn_helper_failure(&mut child, group, caller_group)
+    } else if leader_exited && group_quiescence(group, Some(helper_pid)) == GroupQuiescence::Empty {
+        finish_owned_churn_helper_cleanup(&mut child, group, caller_group, false, Vec::new())
+    } else {
+        let cleanup = cleanup_owned_churn_helper_failure(&mut child, group, caller_group);
+        return Err(ChurnHelperFailure {
+            primary: "churn helper descendants were not quiescent after leader exit".to_string(),
+            marker_error,
+            cleanup: cleanup.map(ChurnCleanupEvidence::Owned),
+            helper_pid,
+            leaf_alive_before_cleanup,
+        });
+    };
+    let cleanup = match cleanup {
+        Ok(cleanup) => cleanup,
+        Err(detail) => {
+            return Err(ChurnHelperFailure {
+                primary: "owned churn-helper cleanup failed".to_string(),
+                marker_error,
+                cleanup: Err(detail),
+                helper_pid,
+                leaf_alive_before_cleanup,
+            });
+        }
+    };
+
+    assert!(
+        ready,
+        "churn helper did not publish readiness before cleanup"
+    );
+    let helper_pgid = recorded_value(workspace.path(), "churn-pgid");
+    let leaf_pid = recorded_value(workspace.path(), "churn-leaf-pid");
+    let leaf_pgid = recorded_value(workspace.path(), "churn-leaf-pgid");
+    assert_eq!(helper_pgid, helper_pid);
+    assert_eq!(leaf_pgid, helper_pid);
+    await_process_death(helper_pid, "direct churn helper");
+    await_process_death(leaf_pid, "recorded churn leaf");
+    await_group_empty(helper_pgid, "churn helper cleanup");
+    assert_eq!(caller_process_group(), caller_group);
+
+    Ok(ChurnHelperOutcome {
+        cleanup,
+        elapsed: started.elapsed(),
+        timed_out,
+    })
+}
+
+#[test]
+fn tg03c_churn_helper_timeout_cleans_complete_owned_group() {
+    let workspace = TempDir::new("tg03c");
+    let outcome = run_churn_helper(&workspace, true, false, ChurnHelperFault::None)
+        .unwrap_or_else(|failure| panic!("forced cleanup failed: {failure}"));
+    assert!(outcome.timed_out, "forced timeout must be reported");
+    assert_owned_churn_cleanup(&outcome.cleanup);
+    assert!(outcome.cleanup.group_sigkill_delivered);
+    let report = std::panic::catch_unwind(|| {
+        panic!("churn helper exceeded its independent wall-clock bound")
+    });
+    assert!(report.is_err());
+}
+
+#[test]
+fn tg03d_churn_helper_non_success_cleans_group_before_panic() {
+    for _ in 0..10 {
+        let workspace = TempDir::new("tg03d");
+        let outcome = run_churn_helper(&workspace, false, true, ChurnHelperFault::None)
+            .unwrap_or_else(|failure| panic!("non-success cleanup failed: {failure}"));
+        assert!(!outcome.timed_out);
+        assert_owned_churn_cleanup(&outcome.cleanup);
+        assert!(outcome.cleanup.group_sigkill_delivered);
+        assert!(
+            !outcome.cleanup.status.success(),
+            "forced-failure helper must report non-success after cleanup"
+        );
+        let report = std::panic::catch_unwind(|| {
+            assert!(
+                outcome.cleanup.status.success(),
+                "bounded churn helper failed: {:?}",
+                outcome.cleanup.status
+            );
+        });
+        assert!(report.is_err());
+    }
+}
+
+#[test]
+fn tg03e_observation_failure_cleans_live_churn_group_before_reporting() {
+    for _ in 0..10 {
+        let workspace = TempDir::new("tg03e");
+        let caller_group = caller_process_group();
+        let failure = run_churn_helper(&workspace, true, false, ChurnHelperFault::Observation)
+            .expect_err("synthetic observation failure must be reported after cleanup");
+
+        assert!(failure.primary.contains("leader observation failed"));
+        assert!(
+            failure
+                .primary
+                .contains("synthetic live-leader observation failure")
+        );
+        let cleanup = match failure.cleanup {
+            Ok(ChurnCleanupEvidence::Owned(cleanup)) => cleanup,
+            other => panic!("observation failure lacked owned cleanup evidence: {other:?}"),
+        };
+        assert_owned_churn_cleanup(&cleanup);
+        assert!(cleanup.group_sigkill_delivered);
+
+        let leaf_pid = recorded_value(workspace.path(), "churn-leaf-pid");
+        let helper_pgid = recorded_value(workspace.path(), "churn-pgid");
+        assert_eq!(helper_pgid, failure.helper_pid);
+        await_process_death(failure.helper_pid, "observation-failure helper");
+        await_process_death(leaf_pid, "observation-failure controlled leaf");
+        await_group_empty(helper_pgid, "observation-failure cleanup");
+        assert_eq!(caller_process_group(), caller_group);
+    }
+}
+
+#[test]
+fn tg03f_ownership_failure_reaps_blocked_helper_before_leaf_creation() {
+    for _ in 0..10 {
+        let workspace = TempDir::new("tg03f");
+        let caller_group = caller_process_group();
+        let failure = run_churn_helper(&workspace, false, false, ChurnHelperFault::Ownership)
+            .expect_err("synthetic ownership rejection must be reported after direct cleanup");
+
+        assert!(failure.primary.contains("ownership was not established"));
+        match failure.cleanup {
+            Ok(ChurnCleanupEvidence::PreOwnership {
+                status,
+                helper_reaped,
+                caller_pgid_preserved,
+            }) => {
+                assert!(!status.success());
+                assert!(helper_reaped);
+                assert!(caller_pgid_preserved);
+            }
+            other => panic!("ownership failure lacked direct cleanup evidence: {other:?}"),
+        }
+        assert!(!process_alive(failure.helper_pid));
+        assert!(!workspace.path().join("churn-pid").exists());
+        assert!(!workspace.path().join("churn-leaf-pid").exists());
+        assert!(!workspace.path().join("churn-leaf-ready").exists());
+        assert_eq!(caller_process_group(), caller_group);
+    }
+}
+
+#[test]
+fn tg03g_churn_start_barrier_requires_exact_token_file() {
+    let workspace = TempDir::new("tg03g");
+    let start = workspace.path().join("churn-helper-start");
+
+    assert!(!churn_start_released(&start));
+    fs::create_dir(&start).expect("directory release impostor");
+    assert!(!churn_start_released(&start));
+    fs::remove_dir(&start).expect("remove directory release impostor");
+    fs::write(&start, b"wrong-token").expect("malformed release token");
+    assert!(!churn_start_released(&start));
+    fs::write(&start, CHURN_START_TOKEN).expect("valid release token");
+    assert!(churn_start_released(&start));
+}
+
+#[test]
+fn tg03h_release_failure_contains_live_helper_without_false_empty() {
+    for _ in 0..10 {
+        let workspace = TempDir::new("tg03h");
+        let caller_group = caller_process_group();
+        let failure = run_churn_helper(&workspace, false, false, ChurnHelperFault::Release)
+            .expect_err("directory-at-release-path must fail before contained return");
+
+        assert!(
+            failure
+                .primary
+                .contains("could not release owned churn helper")
+        );
+        let cleanup = match failure.cleanup {
+            Ok(ChurnCleanupEvidence::Owned(cleanup)) => cleanup,
+            other => panic!("release failure lacked owned cleanup evidence: {other:?}"),
+        };
+        assert_owned_churn_cleanup(&cleanup);
+        assert!(cleanup.group_sigkill_delivered);
+        assert!(!process_alive(failure.helper_pid));
+        assert!(!workspace.path().join("churn-pid").exists());
+        assert!(!workspace.path().join("churn-leaf-pid").exists());
+        await_group_empty(failure.helper_pid, "release-failure cleanup");
+        assert_eq!(caller_process_group(), caller_group);
+    }
+}
+
+#[test]
+fn tg03i_post_release_readiness_failure_contains_live_leaf() {
+    for _ in 0..10 {
+        let workspace = TempDir::new("tg03i");
+        let caller_group = caller_process_group();
+        let failure = run_churn_helper(&workspace, false, false, ChurnHelperFault::Readiness)
+            .expect_err("suppressed post-release readiness must fail after containment");
+
+        assert!(failure.primary.contains("did not publish leaf readiness"));
+        assert!(failure.marker_error.is_none());
+        assert_eq!(failure.leaf_alive_before_cleanup, Some(true));
+        let leaf_pid = recorded_value(workspace.path(), "churn-leaf-pid");
+        let helper_pgid = recorded_value(workspace.path(), "churn-pgid");
+        assert_eq!(helper_pgid, failure.helper_pid);
+        let cleanup = match failure.cleanup {
+            Ok(ChurnCleanupEvidence::Owned(cleanup)) => cleanup,
+            other => panic!("readiness failure lacked owned cleanup evidence: {other:?}"),
+        };
+        assert_owned_churn_cleanup(&cleanup);
+        assert!(cleanup.group_sigkill_delivered);
+        assert!(!process_alive(failure.helper_pid));
+        assert!(!process_alive(leaf_pid));
+        await_group_empty(helper_pgid, "post-release readiness-failure cleanup");
+        assert_eq!(caller_process_group(), caller_group);
+    }
+}
+
+fn assert_leaf_marker_failure_contained(fault: ChurnHelperFault, expected_error: &str, tag: &str) {
+    let workspace = TempDir::new(tag);
+    let caller_group = caller_process_group();
+    let failure = run_churn_helper(&workspace, false, false, fault)
+        .expect_err("leaf marker failure must be reported after containment");
+
+    assert!(failure.primary.contains("did not publish leaf readiness"));
+    assert!(
+        failure
+            .marker_error
+            .as_deref()
+            .is_some_and(|error| error.contains(expected_error))
+    );
+    assert_eq!(failure.leaf_alive_before_cleanup, Some(true));
+    let leaf_pid = recorded_value(workspace.path(), "churn-leaf-control-pid");
+    let cleanup = match failure.cleanup {
+        Ok(ChurnCleanupEvidence::Owned(cleanup)) => cleanup,
+        other => panic!("leaf marker failure lacked owned cleanup evidence: {other:?}"),
+    };
+    assert_owned_churn_cleanup(&cleanup);
+    assert!(cleanup.group_sigkill_delivered);
+    assert!(!process_alive(failure.helper_pid));
+    assert!(!process_alive(leaf_pid));
+    await_group_empty(failure.helper_pid, "leaf-marker-failure cleanup");
+    assert_eq!(caller_process_group(), caller_group);
+}
+
+#[test]
+fn tg03j_malformed_leaf_marker_contains_live_group_before_reporting() {
+    for _ in 0..10 {
+        assert_leaf_marker_failure_contained(
+            ChurnHelperFault::MalformedLeafMarker,
+            "was not a valid u32",
+            "tg03j",
+        );
+    }
+}
+
+#[test]
+fn tg03k_unreadable_leaf_marker_contains_live_group_before_reporting() {
+    for _ in 0..10 {
+        assert_leaf_marker_failure_contained(
+            ChurnHelperFault::UnreadableLeafMarker,
+            "could not read marker",
+            "tg03k",
+        );
+    }
 }
 
 /// Spawns one controlled `sleep` child in its own fresh process group,

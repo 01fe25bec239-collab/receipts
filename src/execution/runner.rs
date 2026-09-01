@@ -94,7 +94,7 @@ use crate::execution::timeout::ProcessTimeoutPolicy;
 use crate::execution::unix_signal::{
     GroupPresence, GroupQuiescence, GroupSignalDelivery, LeaderState, OwnedProcessGroup,
     deliver_group_sigcont, deliver_group_sigkill, deliver_group_sigstop, deliver_group_sigterm,
-    group_presence, group_quiescence, observe_leader_without_reaping,
+    group_presence, group_quiescence, observe_leader_without_reaping, timeout_platform_supported,
 };
 
 /// Common local shell basenames rejected at executable validation.
@@ -133,6 +133,41 @@ const CAPTURE_READER_VERIFY_WINDOW: Duration = Duration::from_secs(2);
 #[cfg(all(test, unix))]
 thread_local! {
     static CAPTURE_TEST_FAULTS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static FORCE_UNSUPPORTED_TIMEOUT_PLATFORM: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(all(test, unix))]
+pub(crate) struct UnsupportedTimeoutPlatformGuard(bool);
+
+#[cfg(all(test, unix))]
+impl Drop for UnsupportedTimeoutPlatformGuard {
+    fn drop(&mut self) {
+        FORCE_UNSUPPORTED_TIMEOUT_PLATFORM.set(self.0);
+    }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn inject_unsupported_timeout_platform() -> UnsupportedTimeoutPlatformGuard {
+    UnsupportedTimeoutPlatformGuard(FORCE_UNSUPPORTED_TIMEOUT_PLATFORM.replace(true))
+}
+
+#[cfg(unix)]
+fn ensure_timeout_platform_supported() -> Result<(), ExecutionError> {
+    #[cfg(test)]
+    if FORCE_UNSUPPORTED_TIMEOUT_PLATFORM.get() {
+        return Err(ExecutionError::UnsupportedTimeoutPlatform);
+    }
+    if timeout_platform_supported() {
+        Ok(())
+    } else {
+        Err(ExecutionError::UnsupportedTimeoutPlatform)
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -267,8 +302,10 @@ pub fn run_with_timeout(
     request: &ProcessRunRequest,
     policy: &ProcessTimeoutPolicy,
 ) -> Result<ProcessRunOutcome, ExecutionError> {
-    // Deadline arithmetic happens first: it is pure, cheap, and fails
-    // closed before any filesystem or process resource is touched.
+    ensure_timeout_platform_supported()?;
+
+    // Capability and deadline arithmetic both fail closed before any
+    // filesystem or process resource is touched.
     let deadline = validated_run_deadline(policy)?;
 
     let executable = validated_executable(request.executable())?;
@@ -335,7 +372,8 @@ const STDERR: &str = "stderr";
 ///
 /// Ordering, in full:
 ///
-/// 1. compute the monotonic deadline (fails closed on overflow);
+/// 1. verify timeout-platform capability and compute the monotonic deadline
+///    (fails closed on unsupported targets or overflow);
 /// 2. validate the request exactly as the uncaptured paths do;
 /// 3. allocate both bounded retention buffers **before** the child exists,
 ///    so a machine that cannot honor the retention bound fails closed with
@@ -374,6 +412,8 @@ pub fn run_with_timeout_and_capture(
     request: &ProcessRunRequest,
     policy: &ProcessTimeoutPolicy,
 ) -> Result<CapturedProcessRun, ExecutionError> {
+    ensure_timeout_platform_supported()?;
+
     let deadline = validated_run_deadline(policy)?;
 
     let executable = validated_executable(request.executable())?;
