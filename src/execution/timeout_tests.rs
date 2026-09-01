@@ -13,8 +13,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::runner::{
-    TimeoutLifecycleEvent, checked_deadline, force_kill_failed_with_cleanup,
-    grace_wait_failed_with_cleanup, inject_unsupported_timeout_platform,
+    CAPTURE_TEST_FAIL_FORCE_KILL, CAPTURE_TEST_FORCE_COMPLETION_BARRIER,
+    TEST_FAIL_FINAL_REAP_RESULT, TEST_FAIL_POST_REAP_GROUP_EMPTY, TimeoutLifecycleEvent,
+    UNCAPTURED_TEST_FAIL_WAIT, checked_deadline, finish_timeout_after_signaling,
+    force_kill_failed_with_cleanup, grace_wait_failed_with_cleanup,
+    graceful_termination_failed_with_cleanup, inject_capture_test_faults,
+    inject_unsupported_timeout_platform, quiescence_failed_with_cleanup,
     take_timeout_lifecycle_events,
 };
 use crate::execution::unix_signal::{
@@ -366,6 +370,20 @@ fn execution_timeout_probe_parent_of_sigterm_ignoring_descendant_then_sleep_long
         .expect("attempt pgid marker");
     fs::write(cwd.join("ready"), b"ready").expect("ready marker");
     std::thread::sleep(PROBE_SLEEP);
+}
+
+/// The direct leader exits normally while its SIGTERM-ignoring descendant
+/// keeps the attempt-owned group alive.
+#[test]
+#[ignore]
+fn execution_timeout_probe_parent_exits_with_live_descendant() {
+    spawn_and_await_descendant_probe(
+        "execution_timeout_probe_descendant_ignores_sigterm_then_sleep_long",
+    );
+    let cwd = std::env::current_dir().expect("probe working directory");
+    fs::write(cwd.join("attempt-pid"), std::process::id().to_string()).expect("attempt pid marker");
+    fs::write(cwd.join("attempt-pgid"), caller_process_group().to_string())
+        .expect("attempt pgid marker");
 }
 
 /// Short-lived churn leaf. Its SIGTERM ignore disposition is inherited from
@@ -1272,6 +1290,140 @@ fn tg03b_churn_helper_has_finite_independent_wall_clock_bound() {
     }
 }
 
+#[test]
+fn repair10_tg03b_normal_deadline_is_anchored_after_release() {
+    let setup_started = Instant::now();
+    std::thread::sleep(Duration::from_millis(25));
+    let released = Instant::now();
+    let deadline = normal_churn_helper_deadline(released);
+    let budget = CHURN_SAFETY_WINDOW + CHURN_SETTLE_WINDOW + Duration::from_secs(2);
+    assert_eq!(deadline.duration_since(released), budget);
+    assert!(deadline.duration_since(setup_started) > budget);
+}
+
+#[test]
+fn repair10_uncaptured_observation_failure_contains_owned_group() {
+    for cleanup_failure in [false, true] {
+        for _ in 0..10 {
+            let workspace = TempDir::new("repair10-observation");
+            let caller_group = caller_process_group();
+            let _ = take_timeout_lifecycle_events();
+            let faults = UNCAPTURED_TEST_FAIL_WAIT
+                | if cleanup_failure {
+                    CAPTURE_TEST_FAIL_FORCE_KILL
+                } else {
+                    0
+                };
+            let _fault = inject_capture_test_faults(faults);
+            let error = run_with_timeout(
+                &bounded_request(
+                    first_existing(&["/bin/sleep", "/usr/bin/sleep"]),
+                    &["30"],
+                    workspace.path(),
+                    workspace.path(),
+                ),
+                &policy(Duration::from_secs(5), Duration::from_secs(1)),
+            )
+            .expect_err("injected post-spawn observation failure must fail after cleanup");
+            assert!(
+                matches!(
+                    error,
+                    ExecutionError::ForceKillFailed { .. } if cleanup_failure
+                ) || matches!(
+                    error,
+                    ExecutionError::ProcessWaitFailed { .. } if !cleanup_failure
+                )
+            );
+            let events = take_timeout_lifecycle_events();
+            let reap = events
+                .iter()
+                .position(|event| *event == TimeoutLifecycleEvent::LeaderReaped)
+                .expect("cleanup must reap the direct leader");
+            assert!(events[..reap].contains(&TimeoutLifecycleEvent::GroupSigkill));
+            if !cleanup_failure {
+                assert_eq!(
+                    events.last(),
+                    Some(&TimeoutLifecycleEvent::GroupEmptyVerified)
+                );
+            }
+            assert_eq!(caller_process_group(), caller_group);
+        }
+    }
+}
+
+#[test]
+fn repair10_uncaptured_direct_exit_with_live_descendant_times_out_and_contains_group() {
+    for _ in 0..10 {
+        let workspace = TempDir::new("repair10-live-descendant");
+        let caller_group = caller_process_group();
+        let _ = take_timeout_lifecycle_events();
+        let outcome = run_with_timeout(
+            &bounded_request(
+                std::env::current_exe().expect("current test executable path"),
+                &[
+                    "execution_timeout_probe_parent_exits_with_live_descendant",
+                    "--ignored",
+                ],
+                workspace.path(),
+                workspace.path(),
+            ),
+            &policy(Duration::from_millis(200), Duration::from_millis(100)),
+        )
+        .expect("live descendant must follow the timeout lifecycle");
+        assert_eq!(
+            outcome.termination(),
+            ProcessTermination::TimedOutForceKilled
+        );
+        let leader = recorded_value(workspace.path(), "attempt-pid");
+        let group = recorded_value(workspace.path(), "attempt-pgid");
+        let descendant = recorded_value(workspace.path(), "descendant-pid");
+        await_process_death(leader, "normally exited direct leader");
+        await_process_death(descendant, "post-leader descendant");
+        await_group_empty(group, "post-leader owned group");
+        let events = take_timeout_lifecycle_events();
+        let reap = events
+            .iter()
+            .position(|event| *event == TimeoutLifecycleEvent::LeaderReaped)
+            .expect("timeout completion must reap the direct leader");
+        assert!(events[..reap].contains(&TimeoutLifecycleEvent::GroupSigkill));
+        assert_eq!(caller_process_group(), caller_group);
+    }
+}
+
+#[test]
+fn repair10_captured_post_reap_failure_never_signals_stale_group() {
+    for _ in 0..10 {
+        let workspace = TempDir::new("repair10-captured-post-reap");
+        let _ = take_timeout_lifecycle_events();
+        let _fault = inject_capture_test_faults(
+            CAPTURE_TEST_FORCE_COMPLETION_BARRIER | TEST_FAIL_POST_REAP_GROUP_EMPTY,
+        );
+        let error = run_with_timeout_and_capture(
+            &bounded_request(
+                first_existing(&["/usr/bin/true", "/bin/true"]),
+                &[],
+                workspace.path(),
+                workspace.path(),
+            ),
+            &policy(Duration::from_secs(5), Duration::from_secs(1)),
+        )
+        .expect_err("synthetic post-reap group proof failure must fail closed");
+        assert!(matches!(error, ExecutionError::ForceKillFailed { .. }));
+        let events = take_timeout_lifecycle_events();
+        let reap = events
+            .iter()
+            .position(|event| *event == TimeoutLifecycleEvent::LeaderReaped)
+            .expect("captured completion must reach leader reap");
+        assert!(events[reap + 1..].iter().all(|event| !matches!(
+            event,
+            TimeoutLifecycleEvent::GroupSigterm
+                | TimeoutLifecycleEvent::GroupSigstop
+                | TimeoutLifecycleEvent::GroupSigcont
+                | TimeoutLifecycleEvent::GroupSigkill
+        )));
+    }
+}
+
 #[derive(Debug)]
 struct ChurnHelperOutcome {
     cleanup: OwnedChurnCleanupEvidence,
@@ -1636,12 +1788,13 @@ fn run_churn_helper(
         });
     }
 
+    let released = Instant::now();
     let ready = marker_appears_within(workspace.path(), "descendant-ready", Duration::from_secs(5))
         && marker_appears_within(workspace.path(), "churn-leaf-ready", Duration::from_secs(5));
     let deadline = if force_timeout {
         Instant::now()
     } else {
-        started + CHURN_SAFETY_WINDOW + CHURN_SETTLE_WINDOW + Duration::from_secs(2)
+        normal_churn_helper_deadline(released)
     };
     let mut primary = (!ready).then(|| "churn helper did not publish leaf readiness".to_string());
     let mut marker_error = None;
@@ -1758,6 +1911,10 @@ fn run_churn_helper(
         elapsed: started.elapsed(),
         timed_out,
     })
+}
+
+fn normal_churn_helper_deadline(released: Instant) -> Instant {
+    released + CHURN_SAFETY_WINDOW + CHURN_SETTLE_WINDOW + Duration::from_secs(2)
 }
 
 #[test]
@@ -2022,6 +2179,7 @@ fn tg05a_non_reaping_exit_observation_preserves_the_waitable_leader() {
 fn tg05_grace_wait_failure_cleanup_preserves_primary_error_within_bounded_cleanup() {
     let (child, group, pid) = spawn_controlled_group_child();
     let original = std::io::Error::other("synthetic grace observation failure");
+    let _ = take_timeout_lifecycle_events();
 
     let error = grace_wait_failed_with_cleanup(child, group, original);
 
@@ -2034,17 +2192,6 @@ fn tg05_grace_wait_failure_cleanup_preserves_primary_error_within_bounded_cleanu
                 "primary error must stay primary: {detail}"
             );
             assert!(detail.contains("synthetic grace observation failure"));
-            // Bounded best-effort cleanup was attempted and evidenced;
-            // nothing claims successful timeout metadata anywhere.
-            assert!(detail.contains("best-effort cleanup"));
-            assert!(
-                detail.contains("SIGKILL delivered") || detail.contains("already empty"),
-                "group cleanup evidence missing: {detail}"
-            );
-            assert!(
-                detail.contains("direct child was reaped"),
-                "reap evidence missing: {detail}"
-            );
             assert!(!detail.contains("TimedOut"));
         }
         other => panic!("expected TimeoutGraceWaitFailed, got: {other:?}"),
@@ -2054,6 +2201,93 @@ fn tg05_grace_wait_failure_cleanup_preserves_primary_error_within_bounded_cleanu
     // forced down inside its own fresh group and reaped.
     assert_ne!(pid, std::process::id());
     await_process_death(pid, "grace-wait cleanup child");
+    let events = take_timeout_lifecycle_events();
+    assert!(events.contains(&TimeoutLifecycleEvent::GroupSigkill));
+    assert!(events.contains(&TimeoutLifecycleEvent::LeaderReaped));
+    assert_eq!(
+        events.last(),
+        Some(&TimeoutLifecycleEvent::GroupEmptyVerified)
+    );
+}
+
+#[test]
+fn repair10_graceful_delivery_failure_preserves_primary_after_containment() {
+    let (child, group, pid) = spawn_controlled_group_child();
+    let _ = take_timeout_lifecycle_events();
+    let error = graceful_termination_failed_with_cleanup(
+        child,
+        group,
+        "synthetic graceful SIGTERM delivery failure".to_string(),
+    );
+    assert!(matches!(
+        error,
+        ExecutionError::GracefulTerminationFailed { ref detail }
+            if detail.contains("synthetic graceful SIGTERM delivery failure")
+    ));
+    await_process_death(pid, "graceful-delivery cleanup child");
+    let events = take_timeout_lifecycle_events();
+    assert!(events.contains(&TimeoutLifecycleEvent::GroupSigkill));
+    assert!(events.contains(&TimeoutLifecycleEvent::LeaderReaped));
+    assert_eq!(
+        events.last(),
+        Some(&TimeoutLifecycleEvent::GroupEmptyVerified)
+    );
+}
+
+#[test]
+fn repair10_quiescence_failure_preserves_primary_after_containment() {
+    let (child, group, pid) = spawn_controlled_group_child();
+    let _ = take_timeout_lifecycle_events();
+    let error = quiescence_failed_with_cleanup(
+        child,
+        group,
+        "synthetic stable-membership failure".to_string(),
+    );
+    assert!(matches!(
+        error,
+        ExecutionError::ProcessWaitFailed { ref detail }
+            if detail.contains("synthetic stable-membership failure")
+    ));
+    await_process_death(pid, "quiescence-failure cleanup child");
+    let events = take_timeout_lifecycle_events();
+    assert!(events.contains(&TimeoutLifecycleEvent::GroupSigkill));
+    assert!(events.contains(&TimeoutLifecycleEvent::LeaderReaped));
+    assert_eq!(
+        events.last(),
+        Some(&TimeoutLifecycleEvent::GroupEmptyVerified)
+    );
+}
+
+#[test]
+fn repair10_final_reap_result_failure_fails_closed_without_stale_signal() {
+    let (child, group, pid) = spawn_controlled_group_child();
+    assert!(matches!(
+        deliver_group_sigkill(group),
+        GroupSignalDelivery::Delivered | GroupSignalDelivery::GroupAlreadyGone
+    ));
+    let _ = take_timeout_lifecycle_events();
+    let _fault = inject_capture_test_faults(TEST_FAIL_FINAL_REAP_RESULT);
+    let error =
+        finish_timeout_after_signaling(child, group, ProcessTermination::TimedOutForceKilled)
+            .expect_err("injected final reap result failure must fail closed");
+    assert!(matches!(
+        error,
+        ExecutionError::TimeoutFinalWaitFailed { .. }
+    ));
+    await_process_death(pid, "final-reap failure child");
+    await_group_empty(group.raw() as u32, "final-reap failure group");
+    let events = take_timeout_lifecycle_events();
+    let reap = events
+        .iter()
+        .position(|event| *event == TimeoutLifecycleEvent::LeaderReaped)
+        .expect("final wait consumed the direct leader");
+    assert!(events[reap + 1..].iter().all(|event| !matches!(
+        event,
+        TimeoutLifecycleEvent::GroupSigterm
+            | TimeoutLifecycleEvent::GroupSigstop
+            | TimeoutLifecycleEvent::GroupSigcont
+            | TimeoutLifecycleEvent::GroupSigkill
+    )));
 }
 
 #[test]

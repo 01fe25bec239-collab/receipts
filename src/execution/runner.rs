@@ -180,6 +180,12 @@ pub(crate) const CAPTURE_TEST_FAIL_STDOUT_READ: u8 = 4;
 pub(crate) const CAPTURE_TEST_FAIL_SIGCONT: u8 = 8;
 #[cfg(all(test, unix))]
 pub(crate) const CAPTURE_TEST_FORCE_COMPLETION_BARRIER: u8 = 16;
+#[cfg(all(test, unix))]
+pub(crate) const UNCAPTURED_TEST_FAIL_WAIT: u8 = 32;
+#[cfg(all(test, unix))]
+pub(crate) const TEST_FAIL_POST_REAP_GROUP_EMPTY: u8 = 64;
+#[cfg(all(test, unix))]
+pub(crate) const TEST_FAIL_FINAL_REAP_RESULT: u8 = 128;
 
 #[cfg(all(test, unix))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,9 +273,9 @@ pub fn run(request: &ProcessRunRequest) -> Result<ProcessRunOutcome, ExecutionEr
 ///
 /// 1. monitor the child with the monotonic clock (`Instant`) using a
 ///    small bounded polling cadence that never sleeps past the deadline;
-/// 2. if the child exits before the deadline, return an ordinary
-///    [`ProcessTermination::Completed`] outcome — non-zero exits
-///    included;
+/// 2. if the child exits before the deadline, keep it unreaped while proving
+///    no attempt-owned descendant remains, then return an ordinary
+///    [`ProcessTermination::Completed`] outcome — non-zero exits included;
 /// 3. at the deadline, observe once more so an already-finished child is
 ///    never needlessly terminated;
 /// 4. deliver graceful termination (`SIGTERM`) to the attempt-owned
@@ -330,7 +336,14 @@ pub fn run_with_timeout(
         None => return Err(process_group_ownership_failed(child)),
     };
 
-    match await_child_until(&mut child, deadline)? {
+    let awaited = match await_owned_child_until(&mut child, group, deadline, false) {
+        Ok(awaited) => awaited,
+        Err(OwnedWaitError::Owned(error)) => {
+            return Err(failure_after_spawn(child, group, error));
+        }
+        Err(OwnedWaitError::Released(error)) => return Err(error),
+    };
+    match awaited {
         Awaited::Exited(status) => Ok(ProcessRunOutcome::new(status.success(), status.code())),
         Awaited::DeadlineReached => enforce_timeout(child, group, policy),
     }
@@ -548,10 +561,13 @@ pub fn run_with_timeout_and_capture(
 
     // EOF alone is not child completion: a child may close both streams and
     // continue running. Observe it only now, under the original deadline.
-    let outcome = match await_captured_child_until(&mut child, group, deadline) {
+    let outcome = match await_owned_child_until(&mut child, group, deadline, true) {
         Ok(Awaited::Exited(status)) => ProcessRunOutcome::new(status.success(), status.code()),
         Ok(Awaited::DeadlineReached) => enforce_timeout(child, group, policy)?,
-        Err(error) => return Err(capture_failure_after_spawn(child, group, error)),
+        Err(OwnedWaitError::Owned(error)) => {
+            return Err(failure_after_spawn(child, group, error));
+        }
+        Err(OwnedWaitError::Released(error)) => return Err(error),
     };
 
     let stdout = stdout.expect("both captures were proven complete");
@@ -756,11 +772,18 @@ pub(crate) fn bounded_reader_completion_failure_for_test(window: Duration) -> Ex
     error
 }
 
-/// Central failure precedence for every post-spawn capture/setup/observation
-/// error: process containment failure wins; otherwise the original capture
-/// error is returned unchanged.
+/// Central failure precedence for captured setup failures.
 #[cfg(unix)]
 fn capture_failure_after_spawn(
+    child: Child,
+    group: OwnedProcessGroup,
+    primary: ExecutionError,
+) -> ExecutionError {
+    failure_after_spawn(child, group, primary)
+}
+
+#[cfg(unix)]
+fn failure_after_spawn(
     child: Child,
     group: OwnedProcessGroup,
     primary: ExecutionError,
@@ -771,10 +794,10 @@ fn capture_failure_after_spawn(
     }
 }
 
-/// Bounded, fail-closed cleanup for one still-owned captured attempt.
+/// Bounded, fail-closed cleanup for any still-owned timed attempt.
 #[cfg(unix)]
 fn cleanup_owned_attempt(mut child: Child, group: OwnedProcessGroup) -> Result<(), ExecutionError> {
-    match capture_deliver_group_sigkill(group) {
+    match deliver_group_sigkill_for_attempt(group) {
         GroupSignalDelivery::Delivered | GroupSignalDelivery::GroupAlreadyGone => {}
         GroupSignalDelivery::Failed { detail } => {
             return Err(force_kill_failed_with_cleanup(child, group, detail));
@@ -800,6 +823,8 @@ fn cleanup_owned_attempt(mut child: Child, group: OwnedProcessGroup) -> Result<(
             ),
         });
     }
+    #[cfg(test)]
+    record_timeout_lifecycle_event(TimeoutLifecycleEvent::GroupEmptyVerified);
     Ok(())
 }
 
@@ -812,6 +837,12 @@ enum Awaited {
     DeadlineReached,
 }
 
+#[cfg(unix)]
+enum OwnedWaitError {
+    Owned(ExecutionError),
+    Released(ExecutionError),
+}
+
 /// Monitors `child` until it exits or `deadline` passes, whichever comes
 /// first.
 ///
@@ -821,43 +852,31 @@ enum Awaited {
 /// poll. One final observation happens after the loop so a child that has
 /// already completed at the boundary is not needlessly terminated.
 #[cfg(unix)]
-fn await_child_until(child: &mut Child, deadline: Instant) -> Result<Awaited, ExecutionError> {
-    loop {
-        if let Some(status) = child.try_wait().map_err(wait_failed)? {
-            return Ok(Awaited::Exited(status));
-        }
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            break;
-        };
-        if remaining.is_zero() {
-            break;
-        }
-        std::thread::sleep(POLL_INTERVAL.min(remaining));
-    }
-
-    if let Some(status) = child.try_wait().map_err(wait_failed)? {
-        return Ok(Awaited::Exited(status));
-    }
-    Ok(Awaited::DeadlineReached)
-}
-
-/// Captured-path observation boundary with private deterministic fault
-/// injection. Production delegates directly to the shared timed waiter.
-#[cfg(unix)]
-fn await_captured_child_until(
+fn await_owned_child_until(
     child: &mut Child,
     group: OwnedProcessGroup,
     deadline: Instant,
-) -> Result<Awaited, ExecutionError> {
+    _captured: bool,
+) -> Result<Awaited, OwnedWaitError> {
     #[cfg(test)]
-    if take_capture_test_fault(CAPTURE_TEST_FAIL_WAIT) {
-        return Err(wait_failed(std::io::Error::other(
-            "injected captured child observation failure",
-        )));
+    {
+        let fault = if _captured {
+            CAPTURE_TEST_FAIL_WAIT
+        } else {
+            UNCAPTURED_TEST_FAIL_WAIT
+        };
+        if take_capture_test_fault(fault) {
+            return Err(OwnedWaitError::Owned(wait_failed(std::io::Error::other(
+                "injected timed child observation failure",
+            ))));
+        }
     }
     let leader = child.id();
     loop {
-        if observe_leader_without_reaping(leader).map_err(wait_failed)? == LeaderState::Exited {
+        if observe_leader_without_reaping(leader)
+            .map_err(|error| OwnedWaitError::Owned(wait_failed(error)))?
+            == LeaderState::Exited
+        {
             #[cfg(test)]
             let preliminary = if take_capture_test_fault(CAPTURE_TEST_FORCE_COMPLETION_BARRIER) {
                 GroupQuiescence::Empty
@@ -872,16 +891,25 @@ fn await_captured_child_until(
                         if Instant::now() >= deadline {
                             return Ok(Awaited::DeadlineReached);
                         }
-                        let status = child.wait().map_err(wait_failed)?;
+                        let status = child
+                            .wait()
+                            .map_err(|error| OwnedWaitError::Released(final_wait_failed(error)))?;
                         #[cfg(test)]
                         record_timeout_lifecycle_event(TimeoutLifecycleEvent::LeaderReaped);
-                        if !await_group_empty(group, GROUP_TEARDOWN_VERIFY_WINDOW) {
-                            return Err(ExecutionError::ForceKillFailed {
-                                detail: format!(
-                                    "the attempt-owned process group -{} was not proven empty after captured completion",
-                                    group.raw()
-                                ),
-                            });
+                        #[cfg(test)]
+                        let group_empty = !take_capture_test_fault(TEST_FAIL_POST_REAP_GROUP_EMPTY)
+                            && await_group_empty(group, GROUP_TEARDOWN_VERIFY_WINDOW);
+                        #[cfg(not(test))]
+                        let group_empty = await_group_empty(group, GROUP_TEARDOWN_VERIFY_WINDOW);
+                        if !group_empty {
+                            return Err(OwnedWaitError::Released(
+                                ExecutionError::ForceKillFailed {
+                                    detail: format!(
+                                        "the attempt-owned process group -{} was not proven empty after timed completion; ownership was released, so no further group signal was attempted",
+                                        group.raw()
+                                    ),
+                                },
+                            ));
                         }
                         #[cfg(test)]
                         record_timeout_lifecycle_event(TimeoutLifecycleEvent::GroupEmptyVerified);
@@ -890,14 +918,22 @@ fn await_captured_child_until(
                     Ok(true) => match capture_deliver_group_sigcont(group) {
                         GroupSignalDelivery::Delivered | GroupSignalDelivery::GroupAlreadyGone => {}
                         GroupSignalDelivery::Failed { detail } => {
-                            return Err(ExecutionError::ForceKillFailed { detail });
+                            return Err(OwnedWaitError::Owned(ExecutionError::ForceKillFailed {
+                                detail,
+                            }));
                         }
                     },
-                    Err(detail) => return Err(ExecutionError::ForceKillFailed { detail }),
+                    Err(detail) => {
+                        return Err(OwnedWaitError::Owned(ExecutionError::ForceKillFailed {
+                            detail,
+                        }));
+                    }
                 },
                 GroupQuiescence::Mutable | GroupQuiescence::AllStopped(_) => {}
                 GroupQuiescence::Unknown { detail } => {
-                    return Err(wait_failed(std::io::Error::other(detail)));
+                    return Err(OwnedWaitError::Owned(wait_failed(std::io::Error::other(
+                        detail,
+                    ))));
                 }
             }
         }
@@ -926,7 +962,7 @@ fn take_capture_test_fault(fault: u8) -> bool {
 }
 
 #[cfg(unix)]
-fn capture_deliver_group_sigkill(group: OwnedProcessGroup) -> GroupSignalDelivery {
+fn deliver_group_sigkill_for_attempt(group: OwnedProcessGroup) -> GroupSignalDelivery {
     #[cfg(test)]
     if take_capture_test_fault(CAPTURE_TEST_FAIL_FORCE_KILL) {
         return GroupSignalDelivery::Failed {
@@ -1123,7 +1159,7 @@ fn enforce_timeout(
 
     // Step 4 — at least one quiesced attempt-owned process survived grace.
     // Kill the group while the unreaped leader still anchors ownership.
-    let termination = match capture_deliver_group_sigkill(group) {
+    let termination = match deliver_group_sigkill_for_attempt(group) {
         GroupSignalDelivery::Delivered => ProcessTermination::TimedOutForceKilled,
         // Every member vanished between observation and delivery; nothing
         // actually required the force step. Verification and reap below
@@ -1140,14 +1176,28 @@ fn enforce_timeout(
 /// Reaps only after the state machine has irrevocably finished group
 /// signaling, then verifies emptiness without attempting stale-PGID repair.
 #[cfg(unix)]
-fn finish_timeout_after_signaling(
+pub(crate) fn finish_timeout_after_signaling(
     mut child: Child,
     group: OwnedProcessGroup,
     termination: ProcessTermination,
 ) -> Result<ProcessRunOutcome, ExecutionError> {
-    let status = child.wait().map_err(final_wait_failed)?;
+    let status = match bounded_child_reap(&mut child) {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            return Err(ExecutionError::TimeoutFinalWaitFailed {
+                detail: "the direct child remained unreaped beyond the bounded final timeout wait window; group signaling was already complete, so no stale group signal was attempted".to_string(),
+            });
+        }
+        Err(error) => return Err(final_wait_failed(error)),
+    };
     #[cfg(test)]
     record_timeout_lifecycle_event(TimeoutLifecycleEvent::LeaderReaped);
+    #[cfg(test)]
+    if take_capture_test_fault(TEST_FAIL_FINAL_REAP_RESULT) {
+        return Err(ExecutionError::TimeoutFinalWaitFailed {
+            detail: "injected final reap result failure after ownership release; no stale group signal was attempted".to_string(),
+        });
+    }
     if !await_group_empty(group, GROUP_TEARDOWN_VERIFY_WINDOW) {
         return Err(ExecutionError::ForceKillFailed {
             detail: format!(
@@ -1254,94 +1304,39 @@ pub(crate) fn checked_deadline(
         })
 }
 
-/// Best-effort orphan safety after graceful group delivery failed: the
-/// original failure stays primary, but neither the attempt-owned group nor
-/// the direct child is casually abandoned while bounded cleanup is still
-/// possible. Cleanup evidence is appended to the reported detail and never
-/// converts the outcome into success.
+/// Preserves graceful-delivery failure only when shared cleanup proves the
+/// owned attempt empty; a cleanup failure supersedes it.
 #[cfg(unix)]
-fn graceful_termination_failed_with_cleanup(
-    mut child: Child,
+pub(crate) fn graceful_termination_failed_with_cleanup(
+    child: Child,
     group: OwnedProcessGroup,
     delivery_detail: String,
 ) -> ExecutionError {
-    let mut detail = delivery_detail;
-    match timeout_deliver_group_sigkill(group) {
-        GroupSignalDelivery::Delivered => {
-            detail.push_str(
-                "; best-effort cleanup: forced SIGKILL delivered to the attempt-owned process \
-                 group",
-            );
-        }
-        GroupSignalDelivery::GroupAlreadyGone => {
-            detail.push_str(
-                "; best-effort cleanup: the attempt-owned process group was already empty",
-            );
-        }
-        GroupSignalDelivery::Failed { detail: failed } => {
-            detail.push_str(&format!(
-                "; best-effort cleanup group SIGKILL also failed: {failed}"
-            ));
-        }
-    }
-    match bounded_child_reap(&mut child) {
-        Ok(Some(_)) => {
-            detail.push_str("; best-effort cleanup: the direct child was reaped");
-        }
-        Ok(None) => {
-            detail.push_str(
-                "; best-effort cleanup: the direct child remained unreaped within the bounded \
-                 cleanup window",
-            );
-        }
-        Err(reap_error) => {
-            detail.push_str(&format!(
-                "; best-effort cleanup reap also failed: {reap_error}"
-            ));
-        }
-    }
-    ExecutionError::GracefulTerminationFailed { detail }
+    failure_after_spawn(
+        child,
+        group,
+        ExecutionError::GracefulTerminationFailed {
+            detail: delivery_detail,
+        },
+    )
 }
 
 /// Reports a failed quiescence proof only after bounded force cleanup while
 /// the unreaped leader still anchors the group.
 #[cfg(unix)]
-fn quiescence_failed_with_cleanup(
-    mut child: Child,
+pub(crate) fn quiescence_failed_with_cleanup(
+    child: Child,
     group: OwnedProcessGroup,
     failure: String,
 ) -> ExecutionError {
-    let mut detail = format!(
-        "process-group quiescence failed for owned group -{}: {failure}",
-        group.raw()
-    );
-    match timeout_deliver_group_sigkill(group) {
-        GroupSignalDelivery::Delivered => {
-            detail.push_str("; forced SIGKILL delivered before ownership release");
-        }
-        GroupSignalDelivery::GroupAlreadyGone => {
-            detail.push_str("; the owned group was already empty");
-        }
-        GroupSignalDelivery::Failed { detail: failed } => {
-            return force_kill_failed_with_cleanup(
-                child,
-                group,
-                format!("{detail}; cleanup SIGKILL also failed: {failed}"),
-            );
-        }
-    }
-    match bounded_child_reap(&mut child) {
-        Ok(Some(_)) => detail.push_str("; the direct child was reaped"),
-        Ok(None) => detail
-            .push_str("; the direct child remained unreaped within the bounded cleanup window"),
-        Err(error) => detail.push_str(&format!("; cleanup reap also failed: {error}")),
-    }
-    if await_group_empty(group, GROUP_TEARDOWN_VERIFY_WINDOW) {
-        detail.push_str("; the owned group was verified empty");
-    } else {
-        detail.push_str("; the owned group was not proven empty after bounded cleanup");
-    }
-    ExecutionError::ForceKillFailed { detail }
+    failure_after_spawn(
+        child,
+        group,
+        wait_failed(std::io::Error::other(format!(
+            "process-group quiescence failed for owned group -{}: {failure}",
+            group.raw()
+        ))),
+    )
 }
 
 /// Typed force-kill failure after group `SIGKILL` delivery failed: the
@@ -1374,6 +1369,8 @@ pub(crate) fn force_kill_failed_with_cleanup(
     }
     match bounded_child_reap(&mut child) {
         Ok(Some(_)) => {
+            #[cfg(test)]
+            record_timeout_lifecycle_event(TimeoutLifecycleEvent::LeaderReaped);
             detail.push_str("; best-effort cleanup: the direct child was reaped");
         }
         Ok(None) => {
@@ -1393,6 +1390,8 @@ pub(crate) fn force_kill_failed_with_cleanup(
             detail.push_str("; follow-up evidence: the owned group still has members");
         }
         GroupPresence::Empty => {
+            #[cfg(test)]
+            record_timeout_lifecycle_event(TimeoutLifecycleEvent::GroupEmptyVerified);
             detail.push_str("; follow-up evidence: the owned group observed empty after failure");
         }
         GroupPresence::Unknown { detail: unknown } => {
@@ -1402,54 +1401,21 @@ pub(crate) fn force_kill_failed_with_cleanup(
     ExecutionError::ForceKillFailed { detail }
 }
 
-/// Maps an observation failure inside the bounded termination-grace window
-/// into its typed error while attempting bounded best-effort cleanup of a
-/// potentially live attempt: forced SIGKILL to the owned group, then a
-/// bounded direct-child reap. The original grace-wait error is preserved
-/// as the primary failure — it is never hidden or replaced, and no
-/// successful timeout metadata can ever be produced on this path.
+/// Preserves a grace-window observation failure only when shared cleanup
+/// proves the owned attempt empty; a cleanup failure supersedes it.
 #[cfg(unix)]
 pub(crate) fn grace_wait_failed_with_cleanup(
-    mut child: Child,
+    child: Child,
     group: OwnedProcessGroup,
     observe_error: std::io::Error,
 ) -> ExecutionError {
-    let mut detail = format!("grace-window observation failed: {observe_error}");
-    match timeout_deliver_group_sigkill(group) {
-        GroupSignalDelivery::Delivered => {
-            detail.push_str(
-                "; best-effort cleanup: forced SIGKILL delivered to the attempt-owned process \
-                 group",
-            );
-        }
-        GroupSignalDelivery::GroupAlreadyGone => {
-            detail.push_str(
-                "; best-effort cleanup: the attempt-owned process group was already empty",
-            );
-        }
-        GroupSignalDelivery::Failed { detail: failed } => {
-            detail.push_str(&format!(
-                "; best-effort cleanup group SIGKILL also failed: {failed}"
-            ));
-        }
-    }
-    match bounded_child_reap(&mut child) {
-        Ok(Some(_)) => {
-            detail.push_str("; best-effort cleanup: the direct child was reaped");
-        }
-        Ok(None) => {
-            detail.push_str(
-                "; best-effort cleanup: the direct child remained unreaped within the bounded \
-                 cleanup window",
-            );
-        }
-        Err(reap_error) => {
-            detail.push_str(&format!(
-                "; best-effort cleanup reap also failed: {reap_error}"
-            ));
-        }
-    }
-    ExecutionError::TimeoutGraceWaitFailed { detail }
+    failure_after_spawn(
+        child,
+        group,
+        ExecutionError::TimeoutGraceWaitFailed {
+            detail: format!("grace-window observation failed: {observe_error}"),
+        },
+    )
 }
 
 /// Maps a failure to reap the child after forced kill into its typed
