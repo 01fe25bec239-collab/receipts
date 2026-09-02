@@ -29,6 +29,7 @@
 //! * no authoritative state read or write path exists here.
 
 pub mod adapter;
+pub mod host_capability_freshness_vocabulary;
 pub mod host_capability_mode_override;
 pub mod host_capability_report_vocabulary;
 pub mod host_detection;
@@ -38,6 +39,9 @@ pub mod normalized_host_event_source_class;
 
 #[cfg(test)]
 mod adapter_tests;
+
+#[cfg(test)]
+mod host_capability_freshness_vocabulary_tests;
 
 #[cfg(test)]
 mod host_capability_mode_override_tests;
@@ -58,6 +62,9 @@ mod normalized_host_event_tests;
 mod normalized_host_event_source_class_tests;
 
 pub use adapter::HostAdapter;
+pub use host_capability_freshness_vocabulary::{
+    HostCapabilityReprobeTrigger, HostCapabilityValidityInput,
+};
 pub use host_capability_mode_override::{
     HostCapabilityModeOverride, HostCapabilityModeOverrideError,
 };
