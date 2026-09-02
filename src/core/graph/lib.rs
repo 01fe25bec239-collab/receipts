@@ -36,6 +36,7 @@ pub mod edge;
 pub mod error;
 pub mod execution_graph;
 pub mod node;
+pub mod node_result_vocabulary;
 pub mod node_state;
 pub mod node_state_transition;
 pub mod passed_acceptance_transition;
@@ -47,6 +48,8 @@ pub mod review_verdict_transition;
 mod accepted_integration_transition_tests;
 #[cfg(test)]
 mod execution_graph_tests;
+#[cfg(test)]
+mod node_result_vocabulary_tests;
 #[cfg(test)]
 mod node_state_tests;
 #[cfg(test)]
@@ -68,6 +71,7 @@ pub use edge::{ControlKind, EdgeClass, GraphEdge, GraphEdgeRelation, PrecedenceK
 pub use error::{GraphError, MAX_IDENTIFIER_LENGTH};
 pub use execution_graph::ExecutionGraph;
 pub use node::{CapabilityName, GraphNode, GraphNodeKind};
+pub use node_result_vocabulary::{GraphNodeCheckResult, GraphNodeResultOutcome};
 pub use node_state::{GraphNodeState, GraphNodeStateParseError};
 pub use node_state_transition::{
     AUTHORIZED_PREFIX_TRANSITIONS, GraphNodeStateTransitionError, PREFIX_STATES, is_prefix_state,
