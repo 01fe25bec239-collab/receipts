@@ -20,7 +20,7 @@ use super::runner::{
     checked_deadline, finish_timeout_after_signaling, force_kill_failed_with_cleanup,
     grace_wait_failed_with_cleanup, graceful_termination_failed_with_cleanup,
     inject_capture_test_faults, inject_ownership_test_faults, inject_reap_test_faults,
-    inject_unsupported_timeout_platform, quiescence_failed_with_cleanup,
+    inject_unsupported_timeout_platform, quiescence_failed_with_cleanup, reap_test_attempts,
     take_timeout_lifecycle_events,
 };
 use crate::execution::unix_signal::{
@@ -228,6 +228,32 @@ fn await_group_empty(pgid: u32, what: &str) {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// Reaps one known, already-exited direct child without any unbounded wait.
+fn reap_exited_controlled_child(pid: u32, what: &str) {
+    unsafe extern "C" {
+        fn waitpid(
+            pid: std::os::raw::c_int,
+            status: *mut std::os::raw::c_int,
+            options: std::os::raw::c_int,
+        ) -> std::os::raw::c_int;
+    }
+    const WNOHANG: std::os::raw::c_int = 1;
+
+    let pid = std::os::raw::c_int::try_from(pid).expect("controlled child pid fits pid_t");
+    let mut status = 0;
+    let waited = unsafe { waitpid(pid, &mut status, WNOHANG) };
+    assert_eq!(
+        waited,
+        pid,
+        "failed to reap exited {what} ({pid}) without blocking: {}",
+        std::io::Error::last_os_error()
+    );
+    assert!(
+        !process_alive(pid as u32),
+        "reaped {what} ({pid}) remains present"
+    );
 }
 
 // --- Controlled child helpers ------------------------------------------
@@ -2457,14 +2483,28 @@ fn repair12_persistent_interrupted_reap_is_bounded_and_fails_closed() {
         assert!(matches!(
             error,
             ExecutionError::TimeoutFinalWaitFailed { ref detail }
-                if detail.contains("persistent interrupted") && detail.contains("proven empty")
+                if detail.contains("persistent interrupted") && detail.contains("not proven empty")
         ));
-        assert!(started.elapsed() < Duration::from_secs(1));
-        assert!(!process_alive(pid));
-        assert_eq!(
-            take_timeout_lifecycle_events(),
-            [TimeoutLifecycleEvent::GroupEmptyVerified]
+        assert!(started.elapsed() >= Duration::from_millis(30));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(
+            reap_test_attempts() <= 5,
+            "persistent interruption must retain the 10ms polling cadence"
         );
+        assert_eq!(
+            observe_leader_without_reaping(pid).expect("unreaped leader observation"),
+            LeaderState::Exited
+        );
+        assert!(
+            process_alive(pid),
+            "production unexpectedly reaped the child"
+        );
+        assert!(
+            !take_timeout_lifecycle_events().contains(&TimeoutLifecycleEvent::LeaderReaped),
+            "production must not claim a failed reap"
+        );
+        reap_exited_controlled_child(pid, "persistent-interruption child");
+        await_group_empty(group.raw() as u32, "persistent-interruption group");
         assert_eq!(caller_process_group(), caller_group);
     }
 }
@@ -2484,14 +2524,25 @@ fn repair12_non_retryable_reap_error_fails_immediately_after_safe_evidence() {
         assert!(matches!(
             error,
             ExecutionError::TimeoutFinalWaitFailed { ref detail }
-                if detail.contains("non-retryable") && detail.contains("proven empty")
+                if detail.contains("non-retryable") && detail.contains("not proven empty")
         ));
-        assert!(started.elapsed() < Duration::from_secs(1));
-        assert!(!process_alive(pid));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(reap_test_attempts(), 1, "non-retryable error was retried");
+        assert_eq!(
+            observe_leader_without_reaping(pid).expect("unreaped leader observation"),
+            LeaderState::Exited
+        );
+        assert!(
+            process_alive(pid),
+            "production unexpectedly reaped the child"
+        );
         assert_eq!(
             take_timeout_lifecycle_events(),
-            [TimeoutLifecycleEvent::GroupEmptyVerified]
+            [],
+            "production must not claim a failed reap or empty group"
         );
+        reap_exited_controlled_child(pid, "non-retryable-error child");
+        await_group_empty(group.raw() as u32, "non-retryable-error group");
         assert_eq!(caller_process_group(), caller_group);
     }
 }

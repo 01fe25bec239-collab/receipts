@@ -135,6 +135,7 @@ thread_local! {
     static CAPTURE_TEST_FAULTS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     static OWNERSHIP_TEST_FAULTS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     static REAP_TEST_FAULTS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static REAP_TEST_ATTEMPTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static REAP_TEST_WINDOW: std::cell::Cell<Option<Duration>> = const {
         std::cell::Cell::new(None)
     };
@@ -266,6 +267,7 @@ pub(crate) fn inject_ownership_test_faults(faults: u8) -> OwnershipTestFaultGuar
 #[cfg(all(test, unix))]
 pub(crate) struct ReapTestFaultGuard {
     faults: u8,
+    attempts: u32,
     window: Option<Duration>,
 }
 
@@ -273,6 +275,7 @@ pub(crate) struct ReapTestFaultGuard {
 impl Drop for ReapTestFaultGuard {
     fn drop(&mut self) {
         REAP_TEST_FAULTS.set(self.faults);
+        REAP_TEST_ATTEMPTS.set(self.attempts);
         REAP_TEST_WINDOW.set(self.window);
     }
 }
@@ -281,8 +284,14 @@ impl Drop for ReapTestFaultGuard {
 pub(crate) fn inject_reap_test_faults(faults: u8, window: Option<Duration>) -> ReapTestFaultGuard {
     ReapTestFaultGuard {
         faults: REAP_TEST_FAULTS.replace(faults),
+        attempts: REAP_TEST_ATTEMPTS.replace(0),
         window: REAP_TEST_WINDOW.replace(window),
     }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn reap_test_attempts() -> u32 {
+    REAP_TEST_ATTEMPTS.get()
 }
 
 /// Runs one validated process request to completion and returns its exit
@@ -1346,6 +1355,7 @@ fn bounded_child_reap(child: &mut Child) -> std::io::Result<Option<ExitStatus>> 
 fn child_try_wait_for_reap(child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
     #[cfg(test)]
     {
+        REAP_TEST_ATTEMPTS.set(REAP_TEST_ATTEMPTS.get() + 1);
         let faults = REAP_TEST_FAULTS.get();
         if faults & TEST_REAP_INTERRUPTED_ONCE != 0 {
             REAP_TEST_FAULTS.set(faults & !TEST_REAP_INTERRUPTED_ONCE);
@@ -1355,7 +1365,6 @@ fn child_try_wait_for_reap(child: &mut Child) -> std::io::Result<Option<ExitStat
             ));
         }
         if faults & TEST_REAP_INTERRUPTED_PERSISTENT != 0 {
-            let _ = child.try_wait()?;
             return Err(std::io::Error::new(
                 ErrorKind::Interrupted,
                 "injected persistent interrupted direct-child reap",
@@ -1363,7 +1372,6 @@ fn child_try_wait_for_reap(child: &mut Child) -> std::io::Result<Option<ExitStat
         }
         if faults & TEST_REAP_NON_RETRYABLE_ONCE != 0 {
             REAP_TEST_FAULTS.set(faults & !TEST_REAP_NON_RETRYABLE_ONCE);
-            let _ = child.try_wait()?;
             return Err(std::io::Error::other(
                 "injected non-retryable direct-child reap failure",
             ));
