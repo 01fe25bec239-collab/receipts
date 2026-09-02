@@ -134,6 +134,10 @@ const CAPTURE_READER_VERIFY_WINDOW: Duration = Duration::from_secs(2);
 thread_local! {
     static CAPTURE_TEST_FAULTS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     static OWNERSHIP_TEST_FAULTS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static REAP_TEST_FAULTS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static REAP_TEST_WINDOW: std::cell::Cell<Option<Duration>> = const {
+        std::cell::Cell::new(None)
+    };
 }
 
 #[cfg(all(test, unix))]
@@ -191,6 +195,12 @@ pub(crate) const TEST_FAIL_FINAL_REAP_RESULT: u8 = 128;
 pub(crate) const TEST_REJECT_GROUP_OWNERSHIP: u8 = 1;
 #[cfg(all(test, unix))]
 pub(crate) const TEST_FAIL_OWNERSHIP_REAP_RESULT: u8 = 2;
+#[cfg(all(test, unix))]
+pub(crate) const TEST_REAP_INTERRUPTED_ONCE: u8 = 1;
+#[cfg(all(test, unix))]
+pub(crate) const TEST_REAP_INTERRUPTED_PERSISTENT: u8 = 2;
+#[cfg(all(test, unix))]
+pub(crate) const TEST_REAP_NON_RETRYABLE_ONCE: u8 = 4;
 
 #[cfg(all(test, unix))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,6 +261,28 @@ impl Drop for OwnershipTestFaultGuard {
 #[cfg(all(test, unix))]
 pub(crate) fn inject_ownership_test_faults(faults: u8) -> OwnershipTestFaultGuard {
     OwnershipTestFaultGuard(OWNERSHIP_TEST_FAULTS.replace(faults))
+}
+
+#[cfg(all(test, unix))]
+pub(crate) struct ReapTestFaultGuard {
+    faults: u8,
+    window: Option<Duration>,
+}
+
+#[cfg(all(test, unix))]
+impl Drop for ReapTestFaultGuard {
+    fn drop(&mut self) {
+        REAP_TEST_FAULTS.set(self.faults);
+        REAP_TEST_WINDOW.set(self.window);
+    }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn inject_reap_test_faults(faults: u8, window: Option<Duration>) -> ReapTestFaultGuard {
+    ReapTestFaultGuard {
+        faults: REAP_TEST_FAULTS.replace(faults),
+        window: REAP_TEST_WINDOW.replace(window),
+    }
 }
 
 /// Runs one validated process request to completion and returns its exit
@@ -361,7 +393,7 @@ pub fn run_with_timeout(
         Err(OwnedWaitError::Owned(error)) => {
             return Err(failure_after_spawn(child, group, error));
         }
-        Err(OwnedWaitError::Released(error)) => return Err(error),
+        Err(OwnedWaitError::NoFurtherSignal(error)) => return Err(error),
     };
     match awaited {
         Awaited::Exited(status) => Ok(ProcessRunOutcome::new(status.success(), status.code())),
@@ -587,7 +619,7 @@ pub fn run_with_timeout_and_capture(
         Err(OwnedWaitError::Owned(error)) => {
             return Err(failure_after_spawn(child, group, error));
         }
-        Err(OwnedWaitError::Released(error)) => return Err(error),
+        Err(OwnedWaitError::NoFurtherSignal(error)) => return Err(error),
     };
 
     let stdout = stdout.expect("both captures were proven complete");
@@ -823,28 +855,11 @@ fn cleanup_owned_attempt(mut child: Child, group: OwnedProcessGroup) -> Result<(
             return Err(force_kill_failed_with_cleanup(child, group, detail));
         }
     }
-    match bounded_child_reap(&mut child) {
-        Ok(Some(_)) => {
-            #[cfg(test)]
-            record_timeout_lifecycle_event(TimeoutLifecycleEvent::LeaderReaped);
-        }
-        Ok(None) => {
-            return Err(ExecutionError::TimeoutFinalWaitFailed {
-                detail: "the direct child remained unreaped beyond the bounded post-spawn failure cleanup window".to_string(),
-            });
-        }
-        Err(error) => return Err(final_wait_failed(error)),
-    }
-    if !await_group_empty(group, GROUP_TEARDOWN_VERIFY_WINDOW) {
-        return Err(ExecutionError::ProcessGroupControlFailed {
-            detail: format!(
-                "the attempt-owned process group -{} was not proven empty after bounded post-spawn failure cleanup",
-                group.raw()
-            ),
-        });
-    }
-    #[cfg(test)]
-    record_timeout_lifecycle_event(TimeoutLifecycleEvent::GroupEmptyVerified);
+    finish_reap_with_group_proof(
+        bounded_child_reap(&mut child),
+        group,
+        "bounded post-spawn failure cleanup",
+    )?;
     Ok(())
 }
 
@@ -860,7 +875,7 @@ enum Awaited {
 #[cfg(unix)]
 enum OwnedWaitError {
     Owned(ExecutionError),
-    Released(ExecutionError),
+    NoFurtherSignal(ExecutionError),
 }
 
 /// Monitors `child` until it exits or `deadline` passes, whichever comes
@@ -911,28 +926,9 @@ fn await_owned_child_until(
                         if Instant::now() >= deadline {
                             return Ok(Awaited::DeadlineReached);
                         }
-                        let status = child
-                            .wait()
-                            .map_err(|error| OwnedWaitError::Released(wait_failed(error)))?;
-                        #[cfg(test)]
-                        record_timeout_lifecycle_event(TimeoutLifecycleEvent::LeaderReaped);
-                        #[cfg(test)]
-                        let group_empty = !take_capture_test_fault(TEST_FAIL_POST_REAP_GROUP_EMPTY)
-                            && await_group_empty(group, GROUP_TEARDOWN_VERIFY_WINDOW);
-                        #[cfg(not(test))]
-                        let group_empty = await_group_empty(group, GROUP_TEARDOWN_VERIFY_WINDOW);
-                        if !group_empty {
-                            return Err(OwnedWaitError::Released(
-                                ExecutionError::ProcessGroupControlFailed {
-                                    detail: format!(
-                                        "the attempt-owned process group -{} was not proven empty after timed completion; ownership was released, so no further group signal was attempted",
-                                        group.raw()
-                                    ),
-                                },
-                            ));
-                        }
-                        #[cfg(test)]
-                        record_timeout_lifecycle_event(TimeoutLifecycleEvent::GroupEmptyVerified);
+                        let reap = bounded_child_reap(child);
+                        let status = finish_reap_with_group_proof(reap, group, "timed completion")
+                            .map_err(OwnedWaitError::NoFurtherSignal)?;
                         return Ok(Awaited::Exited(status));
                     }
                     Ok(true) => match capture_deliver_group_sigcont(group) {
@@ -1219,34 +1215,70 @@ pub(crate) fn finish_timeout_after_signaling(
     group: OwnedProcessGroup,
     termination: ProcessTermination,
 ) -> Result<ProcessRunOutcome, ExecutionError> {
-    let status = match bounded_child_reap(&mut child) {
-        Ok(Some(status)) => status,
-        Ok(None) => {
-            return Err(ExecutionError::TimeoutFinalWaitFailed {
-                detail: "the direct child remained unreaped beyond the bounded final timeout wait window; group signaling was already complete, so no stale group signal was attempted".to_string(),
-            });
-        }
-        Err(error) => return Err(final_wait_failed(error)),
-    };
-    #[cfg(test)]
-    record_timeout_lifecycle_event(TimeoutLifecycleEvent::LeaderReaped);
-    #[cfg(test)]
-    if take_capture_test_fault(TEST_FAIL_FINAL_REAP_RESULT) {
-        return Err(ExecutionError::TimeoutFinalWaitFailed {
-            detail: "injected final reap result failure after ownership release; no stale group signal was attempted".to_string(),
-        });
+    let status = finish_reap_with_group_proof(
+        bounded_child_reap(&mut child),
+        group,
+        "final timeout cleanup after group signaling completed",
+    )?;
+    Ok(timed_out_outcome(termination, status))
+}
+
+#[cfg(unix)]
+fn finish_reap_with_group_proof(
+    reap: std::io::Result<Option<ExitStatus>>,
+    group: OwnedProcessGroup,
+    context: &str,
+) -> Result<ExitStatus, ExecutionError> {
+    if reap.as_ref().is_ok_and(Option::is_some) {
+        #[cfg(test)]
+        record_timeout_lifecycle_event(TimeoutLifecycleEvent::LeaderReaped);
     }
-    if !await_group_empty(group, GROUP_TEARDOWN_VERIFY_WINDOW) {
-        return Err(ExecutionError::ProcessGroupControlFailed {
+    #[cfg(test)]
+    let reap = if take_capture_test_fault(TEST_FAIL_FINAL_REAP_RESULT) {
+        Err(std::io::Error::other("injected final reap result failure"))
+    } else {
+        reap
+    };
+
+    #[cfg(test)]
+    let group_empty = !take_capture_test_fault(TEST_FAIL_POST_REAP_GROUP_EMPTY)
+        && await_group_empty(group, GROUP_TEARDOWN_VERIFY_WINDOW);
+    #[cfg(not(test))]
+    let group_empty = await_group_empty(group, GROUP_TEARDOWN_VERIFY_WINDOW);
+    if group_empty {
+        #[cfg(test)]
+        record_timeout_lifecycle_event(TimeoutLifecycleEvent::GroupEmptyVerified);
+    }
+
+    match reap {
+        Ok(Some(status)) if group_empty => Ok(status),
+        Ok(Some(_)) => Err(ExecutionError::ProcessGroupControlFailed {
             detail: format!(
-                "the attempt-owned process group -{} still had members after the leader was reaped; ownership was released, so no further group signal was attempted",
+                "the attempt-owned process group -{} was not proven empty after {context}; ownership was released, so no further group signal was attempted",
                 group.raw()
             ),
-        });
+        }),
+        Ok(None) => Err(ExecutionError::TimeoutFinalWaitFailed {
+            detail: format!(
+                "the direct child remained unreaped beyond the {context} window; group signaling was complete and the group was {}, so no stale group signal was attempted",
+                if group_empty {
+                    "proven empty"
+                } else {
+                    "not proven empty"
+                }
+            ),
+        }),
+        Err(error) => Err(ExecutionError::TimeoutFinalWaitFailed {
+            detail: format!(
+                "bounded direct-child reap failed during {context}: {error}; the group was {}, and no stale group signal was attempted",
+                if group_empty {
+                    "proven empty"
+                } else {
+                    "not proven empty"
+                }
+            ),
+        }),
     }
-    #[cfg(test)]
-    record_timeout_lifecycle_event(TimeoutLifecycleEvent::GroupEmptyVerified);
-    Ok(timed_out_outcome(termination, status))
 }
 
 /// Polls the zero-signal presence probe until the owned group is empty or
@@ -1276,12 +1308,29 @@ fn await_group_empty(group: OwnedProcessGroup, window: Duration) -> bool {
 /// child exited within the window.
 #[cfg(unix)]
 fn bounded_child_reap(child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
-    let Ok(deadline) = checked_deadline(Instant::now(), CLEANUP_REAP_WINDOW, "cleanup reap") else {
+    #[cfg(test)]
+    let window = REAP_TEST_WINDOW.get().unwrap_or(CLEANUP_REAP_WINDOW);
+    #[cfg(not(test))]
+    let window = CLEANUP_REAP_WINDOW;
+    let Ok(deadline) = checked_deadline(Instant::now(), window, "cleanup reap") else {
         return Ok(None);
     };
     loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(Some(status));
+        let wait = child_try_wait_for_reap(child);
+        match wait {
+            Ok(Some(status)) => return Ok(Some(status)),
+            Ok(None) => {}
+            Err(error) if error.kind() == ErrorKind::Interrupted => {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    return Err(error);
+                };
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+                std::thread::sleep(POLL_INTERVAL.min(remaining));
+                continue;
+            }
+            Err(error) => return Err(error),
         }
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
             return Ok(None);
@@ -1291,6 +1340,36 @@ fn bounded_child_reap(child: &mut Child) -> std::io::Result<Option<ExitStatus>> 
         }
         std::thread::sleep(POLL_INTERVAL.min(remaining));
     }
+}
+
+#[cfg(unix)]
+fn child_try_wait_for_reap(child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
+    #[cfg(test)]
+    {
+        let faults = REAP_TEST_FAULTS.get();
+        if faults & TEST_REAP_INTERRUPTED_ONCE != 0 {
+            REAP_TEST_FAULTS.set(faults & !TEST_REAP_INTERRUPTED_ONCE);
+            return Err(std::io::Error::new(
+                ErrorKind::Interrupted,
+                "injected interrupted direct-child reap",
+            ));
+        }
+        if faults & TEST_REAP_INTERRUPTED_PERSISTENT != 0 {
+            let _ = child.try_wait()?;
+            return Err(std::io::Error::new(
+                ErrorKind::Interrupted,
+                "injected persistent interrupted direct-child reap",
+            ));
+        }
+        if faults & TEST_REAP_NON_RETRYABLE_ONCE != 0 {
+            REAP_TEST_FAULTS.set(faults & !TEST_REAP_NON_RETRYABLE_ONCE);
+            let _ = child.try_wait()?;
+            return Err(std::io::Error::other(
+                "injected non-retryable direct-child reap failure",
+            ));
+        }
+    }
+    child.try_wait()
 }
 
 /// Fails closed when the freshly spawned child does not certify as this
@@ -1482,7 +1561,7 @@ pub(crate) fn grace_wait_failed_with_cleanup(
 /// Maps a failure to reap the child after forced kill into its typed
 /// error, kept distinct from kill-delivery failures so neither boundary is
 /// silently ignored.
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 pub(crate) fn final_wait_failed(error: std::io::Error) -> ExecutionError {
     ExecutionError::TimeoutFinalWaitFailed {
         detail: error.to_string(),
