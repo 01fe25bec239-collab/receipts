@@ -153,15 +153,15 @@ pub enum ExecutionError {
         /// Underlying observation failure detail.
         detail: String,
     },
-    /// Forced kill of a still-running timed-out child could not be
-    /// delivered. Never reported as a successful forced-kill timeout.
+    /// Forced `SIGKILL` delivery or force-containment of an owned process
+    /// group failed. Never reported as successful cleanup or timeout.
     ForceKillFailed {
         /// Underlying delivery failure plus best-effort cleanup evidence.
         detail: String,
     },
-    /// Reaping the child after a successful forced kill failed, so no
-    /// verified final state exists. Fails closed rather than returning a
-    /// timed-out outcome while the runner-owned child remains unwaited.
+    /// The bounded final direct-child reap during timeout or post-spawn
+    /// cleanup failed, so no verified final state exists. Fails closed
+    /// rather than claiming the runner-owned child was reaped.
     TimeoutFinalWaitFailed {
         /// Underlying final-wait failure detail.
         detail: String,
@@ -174,6 +174,14 @@ pub enum ExecutionError {
     ProcessGroupOwnershipFailed {
         /// Why ownership could not be established plus best-effort cleanup
         /// evidence.
+        detail: String,
+    },
+    /// Control or observation of an owned process group, or proof of its
+    /// containment state, failed and no more specific signal, child-wait,
+    /// or ownership error truthfully describes the failed operation.
+    ProcessGroupControlFailed {
+        /// The failed group-control, state-observation, or containment-proof
+        /// operation and its underlying evidence.
         detail: String,
     },
     /// Bounded output retention could not be established, so the frozen
@@ -318,17 +326,21 @@ impl fmt::Display for ExecutionError {
             ExecutionError::ForceKillFailed { detail } => {
                 write!(
                     f,
-                    "forced kill of the still-running timed-out child failed: {detail}"
+                    "forced process-group kill or containment failed: {detail}"
                 )
             }
             ExecutionError::TimeoutFinalWaitFailed { detail } => write!(
                 f,
-                "failed while reaping the child after forced kill: {detail}"
+                "bounded final direct-child reap failed during timeout or post-spawn cleanup: {detail}"
             ),
             ExecutionError::ProcessGroupOwnershipFailed { detail } => write!(
                 f,
                 "the spawned attempt could not be given a dedicated, safely signalable process \
                  group owned by this invocation: {detail}"
+            ),
+            ExecutionError::ProcessGroupControlFailed { detail } => write!(
+                f,
+                "process-group control, state observation, or containment proof failed: {detail}"
             ),
             ExecutionError::CaptureRetentionAllocationFailed { detail } => write!(
                 f,
