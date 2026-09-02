@@ -31,6 +31,7 @@
 pub mod adapter;
 pub mod host_capability_freshness_policy;
 pub mod host_capability_freshness_vocabulary;
+pub mod host_capability_inactive_reason_policy;
 pub mod host_capability_mode_override;
 pub mod host_capability_report_vocabulary;
 pub mod host_detection;
@@ -40,6 +41,9 @@ pub mod normalized_host_event_source_class;
 
 #[cfg(test)]
 mod adapter_tests;
+
+#[cfg(test)]
+mod host_capability_inactive_reason_policy_tests;
 
 #[cfg(test)]
 mod host_capability_freshness_policy_tests;
@@ -71,6 +75,9 @@ pub use host_capability_freshness_policy::{
 };
 pub use host_capability_freshness_vocabulary::{
     HostCapabilityReprobeTrigger, HostCapabilityValidityInput,
+};
+pub use host_capability_inactive_reason_policy::{
+    HostCapabilityInactiveReasonInputs, native_path_inactive_reason,
 };
 pub use host_capability_mode_override::{
     HostCapabilityModeOverride, HostCapabilityModeOverrideError,
