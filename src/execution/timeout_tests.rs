@@ -15,11 +15,13 @@ use std::time::{Duration, Instant};
 use super::runner::{
     CAPTURE_TEST_FAIL_FORCE_KILL, CAPTURE_TEST_FAIL_SIGCONT, CAPTURE_TEST_FORCE_COMPLETION_BARRIER,
     TEST_FAIL_FINAL_REAP_RESULT, TEST_FAIL_OWNERSHIP_REAP_RESULT, TEST_FAIL_POST_REAP_GROUP_EMPTY,
+    TEST_REAP_INTERRUPTED_ONCE, TEST_REAP_INTERRUPTED_PERSISTENT, TEST_REAP_NON_RETRYABLE_ONCE,
     TEST_REJECT_GROUP_OWNERSHIP, TimeoutLifecycleEvent, UNCAPTURED_TEST_FAIL_WAIT,
     checked_deadline, finish_timeout_after_signaling, force_kill_failed_with_cleanup,
     grace_wait_failed_with_cleanup, graceful_termination_failed_with_cleanup,
-    inject_capture_test_faults, inject_ownership_test_faults, inject_unsupported_timeout_platform,
-    quiescence_failed_with_cleanup, take_timeout_lifecycle_events,
+    inject_capture_test_faults, inject_ownership_test_faults, inject_reap_test_faults,
+    inject_unsupported_timeout_platform, quiescence_failed_with_cleanup, reap_test_attempts,
+    take_timeout_lifecycle_events,
 };
 use crate::execution::unix_signal::{
     GroupPresence, GroupSignalDelivery, LeaderState, OwnedProcessGroup, TimeoutSignalClass,
@@ -226,6 +228,32 @@ fn await_group_empty(pgid: u32, what: &str) {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// Reaps one known, already-exited direct child without any unbounded wait.
+fn reap_exited_controlled_child(pid: u32, what: &str) {
+    unsafe extern "C" {
+        fn waitpid(
+            pid: std::os::raw::c_int,
+            status: *mut std::os::raw::c_int,
+            options: std::os::raw::c_int,
+        ) -> std::os::raw::c_int;
+    }
+    const WNOHANG: std::os::raw::c_int = 1;
+
+    let pid = std::os::raw::c_int::try_from(pid).expect("controlled child pid fits pid_t");
+    let mut status = 0;
+    let waited = unsafe { waitpid(pid, &mut status, WNOHANG) };
+    assert_eq!(
+        waited,
+        pid,
+        "failed to reap exited {what} ({pid}) without blocking: {}",
+        std::io::Error::last_os_error()
+    );
+    assert!(
+        !process_alive(pid as u32),
+        "reaped {what} ({pid}) remains present"
+    );
 }
 
 // --- Controlled child helpers ------------------------------------------
@@ -2273,6 +2301,250 @@ fn spawn_controlled_group_child() -> (std::process::Child, OwnedProcessGroup, u3
     let group =
         OwnedProcessGroup::from_child_pid(pid).expect("fresh child certifies as an owned group");
     (child, group, pid)
+}
+
+fn kill_and_observe_controlled_child(
+    child: std::process::Child,
+    group: OwnedProcessGroup,
+) -> (std::process::Child, OwnedProcessGroup, u32) {
+    let pid = child.id();
+    assert!(matches!(
+        deliver_group_sigkill(group),
+        GroupSignalDelivery::Delivered | GroupSignalDelivery::GroupAlreadyGone
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while observe_leader_without_reaping(pid).expect("controlled leader observation")
+        != LeaderState::Exited
+    {
+        assert!(Instant::now() < deadline, "controlled child did not exit");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    (child, group, pid)
+}
+
+#[test]
+fn repair12_cleanup_owned_attempt_recovers_from_interrupted_reap() {
+    for _ in 0..10 {
+        let workspace = TempDir::new("repair12-cleanup-interrupted");
+        let caller_group = caller_process_group();
+        let _ = take_timeout_lifecycle_events();
+        let _wait_fault = inject_capture_test_faults(UNCAPTURED_TEST_FAIL_WAIT);
+        let _reap_fault = inject_reap_test_faults(TEST_REAP_INTERRUPTED_ONCE, None);
+        let error = run_with_timeout(
+            &bounded_request(
+                first_existing(&["/bin/sleep", "/usr/bin/sleep"]),
+                &["30"],
+                workspace.path(),
+                workspace.path(),
+            ),
+            &policy(Duration::from_secs(5), Duration::from_secs(1)),
+        )
+        .expect_err("the injected observation failure remains primary after cleanup");
+        assert!(matches!(error, ExecutionError::ProcessWaitFailed { .. }));
+        let events = take_timeout_lifecycle_events();
+        assert!(events.contains(&TimeoutLifecycleEvent::LeaderReaped));
+        assert_eq!(
+            events.last(),
+            Some(&TimeoutLifecycleEvent::GroupEmptyVerified)
+        );
+        assert_eq!(caller_process_group(), caller_group);
+    }
+}
+
+#[test]
+fn repair12_timed_completion_recovers_from_interrupted_reap() {
+    for _ in 0..10 {
+        let workspace = TempDir::new("repair12-completion-interrupted");
+        let caller_group = caller_process_group();
+        let _ = take_timeout_lifecycle_events();
+        let _fault = inject_reap_test_faults(TEST_REAP_INTERRUPTED_ONCE, None);
+        let outcome = run_with_timeout(
+            &bounded_request(
+                first_existing(&["/usr/bin/true", "/bin/true"]),
+                &[],
+                workspace.path(),
+                workspace.path(),
+            ),
+            &policy(Duration::from_secs(5), Duration::from_secs(1)),
+        )
+        .expect("an interrupted post-proof reap must recover boundedly");
+        assert_eq!(outcome.termination(), ProcessTermination::Completed);
+        let events = take_timeout_lifecycle_events();
+        assert!(events.contains(&TimeoutLifecycleEvent::GroupQuiescent));
+        assert!(events.contains(&TimeoutLifecycleEvent::LeaderReaped));
+        assert_eq!(
+            events.last(),
+            Some(&TimeoutLifecycleEvent::GroupEmptyVerified)
+        );
+        assert_eq!(caller_process_group(), caller_group);
+    }
+}
+
+#[test]
+fn repair12_finish_timeout_recovers_from_interrupted_reap() {
+    for _ in 0..10 {
+        let (child, group, pid) = spawn_controlled_group_child();
+        let (child, group, _) = kill_and_observe_controlled_child(child, group);
+        let caller_group = caller_process_group();
+        let _ = take_timeout_lifecycle_events();
+        let _fault = inject_reap_test_faults(TEST_REAP_INTERRUPTED_ONCE, None);
+        let outcome =
+            finish_timeout_after_signaling(child, group, ProcessTermination::TimedOutForceKilled)
+                .expect("an interrupted first reap must recover within the same window");
+        assert_eq!(
+            outcome.termination(),
+            ProcessTermination::TimedOutForceKilled
+        );
+        assert!(!process_alive(pid));
+        assert_eq!(
+            take_timeout_lifecycle_events(),
+            [
+                TimeoutLifecycleEvent::LeaderReaped,
+                TimeoutLifecycleEvent::GroupEmptyVerified,
+            ]
+        );
+        assert_eq!(caller_process_group(), caller_group);
+    }
+}
+
+#[test]
+fn repair12_ownership_failure_recovers_from_interrupted_reap() {
+    for _ in 0..10 {
+        let workspace = TempDir::new("repair12-ownership-interrupted");
+        let caller_group = caller_process_group();
+        let _ = take_timeout_lifecycle_events();
+        let _ownership_fault = inject_ownership_test_faults(TEST_REJECT_GROUP_OWNERSHIP);
+        let _reap_fault = inject_reap_test_faults(TEST_REAP_INTERRUPTED_ONCE, None);
+        let error = run_with_timeout(
+            &bounded_request(
+                first_existing(&["/bin/sleep", "/usr/bin/sleep"]),
+                &["30"],
+                workspace.path(),
+                workspace.path(),
+            ),
+            &policy(Duration::from_secs(5), Duration::from_secs(1)),
+        )
+        .expect_err("synthetic ownership rejection must remain primary");
+        assert!(matches!(
+            error,
+            ExecutionError::ProcessGroupOwnershipFailed { ref detail }
+                if detail.contains("direct child killed and boundedly reaped")
+        ));
+        let events = take_timeout_lifecycle_events();
+        assert_eq!(events, [TimeoutLifecycleEvent::LeaderReaped]);
+        assert_eq!(caller_process_group(), caller_group);
+    }
+}
+
+#[test]
+fn repair12_force_kill_failure_recovers_from_interrupted_reap() {
+    for _ in 0..10 {
+        let (child, group, pid) = spawn_controlled_group_child();
+        let caller_group = caller_process_group();
+        let _ = take_timeout_lifecycle_events();
+        let _fault = inject_reap_test_faults(TEST_REAP_INTERRUPTED_ONCE, None);
+        let error = force_kill_failed_with_cleanup(
+            child,
+            group,
+            "synthetic initial SIGKILL refusal".to_string(),
+        );
+        assert!(matches!(
+            error,
+            ExecutionError::ForceKillFailed { ref detail }
+                if detail.contains("direct child was reaped")
+                    && detail.contains("observed empty after failure")
+        ));
+        assert!(!process_alive(pid));
+        let events = take_timeout_lifecycle_events();
+        assert!(events.contains(&TimeoutLifecycleEvent::LeaderReaped));
+        assert_eq!(
+            events.last(),
+            Some(&TimeoutLifecycleEvent::GroupEmptyVerified)
+        );
+        assert_eq!(caller_process_group(), caller_group);
+    }
+}
+
+#[test]
+fn repair12_persistent_interrupted_reap_is_bounded_and_fails_closed() {
+    for _ in 0..10 {
+        let (child, group, _) = spawn_controlled_group_child();
+        let (child, group, pid) = kill_and_observe_controlled_child(child, group);
+        let caller_group = caller_process_group();
+        let _ = take_timeout_lifecycle_events();
+        let _fault = inject_reap_test_faults(
+            TEST_REAP_INTERRUPTED_PERSISTENT,
+            Some(Duration::from_millis(30)),
+        );
+        let started = Instant::now();
+        let error =
+            finish_timeout_after_signaling(child, group, ProcessTermination::TimedOutForceKilled)
+                .expect_err("persistent interruption must not produce a timeout success");
+        assert!(matches!(
+            error,
+            ExecutionError::TimeoutFinalWaitFailed { ref detail }
+                if detail.contains("persistent interrupted") && detail.contains("not proven empty")
+        ));
+        assert!(started.elapsed() >= Duration::from_millis(30));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(
+            reap_test_attempts() <= 5,
+            "persistent interruption must retain the 10ms polling cadence"
+        );
+        assert_eq!(
+            observe_leader_without_reaping(pid).expect("unreaped leader observation"),
+            LeaderState::Exited
+        );
+        assert!(
+            process_alive(pid),
+            "production unexpectedly reaped the child"
+        );
+        assert!(
+            !take_timeout_lifecycle_events().contains(&TimeoutLifecycleEvent::LeaderReaped),
+            "production must not claim a failed reap"
+        );
+        reap_exited_controlled_child(pid, "persistent-interruption child");
+        await_group_empty(group.raw() as u32, "persistent-interruption group");
+        assert_eq!(caller_process_group(), caller_group);
+    }
+}
+
+#[test]
+fn repair12_non_retryable_reap_error_fails_immediately_after_safe_evidence() {
+    for _ in 0..10 {
+        let (child, group, _) = spawn_controlled_group_child();
+        let (child, group, pid) = kill_and_observe_controlled_child(child, group);
+        let caller_group = caller_process_group();
+        let _ = take_timeout_lifecycle_events();
+        let _fault = inject_reap_test_faults(TEST_REAP_NON_RETRYABLE_ONCE, None);
+        let started = Instant::now();
+        let error =
+            finish_timeout_after_signaling(child, group, ProcessTermination::TimedOutForceKilled)
+                .expect_err("a non-retryable reap error must fail closed");
+        assert!(matches!(
+            error,
+            ExecutionError::TimeoutFinalWaitFailed { ref detail }
+                if detail.contains("non-retryable") && detail.contains("not proven empty")
+        ));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(reap_test_attempts(), 1, "non-retryable error was retried");
+        assert_eq!(
+            observe_leader_without_reaping(pid).expect("unreaped leader observation"),
+            LeaderState::Exited
+        );
+        assert!(
+            process_alive(pid),
+            "production unexpectedly reaped the child"
+        );
+        assert_eq!(
+            take_timeout_lifecycle_events(),
+            [],
+            "production must not claim a failed reap or empty group"
+        );
+        reap_exited_controlled_child(pid, "non-retryable-error child");
+        await_group_empty(group.raw() as u32, "non-retryable-error group");
+        assert_eq!(caller_process_group(), caller_group);
+    }
 }
 
 #[test]
