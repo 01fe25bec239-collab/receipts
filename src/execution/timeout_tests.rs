@@ -13,13 +13,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::runner::{
-    CAPTURE_TEST_FAIL_FORCE_KILL, CAPTURE_TEST_FORCE_COMPLETION_BARRIER,
-    TEST_FAIL_FINAL_REAP_RESULT, TEST_FAIL_POST_REAP_GROUP_EMPTY, TimeoutLifecycleEvent,
-    UNCAPTURED_TEST_FAIL_WAIT, checked_deadline, finish_timeout_after_signaling,
-    force_kill_failed_with_cleanup, grace_wait_failed_with_cleanup,
-    graceful_termination_failed_with_cleanup, inject_capture_test_faults,
-    inject_unsupported_timeout_platform, quiescence_failed_with_cleanup,
-    take_timeout_lifecycle_events,
+    CAPTURE_TEST_FAIL_FORCE_KILL, CAPTURE_TEST_FAIL_SIGCONT, CAPTURE_TEST_FORCE_COMPLETION_BARRIER,
+    TEST_FAIL_FINAL_REAP_RESULT, TEST_FAIL_OWNERSHIP_REAP_RESULT, TEST_FAIL_POST_REAP_GROUP_EMPTY,
+    TEST_REJECT_GROUP_OWNERSHIP, TimeoutLifecycleEvent, UNCAPTURED_TEST_FAIL_WAIT,
+    checked_deadline, finish_timeout_after_signaling, force_kill_failed_with_cleanup,
+    grace_wait_failed_with_cleanup, graceful_termination_failed_with_cleanup,
+    inject_capture_test_faults, inject_ownership_test_faults, inject_unsupported_timeout_platform,
+    quiescence_failed_with_cleanup, take_timeout_lifecycle_events,
 };
 use crate::execution::unix_signal::{
     GroupPresence, GroupSignalDelivery, LeaderState, OwnedProcessGroup, TimeoutSignalClass,
@@ -1408,7 +1408,10 @@ fn repair10_captured_post_reap_failure_never_signals_stale_group() {
             &policy(Duration::from_secs(5), Duration::from_secs(1)),
         )
         .expect_err("synthetic post-reap group proof failure must fail closed");
-        assert!(matches!(error, ExecutionError::ForceKillFailed { .. }));
+        assert!(matches!(
+            error,
+            ExecutionError::ProcessGroupControlFailed { .. }
+        ));
         let events = take_timeout_lifecycle_events();
         let reap = events
             .iter()
@@ -1422,6 +1425,129 @@ fn repair10_captured_post_reap_failure_never_signals_stale_group() {
                 | TimeoutLifecycleEvent::GroupSigkill
         )));
     }
+}
+
+#[test]
+fn repair11_ownership_failure_cleanup_is_bounded_and_never_signals_a_group() {
+    for _ in 0..10 {
+        let workspace = TempDir::new("repair11-ownership");
+        let _ = take_timeout_lifecycle_events();
+        let _fault = inject_ownership_test_faults(TEST_REJECT_GROUP_OWNERSHIP);
+        let started = Instant::now();
+        let error = run_with_timeout(
+            &bounded_request(
+                first_existing(&["/bin/sleep", "/usr/bin/sleep"]),
+                &["30"],
+                workspace.path(),
+                workspace.path(),
+            ),
+            &policy(Duration::from_secs(5), Duration::from_secs(1)),
+        )
+        .expect_err("synthetic ownership rejection must fail closed");
+        let detail = match error {
+            ExecutionError::ProcessGroupOwnershipFailed { detail } => detail,
+            other => panic!("expected ProcessGroupOwnershipFailed, got: {other:?}"),
+        };
+        assert!(detail.contains("direct child killed and boundedly reaped"));
+        let pid = detail
+            .split_whitespace()
+            .nth(3)
+            .expect("ownership detail contains child pid")
+            .parse::<u32>()
+            .expect("ownership detail child pid is numeric");
+        assert!(!process_alive(pid));
+        assert!(started.elapsed() < BOUNDED_RUN_UPPER_BOUND);
+        assert!(
+            take_timeout_lifecycle_events()
+                .iter()
+                .all(|event| !matches!(
+                    event,
+                    TimeoutLifecycleEvent::GroupSigterm
+                        | TimeoutLifecycleEvent::GroupSigstop
+                        | TimeoutLifecycleEvent::GroupSigcont
+                        | TimeoutLifecycleEvent::GroupSigkill
+                ))
+        );
+    }
+}
+
+#[test]
+fn repair11_ownership_failure_reports_unproven_cleanup_without_leaking_child() {
+    let workspace = TempDir::new("repair11-ownership-reap-failure");
+    let _ = take_timeout_lifecycle_events();
+    let _fault =
+        inject_ownership_test_faults(TEST_REJECT_GROUP_OWNERSHIP | TEST_FAIL_OWNERSHIP_REAP_RESULT);
+    let error = run_with_timeout(
+        &bounded_request(
+            first_existing(&["/bin/sleep", "/usr/bin/sleep"]),
+            &["30"],
+            workspace.path(),
+            workspace.path(),
+        ),
+        &policy(Duration::from_secs(5), Duration::from_secs(1)),
+    )
+    .expect_err("synthetic bounded-reap proof failure must fail closed");
+    let detail = match error {
+        ExecutionError::ProcessGroupOwnershipFailed { detail } => detail,
+        other => panic!("expected ProcessGroupOwnershipFailed, got: {other:?}"),
+    };
+    assert!(detail.contains("cleanup could not be proven"));
+    let pid = detail
+        .split_whitespace()
+        .nth(3)
+        .expect("ownership detail contains child pid")
+        .parse::<u32>()
+        .expect("ownership detail child pid is numeric");
+    assert!(
+        !process_alive(pid),
+        "test-only seam must not leak a real child"
+    );
+    assert!(
+        take_timeout_lifecycle_events()
+            .iter()
+            .all(|event| !matches!(
+                event,
+                TimeoutLifecycleEvent::GroupSigterm
+                    | TimeoutLifecycleEvent::GroupSigstop
+                    | TimeoutLifecycleEvent::GroupSigcont
+                    | TimeoutLifecycleEvent::GroupSigkill
+            ))
+    );
+}
+
+#[test]
+fn repair11_sigcont_failure_uses_group_control_error_after_containment() {
+    let workspace = TempDir::new("repair11-sigcont");
+    let _ = take_timeout_lifecycle_events();
+    let _fault = inject_capture_test_faults(
+        CAPTURE_TEST_FORCE_COMPLETION_BARRIER | CAPTURE_TEST_FAIL_SIGCONT,
+    );
+    let error = run_with_timeout(
+        &bounded_request(
+            std::env::current_exe().expect("current test executable path"),
+            &[
+                "execution_timeout_probe_parent_exits_with_live_descendant",
+                "--ignored",
+            ],
+            workspace.path(),
+            workspace.path(),
+        ),
+        &policy(Duration::from_secs(5), Duration::from_secs(1)),
+    )
+    .expect_err("injected SIGCONT control failure must fail after containment");
+    assert!(matches!(
+        error,
+        ExecutionError::ProcessGroupControlFailed { ref detail }
+            if detail.contains("SIGCONT")
+    ));
+    let events = take_timeout_lifecycle_events();
+    assert!(events.contains(&TimeoutLifecycleEvent::GroupSigstop));
+    assert!(events.contains(&TimeoutLifecycleEvent::GroupSigcont));
+    assert!(events.contains(&TimeoutLifecycleEvent::GroupSigkill));
+    assert_eq!(
+        events.last(),
+        Some(&TimeoutLifecycleEvent::GroupEmptyVerified)
+    );
 }
 
 #[derive(Debug)]
@@ -2236,26 +2362,28 @@ fn repair10_graceful_delivery_failure_preserves_primary_after_containment() {
 
 #[test]
 fn repair10_quiescence_failure_preserves_primary_after_containment() {
-    let (child, group, pid) = spawn_controlled_group_child();
-    let _ = take_timeout_lifecycle_events();
-    let error = quiescence_failed_with_cleanup(
-        child,
-        group,
-        "synthetic stable-membership failure".to_string(),
-    );
-    assert!(matches!(
-        error,
-        ExecutionError::ProcessWaitFailed { ref detail }
-            if detail.contains("synthetic stable-membership failure")
-    ));
-    await_process_death(pid, "quiescence-failure cleanup child");
-    let events = take_timeout_lifecycle_events();
-    assert!(events.contains(&TimeoutLifecycleEvent::GroupSigkill));
-    assert!(events.contains(&TimeoutLifecycleEvent::LeaderReaped));
-    assert_eq!(
-        events.last(),
-        Some(&TimeoutLifecycleEvent::GroupEmptyVerified)
-    );
+    for _ in 0..10 {
+        let (child, group, pid) = spawn_controlled_group_child();
+        let _ = take_timeout_lifecycle_events();
+        let error = quiescence_failed_with_cleanup(
+            child,
+            group,
+            "synthetic stable-membership failure".to_string(),
+        );
+        assert!(matches!(
+            error,
+            ExecutionError::ProcessGroupControlFailed { ref detail }
+                if detail.contains("synthetic stable-membership failure")
+        ));
+        await_process_death(pid, "quiescence-failure cleanup child");
+        let events = take_timeout_lifecycle_events();
+        assert!(events.contains(&TimeoutLifecycleEvent::GroupSigkill));
+        assert!(events.contains(&TimeoutLifecycleEvent::LeaderReaped));
+        assert_eq!(
+            events.last(),
+            Some(&TimeoutLifecycleEvent::GroupEmptyVerified)
+        );
+    }
 }
 
 #[test]

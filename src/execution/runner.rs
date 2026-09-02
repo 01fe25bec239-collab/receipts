@@ -133,6 +133,7 @@ const CAPTURE_READER_VERIFY_WINDOW: Duration = Duration::from_secs(2);
 #[cfg(all(test, unix))]
 thread_local! {
     static CAPTURE_TEST_FAULTS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static OWNERSHIP_TEST_FAULTS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(all(test, unix))]
@@ -186,6 +187,10 @@ pub(crate) const UNCAPTURED_TEST_FAIL_WAIT: u8 = 32;
 pub(crate) const TEST_FAIL_POST_REAP_GROUP_EMPTY: u8 = 64;
 #[cfg(all(test, unix))]
 pub(crate) const TEST_FAIL_FINAL_REAP_RESULT: u8 = 128;
+#[cfg(all(test, unix))]
+pub(crate) const TEST_REJECT_GROUP_OWNERSHIP: u8 = 1;
+#[cfg(all(test, unix))]
+pub(crate) const TEST_FAIL_OWNERSHIP_REAP_RESULT: u8 = 2;
 
 #[cfg(all(test, unix))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,6 +236,21 @@ impl Drop for CaptureTestFaultGuard {
 #[cfg(all(test, unix))]
 pub(crate) fn inject_capture_test_faults(faults: u8) -> CaptureTestFaultGuard {
     CaptureTestFaultGuard(CAPTURE_TEST_FAULTS.replace(faults))
+}
+
+#[cfg(all(test, unix))]
+pub(crate) struct OwnershipTestFaultGuard(u8);
+
+#[cfg(all(test, unix))]
+impl Drop for OwnershipTestFaultGuard {
+    fn drop(&mut self) {
+        OWNERSHIP_TEST_FAULTS.set(self.0);
+    }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn inject_ownership_test_faults(faults: u8) -> OwnershipTestFaultGuard {
+    OwnershipTestFaultGuard(OWNERSHIP_TEST_FAULTS.replace(faults))
 }
 
 /// Runs one validated process request to completion and returns its exit
@@ -331,7 +351,7 @@ pub fn run_with_timeout(
     // group the safety guards certify as this invocation's dedicated
     // group — never zero, one/broadcast, out-of-range values, or the
     // caller's own process group.
-    let group = match OwnedProcessGroup::from_child_pid(child.id()) {
+    let group = match owned_process_group(child.id()) {
         Some(group) => group,
         None => return Err(process_group_ownership_failed(child)),
     };
@@ -448,7 +468,7 @@ pub fn run_with_timeout_and_capture(
 
     let mut child = command.spawn().map_err(spawn_failed)?;
 
-    let group = match OwnedProcessGroup::from_child_pid(child.id()) {
+    let group = match owned_process_group(child.id()) {
         Some(group) => group,
         None => return Err(process_group_ownership_failed(child)),
     };
@@ -810,15 +830,15 @@ fn cleanup_owned_attempt(mut child: Child, group: OwnedProcessGroup) -> Result<(
         }
         Ok(None) => {
             return Err(ExecutionError::TimeoutFinalWaitFailed {
-                detail: "the direct child remained unreaped beyond the bounded capture-failure cleanup window".to_string(),
+                detail: "the direct child remained unreaped beyond the bounded post-spawn failure cleanup window".to_string(),
             });
         }
         Err(error) => return Err(final_wait_failed(error)),
     }
     if !await_group_empty(group, GROUP_TEARDOWN_VERIFY_WINDOW) {
-        return Err(ExecutionError::ForceKillFailed {
+        return Err(ExecutionError::ProcessGroupControlFailed {
             detail: format!(
-                "the attempt-owned process group -{} was not proven empty after bounded capture-failure cleanup",
+                "the attempt-owned process group -{} was not proven empty after bounded post-spawn failure cleanup",
                 group.raw()
             ),
         });
@@ -893,7 +913,7 @@ fn await_owned_child_until(
                         }
                         let status = child
                             .wait()
-                            .map_err(|error| OwnedWaitError::Released(final_wait_failed(error)))?;
+                            .map_err(|error| OwnedWaitError::Released(wait_failed(error)))?;
                         #[cfg(test)]
                         record_timeout_lifecycle_event(TimeoutLifecycleEvent::LeaderReaped);
                         #[cfg(test)]
@@ -903,7 +923,7 @@ fn await_owned_child_until(
                         let group_empty = await_group_empty(group, GROUP_TEARDOWN_VERIFY_WINDOW);
                         if !group_empty {
                             return Err(OwnedWaitError::Released(
-                                ExecutionError::ForceKillFailed {
+                                ExecutionError::ProcessGroupControlFailed {
                                     detail: format!(
                                         "the attempt-owned process group -{} was not proven empty after timed completion; ownership was released, so no further group signal was attempted",
                                         group.raw()
@@ -918,22 +938,22 @@ fn await_owned_child_until(
                     Ok(true) => match capture_deliver_group_sigcont(group) {
                         GroupSignalDelivery::Delivered | GroupSignalDelivery::GroupAlreadyGone => {}
                         GroupSignalDelivery::Failed { detail } => {
-                            return Err(OwnedWaitError::Owned(ExecutionError::ForceKillFailed {
-                                detail,
-                            }));
+                            return Err(OwnedWaitError::Owned(
+                                ExecutionError::ProcessGroupControlFailed { detail },
+                            ));
                         }
                     },
                     Err(detail) => {
-                        return Err(OwnedWaitError::Owned(ExecutionError::ForceKillFailed {
-                            detail,
-                        }));
+                        return Err(OwnedWaitError::Owned(
+                            ExecutionError::ProcessGroupControlFailed { detail },
+                        ));
                     }
                 },
                 GroupQuiescence::Mutable | GroupQuiescence::AllStopped(_) => {}
                 GroupQuiescence::Unknown { detail } => {
-                    return Err(OwnedWaitError::Owned(wait_failed(std::io::Error::other(
-                        detail,
-                    ))));
+                    return Err(OwnedWaitError::Owned(
+                        ExecutionError::ProcessGroupControlFailed { detail },
+                    ));
                 }
             }
         }
@@ -961,6 +981,15 @@ fn take_capture_test_fault(fault: u8) -> bool {
     })
 }
 
+#[cfg(all(test, unix))]
+fn take_ownership_test_fault(fault: u8) -> bool {
+    OWNERSHIP_TEST_FAULTS.with(|faults| {
+        let current = faults.get();
+        faults.set(current & !fault);
+        current & fault != 0
+    })
+}
+
 #[cfg(unix)]
 fn deliver_group_sigkill_for_attempt(group: OwnedProcessGroup) -> GroupSignalDelivery {
     #[cfg(test)]
@@ -970,6 +999,15 @@ fn deliver_group_sigkill_for_attempt(group: OwnedProcessGroup) -> GroupSignalDel
         };
     }
     timeout_deliver_group_sigkill(group)
+}
+
+#[cfg(unix)]
+fn owned_process_group(child_pid: u32) -> Option<OwnedProcessGroup> {
+    #[cfg(test)]
+    if take_ownership_test_fault(TEST_REJECT_GROUP_OWNERSHIP) {
+        return None;
+    }
+    OwnedProcessGroup::from_child_pid(child_pid)
 }
 
 #[cfg(unix)]
@@ -1199,7 +1237,7 @@ pub(crate) fn finish_timeout_after_signaling(
         });
     }
     if !await_group_empty(group, GROUP_TEARDOWN_VERIFY_WINDOW) {
-        return Err(ExecutionError::ForceKillFailed {
+        return Err(ExecutionError::ProcessGroupControlFailed {
             detail: format!(
                 "the attempt-owned process group -{} still had members after the leader was reaped; ownership was released, so no further group signal was attempted",
                 group.raw()
@@ -1256,8 +1294,8 @@ fn bounded_child_reap(child: &mut Child) -> std::io::Result<Option<ExitStatus>> 
 }
 
 /// Fails closed when the freshly spawned child does not certify as this
-/// invocation's dedicated process-group owner. Direct-handle `kill`/`wait`
-/// are used for cleanup because they need no group arithmetic, then the
+/// invocation's dedicated process-group owner. Direct-handle kill and a
+/// bounded reap are used for cleanup because they need no group arithmetic, then the
 /// typed ownership failure is returned.
 #[cfg(unix)]
 fn process_group_ownership_failed(mut child: Child) -> ExecutionError {
@@ -1265,20 +1303,41 @@ fn process_group_ownership_failed(mut child: Child) -> ExecutionError {
         "spawned child pid {} did not yield a certifiably distinct attempt-owned process group",
         child.id()
     );
-    match child.kill() {
-        Ok(()) => match child.wait() {
-            Ok(_) => {
-                detail.push_str("; best-effort cleanup: direct child killed and reaped");
+    let kill_error = child.kill().err();
+    let reap = bounded_child_reap(&mut child);
+    #[cfg(test)]
+    let reap = if take_ownership_test_fault(TEST_FAIL_OWNERSHIP_REAP_RESULT) {
+        let _ = reap;
+        Ok(None)
+    } else {
+        reap
+    };
+    match reap {
+        Ok(Some(_)) => {
+            #[cfg(test)]
+            record_timeout_lifecycle_event(TimeoutLifecycleEvent::LeaderReaped);
+            match kill_error {
+                None => detail
+                    .push_str("; best-effort cleanup: direct child killed and boundedly reaped"),
+                Some(error) => detail.push_str(&format!(
+                    "; best-effort direct kill failed ({error}), but the child was boundedly reaped"
+                )),
             }
-            Err(reap_error) => {
-                detail.push_str(&format!(
-                    "; best-effort cleanup reap also failed: {reap_error}"
-                ));
+        }
+        Ok(None) => {
+            if let Some(error) = kill_error {
+                detail.push_str(&format!("; best-effort direct kill failed: {error}"));
             }
-        },
-        Err(kill_error) => {
+            detail.push_str(
+                "; cleanup could not be proven: the direct child remained unreaped within the bounded cleanup window",
+            );
+        }
+        Err(error) => {
+            if let Some(kill_error) = kill_error {
+                detail.push_str(&format!("; best-effort direct kill failed: {kill_error}"));
+            }
             detail.push_str(&format!(
-                "; best-effort cleanup force kill also failed: {kill_error}"
+                "; cleanup could not be proven: bounded direct-child reap failed: {error}"
             ));
         }
     }
@@ -1332,10 +1391,12 @@ pub(crate) fn quiescence_failed_with_cleanup(
     failure_after_spawn(
         child,
         group,
-        wait_failed(std::io::Error::other(format!(
-            "process-group quiescence failed for owned group -{}: {failure}",
-            group.raw()
-        ))),
+        ExecutionError::ProcessGroupControlFailed {
+            detail: format!(
+                "process-group quiescence failed for owned group -{}: {failure}",
+                group.raw()
+            ),
+        },
     )
 }
 

@@ -1237,7 +1237,7 @@ fn predeadline_sigcont_failure_force_cleans_before_leader_reap() {
     );
     assert!(matches!(
         result,
-        Err(ExecutionError::ForceKillFailed { .. })
+        Err(ExecutionError::ProcessGroupControlFailed { .. })
     ));
     assert!(elapsed < Duration::from_secs(2));
     let events = take_timeout_lifecycle_events();
