@@ -172,23 +172,31 @@ fn capability_evidence(
 }
 
 fn declaration_flag_count(line: &str, target: &str) -> usize {
+    let Some(tokens) = declaration_tokens(line) else {
+        return 0;
+    };
+    tokens.into_iter().filter(|token| *token == target).count()
+}
+
+fn declaration_tokens(line: &str) -> Option<Vec<&str>> {
     let tokens: Vec<_> = line
         .split(|character: char| character.is_whitespace() || character == ',')
         .filter(|token| !token.is_empty())
         .collect();
-    if tokens
-        .iter()
-        .any(|token| !token.starts_with('-') && !token.starts_with('<') && !token.starts_with('['))
-    {
-        return 0;
-    }
-    tokens.into_iter().filter(|token| *token == target).count()
+    (!tokens.is_empty()
+        && tokens[0].starts_with('-')
+        && tokens.iter().all(|token| {
+            token.starts_with('-') || token.starts_with('<') || token.starts_with('[')
+        }))
+    .then_some(tokens)
 }
 
 fn option_declarations(text: &str) -> Vec<&str> {
     let mut usage_seen = false;
     let mut in_options = false;
-    let mut section = Vec::new();
+    let mut declarations = Vec::new();
+    let mut declaration_indent = None;
+    let mut entry_boundary = true;
 
     for line in text.lines() {
         let trimmed = line.trim();
@@ -201,26 +209,21 @@ fn option_declarations(text: &str) -> Vec<&str> {
             }
         } else if !trimmed.is_empty() && line == line.trim_start() {
             break;
+        } else if trimmed.is_empty() {
+            entry_boundary = declaration_indent.is_some();
         } else {
-            section.push(line);
+            let indent = line.len() - line.trim_start().len();
+            let starts_entry = declaration_tokens(trimmed).is_some()
+                && declaration_indent
+                    .is_none_or(|current_indent| indent <= current_indent || entry_boundary);
+
+            if starts_entry {
+                declarations.push(trimmed);
+                declaration_indent = Some(indent);
+            }
+            entry_boundary = false;
         }
     }
 
-    let Some(declaration_indent) = section
-        .iter()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| line.len() - line.trim_start().len())
-        .min()
-    else {
-        return Vec::new();
-    };
-
-    section
-        .into_iter()
-        .filter(|line| {
-            line.len() - line.trim_start().len() == declaration_indent
-                && line.trim_start().starts_with('-')
-        })
-        .map(str::trim)
-        .collect()
+    declarations
 }

@@ -9,11 +9,13 @@ Usage: codex exec [OPTIONS] [PROMPT]
 
 Options:
   -s, --sandbox <SANDBOX_MODE>
-      Select the sandbox policy
-  --output-schema <FILE>
-      Path to a JSON Schema
-  --json
-      Print events as JSONL
+          Select the sandbox policy
+
+      --output-schema <FILE>
+          Path to a JSON Schema
+
+      --json
+          Print events as JSONL
 "#;
 
 const HELP_WITHOUT_TARGETS: &[u8] = br#"Codex execution
@@ -50,8 +52,20 @@ fn command_plan_is_exactly_argv_data() {
 
 #[test]
 fn current_evidence_supports_all_target_declarations() {
+    let declaration_indents: Vec<_> = str::from_utf8(CURRENT_HELP)
+        .unwrap()
+        .lines()
+        .filter(|line| {
+            matches!(
+                line.trim(),
+                "-s, --sandbox <SANDBOX_MODE>" | "--output-schema <FILE>" | "--json"
+            )
+        })
+        .map(|line| line.len() - line.trim_start().len())
+        .collect();
     let report = parse_with_help(CURRENT_HELP).unwrap();
 
+    assert_eq!(declaration_indents, [2, 6, 6]);
     assert_eq!(report.version, "codex-cli 0.152.1");
     assert_eq!(report.json, CodexCapabilityEvidence::Supported);
     assert_eq!(report.output_schema, CodexCapabilityEvidence::Supported);
@@ -135,13 +149,28 @@ fn true_json_declaration_is_supported() {
         br#"Usage: codex exec [OPTIONS]
 
 Options:
-    --json
-        Print events as JSONL
+      --json
+          Print events as JSONL
 "#,
     )
     .unwrap();
 
     assert_eq!(report.json, CodexCapabilityEvidence::Supported);
+}
+
+#[test]
+fn true_output_schema_declaration_is_supported() {
+    let report = parse_with_help(
+        br#"Usage: codex exec [OPTIONS]
+
+Options:
+      --output-schema <FILE>
+          Path to a JSON Schema
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(report.output_schema, CodexCapabilityEvidence::Supported);
 }
 
 #[test]
