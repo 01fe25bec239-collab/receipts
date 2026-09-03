@@ -47,6 +47,7 @@
 //! path values. No remote operation is implemented: no credential handling,
 //! no fetch, no push, no remote publication, no force-push.
 
+pub mod checkpoint_capture_core;
 pub mod checkpoint_evidence_vocabulary;
 pub mod checkpoint_executed_check;
 pub mod checkpoint_reference;
@@ -66,6 +67,8 @@ pub mod teardown;
 pub mod execution;
 
 #[cfg(test)]
+mod checkpoint_capture_core_tests;
+#[cfg(test)]
 mod checkpoint_evidence_vocabulary_tests;
 #[cfg(test)]
 mod checkpoint_executed_check_tests;
@@ -80,6 +83,9 @@ mod teardown_tests;
 #[cfg(test)]
 mod test_support;
 
+pub use checkpoint_capture_core::{
+    WorkspaceCheckpointCaptureCore, WorkspaceCheckpointCaptureCoreError,
+};
 pub use checkpoint_evidence_vocabulary::{
     WorkspaceCheckpointCheckSource, WorkspaceCheckpointRefType,
 };
