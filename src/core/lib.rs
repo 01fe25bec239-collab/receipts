@@ -16,5 +16,7 @@ pub mod graph;
 
 pub use graph::*;
 
+pub mod scheduler;
+
 #[cfg(test)]
 mod facade_tests;
