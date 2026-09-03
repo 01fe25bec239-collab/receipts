@@ -1,7 +1,10 @@
 //! Closed product-entitlement vocabularies and validated string values.
 
+mod product_entitlement_string_fields;
 mod product_entitlement_values;
 mod vocabulary;
+
+pub use product_entitlement_string_fields::ProductEntitlementStringFields;
 
 pub use product_entitlement_values::{
     ProductCapabilityId, ProductEntitlementKeyId, ProductEntitlementSignature,
@@ -9,6 +12,9 @@ pub use product_entitlement_values::{
 };
 
 pub use vocabulary::{ActivationStateKind, ProductEntitlementState};
+
+#[cfg(test)]
+mod product_entitlement_string_fields_tests;
 
 #[cfg(test)]
 mod product_entitlement_values_tests;
