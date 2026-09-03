@@ -47,6 +47,7 @@
 //! path values. No remote operation is implemented: no credential handling,
 //! no fetch, no push, no remote publication, no force-push.
 
+pub mod checkpoint_evidence_vocabulary;
 pub mod checkpoint_vocabulary;
 pub mod error;
 pub mod git;
@@ -63,6 +64,8 @@ pub mod teardown;
 pub mod execution;
 
 #[cfg(test)]
+mod checkpoint_evidence_vocabulary_tests;
+#[cfg(test)]
 mod checkpoint_vocabulary_tests;
 #[cfg(test)]
 mod provision_tests;
@@ -71,6 +74,9 @@ mod teardown_tests;
 #[cfg(test)]
 mod test_support;
 
+pub use checkpoint_evidence_vocabulary::{
+    WorkspaceCheckpointCheckSource, WorkspaceCheckpointRefType,
+};
 pub use checkpoint_vocabulary::{WorkspaceCheckpointKind, WorkspaceRecoveryDecision};
 pub use error::WorkspaceError;
 pub use handle::{CommitSha, WorkspaceHandle, WorkspaceIsolation, WorkspaceState};
