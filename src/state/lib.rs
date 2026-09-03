@@ -19,6 +19,7 @@ pub mod canonical_timestamp;
 pub mod context_epoch;
 pub mod context_manifest;
 pub mod context_rehydration;
+pub mod entitlement;
 pub mod error;
 pub mod event;
 pub mod executor_binding;
