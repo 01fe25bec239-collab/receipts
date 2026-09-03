@@ -35,6 +35,7 @@ pub mod host_capability_freshness_vocabulary;
 pub mod host_capability_inactive_reason_policy;
 pub mod host_capability_mode_override;
 pub mod host_capability_native_prerequisite;
+pub mod host_capability_report_core;
 pub mod host_capability_report_vocabulary;
 pub mod host_detection;
 pub mod host_id;
@@ -61,6 +62,9 @@ mod host_capability_mode_override_tests;
 
 #[cfg(test)]
 mod host_capability_native_prerequisite_tests;
+
+#[cfg(test)]
+mod host_capability_report_core_tests;
 
 #[cfg(test)]
 mod host_capability_report_vocabulary_tests;
@@ -97,6 +101,10 @@ pub use host_capability_mode_override::{
 pub use host_capability_native_prerequisite::{
     HostCapabilityNativePrerequisiteInputs, HostCapabilityNativePrerequisiteState,
     assess_native_path_prerequisites,
+};
+pub use host_capability_report_core::{
+    HostCapabilityReportNonTemporalCore, HostCapabilityReportNonTemporalCoreError,
+    HostCapabilityReportNonTemporalCoreInputs,
 };
 pub use host_capability_report_vocabulary::{
     HostCapabilityEvidenceLabel, HostCapabilityHookCoverageClass, HostCapabilityInactiveReason,
