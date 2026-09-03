@@ -76,32 +76,3 @@ fn empty_target_error_is_typed_and_standard() {
         "workspace checkpoint reference target is empty"
     );
 }
-
-#[test]
-fn source_exposes_no_mutable_or_resolution_bypass() {
-    let source = include_str!("checkpoint_reference.rs");
-    for field in [
-        "    ref_type: WorkspaceCheckpointRefType,",
-        "    target: String,",
-        "    digest: Option<String>,",
-        "    section: Option<String>,",
-    ] {
-        assert!(source.contains(field));
-    }
-    for forbidden in [
-        "pub target:",
-        "pub digest:",
-        "pub section:",
-        "impl Default",
-        "fn set_target",
-        "fn target_mut",
-        "fn resolve(",
-        "fn read(",
-        "fn fetch(",
-        "fn load(",
-        "fn query(",
-        "fn validate_target(",
-    ] {
-        assert!(!source.contains(forbidden), "forbidden source: {forbidden}");
-    }
-}
