@@ -7,3 +7,6 @@ publish = false
 
 [lib]
 path = "../../src/adapters/runtime/lib.rs"
+
+[dependencies]
+receipts-workspace-execution = { path = "../receipts-workspace-execution" }

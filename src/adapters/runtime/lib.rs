@@ -1,10 +1,13 @@
 mod adapter;
 mod auth_status;
 mod codex_probe;
+mod codex_probe_execution;
 mod failure;
 
 #[cfg(test)]
 mod adapter_tests;
+#[cfg(test)]
+mod codex_probe_execution_tests;
 #[cfg(test)]
 mod codex_probe_tests;
 #[cfg(test)]
@@ -17,4 +20,5 @@ pub use codex_probe::{
     CodexCapabilityProbeReport, CodexProbeChannel, CodexProbeCommand, CodexProbeError,
     CodexProbeKind, CodexProbeObservation, parse_codex_probe,
 };
+pub use codex_probe_execution::{CodexProbeExecutionError, execute_codex_capability_probe};
 pub use failure::FailureClass;
