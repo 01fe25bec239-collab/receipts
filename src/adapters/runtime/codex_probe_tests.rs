@@ -1,0 +1,696 @@
+use crate::{
+    CODEX_EXEC_HELP_PROBE, CODEX_VERSION_PROBE, CodexCapability, CodexCapabilityEvidence,
+    CodexProbeChannel, CodexProbeError, CodexProbeKind, CodexProbeObservation, parse_codex_probe,
+};
+
+const CURRENT_HELP: &[u8] = br#"Codex execution
+
+Usage: codex exec [OPTIONS] [PROMPT]
+
+Options:
+  -s, --sandbox <SANDBOX_MODE>
+          Select the sandbox policy
+
+      --output-schema <FILE>
+          Path to a JSON Schema
+
+      --json
+          Print events as JSONL
+"#;
+
+const HELP_WITHOUT_TARGETS: &[u8] = br#"Codex execution
+
+Usage: codex exec [OPTIONS] [PROMPT]
+
+Options:
+  --color <WHEN>
+      Control terminal colors
+"#;
+
+fn observation(stdout: &'static [u8]) -> CodexProbeObservation<'static> {
+    CodexProbeObservation {
+        stdout,
+        stderr: b"",
+        exit_code: Some(0),
+        capture_complete: true,
+    }
+}
+
+fn observation_with_channels(
+    stdout: &'static [u8],
+    stderr: &'static [u8],
+) -> CodexProbeObservation<'static> {
+    CodexProbeObservation {
+        stdout,
+        stderr,
+        exit_code: Some(0),
+        capture_complete: true,
+    }
+}
+
+fn parse_with_help(
+    help: &'static [u8],
+) -> Result<crate::CodexCapabilityProbeReport, CodexProbeError> {
+    parse_codex_probe(observation(b"codex-cli 0.152.1\n"), observation(help))
+}
+
+#[test]
+fn command_plan_is_exactly_argv_data() {
+    assert_eq!(CODEX_VERSION_PROBE.program, "codex");
+    assert_eq!(CODEX_VERSION_PROBE.args, ["--version"]);
+    assert_eq!(CODEX_EXEC_HELP_PROBE.program, "codex");
+    assert_eq!(CODEX_EXEC_HELP_PROBE.args, ["exec", "--help"]);
+}
+
+#[test]
+fn current_evidence_supports_all_target_declarations() {
+    let declaration_indents: Vec<_> = str::from_utf8(CURRENT_HELP)
+        .unwrap()
+        .lines()
+        .filter(|line| {
+            matches!(
+                line.trim(),
+                "-s, --sandbox <SANDBOX_MODE>" | "--output-schema <FILE>" | "--json"
+            )
+        })
+        .map(|line| line.len() - line.trim_start().len())
+        .collect();
+    let report = parse_with_help(CURRENT_HELP).unwrap();
+
+    assert_eq!(declaration_indents, [2, 6, 6]);
+    assert_eq!(report.version, "codex-cli 0.152.1");
+    assert_eq!(report.json, CodexCapabilityEvidence::Supported);
+    assert_eq!(report.output_schema, CodexCapabilityEvidence::Supported);
+    assert_eq!(report.sandbox, CodexCapabilityEvidence::Supported);
+
+    let mixed_columns = parse_with_help(
+        br#"Usage: codex exec [OPTIONS]
+Options:
+  -s, --sandbox <SANDBOX_MODE>    Select sandbox
+
+      --output-schema <FILE>    Path to schema
+
+      --json    Print events as JSONL
+"#,
+    )
+    .unwrap();
+    assert_eq!(mixed_columns.json, CodexCapabilityEvidence::Supported);
+    assert_eq!(
+        mixed_columns.output_schema,
+        CodexCapabilityEvidence::Supported
+    );
+    assert_eq!(mixed_columns.sandbox, CodexCapabilityEvidence::Supported);
+}
+
+#[test]
+fn capability_detection_is_version_independent() {
+    let report = parse_codex_probe(
+        observation(b"codex-cli 999.0.0-test\n"),
+        observation(CURRENT_HELP),
+    )
+    .unwrap();
+
+    assert_eq!(report.version, "codex-cli 999.0.0-test");
+    assert_eq!(report.json, CodexCapabilityEvidence::Supported);
+    assert_eq!(report.output_schema, CodexCapabilityEvidence::Supported);
+    assert_eq!(report.sandbox, CodexCapabilityEvidence::Supported);
+}
+
+#[test]
+fn version_prefers_stdout_and_falls_back_to_stderr() {
+    for (stdout, stderr, expected) in [
+        (
+            b"codex-cli 0.152.1" as &[u8],
+            b"" as &[u8],
+            "codex-cli 0.152.1",
+        ),
+        (
+            b"codex-cli 0.152.1",
+            b"WARNING: diagnostic text",
+            "codex-cli 0.152.1",
+        ),
+        (b"", b"codex-cli 0.152.1", "codex-cli 0.152.1"),
+        (b" \n\t", b"codex-cli 0.152.1", "codex-cli 0.152.1"),
+        (b"  codex-cli 0.152.1  ", b"WARNING", "codex-cli 0.152.1"),
+    ] {
+        let report = parse_codex_probe(
+            observation_with_channels(stdout, stderr),
+            observation(CURRENT_HELP),
+        )
+        .unwrap();
+
+        assert_eq!(report.version, expected);
+    }
+
+    assert_eq!(
+        parse_codex_probe(
+            observation_with_channels(b" \n", b"\t "),
+            observation(CURRENT_HELP)
+        ),
+        Err(CodexProbeError::MissingVersionEvidence)
+    );
+}
+
+#[test]
+fn real_version_warning_is_not_appended_or_used_for_capabilities() {
+    let clean =
+        parse_codex_probe(observation(b"codex-cli 0.152.1"), observation(CURRENT_HELP)).unwrap();
+    let warned = parse_codex_probe(
+        observation_with_channels(
+            b"codex-cli 0.152.1",
+            b"WARNING: proceeding, even though we could not create PATH aliases:\nOperation not permitted (os error 1)",
+        ),
+        observation(CURRENT_HELP),
+    )
+    .unwrap();
+
+    assert_eq!(warned.version, "codex-cli 0.152.1");
+    assert_eq!(warned.json, clean.json);
+    assert_eq!(warned.output_schema, clean.output_schema);
+    assert_eq!(warned.sandbox, clean.sandbox);
+}
+
+#[test]
+fn absent_target_declarations_are_unknown_independently() {
+    for (help, expected) in [
+        (
+            br#"Usage: codex exec [OPTIONS]
+Options:
+  --output-schema <FILE>
+  --sandbox <MODE>
+"# as &[u8],
+            (
+                CodexCapabilityEvidence::Unknown,
+                CodexCapabilityEvidence::Supported,
+                CodexCapabilityEvidence::Supported,
+            ),
+        ),
+        (
+            br#"Usage: codex exec [OPTIONS]
+Options:
+  --json
+  --sandbox <MODE>
+"#,
+            (
+                CodexCapabilityEvidence::Supported,
+                CodexCapabilityEvidence::Unknown,
+                CodexCapabilityEvidence::Supported,
+            ),
+        ),
+        (
+            br#"Usage: codex exec [OPTIONS]
+Options:
+  --json
+  --output-schema <FILE>
+"#,
+            (
+                CodexCapabilityEvidence::Supported,
+                CodexCapabilityEvidence::Supported,
+                CodexCapabilityEvidence::Unknown,
+            ),
+        ),
+    ] {
+        let report = parse_with_help(help).unwrap();
+        assert_eq!(
+            (report.json, report.output_schema, report.sandbox),
+            expected
+        );
+    }
+}
+
+#[test]
+fn valid_help_without_targets_reports_all_unknown() {
+    let report = parse_with_help(HELP_WITHOUT_TARGETS).unwrap();
+
+    assert_eq!(report.json, CodexCapabilityEvidence::Unknown);
+    assert_eq!(report.output_schema, CodexCapabilityEvidence::Unknown);
+    assert_eq!(report.sandbox, CodexCapabilityEvidence::Unknown);
+}
+
+#[test]
+fn true_json_declaration_is_supported() {
+    let report = parse_with_help(
+        br#"Usage: codex exec [OPTIONS]
+
+Options:
+      --json
+          Print events as JSONL
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(report.json, CodexCapabilityEvidence::Supported);
+}
+
+#[test]
+fn true_output_schema_declaration_is_supported() {
+    let report = parse_with_help(
+        br#"Usage: codex exec [OPTIONS]
+
+Options:
+      --output-schema <FILE>
+          Path to a JSON Schema
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(report.output_schema, CodexCapabilityEvidence::Supported);
+}
+
+#[test]
+fn same_line_descriptions_preserve_declaration_prefixes() {
+    for (help, capability) in [
+        (
+            br#"Usage: codex exec [OPTIONS]
+Options:
+  --json    Print events as JSONL
+"# as &[u8],
+            CodexCapability::Json,
+        ),
+        (
+            br#"Usage: codex exec [OPTIONS]
+Options:
+  --output-schema <FILE>    Path to JSON schema
+"#,
+            CodexCapability::OutputSchema,
+        ),
+        (
+            br#"Usage: codex exec [OPTIONS]
+Options:
+  -s, --sandbox <SANDBOX_MODE>    Select sandbox
+"#,
+            CodexCapability::Sandbox,
+        ),
+    ] {
+        let report = parse_with_help(help).unwrap();
+        let evidence = match capability {
+            CodexCapability::Json => report.json,
+            CodexCapability::OutputSchema => report.output_schema,
+            CodexCapability::Sandbox => report.sandbox,
+        };
+        assert_eq!(evidence, CodexCapabilityEvidence::Supported);
+    }
+
+    let report = parse_with_help(
+        br#"Usage: codex exec [OPTIONS]
+Options:
+  --json    Print events as JSONL
+  --output-schema <FILE>    Path to schema
+  -s, --sandbox <SANDBOX_MODE>    Select sandbox
+"#,
+    )
+    .unwrap();
+    assert_eq!(report.json, CodexCapabilityEvidence::Supported);
+    assert_eq!(report.output_schema, CodexCapabilityEvidence::Supported);
+    assert_eq!(report.sandbox, CodexCapabilityEvidence::Supported);
+}
+
+#[test]
+fn flags_in_same_line_description_prose_are_ignored() {
+    let json = parse_with_help(
+        br#"Usage: codex exec [OPTIONS]
+Options:
+  --color <WHEN>    prose mentions --json
+"#,
+    )
+    .unwrap();
+    let other = parse_with_help(
+        br#"Usage: codex exec [OPTIONS]
+Options:
+  --color <WHEN>    prose mentions --output-schema and --sandbox
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(json.json, CodexCapabilityEvidence::Unknown);
+    assert_eq!(other.output_schema, CodexCapabilityEvidence::Unknown);
+    assert_eq!(other.sandbox, CodexCapabilityEvidence::Unknown);
+}
+
+#[test]
+fn description_examples_do_not_prove_capabilities() {
+    for (help, capability) in [
+        (
+            br#"Usage: codex exec [OPTIONS]
+Options:
+  --color <WHEN>
+      Try this example:
+      --json
+"# as &[u8],
+            CodexCapability::Json,
+        ),
+        (
+            br#"Usage: codex exec [OPTIONS]
+Options:
+  --color <WHEN>
+      Try this example:
+      --output-schema
+"#,
+            CodexCapability::OutputSchema,
+        ),
+        (
+            br#"Usage: codex exec [OPTIONS]
+Options:
+  --color <WHEN>
+      Try this example:
+      --sandbox
+"#,
+            CodexCapability::Sandbox,
+        ),
+    ] {
+        let report = parse_with_help(help).unwrap();
+        let evidence = match capability {
+            CodexCapability::Json => report.json,
+            CodexCapability::OutputSchema => report.output_schema,
+            CodexCapability::Sandbox => report.sandbox,
+        };
+        assert_eq!(evidence, CodexCapabilityEvidence::Unknown);
+    }
+}
+
+#[test]
+fn a4_007_exact_attack_does_not_prove_capabilities() {
+    let help = br#"Usage: codex exec [OPTIONS]
+
+Options:
+  --color <WHEN>
+      To request machine-readable output, pass this example:
+      --json
+      --output-schema
+      --sandbox
+"#;
+    let report = parse_with_help(help).unwrap();
+
+    assert_eq!(report.json, CodexCapabilityEvidence::Unknown);
+    assert_eq!(report.output_schema, CodexCapabilityEvidence::Unknown);
+    assert_eq!(report.sandbox, CodexCapabilityEvidence::Unknown);
+}
+
+#[test]
+fn blank_line_does_not_end_an_option_description_body() {
+    for (target, capability) in [
+        ("--json", CodexCapability::Json),
+        ("--output-schema", CodexCapability::OutputSchema),
+        ("--sandbox", CodexCapability::Sandbox),
+    ] {
+        let help = format!(
+            "Usage: codex exec [OPTIONS]\n\nOptions:\n  -c, --config <key=value>\n          Override a configuration value\n\n          {target}\n"
+        );
+        let report = parse_codex_probe(
+            observation(b"codex-cli 0.152.1"),
+            CodexProbeObservation {
+                stdout: help.as_bytes(),
+                stderr: b"",
+                exit_code: Some(0),
+                capture_complete: true,
+            },
+        )
+        .unwrap();
+        let evidence = match capability {
+            CodexCapability::Json => report.json,
+            CodexCapability::OutputSchema => report.output_schema,
+            CodexCapability::Sandbox => report.sandbox,
+        };
+        assert_eq!(evidence, CodexCapabilityEvidence::Unknown);
+    }
+
+    let report = parse_with_help(
+        br#"Usage: codex exec [OPTIONS]
+
+Options:
+  -c, --config <key=value>
+          Override a configuration value
+
+          --json
+          --output-schema
+          --sandbox
+"#,
+    )
+    .unwrap();
+    assert_eq!(report.json, CodexCapabilityEvidence::Unknown);
+    assert_eq!(report.output_schema, CodexCapabilityEvidence::Unknown);
+    assert_eq!(report.sandbox, CodexCapabilityEvidence::Unknown);
+}
+
+#[test]
+fn shaped_stderr_description_examples_do_not_prove_capabilities() {
+    let help = CodexProbeObservation {
+        stdout: HELP_WITHOUT_TARGETS,
+        stderr: br#"Usage: codex exec [OPTIONS]
+Options:
+  --color <WHEN>
+      WARNING: try --json, --output-schema, and --sandbox:
+      --json
+      --output-schema
+      --sandbox
+"#,
+        exit_code: Some(0),
+        capture_complete: true,
+    };
+    let report = parse_codex_probe(observation(b"codex-cli test"), help).unwrap();
+
+    assert_eq!(report.json, CodexCapabilityEvidence::Unknown);
+    assert_eq!(report.output_schema, CodexCapabilityEvidence::Unknown);
+    assert_eq!(report.sandbox, CodexCapabilityEvidence::Unknown);
+}
+
+#[test]
+fn options_before_exec_usage_are_ignored() {
+    let help = br#"Options:
+  --json
+
+Some preamble
+
+Usage: codex exec [OPTIONS]
+
+Options:
+  --color <WHEN>
+"#;
+    let report = parse_with_help(help).unwrap();
+
+    assert_eq!(report.json, CodexCapabilityEvidence::Unknown);
+}
+
+#[test]
+fn later_top_level_sections_are_ignored() {
+    let help = br#"Usage: codex exec [OPTIONS]
+
+Options:
+  --color <WHEN>
+
+Examples:
+  --json
+  --output-schema
+  --sandbox
+"#;
+    let report = parse_with_help(help).unwrap();
+
+    assert_eq!(report.json, CodexCapabilityEvidence::Unknown);
+    assert_eq!(report.output_schema, CodexCapabilityEvidence::Unknown);
+    assert_eq!(report.sandbox, CodexCapabilityEvidence::Unknown);
+}
+
+#[test]
+fn sandbox_short_alias_declaration_is_supported() {
+    let report = parse_with_help(
+        br#"Usage: codex exec [OPTIONS]
+Options:
+  -s, --sandbox <SANDBOX_MODE>
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(report.sandbox, CodexCapabilityEvidence::Supported);
+}
+
+#[test]
+fn prefix_impostor_declarations_are_rejected() {
+    let report = parse_with_help(
+        br#"Usage: codex exec [OPTIONS]
+Options:
+  --jsonish
+  --output-schema-old
+  --sandboxed
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(report.json, CodexCapabilityEvidence::Unknown);
+    assert_eq!(report.output_schema, CodexCapabilityEvidence::Unknown);
+    assert_eq!(report.sandbox, CodexCapabilityEvidence::Unknown);
+}
+
+#[test]
+fn substrings_and_prose_do_not_prove_capabilities() {
+    let help = br#"Usage: codex exec [OPTIONS]
+Options:
+  --jsonish
+      Use --json if available
+      --json is mentioned in prose, not declared
+  --color <WHEN>
+      Mention --output-schema in prose
+      Mention --sandbox in prose
+"#;
+    let report = parse_with_help(help).unwrap();
+
+    assert_eq!(report.json, CodexCapabilityEvidence::Unknown);
+    assert_eq!(report.output_schema, CodexCapabilityEvidence::Unknown);
+    assert_eq!(report.sandbox, CodexCapabilityEvidence::Unknown);
+}
+
+#[test]
+fn valid_help_on_stderr_is_parsed_but_unshaped_warnings_are_not() {
+    let stderr_help = CodexProbeObservation {
+        stdout: b"",
+        stderr: CURRENT_HELP,
+        exit_code: Some(0),
+        capture_complete: true,
+    };
+    assert_eq!(
+        parse_codex_probe(observation(b"codex-cli test"), stderr_help)
+            .unwrap()
+            .json,
+        CodexCapabilityEvidence::Supported
+    );
+
+    let warning = CodexProbeObservation {
+        stdout: HELP_WITHOUT_TARGETS,
+        stderr: b"warning: use --json, --output-schema, and --sandbox if available",
+        exit_code: Some(0),
+        capture_complete: true,
+    };
+    let report = parse_codex_probe(observation(b"codex-cli test"), warning).unwrap();
+    assert_eq!(report.json, CodexCapabilityEvidence::Unknown);
+    assert_eq!(report.output_schema, CodexCapabilityEvidence::Unknown);
+    assert_eq!(report.sandbox, CodexCapabilityEvidence::Unknown);
+}
+
+#[test]
+fn missing_and_failed_statuses_fail_closed() {
+    for (version_status, help_status, expected) in [
+        (
+            None,
+            Some(0),
+            CodexProbeError::MissingStatus(CodexProbeKind::Version),
+        ),
+        (
+            Some(7),
+            Some(0),
+            CodexProbeError::NonSuccessStatus(CodexProbeKind::Version, 7),
+        ),
+        (
+            Some(0),
+            None,
+            CodexProbeError::MissingStatus(CodexProbeKind::ExecHelp),
+        ),
+        (
+            Some(0),
+            Some(9),
+            CodexProbeError::NonSuccessStatus(CodexProbeKind::ExecHelp, 9),
+        ),
+    ] {
+        let mut version = observation(b"codex-cli test");
+        let mut help = observation(CURRENT_HELP);
+        version.exit_code = version_status;
+        help.exit_code = help_status;
+        assert_eq!(parse_codex_probe(version, help), Err(expected));
+    }
+}
+
+#[test]
+fn incomplete_captures_fail_closed() {
+    let mut version = observation(b"codex-cli test");
+    version.capture_complete = false;
+    assert_eq!(
+        parse_codex_probe(version, observation(CURRENT_HELP)),
+        Err(CodexProbeError::IncompleteCapture(CodexProbeKind::Version))
+    );
+
+    let mut help = observation(CURRENT_HELP);
+    help.capture_complete = false;
+    assert_eq!(
+        parse_codex_probe(observation(b"codex-cli test"), help),
+        Err(CodexProbeError::IncompleteCapture(CodexProbeKind::ExecHelp))
+    );
+}
+
+#[test]
+fn missing_evidence_and_invalid_help_shape_fail_closed() {
+    assert_eq!(
+        parse_codex_probe(observation(b" \n"), observation(CURRENT_HELP)),
+        Err(CodexProbeError::MissingVersionEvidence)
+    );
+    assert_eq!(
+        parse_codex_probe(observation(b"codex-cli test"), observation(b" \n")),
+        Err(CodexProbeError::MissingHelpEvidence)
+    );
+    assert_eq!(
+        parse_codex_probe(
+            observation(b"codex-cli test"),
+            observation(b"arbitrary non-empty text")
+        ),
+        Err(CodexProbeError::InvalidHelpShape)
+    );
+}
+
+#[test]
+fn duplicate_target_declarations_fail_closed() {
+    let help = br#"Usage: codex exec [OPTIONS]
+Options:
+  --json
+  --json <MODE>
+"#;
+    assert_eq!(
+        parse_with_help(help),
+        Err(CodexProbeError::AmbiguousCapabilityEvidence(
+            CodexCapability::Json
+        ))
+    );
+}
+
+#[test]
+fn invalid_utf8_in_either_channel_fails_closed() {
+    let invalid_version = CodexProbeObservation {
+        stdout: b"codex-cli test",
+        stderr: b"\xff",
+        exit_code: Some(0),
+        capture_complete: true,
+    };
+    assert_eq!(
+        parse_codex_probe(invalid_version, observation(CURRENT_HELP)),
+        Err(CodexProbeError::InvalidEncoding(
+            CodexProbeKind::Version,
+            CodexProbeChannel::Stderr
+        ))
+    );
+
+    let invalid_help = CodexProbeObservation {
+        stdout: b"\xff",
+        stderr: b"",
+        exit_code: Some(0),
+        capture_complete: true,
+    };
+    assert_eq!(
+        parse_codex_probe(observation(b"codex-cli test"), invalid_help),
+        Err(CodexProbeError::InvalidEncoding(
+            CodexProbeKind::ExecHelp,
+            CodexProbeChannel::Stdout
+        ))
+    );
+}
+
+#[test]
+fn duplicate_declarations_across_channels_fail_closed() {
+    let help = CodexProbeObservation {
+        stdout: CURRENT_HELP,
+        stderr: CURRENT_HELP,
+        exit_code: Some(0),
+        capture_complete: true,
+    };
+    assert_eq!(
+        parse_codex_probe(observation(b"codex-cli test"), help),
+        Err(CodexProbeError::AmbiguousCapabilityEvidence(
+            CodexCapability::Json
+        ))
+    );
+}
