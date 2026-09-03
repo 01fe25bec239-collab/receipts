@@ -29,6 +29,7 @@
 //! * no authoritative state read or write path exists here.
 
 pub mod adapter;
+pub mod host_capability_consistency;
 pub mod host_capability_freshness_policy;
 pub mod host_capability_freshness_vocabulary;
 pub mod host_capability_inactive_reason_policy;
@@ -41,6 +42,9 @@ pub mod normalized_host_event_source_class;
 
 #[cfg(test)]
 mod adapter_tests;
+
+#[cfg(test)]
+mod host_capability_consistency_tests;
 
 #[cfg(test)]
 mod host_capability_inactive_reason_policy_tests;
@@ -70,6 +74,10 @@ mod normalized_host_event_tests;
 mod normalized_host_event_source_class_tests;
 
 pub use adapter::HostAdapter;
+pub use host_capability_consistency::{
+    HostCapabilityConsistencyError, HostCapabilityConsistencyInputs,
+    validate_complete_probe_consistency,
+};
 pub use host_capability_freshness_policy::{
     HostCapabilityFreshnessDisposition, freshness_disposition, is_embedded_eligible,
 };
