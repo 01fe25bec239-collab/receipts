@@ -82,7 +82,7 @@ pub fn parse_codex_probe(
     exec_help: CodexProbeObservation<'_>,
 ) -> Result<CodexCapabilityProbeReport, CodexProbeError> {
     let (version_stdout, version_stderr) = validate_observation(version, CodexProbeKind::Version)?;
-    let version = joined_nonempty(version_stdout, version_stderr)
+    let version = preferred_nonempty(version_stdout, version_stderr)
         .ok_or(CodexProbeError::MissingVersionEvidence)?;
 
     let (help_stdout, help_stderr) = validate_observation(exec_help, CodexProbeKind::ExecHelp)?;
@@ -130,13 +130,11 @@ fn validate_observation(
     Ok((stdout, stderr))
 }
 
-fn joined_nonempty(stdout: &str, stderr: &str) -> Option<String> {
-    match (stdout.trim(), stderr.trim()) {
-        ("", "") => None,
-        (stdout, "") => Some(stdout.to_owned()),
-        ("", stderr) => Some(stderr.to_owned()),
-        (stdout, stderr) => Some(format!("{stdout}\n{stderr}")),
-    }
+fn preferred_nonempty(stdout: &str, stderr: &str) -> Option<String> {
+    [stdout.trim(), stderr.trim()]
+        .into_iter()
+        .find(|text| !text.is_empty())
+        .map(str::to_owned)
 }
 
 fn has_exec_help_shape(text: &str) -> bool {
@@ -182,13 +180,16 @@ fn declaration_tokens(line: &str) -> Option<Vec<&str>> {
     let tokens: Vec<_> = line
         .split(|character: char| character.is_whitespace() || character == ',')
         .filter(|token| !token.is_empty())
+        .take_while(|token| token.starts_with('-') || is_placeholder(token))
         .collect();
-    (!tokens.is_empty()
-        && tokens[0].starts_with('-')
-        && tokens.iter().all(|token| {
-            token.starts_with('-') || token.starts_with('<') || token.starts_with('[')
-        }))
-    .then_some(tokens)
+
+    (!tokens.is_empty() && tokens[0].starts_with('-')).then_some(tokens)
+}
+
+fn is_placeholder(token: &str) -> bool {
+    token.len() > 2
+        && ((token.starts_with('<') && token.ends_with('>'))
+            || (token.starts_with('[') && token.ends_with(']')))
 }
 
 fn option_declarations(text: &str) -> Vec<&str> {
@@ -196,7 +197,9 @@ fn option_declarations(text: &str) -> Vec<&str> {
     let mut in_options = false;
     let mut declarations = Vec::new();
     let mut declaration_indent = None;
-    let mut entry_boundary = true;
+    let mut aligned_long_indent = None;
+    let mut body_indent = None;
+    let mut blank_line = false;
 
     for line in text.lines() {
         let trimmed = line.trim();
@@ -210,18 +213,36 @@ fn option_declarations(text: &str) -> Vec<&str> {
         } else if !trimmed.is_empty() && line == line.trim_start() {
             break;
         } else if trimmed.is_empty() {
-            entry_boundary = declaration_indent.is_some();
+            blank_line = declaration_indent.is_some();
         } else {
             let indent = line.len() - line.trim_start().len();
-            let starts_entry = declaration_tokens(trimmed).is_some()
-                && declaration_indent
-                    .is_none_or(|current_indent| indent <= current_indent || entry_boundary);
+            let tokens = declaration_tokens(trimmed);
+            let starts_entry = tokens.is_some()
+                && declaration_indent.is_none_or(|current_indent| {
+                    indent <= current_indent
+                        || (blank_line
+                            && aligned_long_indent == Some(indent)
+                            && body_indent.is_none_or(|body_indent| indent < body_indent))
+                });
 
             if starts_entry {
                 declarations.push(trimmed);
                 declaration_indent = Some(indent);
+                aligned_long_indent = tokens.and_then(|tokens| {
+                    let short = tokens.first()?;
+                    let long = tokens
+                        .iter()
+                        .skip(1)
+                        .find(|token| token.starts_with("--"))?;
+                    (!short.starts_with("--"))
+                        .then(|| indent + trimmed.find(long).expect("token came from line"))
+                });
+                body_indent = None;
+            } else if declaration_indent.is_some_and(|current_indent| indent > current_indent) {
+                body_indent =
+                    Some(body_indent.map_or(indent, |body_indent: usize| body_indent.min(indent)));
             }
-            entry_boundary = false;
+            blank_line = false;
         }
     }
 
