@@ -6,4 +6,4 @@ rust-version = "1.97.1"
 publish = false
 
 [lib]
-path = "../../src/core/graph/lib.rs"
+path = "../../src/core/lib.rs"
