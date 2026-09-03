@@ -130,6 +130,168 @@ fn valid_help_without_targets_reports_all_unknown() {
 }
 
 #[test]
+fn true_json_declaration_is_supported() {
+    let report = parse_with_help(
+        br#"Usage: codex exec [OPTIONS]
+
+Options:
+    --json
+        Print events as JSONL
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(report.json, CodexCapabilityEvidence::Supported);
+}
+
+#[test]
+fn description_examples_do_not_prove_capabilities() {
+    for (help, capability) in [
+        (
+            br#"Usage: codex exec [OPTIONS]
+Options:
+  --color <WHEN>
+      Try this example:
+      --json
+"# as &[u8],
+            CodexCapability::Json,
+        ),
+        (
+            br#"Usage: codex exec [OPTIONS]
+Options:
+  --color <WHEN>
+      Try this example:
+      --output-schema
+"#,
+            CodexCapability::OutputSchema,
+        ),
+        (
+            br#"Usage: codex exec [OPTIONS]
+Options:
+  --color <WHEN>
+      Try this example:
+      --sandbox
+"#,
+            CodexCapability::Sandbox,
+        ),
+    ] {
+        let report = parse_with_help(help).unwrap();
+        let evidence = match capability {
+            CodexCapability::Json => report.json,
+            CodexCapability::OutputSchema => report.output_schema,
+            CodexCapability::Sandbox => report.sandbox,
+        };
+        assert_eq!(evidence, CodexCapabilityEvidence::Unknown);
+    }
+}
+
+#[test]
+fn a4_007_exact_attack_does_not_prove_capabilities() {
+    let help = br#"Usage: codex exec [OPTIONS]
+
+Options:
+  --color <WHEN>
+      To request machine-readable output, pass this example:
+      --json
+      --output-schema
+      --sandbox
+"#;
+    let report = parse_with_help(help).unwrap();
+
+    assert_eq!(report.json, CodexCapabilityEvidence::Unknown);
+    assert_eq!(report.output_schema, CodexCapabilityEvidence::Unknown);
+    assert_eq!(report.sandbox, CodexCapabilityEvidence::Unknown);
+}
+
+#[test]
+fn shaped_stderr_description_examples_do_not_prove_capabilities() {
+    let help = CodexProbeObservation {
+        stdout: HELP_WITHOUT_TARGETS,
+        stderr: br#"Usage: codex exec [OPTIONS]
+Options:
+  --color <WHEN>
+      WARNING: try --json, --output-schema, and --sandbox:
+      --json
+      --output-schema
+      --sandbox
+"#,
+        exit_code: Some(0),
+        capture_complete: true,
+    };
+    let report = parse_codex_probe(observation(b"codex-cli test"), help).unwrap();
+
+    assert_eq!(report.json, CodexCapabilityEvidence::Unknown);
+    assert_eq!(report.output_schema, CodexCapabilityEvidence::Unknown);
+    assert_eq!(report.sandbox, CodexCapabilityEvidence::Unknown);
+}
+
+#[test]
+fn options_before_exec_usage_are_ignored() {
+    let help = br#"Options:
+  --json
+
+Some preamble
+
+Usage: codex exec [OPTIONS]
+
+Options:
+  --color <WHEN>
+"#;
+    let report = parse_with_help(help).unwrap();
+
+    assert_eq!(report.json, CodexCapabilityEvidence::Unknown);
+}
+
+#[test]
+fn later_top_level_sections_are_ignored() {
+    let help = br#"Usage: codex exec [OPTIONS]
+
+Options:
+  --color <WHEN>
+
+Examples:
+  --json
+  --output-schema
+  --sandbox
+"#;
+    let report = parse_with_help(help).unwrap();
+
+    assert_eq!(report.json, CodexCapabilityEvidence::Unknown);
+    assert_eq!(report.output_schema, CodexCapabilityEvidence::Unknown);
+    assert_eq!(report.sandbox, CodexCapabilityEvidence::Unknown);
+}
+
+#[test]
+fn sandbox_short_alias_declaration_is_supported() {
+    let report = parse_with_help(
+        br#"Usage: codex exec [OPTIONS]
+Options:
+  -s, --sandbox <SANDBOX_MODE>
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(report.sandbox, CodexCapabilityEvidence::Supported);
+}
+
+#[test]
+fn prefix_impostor_declarations_are_rejected() {
+    let report = parse_with_help(
+        br#"Usage: codex exec [OPTIONS]
+Options:
+  --jsonish
+  --output-schema-old
+  --sandboxed
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(report.json, CodexCapabilityEvidence::Unknown);
+    assert_eq!(report.output_schema, CodexCapabilityEvidence::Unknown);
+    assert_eq!(report.sandbox, CodexCapabilityEvidence::Unknown);
+}
+
+#[test]
 fn substrings_and_prose_do_not_prove_capabilities() {
     let help = br#"Usage: codex exec [OPTIONS]
 Options:

@@ -141,11 +141,12 @@ fn joined_nonempty(stdout: &str, stderr: &str) -> Option<String> {
 
 fn has_exec_help_shape(text: &str) -> bool {
     let mut usage_seen = false;
-    for line in text.lines().map(str::trim) {
-        if let Some(usage) = line.strip_prefix("Usage:") {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(usage) = trimmed.strip_prefix("Usage:") {
             let mut words = usage.split_whitespace();
             usage_seen = words.next() == Some("codex") && words.next() == Some("exec");
-        } else if usage_seen && line == "Options:" {
+        } else if usage_seen && line == trimmed && trimmed == "Options:" {
             return true;
         }
     }
@@ -184,10 +185,42 @@ fn declaration_flag_count(line: &str, target: &str) -> usize {
     tokens.into_iter().filter(|token| *token == target).count()
 }
 
-fn option_declarations(text: &str) -> impl Iterator<Item = &str> {
-    text.lines()
-        .skip_while(|line| line.trim() != "Options:")
-        .skip(1)
+fn option_declarations(text: &str) -> Vec<&str> {
+    let mut usage_seen = false;
+    let mut in_options = false;
+    let mut section = Vec::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !in_options {
+            if let Some(usage) = trimmed.strip_prefix("Usage:") {
+                let mut words = usage.split_whitespace();
+                usage_seen = words.next() == Some("codex") && words.next() == Some("exec");
+            } else if usage_seen && line == trimmed && trimmed == "Options:" {
+                in_options = true;
+            }
+        } else if !trimmed.is_empty() && line == line.trim_start() {
+            break;
+        } else {
+            section.push(line);
+        }
+    }
+
+    let Some(declaration_indent) = section
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.len() - line.trim_start().len())
+        .min()
+    else {
+        return Vec::new();
+    };
+
+    section
+        .into_iter()
+        .filter(|line| {
+            line.len() - line.trim_start().len() == declaration_indent
+                && line.trim_start().starts_with('-')
+        })
         .map(str::trim)
-        .filter(|line| line.starts_with('-'))
+        .collect()
 }
