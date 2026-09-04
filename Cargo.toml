@@ -18,6 +18,7 @@ members = [
     "crates/receipts-runtime-adapters",
     "crates/receipts-workspace-execution",
     "crates/receipts-host-integration",
+    "crates/receipts-model-routing",
 ]
 
 [dependencies]
