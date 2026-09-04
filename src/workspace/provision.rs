@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use crate::error::WorkspaceError;
 use crate::git;
 use crate::handle::{CommitSha, WorkspaceHandle};
+use crate::remote_publish_policy::WorkspaceRemotePublishPolicy;
 
 /// Maximum accepted length for caller-supplied identifiers, in bytes.
 pub(crate) const MAX_IDENTIFIER_LENGTH: usize = 256;
@@ -41,6 +42,7 @@ pub struct WorkspaceProvisionRequest {
     branch: String,
     worktree_path: PathBuf,
     base_sha: CommitSha,
+    remote_publish_policy: Option<WorkspaceRemotePublishPolicy>,
 }
 
 impl WorkspaceProvisionRequest {
@@ -85,7 +87,14 @@ impl WorkspaceProvisionRequest {
             branch: branch.to_string(),
             worktree_path,
             base_sha,
+            remote_publish_policy: None,
         })
+    }
+
+    /// Stores an explicit policy without executing or authorizing remote operations.
+    pub fn with_remote_publish_policy(mut self, policy: WorkspaceRemotePublishPolicy) -> Self {
+        self.remote_publish_policy = Some(policy);
+        self
     }
 
     /// The local Git repository the branch and worktree are created in.
@@ -259,6 +268,7 @@ impl WorkspaceProvisionRequest {
             self.branch.clone(),
             self.worktree_path.clone().into_boxed_path(),
             self.base_sha.clone(),
+            self.remote_publish_policy,
         ))
     }
 }

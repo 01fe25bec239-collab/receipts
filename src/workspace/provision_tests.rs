@@ -183,6 +183,7 @@ fn t06_handle_is_provisioned_with_expected_fields() {
     assert_eq!(handle.state().as_str(), "PROVISIONED");
     assert_eq!(handle.isolation(), WorkspaceIsolation::WorkspaceIsolation);
     assert_eq!(handle.isolation().as_str(), "WORKSPACE_ISOLATION");
+    assert_eq!(handle.remote_publish_policy(), None);
 }
 
 // T7 — a Git command failure (duplicate branch creation refused by Git) is
