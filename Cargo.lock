@@ -214,6 +214,10 @@ name = "receipts-host-integration"
 version = "0.1.0"
 
 [[package]]
+name = "receipts-model-routing"
+version = "0.1.0"
+
+[[package]]
 name = "receipts-orchestration"
 version = "0.1.0"
 
