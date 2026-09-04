@@ -56,6 +56,7 @@ pub mod error;
 pub mod git;
 pub mod handle;
 pub mod provision;
+pub mod remote_publish_policy;
 pub mod teardown;
 
 /// Argv-only local process-runner foundation owned by the execution layer.
@@ -79,6 +80,8 @@ mod checkpoint_vocabulary_tests;
 #[cfg(test)]
 mod provision_tests;
 #[cfg(test)]
+mod remote_publish_policy_tests;
+#[cfg(test)]
 mod teardown_tests;
 #[cfg(test)]
 mod test_support;
@@ -97,4 +100,5 @@ pub use checkpoint_vocabulary::{WorkspaceCheckpointKind, WorkspaceRecoveryDecisi
 pub use error::WorkspaceError;
 pub use handle::{CommitSha, WorkspaceHandle, WorkspaceIsolation, WorkspaceState};
 pub use provision::{WorkspaceProvisionRequest, validate_branch_name};
+pub use remote_publish_policy::WorkspaceRemotePublishPolicy;
 pub use teardown::WorkspaceTeardownRequest;
