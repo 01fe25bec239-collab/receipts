@@ -46,6 +46,9 @@ pub mod normalized_host_event_source_class;
 mod adapter_tests;
 
 #[cfg(test)]
+mod conformance_tests;
+
+#[cfg(test)]
 mod host_capability_consistency_tests;
 
 #[cfg(test)]
