@@ -6,6 +6,7 @@
 
 pub mod dispatch_admission_axis_references;
 pub mod dispatch_admission_core;
+pub mod dispatch_admission_provider_auth_axis;
 pub mod dispatch_admission_vocabulary;
 
 pub use dispatch_admission_axis_references::{
@@ -16,6 +17,7 @@ pub use dispatch_admission_axis_references::{
 pub use dispatch_admission_core::{
     DispatchAdmissionDecisionCore, DispatchAdmissionDecisionCoreError,
 };
+pub use dispatch_admission_provider_auth_axis::DispatchAdmissionProviderAuthAxisResult;
 pub use dispatch_admission_vocabulary::{
     DispatchAdmissionAxisResult, DispatchAdmissionDenialReason, DispatchAdmissionFailingAxis,
     DispatchAdmissionOutcome,
@@ -25,5 +27,7 @@ pub use dispatch_admission_vocabulary::{
 mod dispatch_admission_axis_references_tests;
 #[cfg(test)]
 mod dispatch_admission_core_tests;
+#[cfg(test)]
+mod dispatch_admission_provider_auth_axis_tests;
 #[cfg(test)]
 mod dispatch_admission_vocabulary_tests;
