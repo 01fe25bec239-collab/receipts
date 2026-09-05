@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use crate::error::WorkspaceError;
+use crate::remote_publish_policy::WorkspaceRemotePublishPolicy;
 
 /// An exact lowercase 40-character hexadecimal Git commit SHA.
 ///
@@ -118,6 +119,7 @@ pub struct WorkspaceHandle {
     task_id: Option<String>,
     head_sha: Option<CommitSha>,
     isolation: WorkspaceIsolation,
+    remote_publish_policy: Option<WorkspaceRemotePublishPolicy>,
 }
 
 impl WorkspaceHandle {
@@ -129,6 +131,7 @@ impl WorkspaceHandle {
         branch: String,
         worktree_path: Box<Path>,
         base_sha: CommitSha,
+        remote_publish_policy: Option<WorkspaceRemotePublishPolicy>,
     ) -> Self {
         Self {
             workspace_id,
@@ -139,6 +142,7 @@ impl WorkspaceHandle {
             state: WorkspaceState::Provisioned,
             isolation: WorkspaceIsolation::WorkspaceIsolation,
             task_id,
+            remote_publish_policy,
         }
     }
 
@@ -160,6 +164,7 @@ impl WorkspaceHandle {
             state: WorkspaceState::TornDown,
             isolation: prior.isolation,
             task_id: prior.task_id.clone(),
+            remote_publish_policy: prior.remote_publish_policy,
         }
     }
 
@@ -204,5 +209,10 @@ impl WorkspaceHandle {
     /// The frozen isolation semantics of the backing worktree.
     pub fn isolation(&self) -> WorkspaceIsolation {
         self.isolation
+    }
+
+    /// The explicitly supplied policy, stored without granting remote authority.
+    pub fn remote_publish_policy(&self) -> Option<WorkspaceRemotePublishPolicy> {
+        self.remote_publish_policy
     }
 }

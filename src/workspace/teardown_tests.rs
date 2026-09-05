@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use crate::error::WorkspaceError;
 use crate::handle::{CommitSha, WorkspaceHandle, WorkspaceIsolation, WorkspaceState};
 use crate::provision::WorkspaceProvisionRequest;
+use crate::remote_publish_policy::WorkspaceRemotePublishPolicy;
 use crate::teardown::WorkspaceTeardownRequest;
 use crate::test_support::{
     TestRepo, branch_exists, git, porcelain_status, stdout_trimmed, worktree_list_porcelain,
@@ -102,6 +103,8 @@ fn td01_successful_teardown_returns_torn_down_and_verifies_externally() {
         "the final head must be the exact verified pre-removal commit"
     );
     assert_eq!(torn.isolation(), WorkspaceIsolation::WorkspaceIsolation);
+    assert_eq!(handle.remote_publish_policy(), None);
+    assert_eq!(torn.remote_publish_policy(), None);
 
     // External verification: registration gone, checkout removed, branch
     // retained at the exact original commit.
@@ -441,6 +444,7 @@ fn td11_missing_worktree_checkout_fails_closed() {
         "task/phantom".to_string(),
         phantom.clone().into_boxed_path(),
         CommitSha::parse(&base_sha).expect("fixture SHA shape"),
+        None,
     );
 
     let error = teardown_request(&repo)
@@ -476,4 +480,67 @@ fn td12_unresolvable_repository_root_fails_closed() {
         listing.contains("worktree "),
         "fixture sanity: registration output must be parseable"
     );
+}
+
+#[test]
+fn explicit_remote_policies_are_preserved_without_remote_behavior() {
+    for policy in [
+        WorkspaceRemotePublishPolicy::LocalOnly,
+        WorkspaceRemotePublishPolicy::PushOnAccept,
+        WorkspaceRemotePublishPolicy::PushAlways,
+    ] {
+        let repo = TestRepo::new_nested("wtd-policy", "repo");
+        let unusable_remote = repo.root.path().join("not-a-git-repository");
+        std::fs::write(&unusable_remote, "ordinary local file").expect("create unusable target");
+        git(
+            repo.path(),
+            &[
+                "config",
+                "remote.origin.url",
+                unusable_remote.to_str().expect("fixture path is UTF-8"),
+            ],
+        );
+        let base_sha = repo.head_sha();
+        let worktree_path = repo.path().join("policy worktree");
+        let request = WorkspaceProvisionRequest::new(
+            repo.path(),
+            "ws-policy",
+            Some("task-policy"),
+            "task/policy",
+            &worktree_path,
+            &base_sha,
+        )
+        .expect("valid request")
+        .with_remote_publish_policy(policy);
+        let handle = request.provision().expect("policy must remain data only");
+        assert_eq!(handle.remote_publish_policy(), Some(policy));
+        assert_eq!(handle.state(), WorkspaceState::Provisioned);
+        assert_eq!(handle.workspace_id(), "ws-policy");
+        assert_eq!(handle.task_id(), Some("task-policy"));
+        assert_eq!(handle.branch(), "task/policy");
+        assert_eq!(handle.worktree_path(), worktree_path);
+        assert_eq!(handle.base_sha().as_str(), base_sha);
+        assert_eq!(handle.head_sha(), Some(handle.base_sha()));
+        assert_eq!(handle.isolation(), WorkspaceIsolation::WorkspaceIsolation);
+        assert!(worktree_registered(&repo, &worktree_path));
+        assert_eq!(porcelain_status(&worktree_path), "");
+
+        let torn = teardown_request(&repo)
+            .teardown(&handle)
+            .expect("teardown must not execute the remote policy");
+        assert_eq!(torn.state(), WorkspaceState::TornDown);
+        assert_eq!(torn.remote_publish_policy(), Some(policy));
+        assert_eq!(handle.remote_publish_policy(), Some(policy));
+        assert_eq!(torn.workspace_id(), handle.workspace_id());
+        assert_eq!(torn.task_id(), handle.task_id());
+        assert_eq!(torn.branch(), handle.branch());
+        assert_eq!(torn.worktree_path(), handle.worktree_path());
+        assert_eq!(torn.base_sha(), handle.base_sha());
+        assert_eq!(torn.head_sha(), handle.head_sha());
+        assert_eq!(torn.isolation(), handle.isolation());
+        assert!(!worktree_registered(&repo, &worktree_path));
+        assert!(!worktree_path.exists());
+        assert_eq!(retained_branch_target(&repo, "task/policy"), base_sha);
+        assert!(unusable_remote.is_file());
+    }
 }
