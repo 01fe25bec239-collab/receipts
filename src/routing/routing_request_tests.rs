@@ -105,11 +105,11 @@ fn request(
 #[test]
 fn identifier_boundaries_count_unicode_characters_and_preserve_text() {
     assert_eq!(
-        request(String::new(), None, vec![String::new()], None),
+        request(String::new(), None, vec!["coding".into()], None),
         Err(RoutingRequestCoreError::EmptyRequestId)
     );
     assert_eq!(
-        request("r".into(), Some(String::new()), vec![String::new()], None),
+        request("r".into(), Some(String::new()), vec!["coding".into()], None),
         Err(RoutingRequestCoreError::EmptyTaskId)
     );
     for text in [
@@ -121,7 +121,13 @@ fn identifier_boundaries_count_unicode_characters_and_preserve_text() {
         " \t\n".into(),
         " Opaque/界/e\u{301} ".into(),
     ] {
-        let core = request(text.clone(), Some(text.clone()), vec![String::new()], None).unwrap();
+        let core = request(
+            text.clone(),
+            Some(text.clone()),
+            vec!["coding".into()],
+            None,
+        )
+        .unwrap();
         assert_eq!(core.request_id(), text);
         assert_eq!(core.task_id(), Some(text.as_str()));
     }
@@ -131,16 +137,16 @@ fn identifier_boundaries_count_unicode_characters_and_preserve_text() {
         format!("{}x", "e\u{301}".repeat(100)),
     ] {
         assert_eq!(
-            request(text.clone(), None, vec![String::new()], None),
+            request(text.clone(), None, vec!["coding".into()], None),
             Err(RoutingRequestCoreError::RequestIdTooLong)
         );
         assert_eq!(
-            request("r".into(), Some(text), vec![String::new()], None),
+            request("r".into(), Some(text), vec!["coding".into()], None),
             Err(RoutingRequestCoreError::TaskIdTooLong)
         );
     }
     assert_eq!(
-        request("r".into(), None, vec![String::new()], None)
+        request("r".into(), None, vec!["coding".into()], None)
             .unwrap()
             .task_id(),
         None
@@ -148,23 +154,37 @@ fn identifier_boundaries_count_unicode_characters_and_preserve_text() {
 }
 
 #[test]
-fn capability_arrays_preserve_omission_empty_items_duplicates_and_order() {
+fn capability_arrays_preserve_omission_empty_arrays_duplicates_order_and_exact_strings() {
     assert_eq!(
         request("r".into(), None, vec![], None),
         Err(RoutingRequestCoreError::EmptyRequiredCapabilities)
     );
     let values = vec![
-        "".into(),
+        "coding".into(),
+        "structured_output".into(),
+        "future_capability".into(),
+        "future_new_capability".into(),
+        "☃".into(),
+        "能力".into(),
+        "Ω".into(),
+        " ".into(),
+        "   ".into(),
+        "\t".into(),
+        "\n".into(),
+        " \t ".into(),
+        "CoDiNg".into(),
+        "future/capability:v2+beta".into(),
+        "  coding  ".into(),
         "future-capability/Ω".into(),
         " \t\n".into(),
         "界/e\u{301}".into(),
         "future-capability/Ω".into(),
     ];
-    for required in [vec![String::new()], values.clone()] {
+    for required in [vec!["coding".into()], values.clone()] {
         for preferred in [
             None,
             Some(vec![]),
-            Some(vec![String::new()]),
+            Some(vec!["coding".into()]),
             Some(values.clone()),
         ] {
             let core = request("r".into(), None, required.clone(), preferred.clone()).unwrap();
@@ -174,6 +194,28 @@ fn capability_arrays_preserve_omission_empty_items_duplicates_and_order() {
             assert_eq!(core.quality_priority(), None);
             assert_eq!(core.cost_priority(), None);
         }
+    }
+}
+
+#[test]
+fn empty_capability_entries_are_rejected_at_every_position() {
+    for (values, index) in [
+        (vec![""], 0),
+        (vec!["", "coding"], 0),
+        (vec!["coding", ""], 1),
+        (vec!["coding", "", "review"], 1),
+        (vec!["coding", "review", ""], 2),
+        (vec!["coding", "", ""], 1),
+    ] {
+        let values: Vec<String> = values.into_iter().map(String::from).collect();
+        assert_eq!(
+            request("r".into(), None, values.clone(), None),
+            Err(RoutingRequestCoreError::EmptyRequiredCapability { index })
+        );
+        assert_eq!(
+            request("r".into(), None, vec!["coding".into()], Some(values)),
+            Err(RoutingRequestCoreError::EmptyPreferredCapability { index })
+        );
     }
 }
 
@@ -323,7 +365,7 @@ fn all_request_vocabularies_priorities_and_context_hints_are_independent_storage
                                     role,
                                     task,
                                     floor,
-                                    vec![String::new()],
+                                    vec!["coding".into()],
                                     None,
                                     quality,
                                     cost,

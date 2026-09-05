@@ -216,6 +216,8 @@ pub enum RoutingRequestCoreError {
     EmptyTaskId,
     TaskIdTooLong,
     EmptyRequiredCapabilities,
+    EmptyRequiredCapability { index: usize },
+    EmptyPreferredCapability { index: usize },
 }
 
 impl RoutingRequestNonTemporalCore {
@@ -250,6 +252,14 @@ impl RoutingRequestNonTemporalCore {
         }
         if required_capabilities.is_empty() {
             return Err(RoutingRequestCoreError::EmptyRequiredCapabilities);
+        }
+        if let Some(index) = required_capabilities.iter().position(String::is_empty) {
+            return Err(RoutingRequestCoreError::EmptyRequiredCapability { index });
+        }
+        if let Some(capabilities) = &preferred_capabilities
+            && let Some(index) = capabilities.iter().position(String::is_empty)
+        {
+            return Err(RoutingRequestCoreError::EmptyPreferredCapability { index });
         }
         Ok(Self {
             request_id,
