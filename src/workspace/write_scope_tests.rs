@@ -459,6 +459,59 @@ fn natural_diff_failure_after_valid_commit_checks_is_typed() {
 }
 
 #[test]
+fn hostile_diff_relative_config_preserves_root_paths_from_subdirectory() {
+    let repo = TestRepo::new("scope-relative-config");
+    let subdir = repo.path().join("subdir");
+    std::fs::create_dir_all(&subdir).unwrap();
+    for path in ["outside.txt", "subdir/inside.txt"] {
+        std::fs::write(repo.path().join(path), "baseline").unwrap();
+    }
+    let base = commit_all(&repo);
+    for path in ["outside.txt", "subdir/inside.txt"] {
+        std::fs::write(repo.path().join(path), "candidate").unwrap();
+    }
+    let candidate = commit_all(&repo);
+    git(repo.path(), &["config", "--local", "diff.relative", "true"]);
+
+    // Reproduce the incomplete, rewritten identities without --no-relative.
+    let args: Vec<&OsStr> = [
+        "--no-pager",
+        "--no-replace-objects",
+        "--no-optional-locks",
+        "diff",
+        "--name-only",
+        "-z",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--ignore-submodules=none",
+        &base,
+        &candidate,
+        "--",
+    ]
+    .into_iter()
+    .map(OsStr::new)
+    .collect();
+    let defective = crate::git::prepared_command(&subdir, "fixture relative diff", &args)
+        .unwrap()
+        .output()
+        .unwrap();
+    assert!(defective.status.success(), "{:?}", defective.stderr);
+    assert_eq!(defective.stdout, b"inside.txt\0");
+
+    let result =
+        crate::verify_write_scope(&subdir, &base, &candidate, &strings(&["subdir/**"]), &[])
+            .unwrap();
+    assert_eq!(result.verification(), WriteScopeVerificationStatus::Fail);
+    assert_eq!(
+        result.changed_paths(),
+        strings(&["outside.txt", "subdir/inside.txt"])
+    );
+    assert_eq!(result.unauthorized_paths(), strings(&["outside.txt"]));
+    assert!(result.forbidden_matches().is_empty());
+}
+
+#[test]
 fn hostile_diff_config_cannot_hide_paths_or_invoke_helpers() {
     let repo = TestRepo::new("scope-hostile-config");
     repo.commit_file(".gitattributes", "*.rs diff=hostile\n");

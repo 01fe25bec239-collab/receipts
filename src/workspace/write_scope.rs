@@ -174,6 +174,7 @@ pub fn verify_write_scope(
             "--no-ext-diff",
             "--no-textconv",
             "--no-renames",
+            "--no-relative",
             "--ignore-submodules=none",
             baseline_sha.as_str(),
             candidate_sha.as_str(),
