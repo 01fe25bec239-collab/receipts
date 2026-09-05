@@ -37,6 +37,7 @@ pub mod host_capability_mode_override;
 pub mod host_capability_native_prerequisite;
 pub mod host_capability_report_core;
 pub mod host_capability_report_vocabulary;
+pub mod host_capability_selected_mode_consistency;
 pub mod host_detection;
 pub mod host_id;
 pub mod normalized_host_event;
@@ -71,6 +72,9 @@ mod host_capability_report_core_tests;
 
 #[cfg(test)]
 mod host_capability_report_vocabulary_tests;
+
+#[cfg(test)]
+mod host_capability_selected_mode_consistency_tests;
 
 #[cfg(test)]
 mod host_detection_tests;
@@ -113,6 +117,10 @@ pub use host_capability_report_vocabulary::{
     HostCapabilityEvidenceLabel, HostCapabilityHookCoverageClass, HostCapabilityInactiveReason,
     HostCapabilityModeOverrideSource, HostCapabilityProbeStatus, HostCapabilitySelectedMode,
     HostCapabilityStaleReason,
+};
+pub use host_capability_selected_mode_consistency::{
+    HostCapabilitySelectedModeConsistencyError, HostCapabilitySelectedModeConsistencyInputs,
+    validate_selected_mode_consistency,
 };
 pub use host_detection::{HostDetectionError, HostDetectionSignals, resolve_host};
 pub use host_id::HostId;
