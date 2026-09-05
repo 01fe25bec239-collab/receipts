@@ -545,8 +545,8 @@ fn malformed_nodes_fail_explicitly() {
 
     assert_eq!(
         CapabilityName::new(""),
-        Err(GraphError::EmptyIdentifier {
-            field: "required_capabilities entry"
+        Err(GraphError::InvalidCapabilitySyntax {
+            value: String::new()
         }),
     );
 }

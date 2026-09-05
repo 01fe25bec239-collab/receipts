@@ -79,14 +79,19 @@ impl AsRef<str> for GraphNodeKind {
 pub struct CapabilityName(String);
 
 impl CapabilityName {
-    /// Creates a capability name from a non-empty string. Fails explicitly on
-    /// empty input.
+    /// Creates an open capability id matching
+    /// `^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$`, preserving the input exactly.
+    /// Malformed syntax fails explicitly; no catalog or length limit applies.
     pub fn new(value: impl Into<String>) -> Result<Self, GraphError> {
         let value = value.into();
-        if value.is_empty() {
-            return Err(GraphError::EmptyIdentifier {
-                field: "required_capabilities entry",
-            });
+        if !value.contains('.')
+            || !value.split('.').all(|component| {
+                let mut bytes = component.bytes();
+                matches!(bytes.next(), Some(b'a'..=b'z'))
+                    && bytes.all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_'))
+            })
+        {
+            return Err(GraphError::InvalidCapabilitySyntax { value });
         }
         Ok(Self(value))
     }
@@ -117,7 +122,7 @@ impl GraphNode {
     /// * `node_id` must be non-empty and at most 200 scalar values;
     /// * `kind` must be non-empty (`GraphNodeKind::new` enforces this);
     /// * capability entries are [`CapabilityName`] values, which are
-    ///   validated non-empty at their own construction.
+    ///   validated against the namespaced ASCII syntax at their own construction.
     ///
     /// `required_capabilities` is stored verbatim (order preserved) and is
     /// data only in this slice.

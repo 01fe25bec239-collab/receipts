@@ -12,6 +12,11 @@ pub const MAX_IDENTIFIER_LENGTH: usize = 200;
 /// Every way a graph-domain operation can fail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GraphError {
+    /// A capability id did not satisfy the namespaced ASCII syntax.
+    InvalidCapabilitySyntax {
+        /// The original offending input, unchanged.
+        value: String,
+    },
     /// A required identifier was empty.
     EmptyIdentifier {
         /// Which field was empty (e.g. `node_id`, `edge_id`, `graph_id`).
@@ -91,6 +96,9 @@ impl GraphError {
 impl std::fmt::Display for GraphError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            GraphError::InvalidCapabilitySyntax { value } => {
+                write!(f, "invalid capability syntax for {value:?}")
+            }
             GraphError::EmptyIdentifier { field } => {
                 write!(f, "empty identifier for {field}")
             }
