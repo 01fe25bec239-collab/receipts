@@ -58,6 +58,7 @@ pub mod handle;
 pub mod provision;
 pub mod remote_publish_policy;
 pub mod teardown;
+pub mod write_scope;
 
 /// Argv-only local process-runner foundation owned by the execution layer.
 ///
@@ -102,3 +103,7 @@ pub use handle::{CommitSha, WorkspaceHandle, WorkspaceIsolation, WorkspaceState}
 pub use provision::{WorkspaceProvisionRequest, validate_branch_name};
 pub use remote_publish_policy::WorkspaceRemotePublishPolicy;
 pub use teardown::WorkspaceTeardownRequest;
+pub use write_scope::{
+    ForbiddenWriteMatch, WriteScopeGitOperation, WriteScopePatternSet, WriteScopeVerification,
+    WriteScopeVerificationError, WriteScopeVerificationStatus, verify_write_scope,
+};
