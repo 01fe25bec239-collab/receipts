@@ -1,10 +1,14 @@
 //! Closed product-entitlement vocabularies and validated string values.
 
+mod activation_identity_consistency;
 mod activation_identity_fields;
 mod product_entitlement_string_fields;
 mod product_entitlement_values;
 mod vocabulary;
 
+pub use activation_identity_consistency::{
+    ActivationIdentityConsistencyError, validate_activation_identity_fields,
+};
 pub use activation_identity_fields::ActivationIdentityFields;
 pub use product_entitlement_string_fields::ProductEntitlementStringFields;
 
@@ -14,6 +18,9 @@ pub use product_entitlement_values::{
 };
 
 pub use vocabulary::{ActivationStateKind, ProductEntitlementState};
+
+#[cfg(test)]
+mod activation_identity_consistency_tests;
 
 #[cfg(test)]
 mod activation_identity_fields_tests;
