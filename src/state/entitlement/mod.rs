@@ -2,6 +2,7 @@
 
 mod activation_identity_consistency;
 mod activation_identity_fields;
+mod entitlement_state_resolution;
 mod product_entitlement_string_fields;
 mod product_entitlement_values;
 mod vocabulary;
@@ -10,6 +11,10 @@ pub use activation_identity_consistency::{
     ActivationIdentityConsistencyError, validate_activation_identity_fields,
 };
 pub use activation_identity_fields::ActivationIdentityFields;
+pub use entitlement_state_resolution::{
+    LicensingServiceAvailability, LocalClockEvidence, ObservedEntitlementEvidence,
+    VerifiedEntitlementTemporalClass, resolve_product_entitlement_state,
+};
 pub use product_entitlement_string_fields::ProductEntitlementStringFields;
 
 pub use product_entitlement_values::{
@@ -24,6 +29,9 @@ mod activation_identity_consistency_tests;
 
 #[cfg(test)]
 mod activation_identity_fields_tests;
+
+#[cfg(test)]
+mod entitlement_state_resolution_tests;
 
 #[cfg(test)]
 mod product_entitlement_string_fields_tests;
