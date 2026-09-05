@@ -222,6 +222,10 @@ name = "receipts-orchestration"
 version = "0.1.0"
 
 [[package]]
+name = "receipts-review-integration"
+version = "0.1.0"
+
+[[package]]
 name = "receipts-runtime-adapters"
 version = "0.1.0"
 dependencies = [
