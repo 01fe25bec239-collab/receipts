@@ -48,6 +48,8 @@ pub mod review_verdict_transition;
 #[cfg(test)]
 mod accepted_integration_transition_tests;
 #[cfg(test)]
+mod capability_name_tests;
+#[cfg(test)]
 mod execution_graph_tests;
 #[cfg(test)]
 mod graph_mutation_vocabulary_tests;
