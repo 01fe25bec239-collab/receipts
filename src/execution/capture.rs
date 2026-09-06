@@ -265,6 +265,25 @@ impl BoundedStreamRetention {
         self.total_bytes = total;
     }
 
+    /// Bounded, fallibly allocated point-in-time evidence, without consuming retention.
+    pub(crate) fn snapshot(&self) -> Result<CapturedStream, TryReserveError> {
+        let mut head = Vec::new();
+        head.try_reserve_exact(self.head.len())?;
+        head.extend_from_slice(&self.head);
+        let mut tail = Vec::new();
+        tail.try_reserve_exact(self.tail_len)?;
+        let first = self.tail_len.min(self.tail_cap - self.tail_start);
+        tail.extend_from_slice(&self.tail[self.tail_start..self.tail_start + first]);
+        tail.extend_from_slice(&self.tail[..self.tail_len - first]);
+        Ok(CapturedStream {
+            captured_bytes: (head.len() + tail.len()) as u64,
+            head,
+            tail,
+            total_bytes: self.total_bytes,
+            truncated: self.total_bytes > (self.head_cap + self.tail_cap) as u64,
+        })
+    }
+
     /// Freezes retention into the immutable captured representation.
     ///
     /// Linearizing the ring is a rotation of already-owned storage, so no

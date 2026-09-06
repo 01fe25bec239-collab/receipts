@@ -164,7 +164,7 @@ pub(crate) fn inject_unsupported_timeout_platform() -> UnsupportedTimeoutPlatfor
 }
 
 #[cfg(unix)]
-fn ensure_timeout_platform_supported() -> Result<(), ExecutionError> {
+pub(crate) fn ensure_timeout_platform_supported() -> Result<(), ExecutionError> {
     #[cfg(test)]
     if FORCE_UNSUPPORTED_TIMEOUT_PLATFORM.get() {
         return Err(ExecutionError::UnsupportedTimeoutPlatform);
@@ -742,7 +742,7 @@ fn join_reader(
 /// Renders whatever a panicking reader carried, without ever unwinding
 /// again while assembling the failure.
 #[cfg(unix)]
-fn reader_panic_detail(payload: &(dyn std::any::Any + Send)) -> String {
+pub(crate) fn reader_panic_detail(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
         format!("the reader thread panicked: {message}")
     } else if let Some(message) = payload.downcast_ref::<String>() {
@@ -844,7 +844,7 @@ fn capture_failure_after_spawn(
 }
 
 #[cfg(unix)]
-fn failure_after_spawn(
+pub(crate) fn failure_after_spawn(
     child: Child,
     group: OwnedProcessGroup,
     primary: ExecutionError,
@@ -857,7 +857,10 @@ fn failure_after_spawn(
 
 /// Bounded, fail-closed cleanup for any still-owned timed attempt.
 #[cfg(unix)]
-fn cleanup_owned_attempt(mut child: Child, group: OwnedProcessGroup) -> Result<(), ExecutionError> {
+pub(crate) fn cleanup_owned_attempt(
+    mut child: Child,
+    group: OwnedProcessGroup,
+) -> Result<(), ExecutionError> {
     match deliver_group_sigkill_for_attempt(group) {
         GroupSignalDelivery::Delivered | GroupSignalDelivery::GroupAlreadyGone => {}
         GroupSignalDelivery::Failed { detail } => {
@@ -882,7 +885,7 @@ enum Awaited {
 }
 
 #[cfg(unix)]
-enum OwnedWaitError {
+pub(crate) enum OwnedWaitError {
     Owned(ExecutionError),
     NoFurtherSignal(ExecutionError),
 }
@@ -915,52 +918,9 @@ fn await_owned_child_until(
             ))));
         }
     }
-    let leader = child.id();
     loop {
-        if observe_leader_without_reaping(leader)
-            .map_err(|error| OwnedWaitError::Owned(wait_failed(error)))?
-            == LeaderState::Exited
-        {
-            #[cfg(test)]
-            let preliminary = if take_capture_test_fault(CAPTURE_TEST_FORCE_COMPLETION_BARRIER) {
-                GroupQuiescence::Empty
-            } else {
-                group_quiescence(group, Some(leader))
-            };
-            #[cfg(not(test))]
-            let preliminary = group_quiescence(group, Some(leader));
-            match preliminary {
-                GroupQuiescence::Empty => match quiesce_owned_group(group, leader) {
-                    Ok(false) => {
-                        if Instant::now() >= deadline {
-                            return Ok(Awaited::DeadlineReached);
-                        }
-                        let reap = bounded_child_reap(child);
-                        let status = finish_reap_with_group_proof(reap, group, "timed completion")
-                            .map_err(OwnedWaitError::NoFurtherSignal)?;
-                        return Ok(Awaited::Exited(status));
-                    }
-                    Ok(true) => match capture_deliver_group_sigcont(group) {
-                        GroupSignalDelivery::Delivered | GroupSignalDelivery::GroupAlreadyGone => {}
-                        GroupSignalDelivery::Failed { detail } => {
-                            return Err(OwnedWaitError::Owned(
-                                ExecutionError::ProcessGroupControlFailed { detail },
-                            ));
-                        }
-                    },
-                    Err(detail) => {
-                        return Err(OwnedWaitError::Owned(
-                            ExecutionError::ProcessGroupControlFailed { detail },
-                        ));
-                    }
-                },
-                GroupQuiescence::Mutable | GroupQuiescence::AllStopped(_) => {}
-                GroupQuiescence::Unknown { detail } => {
-                    return Err(OwnedWaitError::Owned(
-                        ExecutionError::ProcessGroupControlFailed { detail },
-                    ));
-                }
-            }
+        if let Some(status) = try_complete_owned_child(child, group, deadline)? {
+            return Ok(Awaited::Exited(status));
         }
 
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
@@ -971,6 +931,63 @@ fn await_owned_child_until(
         }
         std::thread::sleep(POLL_INTERVAL.min(remaining));
     }
+}
+
+/// One non-reaping completion probe with the accepted quiescence/reap boundary.
+#[cfg(unix)]
+pub(crate) fn try_complete_owned_child(
+    child: &mut Child,
+    group: OwnedProcessGroup,
+    deadline: Instant,
+) -> Result<Option<ExitStatus>, OwnedWaitError> {
+    let leader = child.id();
+    if observe_leader_without_reaping(leader)
+        .map_err(|error| OwnedWaitError::Owned(wait_failed(error)))?
+        == LeaderState::Exited
+    {
+        #[cfg(test)]
+        let preliminary = if take_capture_test_fault(CAPTURE_TEST_FORCE_COMPLETION_BARRIER) {
+            GroupQuiescence::Empty
+        } else {
+            group_quiescence(group, Some(leader))
+        };
+        #[cfg(not(test))]
+        let preliminary = group_quiescence(group, Some(leader));
+        match preliminary {
+            GroupQuiescence::Empty => match quiesce_owned_group(group, leader) {
+                Ok(false) => {
+                    if Instant::now() >= deadline {
+                        return Ok(None);
+                    }
+                    let reap = bounded_child_reap(child);
+                    let status = finish_reap_with_group_proof(reap, group, "timed completion")
+                        .map_err(OwnedWaitError::NoFurtherSignal)?;
+                    return Ok(Some(status));
+                }
+                Ok(true) => match capture_deliver_group_sigcont(group) {
+                    GroupSignalDelivery::Delivered | GroupSignalDelivery::GroupAlreadyGone => {}
+                    GroupSignalDelivery::Failed { detail } => {
+                        return Err(OwnedWaitError::Owned(
+                            ExecutionError::ProcessGroupControlFailed { detail },
+                        ));
+                    }
+                },
+                Err(detail) => {
+                    return Err(OwnedWaitError::Owned(
+                        ExecutionError::ProcessGroupControlFailed { detail },
+                    ));
+                }
+            },
+            GroupQuiescence::Mutable | GroupQuiescence::AllStopped(_) => {}
+            GroupQuiescence::Unknown { detail } => {
+                return Err(OwnedWaitError::Owned(
+                    ExecutionError::ProcessGroupControlFailed { detail },
+                ));
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 #[cfg(all(test, unix))]
@@ -1007,7 +1024,7 @@ fn deliver_group_sigkill_for_attempt(group: OwnedProcessGroup) -> GroupSignalDel
 }
 
 #[cfg(unix)]
-fn owned_process_group(child_pid: u32) -> Option<OwnedProcessGroup> {
+pub(crate) fn owned_process_group(child_pid: u32) -> Option<OwnedProcessGroup> {
     #[cfg(test)]
     if take_ownership_test_fault(TEST_REJECT_GROUP_OWNERSHIP) {
         return None;
@@ -1053,7 +1070,9 @@ fn timeout_deliver_group_sigkill(group: OwnedProcessGroup) -> GroupSignalDeliver
 /// spawned. The grace loop itself uses elapsed time, so no fallible deadline
 /// arithmetic remains after ownership begins.
 #[cfg(unix)]
-fn validated_run_deadline(policy: &ProcessTimeoutPolicy) -> Result<Instant, ExecutionError> {
+pub(crate) fn validated_run_deadline(
+    policy: &ProcessTimeoutPolicy,
+) -> Result<Instant, ExecutionError> {
     let now = Instant::now();
     let deadline = checked_deadline(now, policy.run_timeout(), "run_timeout")?;
     checked_deadline(now, policy.termination_grace(), "termination_grace")?;
@@ -1149,6 +1168,24 @@ fn enforce_timeout(
     group: OwnedProcessGroup,
     policy: &ProcessTimeoutPolicy,
 ) -> Result<ProcessRunOutcome, ExecutionError> {
+    let (status, forced) = terminate_owned_attempt(child, group, policy)?;
+    Ok(timed_out_outcome(
+        if forced {
+            ProcessTermination::TimedOutForceKilled
+        } else {
+            ProcessTermination::TimedOutGracefullyTerminated
+        },
+        status,
+    ))
+}
+
+/// Shared cleanup mechanism; does not assign a terminal cause.
+#[cfg(unix)]
+pub(crate) fn terminate_owned_attempt(
+    child: Child,
+    group: OwnedProcessGroup,
+    policy: &ProcessTimeoutPolicy,
+) -> Result<(ExitStatus, bool), ExecutionError> {
     let leader = child.id();
     // Step 1 — graceful SIGTERM to the whole attempt-owned group.
     match timeout_deliver_group_sigterm(group) {
@@ -1158,6 +1195,25 @@ fn enforce_timeout(
         // observation loop below reaps and re-checks membership.
         GroupSignalDelivery::GroupAlreadyGone => {}
         GroupSignalDelivery::Failed { detail } => {
+            // On macOS a group containing only an unreaped zombie can refuse
+            // SIGTERM with EPERM. A live cancellation can legitimately win
+            // before completion observes that exit. Only the same stable
+            // no-live-member proof used by completion can discharge ownership.
+            if matches!(
+                observe_leader_without_reaping(leader),
+                Ok(LeaderState::Exited)
+            ) && group_quiescence(group, Some(leader)) == GroupQuiescence::Empty
+            {
+                match quiesce_owned_group(group, leader) {
+                    Ok(false) => {
+                        return finish_owned_signaling(child, group).map(|status| (status, false));
+                    }
+                    Ok(true) => {}
+                    Err(failure) => {
+                        return Err(quiescence_failed_with_cleanup(child, group, failure));
+                    }
+                }
+            }
             return Err(graceful_termination_failed_with_cleanup(
                 child, group, detail,
             ));
@@ -1193,43 +1249,46 @@ fn enforce_timeout(
         Err(detail) => return Err(quiescence_failed_with_cleanup(child, group, detail)),
     };
     if !leader_survived && !has_live_descendants {
-        return finish_timeout_after_signaling(
-            child,
-            group,
-            ProcessTermination::TimedOutGracefullyTerminated,
-        );
+        return finish_owned_signaling(child, group).map(|status| (status, false));
     }
 
     // Step 4 — at least one quiesced attempt-owned process survived grace.
     // Kill the group while the unreaped leader still anchors ownership.
-    let termination = match deliver_group_sigkill_for_attempt(group) {
-        GroupSignalDelivery::Delivered => ProcessTermination::TimedOutForceKilled,
+    let forced = match deliver_group_sigkill_for_attempt(group) {
+        GroupSignalDelivery::Delivered => true,
         // Every member vanished between observation and delivery; nothing
         // actually required the force step. Verification and reap below
         // still run before any outcome is produced.
-        GroupSignalDelivery::GroupAlreadyGone => ProcessTermination::TimedOutGracefullyTerminated,
+        GroupSignalDelivery::GroupAlreadyGone => false,
         GroupSignalDelivery::Failed { detail } => {
             return Err(force_kill_failed_with_cleanup(child, group, detail));
         }
     };
 
-    finish_timeout_after_signaling(child, group, termination)
+    finish_owned_signaling(child, group).map(|status| (status, forced))
 }
 
 /// Reaps only after the state machine has irrevocably finished group
 /// signaling, then verifies emptiness without attempting stale-PGID repair.
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 pub(crate) fn finish_timeout_after_signaling(
-    mut child: Child,
+    child: Child,
     group: OwnedProcessGroup,
     termination: ProcessTermination,
 ) -> Result<ProcessRunOutcome, ExecutionError> {
-    let status = finish_reap_with_group_proof(
+    finish_owned_signaling(child, group).map(|status| timed_out_outcome(termination, status))
+}
+
+#[cfg(unix)]
+fn finish_owned_signaling(
+    mut child: Child,
+    group: OwnedProcessGroup,
+) -> Result<ExitStatus, ExecutionError> {
+    finish_reap_with_group_proof(
         bounded_child_reap(&mut child),
         group,
         "final timeout cleanup after group signaling completed",
-    )?;
-    Ok(timed_out_outcome(termination, status))
+    )
 }
 
 #[cfg(unix)]
@@ -1385,7 +1444,7 @@ fn child_try_wait_for_reap(child: &mut Child) -> std::io::Result<Option<ExitStat
 /// bounded reap are used for cleanup because they need no group arithmetic, then the
 /// typed ownership failure is returned.
 #[cfg(unix)]
-fn process_group_ownership_failed(mut child: Child) -> ExecutionError {
+pub(crate) fn process_group_ownership_failed(mut child: Child) -> ExecutionError {
     let mut detail = format!(
         "spawned child pid {} did not yield a certifiably distinct attempt-owned process group",
         child.id()

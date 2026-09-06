@@ -59,6 +59,7 @@
 
 mod capture;
 mod error;
+mod live_attempt;
 mod outcome;
 mod request;
 mod runner;
@@ -87,3 +88,11 @@ mod timeout_tests;
 // runner and needs the same Unix process-group machinery.
 #[cfg(all(test, unix))]
 mod capture_tests;
+
+pub use live_attempt::{
+    LiveProcessAttempt, LiveProcessAttemptError, LiveProcessCancelAcceptance, LiveProcessOutcome,
+    LiveProcessOutput, LiveProcessTerminalCause, start_live_process_attempt,
+};
+
+#[cfg(all(test, unix))]
+mod live_attempt_tests;
