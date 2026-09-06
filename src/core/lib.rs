@@ -20,5 +20,7 @@ pub mod scheduler;
 
 pub mod capsules;
 
+pub mod goal;
+
 #[cfg(test)]
 mod facade_tests;
