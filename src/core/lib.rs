@@ -18,5 +18,7 @@ pub use graph::*;
 
 pub mod scheduler;
 
+pub mod capsules;
+
 #[cfg(test)]
 mod facade_tests;
