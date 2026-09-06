@@ -1,6 +1,7 @@
 mod adapter;
 mod auth_status;
 mod codex_failure_classification;
+mod codex_jsonl;
 mod codex_probe;
 mod codex_probe_execution;
 mod codex_probe_failure_classification;
@@ -11,6 +12,8 @@ mod failure;
 mod adapter_tests;
 #[cfg(test)]
 mod codex_failure_classification_tests;
+#[cfg(test)]
+mod codex_jsonl_tests;
 #[cfg(test)]
 mod codex_probe_execution_tests;
 #[cfg(test)]
@@ -26,6 +29,10 @@ pub use adapter::RuntimeAdapter;
 pub use auth_status::RuntimeAuthStatus;
 pub use codex_failure_classification::{
     classify_codex_task_execution_error, classify_codex_task_execution_result,
+};
+pub use codex_jsonl::{
+    CodexJsonlError, CodexJsonlErrorKind, CodexJsonlEvent, CodexJsonlEventKind,
+    CodexJsonlInterpretation, CodexProtocolTermination, interpret_codex_jsonl,
 };
 pub use codex_probe::{
     CODEX_EXEC_HELP_PROBE, CODEX_VERSION_PROBE, CodexCapability, CodexCapabilityEvidence,

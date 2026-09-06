@@ -10,3 +10,4 @@ path = "../../src/adapters/runtime/lib.rs"
 
 [dependencies]
 receipts-workspace-execution = { path = "../receipts-workspace-execution" }
+serde_json = "=1.0.151"
