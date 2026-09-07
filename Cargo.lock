@@ -233,6 +233,7 @@ name = "receipts-runtime-adapters"
 version = "0.1.0"
 dependencies = [
  "receipts-workspace-execution",
+ "serde_json",
 ]
 
 [[package]]
