@@ -37,6 +37,7 @@ pub mod host_capability_mode_override;
 pub mod host_capability_mode_selection;
 pub mod host_capability_native_prerequisite;
 pub mod host_capability_report_core;
+pub mod host_capability_report_selection_composition;
 pub mod host_capability_report_vocabulary;
 pub mod host_capability_selected_mode_consistency;
 pub mod host_detection;
@@ -73,6 +74,9 @@ mod host_capability_native_prerequisite_tests;
 
 #[cfg(test)]
 mod host_capability_report_core_tests;
+
+#[cfg(test)]
+mod host_capability_report_selection_composition_tests;
 
 #[cfg(test)]
 mod host_capability_report_vocabulary_tests;
@@ -121,6 +125,10 @@ pub use host_capability_native_prerequisite::{
 pub use host_capability_report_core::{
     HostCapabilityReportNonTemporalCore, HostCapabilityReportNonTemporalCoreError,
     HostCapabilityReportNonTemporalCoreInputs,
+};
+pub use host_capability_report_selection_composition::{
+    HostCapabilityReportSelectionCompositionError, HostCapabilityReportSelectionCompositionInputs,
+    HostCapabilityReportSelectionCompositionOutcome, compose_host_capability_report_selection,
 };
 pub use host_capability_report_vocabulary::{
     HostCapabilityEvidenceLabel, HostCapabilityHookCoverageClass, HostCapabilityInactiveReason,
