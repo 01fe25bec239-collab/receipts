@@ -238,7 +238,14 @@ impl TestGate {
     }
 }
 #[cfg(test)]
+type ReaderObservation = Box<
+    dyn FnOnce(&[(&'static str, JoinHandle<Result<(), ExecutionError>>)], &mut std::time::Instant)
+        + Send,
+>;
+#[cfg(test)]
 thread_local! {
+    pub(super) static READER_EOF_GATES: std::cell::RefCell<Vec<(&'static str, TestGate)>> = const { std::cell::RefCell::new(Vec::new()) };
+    pub(super) static EOF_OBSERVATION: std::cell::RefCell<Option<ReaderObservation>> = const { std::cell::RefCell::new(None) };
     pub(super) static CONTROLLER_FAULTS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     pub(super) static BEFORE_MONITOR: std::cell::RefCell<Option<TestGate>> = const { std::cell::RefCell::new(None) };
     pub(super) static AFTER_CLAIM: std::cell::RefCell<Option<TestGate>> = const { std::cell::RefCell::new(None) };
@@ -272,15 +279,21 @@ mod platform {
         }
         fn join_readers(&mut self) -> Result<(), ExecutionError> {
             let started = Instant::now();
+            #[cfg(test)]
+            let mut started = started;
             while self.readers.iter().any(|(_, reader)| !reader.is_finished()) {
+                // Test gates force EOF between the preliminary and expiry observations.
+                #[cfg(test)]
+                if let Some(observe) = EOF_OBSERVATION.take() {
+                    observe(&self.readers, &mut started);
+                }
                 if started.elapsed() >= READER_VERIFY {
+                    let Some((stream, _)) = self.readers.iter().find(|(_, r)| !r.is_finished())
+                    else {
+                        break;
+                    };
                     return Err(ExecutionError::CaptureReaderFailed {
-                        stream: self
-                            .readers
-                            .iter()
-                            .find(|(_, r)| !r.is_finished())
-                            .unwrap()
-                            .0,
+                        stream,
                         detail: "live reader EOF verification exceeded two seconds".into(),
                     });
                 }
@@ -319,13 +332,26 @@ mod platform {
         mut source: impl Read + Send + 'static,
         retention: Retention,
     ) -> Result<Reader, ExecutionError> {
+        #[cfg(test)]
+        let eof_gate = READER_EOF_GATES.with_borrow_mut(|gates| {
+            gates
+                .iter()
+                .position(|(name, _)| *name == stream)
+                .map(|index| gates.swap_remove(index).1)
+        });
         std::thread::Builder::new()
             .name(format!("receipts-live-{stream}"))
             .spawn(move || {
                 let mut buffer = [0u8; 32 * 1024];
                 loop {
                     match source.read(&mut buffer) {
-                        Ok(0) => return Ok(()),
+                        Ok(0) => {
+                            #[cfg(test)]
+                            if let Some(gate) = eof_gate {
+                                gate.wait();
+                            }
+                            return Ok(());
+                        }
                         Ok(n) => lock(&retention)
                             .push(&buffer[..n])
                             .map_err(|fault| runner::capture_fault_failed(stream, fault))?,
@@ -417,11 +443,19 @@ mod platform {
         let faults = CONTROLLER_FAULTS.replace(0);
         #[cfg(test)]
         let after_claim = AFTER_CLAIM.take();
+        #[cfg(test)]
+        let eof_gates = READER_EOF_GATES.take();
+        #[cfg(test)]
+        let eof_observation = EOF_OBSERVATION.take();
         let controller = std::thread::Builder::new()
             .name("receipts-live-controller".into())
             .spawn(move || {
                 #[cfg(test)]
                 AFTER_CLAIM.set(after_claim);
+                #[cfg(test)]
+                READER_EOF_GATES.set(eof_gates);
+                #[cfg(test)]
+                EOF_OBSERVATION.set(eof_observation);
                 #[cfg(test)]
                 let _faults = runner::inject_capture_test_faults(faults);
                 let _closed = CloseLifecycle(state.clone());

@@ -556,3 +556,118 @@ fn live_incremental_snapshot_matches_retention_across_ring_wraps() {
         assert_eq!(retention.snapshot().unwrap(), retention.finish());
     }
 }
+
+// Real reader threads drain real child pipes, then wait at EOF. The observation
+// hook runs only after join_readers has observed an unfinished reader. Moving
+// its private clock makes expiry ordering deterministic without timing sleeps.
+fn eof_boundary_case(finish_at_boundary: &[&'static str], expired: bool) {
+    use super::live_attempt::{EOF_OBSERVATION, READER_EOF_GATES};
+    let ws = Workspace::new();
+    ws.write("stderr-bytes", b"23");
+    ws.write("spawn-descendant", b"1");
+    let mut arrivals = Vec::new();
+    let mut releases = Vec::new();
+    for stream in ["stdout", "stderr"] {
+        let (reached, arrival) = sync_channel(1);
+        let (release, permit) = sync_channel(1);
+        READER_EOF_GATES.with_borrow_mut(|gates| {
+            gates.push((
+                stream,
+                TestGate {
+                    reached,
+                    release: permit,
+                },
+            ))
+        });
+        arrivals.push(arrival);
+        releases.push((stream, release));
+    }
+    let finished = finish_at_boundary.to_vec();
+    let (observed, observation) = sync_channel(1);
+    EOF_OBSERVATION.set(Some(Box::new(move |readers, started| {
+        for arrival in arrivals {
+            arrive(&arrival);
+        }
+        assert_eq!(readers.len(), 2);
+        assert!(readers.iter().all(|(_, reader)| !reader.is_finished()));
+        for (stream, release) in &releases {
+            if finished.contains(stream) {
+                release.send(()).unwrap();
+            }
+        }
+        until(|| {
+            readers
+                .iter()
+                .all(|(stream, reader)| reader.is_finished() == finished.contains(stream))
+        });
+        *started = Instant::now();
+        if expired {
+            *started -= Duration::from_secs(2);
+        }
+        observed.send(()).unwrap();
+        if finished.len() != readers.len() {
+            // Keep the wedge through the error decision. Resources::drop then
+            // releases and joins the test readers, retaining the original error.
+            EOF_OBSERVATION.set(Some(Box::new(move |readers, _| {
+                assert!(readers.iter().any(|(_, reader)| !reader.is_finished()));
+                for (stream, release) in releases {
+                    if !finished.contains(&stream) {
+                        release.send(()).unwrap();
+                    }
+                }
+                until(|| readers.iter().all(|(_, reader)| reader.is_finished()));
+            })));
+        }
+    })));
+    let (arrived, release) = gate(&BEFORE_MONITOR);
+    let attempt = ws.start(LIMIT);
+    arrive(&arrived);
+    ws.ready();
+    assert_eq!(
+        attempt.cancel(),
+        LiveProcessCancelAcceptance::CancelAccepted
+    );
+    release.send(()).unwrap();
+    let result = attempt.wait_collect();
+    arrive(&observation);
+    if finish_at_boundary.len() == 2 {
+        let result = result.expect("EOF completion must collect without ControllerFailed");
+        assert_eq!(result.terminal_cause(), LiveProcessTerminalCause::Cancelled);
+        // Both the leader and its descendant emit 23 bytes.
+        assert_eq!(result.stderr().total_bytes(), 46);
+        assert_eq!(attempt.snapshot_output().unwrap().stderr(), result.stderr());
+    } else {
+        let expected = ["stdout", "stderr"]
+            .into_iter()
+            .find(|stream| !finish_at_boundary.contains(stream))
+            .unwrap();
+        match result {
+            Err(LiveProcessAttemptError::Execution(ExecutionError::CaptureReaderFailed {
+                stream,
+                detail,
+            })) => {
+                assert_eq!(stream, expected);
+                assert_eq!(detail, "live reader EOF verification exceeded two seconds");
+            }
+            other => panic!("expected typed failure for {expected}, got {other:?}"),
+        }
+    }
+    prove_empty(&ws, caller_process_group());
+}
+
+#[test]
+fn live_eof_boundary_readers_finish_before_deadline() {
+    eof_boundary_case(&["stdout", "stderr"], false);
+}
+
+#[test]
+fn live_eof_boundary_all_readers_finish_between_observations() {
+    eof_boundary_case(&["stdout", "stderr"], true);
+}
+
+#[test]
+fn live_eof_boundary_wedged_reader_is_typed_through_wait_collect() {
+    for finished in ["stdout", "stderr"] {
+        eof_boundary_case(&[finished], true);
+    }
+}
