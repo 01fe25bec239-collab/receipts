@@ -20,3 +20,13 @@ pub use a4_review_structured_core::{
 
 #[cfg(test)]
 mod a4_review_structured_core_tests;
+
+pub mod review_capsule_structured_core;
+pub use review_capsule_structured_core::{
+    ReviewCapsuleCheck, ReviewCapsuleCheckResult, ReviewCapsuleConstructionError,
+    ReviewCapsuleCriterion, ReviewCapsuleCriterionKind, ReviewCapsuleNonTemporalCore,
+    ReviewCapsuleReviewScope, ReviewCapsuleSeverityPolicy,
+};
+
+#[cfg(test)]
+mod review_capsule_structured_core_tests;
