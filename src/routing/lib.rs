@@ -13,6 +13,18 @@ mod routing_request;
 #[cfg(test)]
 mod routing_request_tests;
 
+mod routing_decision;
+#[cfg(test)]
+mod routing_decision_tests;
+
+pub use routing_decision::{
+    AlternativeCandidate, AlternativeCandidateError, CapabilityEvidenceNonTemporalCore,
+    DecisionConfidence, EstimatedCostClass, EvidenceConfidence, EvidenceSourceRef,
+    EvidenceSourceRefError, EvidenceSourceRefType, RegistryFreshness, RoutingDecisionCoreError,
+    RoutingDecisionMode, RoutingDecisionNonTemporalCore, RoutingDecisionOutcome,
+    RoutingScoreComponents, RoutingScoreComponentsError, SelectionReason,
+};
+
 pub use routing_request::{
     RoutingPriority, RoutingQualityFloor, RoutingRequestConstraints,
     RoutingRequestConstraintsError, RoutingRequestCoreError, RoutingRequestNonTemporalCore,
