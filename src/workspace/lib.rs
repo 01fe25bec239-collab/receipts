@@ -48,6 +48,7 @@
 //! no fetch, no push, no remote publication, no force-push.
 
 pub mod checkpoint_capture_core;
+pub mod checkpoint_evidence_capture;
 pub mod checkpoint_evidence_vocabulary;
 pub mod checkpoint_executed_check;
 pub mod checkpoint_reference;
@@ -89,6 +90,11 @@ mod test_support;
 
 pub use checkpoint_capture_core::{
     WorkspaceCheckpointCaptureCore, WorkspaceCheckpointCaptureCoreError,
+};
+pub use checkpoint_evidence_capture::{
+    WorkspaceCheckpointEvidenceCaptureError, WorkspaceCheckpointEvidenceCaptureRequest,
+    WorkspaceCheckpointGitObservation, WorkspaceCheckpointGitStream,
+    capture_workspace_checkpoint_evidence,
 };
 pub use checkpoint_evidence_vocabulary::{
     WorkspaceCheckpointCheckSource, WorkspaceCheckpointRefType,
