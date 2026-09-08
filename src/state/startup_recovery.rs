@@ -9,6 +9,7 @@ use crate::executor_binding::{ExecutorBinding, ReleaseReason};
 use crate::logical_role::{LogicalRole, LogicalRoleStatus};
 
 /// Typed durable facts supplied by a higher-level startup scanner.
+/// Optional records set to `None` are unsupplied evidence, not proven absence.
 #[derive(Debug, Clone, Copy)]
 pub struct StartupRecoverySnapshot<'a> {
     pub role: &'a LogicalRole,
@@ -105,9 +106,9 @@ fn classify_binding(
 ) {
     let Some(binding) = binding else {
         if role.active_binding_id.is_some() {
-            inconsistent(
+            require(
                 result,
-                StartupDurableInconsistency::RoleBindingReferenceMismatch,
+                StartupReconciliationRequirement::DurableFactReconciliation,
             );
         }
         return;
@@ -178,11 +179,6 @@ fn classify_context(
             StartupDurableInconsistency::RoleManifestReferenceMismatch,
             result,
         );
-    } else if role.context_manifest_id.is_some() {
-        inconsistent(
-            result,
-            StartupDurableInconsistency::RoleManifestReferenceMismatch,
-        );
     }
 
     if let Some(epoch) = latest_epoch {
@@ -204,22 +200,32 @@ fn classify_context(
             StartupDurableInconsistency::RehydrationProjectMismatch,
             result,
         );
-        check(
-            manifest.is_some_and(|value| value.manifest_id == attempt.context_manifest_id),
-            StartupDurableInconsistency::RehydrationManifestMismatch,
-            result,
-        );
+        if let Some(manifest) = manifest {
+            check(
+                manifest.manifest_id == attempt.context_manifest_id,
+                StartupDurableInconsistency::RehydrationManifestMismatch,
+                result,
+            );
+        }
         check(
             attempt.context_epoch_id == role.current_context_epoch,
             StartupDurableInconsistency::RehydrationEpochMismatch,
             result,
         );
-        check(
-            attempt.executor_binding_id.as_deref()
-                == binding.map(|value| value.binding_id.as_str()),
-            StartupDurableInconsistency::RehydrationBindingMismatch,
-            result,
-        );
+        if let Some(id) = &attempt.executor_binding_id {
+            if let Some(binding) = binding {
+                check(
+                    id == &binding.binding_id,
+                    StartupDurableInconsistency::RehydrationBindingMismatch,
+                    result,
+                );
+            } else {
+                require(
+                    result,
+                    StartupReconciliationRequirement::DurableFactReconciliation,
+                );
+            }
+        }
     }
 }
 
