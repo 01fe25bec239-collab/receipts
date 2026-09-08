@@ -321,28 +321,7 @@ pub(crate) fn execute_with_runner(
         &ProcessTimeoutPolicy,
     ) -> Result<TaskCaptureSnapshot, CodexTaskExecutionError>,
 ) -> Result<CodexTaskExecutionResult, CodexTaskExecutionError> {
-    // Only the true empty string is rejected. Whitespace-only prompts are
-    // valid data and must reach the child untouched.
-    if request.prompt().is_empty() {
-        return Err(CodexTaskExecutionError::EmptyPrompt);
-    }
-
-    // The prompt becomes exactly one argv element, verbatim: no shell, no
-    // splitting, no interpolation, no added flags.
-    let argv: Vec<OsString> = vec![
-        OsString::from("exec"),
-        OsString::from("--json"),
-        OsString::from("--sandbox"),
-        OsString::from(request.sandbox_mode().cli_value()),
-        OsString::from(request.prompt()),
-    ];
-    let process_request = ProcessRunRequest::new(
-        request.absolute_codex_path(),
-        argv,
-        request.workspace_root(),
-        request.cwd(),
-    )
-    .map_err(|source| CodexTaskExecutionError::WorkspaceExecution { source })?;
+    let process_request = build_codex_task_request(request)?;
 
     let snapshot = run_one(&process_request, request.timeout_policy())?;
 
@@ -391,4 +370,32 @@ fn real_runner(
     let captured = run_with_timeout_and_capture(request, timeout_policy)
         .map_err(|source| CodexTaskExecutionError::WorkspaceExecution { source })?;
     Ok(TaskCaptureSnapshot::from_captured(&captured))
+}
+
+/// One argv builder shared by one-shot and live execution; never executes.
+pub(crate) fn build_codex_task_request(
+    request: &CodexTaskExecutionRequest,
+) -> Result<ProcessRunRequest, CodexTaskExecutionError> {
+    // Only the true empty string is rejected. Whitespace-only prompts are
+    // valid data and must reach the child untouched.
+    if request.prompt().is_empty() {
+        return Err(CodexTaskExecutionError::EmptyPrompt);
+    }
+
+    // The prompt becomes exactly one argv element, verbatim: no shell, no
+    // splitting, no interpolation, no added flags.
+    let argv: Vec<OsString> = vec![
+        OsString::from("exec"),
+        OsString::from("--json"),
+        OsString::from("--sandbox"),
+        OsString::from(request.sandbox_mode().cli_value()),
+        OsString::from(request.prompt()),
+    ];
+    ProcessRunRequest::new(
+        request.absolute_codex_path(),
+        argv,
+        request.workspace_root(),
+        request.cwd(),
+    )
+    .map_err(|source| CodexTaskExecutionError::WorkspaceExecution { source })
 }

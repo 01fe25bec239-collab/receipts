@@ -1,4 +1,4 @@
-//! Interpretation of completed, bounded Codex stdout; never task acceptance.
+//! Interpretation of bounded Codex stdout; never task acceptance.
 //!
 //! Evidence: codex-cli 0.153.4, read-only live probe (2026-09-07):
 //! thread.started -> turn.started -> item.completed (agent_message.text)
@@ -126,7 +126,7 @@ impl CodexJsonlEvent<'_> {
 /// No public raw-byte constructor or alternate unbounded input path exists.
 pub struct CodexJsonlInterpretation<'a> {
     execution: &'a CodexTaskExecutionResult,
-    events: Vec<CodexJsonlEvent<'a>>,
+    protocol: CodexJsonlProtocol<'a>,
 }
 
 impl CodexJsonlInterpretation<'_> {
@@ -134,16 +134,51 @@ impl CodexJsonlInterpretation<'_> {
         self.execution.exit_code()
     }
 
+    /// Ordered stdout records with their exact raw evidence.
+    pub fn events(&self) -> &[CodexJsonlEvent<'_>] {
+        self.protocol.events()
+    }
+    /// Whether these bytes contain a turn.completed event, not a task verdict.
+    pub fn turn_completed_observed(&self) -> bool {
+        self.protocol.turn_completed_observed()
+    }
+    /// Whether these bytes contain a turn.failed event, not a FailureClass.
+    pub fn turn_failed_observed(&self) -> bool {
+        self.protocol.turn_failed_observed()
+    }
+    /// Conservative protocol termination; independent of process exit status.
+    pub fn termination(&self) -> CodexProtocolTermination {
+        self.protocol.termination()
+    }
+    /// Selects only the sole message in one recognized completed turn.
+    /// See [`CodexJsonlProtocol::final_agent_message`] for conservative exclusions.
+    pub fn final_agent_message(&self) -> Option<&str> {
+        self.protocol.final_agent_message()
+    }
+}
+
+/// Ordered stdout protocol evidence, independent of process lifecycle and exit status.
+/// For a live snapshot, termination describes only the current bytes, never a
+/// terminal process result or Receipts task/review/admission success.
+/// Constructed only from bounded Runtime evidence; stderr is never input.
+pub struct CodexJsonlProtocol<'a> {
+    events: Vec<CodexJsonlEvent<'a>>,
+}
+
+impl CodexJsonlProtocol<'_> {
+    /// Ordered stdout records with their exact raw evidence.
     pub fn events(&self) -> &[CodexJsonlEvent<'_>] {
         &self.events
     }
 
+    /// Whether these bytes contain a turn.completed event, not a task verdict.
     pub fn turn_completed_observed(&self) -> bool {
         self.events
             .iter()
             .any(|e| e.kind == CodexJsonlEventKind::TurnCompleted)
     }
 
+    /// Whether these bytes contain a turn.failed event, not a FailureClass.
     pub fn turn_failed_observed(&self) -> bool {
         self.events
             .iter()
@@ -205,12 +240,16 @@ impl CodexJsonlInterpretation<'_> {
 pub fn interpret_codex_jsonl(
     execution: &CodexTaskExecutionResult,
 ) -> Result<CodexJsonlInterpretation<'_>, CodexJsonlError> {
+    Ok(CodexJsonlInterpretation {
+        execution,
+        protocol: interpret_stdout(execution.stdout())?,
+    })
+}
+
+/// Single parser core for complete one-shot stdout and bounded live observations.
+pub(crate) fn interpret_stdout(stdout: &[u8]) -> Result<CodexJsonlProtocol<'_>, CodexJsonlError> {
     let mut events = Vec::new();
-    for (index, raw_record) in execution
-        .stdout()
-        .split_inclusive(|b| *b == b'\n')
-        .enumerate()
-    {
+    for (index, raw_record) in stdout.split_inclusive(|b| *b == b'\n').enumerate() {
         let error = |kind| CodexJsonlError {
             line: index + 1,
             kind,
@@ -232,7 +271,7 @@ pub fn interpret_codex_jsonl(
             kind,
         });
     }
-    Ok(CodexJsonlInterpretation { execution, events })
+    Ok(CodexJsonlProtocol { events })
 }
 
 fn event_kind(value: &Value) -> Option<CodexJsonlEventKind> {
