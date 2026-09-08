@@ -30,3 +30,13 @@ pub use review_capsule_structured_core::{
 
 #[cfg(test)]
 mod review_capsule_structured_core_tests;
+
+pub mod a3_handoff_structured_core;
+pub use a3_handoff_structured_core::{
+    A3HandoffBlocker, A3HandoffCheck, A3HandoffCheckResult, A3HandoffConstructionError,
+    A3HandoffContractConsumed, A3HandoffEvidenceLabel, A3HandoffImplementer,
+    A3HandoffLabeledEvidence, A3HandoffNonTemporalCore,
+};
+
+#[cfg(test)]
+mod a3_handoff_structured_core_tests;
