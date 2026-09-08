@@ -2,6 +2,7 @@ mod adapter;
 mod auth_status;
 mod codex_failure_classification;
 mod codex_jsonl;
+mod codex_live_attempt;
 mod codex_probe;
 mod codex_probe_execution;
 mod codex_probe_failure_classification;
@@ -14,6 +15,8 @@ mod adapter_tests;
 mod codex_failure_classification_tests;
 #[cfg(test)]
 mod codex_jsonl_tests;
+#[cfg(all(test, unix))]
+mod codex_live_attempt_tests;
 #[cfg(test)]
 mod codex_probe_execution_tests;
 #[cfg(test)]
@@ -32,7 +35,11 @@ pub use codex_failure_classification::{
 };
 pub use codex_jsonl::{
     CodexJsonlError, CodexJsonlErrorKind, CodexJsonlEvent, CodexJsonlEventKind,
-    CodexJsonlInterpretation, CodexProtocolTermination, interpret_codex_jsonl,
+    CodexJsonlInterpretation, CodexJsonlProtocol, CodexProtocolTermination, interpret_codex_jsonl,
+};
+pub use codex_live_attempt::{
+    CodexLiveAttempt, CodexLiveOutcome, CodexLiveOutputSnapshot, CodexLiveProtocolError,
+    CodexLiveStartError, start_codex_live_attempt,
 };
 pub use codex_probe::{
     CODEX_EXEC_HELP_PROBE, CODEX_VERSION_PROBE, CodexCapability, CodexCapabilityEvidence,
