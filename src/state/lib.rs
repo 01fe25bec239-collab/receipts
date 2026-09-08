@@ -26,6 +26,7 @@ pub mod executor_binding;
 pub mod executor_binding_lease_expiry;
 pub mod logical_role;
 pub mod repository;
+pub mod startup_recovery;
 pub mod trusted_time;
 
 mod migrations;
@@ -73,6 +74,9 @@ mod executor_binding_tests;
 mod logical_role_tests;
 
 #[cfg(test)]
+mod startup_recovery_tests;
+
+#[cfg(test)]
 mod trusted_time_watermark_tests;
 
 #[cfg(test)]
@@ -105,4 +109,8 @@ pub use executor_binding_lease_expiry::{
 };
 pub use logical_role::{LogicalRole, LogicalRoleStatus, LogicalRoleType};
 pub use repository::SqliteStateRepository;
+pub use startup_recovery::{
+    DurableBindingState, StartupDurableInconsistency, StartupReconciliationRequirement,
+    StartupRecoveryClassification, StartupRecoverySnapshot, classify_startup_recovery,
+};
 pub use trusted_time::{TrustedClockV1, TrustedTimeSampleV1, TrustedTimeWatermarkV1};
