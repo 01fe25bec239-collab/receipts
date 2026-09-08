@@ -38,6 +38,7 @@ pub mod host_capability_mode_selection;
 pub mod host_capability_native_prerequisite;
 pub mod host_capability_observation;
 pub mod host_capability_report_core;
+pub mod host_capability_report_refresh;
 pub mod host_capability_report_selection_composition;
 pub mod host_capability_report_vocabulary;
 pub mod host_capability_selected_mode_consistency;
@@ -126,6 +127,10 @@ pub use host_capability_native_prerequisite::{
 pub use host_capability_report_core::{
     HostCapabilityReportNonTemporalCore, HostCapabilityReportNonTemporalCoreError,
     HostCapabilityReportNonTemporalCoreInputs,
+};
+pub use host_capability_report_refresh::{
+    HostCapabilityReportRefreshOutcome, HostCapabilityReportRefreshRequest,
+    refresh_host_capability_report,
 };
 pub use host_capability_report_selection_composition::{
     HostCapabilityReportSelectionCompositionError, HostCapabilityReportSelectionCompositionInputs,
