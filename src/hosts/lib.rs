@@ -1,7 +1,7 @@
 //! Host Integration foundation: the host-neutral [`HostAdapter`]
 //! translation boundary and the pure host detection/selection policy.
 //!
-//! This crate implements only the interface slice of `M-HOST-1`: the frozen
+//! This crate implements the interface and bounded read-only observation slice of `M-HOST-1`: the frozen
 //! architectural boundary between the Receipts core and external hosts
 //! (Claude Code, Codex, headless runners). An adapter is a translation
 //! boundary and nothing else. It contains no orchestration, routing, state,
@@ -16,12 +16,12 @@
 //!
 //! Boundary rules honored by this crate:
 //!
-//! * Rust `std`/`core` only; zero dependencies, zero feature flags;
-//! * no concrete host behavior: no detection or environment/process
-//!   probing, no installation, no process control, no Claude/Codex hooks,
-//!   no plugin manifests or packaging, no event normalization, no
-//!   capability probing, no rendering, no credential handling, no
-//!   networking, no subprocess/shell execution, and no filesystem writes;
+//! * bounded source-specific JSON/TOML decoding with the authorized serde,
+//!   serde_json, and toml substrate;
+//! * read-only Host capability observation through fixed configuration paths
+//!   and an enumerated non-worker CLI probe; no shell or filesystem writes;
+//! * no installation, hook mutation, trust approval, credential authority,
+//!   networking, rendering, event normalization, or runtime worker execution;
 //! * adjacent frozen contracts (`InstallPlan`, `CoreHandle`,
 //!   `NormalizedHostEvent`, `CoreView`, `UserPrompt`, `UserResponse`,
 //!   `HostCapabilityReport`, shutdown reason) remain externally owned and
@@ -36,6 +36,7 @@ pub mod host_capability_inactive_reason_policy;
 pub mod host_capability_mode_override;
 pub mod host_capability_mode_selection;
 pub mod host_capability_native_prerequisite;
+pub mod host_capability_observation;
 pub mod host_capability_report_core;
 pub mod host_capability_report_selection_composition;
 pub mod host_capability_report_vocabulary;
