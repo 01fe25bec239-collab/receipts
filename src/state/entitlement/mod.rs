@@ -3,6 +3,7 @@
 mod activation_identity_consistency;
 mod activation_identity_fields;
 mod entitlement_state_resolution;
+mod physical_contracts;
 mod product_entitlement_string_fields;
 mod product_entitlement_values;
 mod vocabulary;
@@ -15,6 +16,7 @@ pub use entitlement_state_resolution::{
     LicensingServiceAvailability, LocalClockEvidence, ObservedEntitlementEvidence,
     VerifiedEntitlementTemporalClass, resolve_product_entitlement_state,
 };
+pub use physical_contracts::{ActivationState, ProductEntitlement, ProductEntitlementVersion};
 pub use product_entitlement_string_fields::ProductEntitlementStringFields;
 
 pub use product_entitlement_values::{
@@ -32,6 +34,9 @@ mod activation_identity_fields_tests;
 
 #[cfg(test)]
 mod entitlement_state_resolution_tests;
+
+#[cfg(test)]
+mod physical_contracts_tests;
 
 #[cfg(test)]
 mod product_entitlement_string_fields_tests;
