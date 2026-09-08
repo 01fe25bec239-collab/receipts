@@ -22,5 +22,7 @@ pub mod capsules;
 
 pub mod goal;
 
+pub mod orchestration;
+
 #[cfg(test)]
 mod facade_tests;
