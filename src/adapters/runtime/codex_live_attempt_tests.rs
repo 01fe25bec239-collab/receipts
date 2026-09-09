@@ -546,3 +546,185 @@ fn workspace_ownership_is_composed_without_runtime_control_authority() {
     }
     assert!(source.contains("attempt: LiveProcessAttempt"));
 }
+
+#[test]
+fn bound_attempt_result_preserves_completed_process_and_protocol_cross_product() {
+    use crate::{AttemptHandle, AttemptId};
+    let unknown = "{\"type\":\"future.世界\"}\n";
+    let item = "{\"type\":\"item.completed\",\"item\":{\"id\":\"i\",\"type\":\"future_item\",\"status\":\"future_status\"}}\n";
+    for code in [0, 7, 124, 137] {
+        for stdout in [
+            COMPLETED.into(),
+            "{malformed}".into(),
+            STARTED.into(),
+            String::new(),
+            format!("{COMPLETED}{FAILED}"),
+            format!("{FAILED}{COMPLETED}"),
+            format!("{STARTED}{unknown}{item}"),
+        ] {
+            let ws = Workspace::new();
+            ws.write("stdout", &stdout);
+            ws.write("stderr", COMPLETED);
+            ws.write("exit", code.to_string());
+            ws.write("release", "1");
+            let id = AttemptId::new("caller/世界").unwrap();
+            let handle = AttemptHandle::new(id.clone(), ws.start(Duration::from_secs(10)));
+            assert_eq!(handle.id(), &id);
+            let result = handle.collect_result().unwrap();
+            assert_eq!(result.id(), &id);
+            let codex = result.codex();
+            assert_eq!(codex.process().terminal_cause(), Cause::Completed);
+            assert_eq!(codex.process().exit_code(), Some(code));
+            assert!(!codex.process().forced_kill_required());
+            assert_eq!(codex.process().stdout().head(), stdout.as_bytes());
+            assert_eq!(codex.process().stderr().head(), COMPLETED.as_bytes());
+            assert_eq!(codex.sandbox_mode(), Sandbox::ReadOnly);
+            if stdout == "{malformed}" {
+                assert!(codex.protocol().is_err());
+            } else {
+                let protocol = codex.protocol().unwrap();
+                assert_eq!(
+                    protocol.termination(),
+                    if stdout == COMPLETED {
+                        Protocol::Completed
+                    } else {
+                        Protocol::Indeterminate
+                    }
+                );
+                let records: Vec<_> = protocol
+                    .events()
+                    .iter()
+                    .flat_map(|e| e.raw_record().iter().copied())
+                    .collect();
+                assert_eq!(records, stdout.as_bytes());
+                if stdout.contains("future.世界") {
+                    assert_eq!(protocol.events()[1].kind(), Kind::Unknown);
+                    assert_eq!(protocol.events()[1].event_type(), "future.世界");
+                    assert_eq!(protocol.events()[2].item_type(), Some("future_item"));
+                    assert_eq!(protocol.events()[2].item_status(), Some("future_status"));
+                }
+                assert_eq!(protocol.final_agent_message(), None);
+            }
+            assert_eq!(handle.terminal_cause(), Some(Cause::Completed));
+            assert_eq!(handle.cancel(), Acceptance::AlreadyTerminalOrTerminating);
+            let error = handle.collect_result().err().unwrap();
+            assert_eq!(
+                error.evidence(),
+                crate::RawFailureEvidence::AlreadyCollectedOrCollecting
+            );
+            assert_eq!(error.classify_failure(), crate::FailureClass::Unknown);
+            ws.prove_empty();
+        }
+    }
+}
+
+#[test]
+fn bound_attempt_cancellation_timeout_and_forced_cleanup_remain_workspace_truth() {
+    use crate::{AttemptHandle, AttemptId};
+    for timeout in [false, true] {
+        for forced in [false, true] {
+            let ws = Workspace::new();
+            ws.write("stdout", "{\"type\":");
+            ws.write("stderr", COMPLETED);
+            if forced {
+                ws.write("ignore", "1");
+            }
+            let id = AttemptId::new("same-caller-identity").unwrap();
+            let handle = AttemptHandle::new(
+                id.clone(),
+                ws.start(Duration::from_secs(if timeout { 2 } else { 10 })),
+            );
+            ws.ready();
+            let cause = if timeout {
+                until(|| handle.terminal_cause() == Some(Cause::TimedOut));
+                assert_eq!(handle.cancel(), Acceptance::AlreadyTerminalOrTerminating);
+                Cause::TimedOut
+            } else {
+                assert_eq!(handle.cancel(), Acceptance::CancelAccepted);
+                assert_eq!(handle.cancel(), Acceptance::AlreadyTerminalOrTerminating);
+                Cause::Cancelled
+            };
+            let result = handle.collect_result().unwrap();
+            assert_eq!(result.id(), &id);
+            assert_eq!(handle.terminal_cause(), Some(cause));
+            assert_eq!(result.codex().process().terminal_cause(), cause);
+            assert_eq!(result.codex().process().forced_kill_required(), forced);
+            assert_eq!(result.codex().process().stdout().head(), b"{\"type\":");
+            assert_eq!(
+                result.codex().process().stderr().head(),
+                COMPLETED.as_bytes()
+            );
+            let error = result.codex().protocol().err().unwrap();
+            assert_eq!(
+                crate::RawFailure::from(&error).classify_failure(),
+                crate::FailureClass::Unknown
+            );
+            ws.prove_empty();
+        }
+    }
+}
+
+#[test]
+fn bound_attempt_snapshots_truncation_and_drop_reuse_the_real_live_attempt() {
+    use crate::{AttemptHandle, AttemptId};
+    fn shared<T: Send + Sync>() {}
+    shared::<AttemptHandle>();
+    for truncated in [false, true] {
+        let ws = Workspace::new();
+        let stdout = if truncated {
+            vec![b' '; STREAM_CAPTURE_LIMIT_BYTES as usize + 1]
+        } else {
+            STARTED.as_bytes().to_vec()
+        };
+        ws.write("stdout", &stdout);
+        ws.write("stderr", COMPLETED);
+        let handle = AttemptHandle::new(
+            AttemptId::new("bounded").unwrap(),
+            ws.start(Duration::from_secs(10)),
+        );
+        ws.ready();
+        until(|| {
+            handle
+                .snapshot_output()
+                .unwrap()
+                .output()
+                .stdout()
+                .total_bytes()
+                == stdout.len() as u64
+        });
+        for _ in 0..3 {
+            let snapshot = handle.snapshot_output().unwrap();
+            assert!(snapshot.output().stdout().captured_bytes() <= STREAM_CAPTURE_LIMIT_BYTES);
+            assert_eq!(snapshot.output().stdout().truncated(), truncated);
+            assert_eq!(handle.terminal_cause(), None);
+            if truncated {
+                assert_eq!(
+                    snapshot.protocol().err(),
+                    Some(CodexLiveProtocolError::StdoutTruncated)
+                );
+            } else {
+                assert_eq!(snapshot.protocol().unwrap().events().len(), 1);
+            }
+        }
+        ws.write("release", "1");
+        let result = handle.collect_result().unwrap();
+        assert_eq!(result.codex().process().terminal_cause(), Cause::Completed);
+        assert_eq!(result.codex().process().stdout().truncated(), truncated);
+        if truncated {
+            assert_eq!(
+                result.codex().protocol().err(),
+                Some(CodexLiveProtocolError::StdoutTruncated)
+            );
+        }
+        ws.prove_empty();
+    }
+    let ws = Workspace::new();
+    ws.write("spawn-descendant", "1");
+    let handle = AttemptHandle::new(
+        AttemptId::new("drop-owned").unwrap(),
+        ws.start(Duration::from_secs(10)),
+    );
+    ws.ready();
+    drop(handle);
+    ws.prove_empty();
+}
