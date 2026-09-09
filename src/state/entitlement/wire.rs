@@ -84,7 +84,7 @@ impl<'de> Visitor<'de> for EntitlementVisitor<'_> {
                 5 => wire.entitlement_version = Some(value!()),
                 6 => wire.key_id = Some(value!()),
                 7 => wire.signature = Some(value!()),
-                // Schema null and omission both map to None. Seen bits remain independent.
+                // Seen bits distinguish omission from null until the map is complete.
                 8 => wire.offline_grace_until = value!(),
                 9 => wire.device_binding = value!(),
                 _ => unreachable!(),
@@ -94,6 +94,13 @@ impl<'de> Visitor<'de> for EntitlementVisitor<'_> {
             if !seen[index] {
                 *self.0 = Some(Error::MissingRequiredField(FIELDS[index]));
                 return Err(de::Error::custom("missing entitlement field"));
+            }
+        }
+        // Defer null rejection so a later duplicate still wins, including escaped keys.
+        for (index, value) in [(8, &wire.offline_grace_until), (9, &wire.device_binding)] {
+            if seen[index] && value.is_none() {
+                *self.0 = Some(Error::InvalidPhysicalField(FIELDS[index]));
+                return Err(de::Error::custom("null entitlement optional"));
             }
         }
         Ok(wire)

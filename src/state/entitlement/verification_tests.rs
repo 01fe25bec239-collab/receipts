@@ -457,27 +457,143 @@ fn subject_exactness_including_unicode_normalization_case_and_spaces() {
 }
 
 #[test]
-fn optional_null_and_omission_match_but_present_empty_is_distinct() {
+fn omitted_and_present_optionals_preserve_binary_framing_and_v1_policy() {
     let absent = NO_OPTIONALS.replace(",\"offline_grace_until\":null", "");
-    assert!(verify(&absent).is_ok());
+    let proof = verify(&absent).unwrap();
+    assert_eq!(proof.entitlement().offline_grace_until(), None);
+    assert_eq!(proof.entitlement().device_binding(), None);
+    let absent_message = signed_message(proof.entitlement());
+    let present = verify(VALID).unwrap();
     assert_eq!(
-        signed_message(&wire::parse(absent.as_bytes()).unwrap()),
-        signed_message(&wire::parse(NO_OPTIONALS.as_bytes()).unwrap())
+        present
+            .entitlement()
+            .offline_grace_until()
+            .unwrap()
+            .as_str(),
+        "2027-02-01T00:00:00.000000000Z"
     );
-    assert!(verify(&append(&absent, "\"device_binding\":null")).is_ok());
-    let unbound = signed_message(&wire::parse(VALID.as_bytes()).unwrap());
+    let unbound = signed_message(present.entitlement());
+    let optional_start = absent_message.len() - 2;
+    assert_eq!(&absent_message[optional_start..], &[0, 0]);
+    assert_eq!(
+        &unbound[..optional_start],
+        &absent_message[..optional_start]
+    );
+    assert_eq!(
+        &unbound[optional_start..],
+        b"\x01\0\0\0\0\0\0\0\x1e2027-02-01T00:00:00.000000000Z\x00"
+    );
     let empty = signed_message(&wire::parse(BOUND_EMPTY.as_bytes()).unwrap());
     assert_eq!(&empty[..unbound.len() - 1], &unbound[..unbound.len() - 1]);
     assert_eq!(&empty[unbound.len() - 1..], &[1, 0, 0, 0, 0, 0, 0, 0, 0]);
-    assert_ne!(
-        unbound,
-        signed_message(&wire::parse(NO_OPTIONALS.as_bytes()).unwrap())
-    );
+    assert_ne!(unbound, absent_message);
     assert_eq!(verify(BOUND_EMPTY), Err(Error::UnsupportedDeviceBindingV1));
     assert_eq!(verify(BOUND), Err(Error::UnsupportedDeviceBindingV1));
     assert_eq!(
         verify(&append(VALID, "\"device_binding\":\"\"")),
         Err(Error::SignatureVerificationFailed)
+    );
+}
+
+#[test]
+fn explicit_null_never_reaches_signing_proof_or_cache_authority() {
+    let absent = NO_OPTIONALS.replace(",\"offline_grace_until\":null", "");
+    let prior = verify(&absent).unwrap();
+    let snapshot = prior.clone();
+    for field in ["offline_grace_until", "device_binding"] {
+        for key in [field.to_owned(), field.replacen('_', "\\u005f", 1)] {
+            for token in ["null", " \t\r\nnull \t\r\n"] {
+                // Retain the valid absent-state signature: accepting null would verify.
+                let raw = append(&absent, &format!("\"{key}\":{token}"));
+                let error = Error::InvalidPhysicalField(field);
+                assert_eq!(
+                    wire::parse(raw.as_bytes()).map(|p| signed_message(&p)),
+                    Err(error)
+                );
+                assert_eq!(verify(&raw), Err(error));
+                assert_eq!(
+                    verifier().ingest(raw.as_bytes(), &subject("é"), None),
+                    Err(error)
+                );
+                assert_eq!(
+                    verifier().ingest(raw.as_bytes(), &subject("é"), Some(&prior)),
+                    Err(error)
+                );
+                assert_eq!(prior, snapshot);
+            }
+        }
+    }
+    assert!(verify(NO_OPTIONALS).is_err());
+    assert!(verify(std::str::from_utf8(prior.raw_document()).unwrap()).is_ok());
+}
+
+#[test]
+fn optional_null_duplicates_win_in_both_orders_and_key_spellings() {
+    let absent = NO_OPTIONALS.replace(",\"offline_grace_until\":null", "");
+    for (field, value) in [
+        ("offline_grace_until", "\"2026-09-09T00:00:00.000000000Z\""),
+        ("device_binding", "\"\""),
+    ] {
+        let escaped = field.replacen('_', "\\u005f", 1);
+        for (first_key, second_key) in [(field, field), (&escaped, field), (field, &escaped)] {
+            for (first_value, second_value) in [("null", value), (value, "null"), ("null", "null")]
+            {
+                let raw = append(
+                    &absent,
+                    &format!("\"{first_key}\":{first_value},\"{second_key}\":{second_value}"),
+                );
+                parsed_error(&raw, Error::DuplicateField(field));
+            }
+        }
+    }
+}
+
+#[test]
+fn optional_validation_does_not_confuse_empty_wrong_types_or_nested_null() {
+    parsed_error(
+        &VALID.replace("2027-02-01T00:00:00.000000000Z", ""),
+        Error::UnsupportedTimestamp("offline_grace_until"),
+    );
+    let absent = NO_OPTIONALS.replace(",\"offline_grace_until\":null", "");
+    for field in ["offline_grace_until", "device_binding"] {
+        for value in ["true", "42", "[null]", "{\"nested\":null}"] {
+            parsed_error(
+                &append(&absent, &format!("\"{field}\":{value}")),
+                Error::InvalidPhysicalField(field),
+            );
+        }
+    }
+    for value in [
+        "null",
+        "{\"device_binding\":null,\"offline_grace_until\":null}",
+    ] {
+        parsed_error(
+            &append(&absent, &format!("\"unknown\":{value}")),
+            Error::UnknownField,
+        );
+    }
+    parsed_error(
+        &absent.replace("[\"b.c\",\"a.b\",\"b.c\"]", "[null]"),
+        Error::InvalidPhysicalField("capabilities"),
+    );
+}
+
+#[test]
+fn whitespace_device_binding_is_present_and_unsupported_when_authentic() {
+    use ed25519_dalek::{Signer, SigningKey};
+
+    let raw = append(VALID, "\"device_binding\":\" \"");
+    let physical = wire::parse(raw.as_bytes()).unwrap();
+    assert_eq!(physical.device_binding(), Some(" "));
+    let message = signed_message(&physical);
+    assert!(message.ends_with(&[1, 0, 0, 0, 0, 0, 0, 0, 1, b' ']));
+    let key = SigningKey::from_bytes(&[7; 32]);
+    let signature = encoded(&key.sign(&message).to_bytes());
+    let raw = raw.replace(physical.signature().as_str(), &signature);
+    assert_eq!(
+        trust(&[("k", &encoded(&key.verifying_key().to_bytes()))])
+            .reverify_cached(raw.as_bytes(), &subject("é")),
+        Err(Error::UnsupportedDeviceBindingV1)
     );
 }
 
