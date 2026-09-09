@@ -40,3 +40,12 @@ pub use a3_handoff_structured_core::{
 
 #[cfg(test)]
 mod a3_handoff_structured_core_tests;
+
+pub mod repair_cycle_control;
+pub use repair_cycle_control::{
+    DEFAULT_MAX_REPAIR_ATTEMPTS, DeterministicRepairCycleControlCore, RepairCycleControlError,
+    RepairCycleControlResult, RepairCycleDisposition,
+};
+
+#[cfg(test)]
+mod repair_cycle_control_tests;
