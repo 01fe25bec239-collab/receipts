@@ -57,6 +57,7 @@ pub mod error;
 pub mod git;
 pub mod handle;
 pub mod provision;
+pub mod recovery_preparation;
 pub mod remote_publish_policy;
 pub mod teardown;
 pub mod write_scope;
@@ -81,6 +82,8 @@ mod checkpoint_reference_tests;
 mod checkpoint_vocabulary_tests;
 #[cfg(test)]
 mod provision_tests;
+#[cfg(test)]
+mod recovery_preparation_tests;
 #[cfg(test)]
 mod remote_publish_policy_tests;
 #[cfg(test)]
@@ -107,6 +110,10 @@ pub use checkpoint_vocabulary::{WorkspaceCheckpointKind, WorkspaceRecoveryDecisi
 pub use error::WorkspaceError;
 pub use handle::{CommitSha, WorkspaceHandle, WorkspaceIsolation, WorkspaceState};
 pub use provision::{WorkspaceProvisionRequest, validate_branch_name};
+pub use recovery_preparation::{
+    WorkspaceRecoveryPreparation, WorkspaceRecoveryPreparationError,
+    WorkspaceRecoveryPreparationRequest, prepare_workspace_checkpoint_recovery,
+};
 pub use remote_publish_policy::WorkspaceRemotePublishPolicy;
 pub use teardown::WorkspaceTeardownRequest;
 pub use write_scope::{
