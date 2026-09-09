@@ -6,7 +6,15 @@ mod entitlement_state_resolution;
 mod physical_contracts;
 mod product_entitlement_string_fields;
 mod product_entitlement_values;
+mod verification;
 mod vocabulary;
+mod wire;
+
+pub use verification::{
+    EntitlementCacheDecision, EntitlementVerificationError, EntitlementVerifier,
+    VerifiedProductEntitlement,
+};
+pub use wire::MAX_ENTITLEMENT_WIRE_BYTES;
 
 pub use activation_identity_consistency::{
     ActivationIdentityConsistencyError, validate_activation_identity_fields,
@@ -46,3 +54,9 @@ mod product_entitlement_values_tests;
 
 #[cfg(test)]
 mod vocabulary_tests;
+
+#[cfg(test)]
+mod verification_vectors;
+
+#[cfg(test)]
+mod verification_tests;
