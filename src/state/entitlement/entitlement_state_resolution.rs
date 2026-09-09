@@ -1,9 +1,21 @@
 use super::{
     ActivationIdentityFields, ActivationStateKind, ProductEntitlementState,
-    ProductEntitlementStringFields,
+    VerifiedProductEntitlement,
 };
 
-/// Already-observed artifact authority; this classification performs no verification.
+/// Resolver evidence requires a cryptographic proof for the verified case.
+/// Temporal classification remains separately supplied authority.
+///
+/// ```compile_fail
+/// use receipts_state::entitlement::{ObservedEntitlementEvidence, ProductEntitlementStringFields,
+///     VerifiedEntitlementTemporalClass};
+/// fn forge(raw: &ProductEntitlementStringFields) -> ObservedEntitlementEvidence<'_> {
+///     ObservedEntitlementEvidence::Verified {
+///         entitlement: raw,
+///         temporal_class: VerifiedEntitlementTemporalClass::WithinActiveValidity,
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObservedEntitlementEvidence<'a> {
     /// No cached artifact is available.
@@ -14,7 +26,7 @@ pub enum ObservedEntitlementEvidence<'a> {
     Indeterminate,
     /// Upstream has verified this as the relevant paid authority, regardless of tier text.
     Verified {
-        entitlement: &'a ProductEntitlementStringFields,
+        entitlement: &'a VerifiedProductEntitlement,
         temporal_class: VerifiedEntitlementTemporalClass,
     },
 }

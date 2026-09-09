@@ -6,15 +6,13 @@ use super::{
     LocalClockEvidence::{EarlierThanLastObservedServerTime, NoRollbackDetected},
     ObservedEntitlementEvidence,
     ObservedEntitlementEvidence::{Corrupt, Indeterminate, Missing, Verified},
-    ProductCapabilityId, ProductEntitlementKeyId, ProductEntitlementSignature,
     ProductEntitlementState,
     ProductEntitlementState::{EntitlementUnknown, Free, ProActive, ProExpired, ProGrace},
-    ProductEntitlementStringFields, ProductEntitlementSubjectId, ProductTierId,
     VerifiedEntitlementTemporalClass,
     VerifiedEntitlementTemporalClass::{
         PastPermittedGrace, WithinActiveValidity, WithinApplicableSignedOfflineGrace,
     },
-    resolve_product_entitlement_state,
+    VerifiedProductEntitlement, resolve_product_entitlement_state,
 };
 
 const SERVICES: [LicensingServiceAvailability; 2] = [Available, Unavailable];
@@ -24,21 +22,30 @@ const TEMPORAL_ROWS: [(VerifiedEntitlementTemporalClass, ProductEntitlementState
     (PastPermittedGrace, ProExpired),
 ];
 
-fn entitlement(tier: &str, capabilities: &[&str]) -> ProductEntitlementStringFields {
-    ProductEntitlementStringFields::new(
-        ProductEntitlementSubjectId::new("account-001".into()).unwrap(),
-        ProductTierId::new(tier.into()).unwrap(),
-        capabilities
-            .iter()
-            .map(|value| ProductCapabilityId::new((*value).into()).unwrap())
-            .collect(),
-        ProductEntitlementKeyId::new("key-001".into()).unwrap(),
-        ProductEntitlementSignature::new("opaque-signature".into()).unwrap(),
-        None,
+fn entitlement(tier: &str, capabilities: &[&str]) -> VerifiedProductEntitlement {
+    use super::verification_vectors::*;
+    let raw = match (tier, capabilities) {
+        ("pro", []) => RESOLVER_0_0,
+        ("pro", ["future.new_capability"]) => RESOLVER_0_1,
+        ("enterprise.future", []) => RESOLVER_1_0,
+        ("enterprise.future", ["future.new_capability"]) => RESOLVER_1_1,
+        ("free", []) => RESOLVER_2_0,
+        ("free", ["future.new_capability"]) => RESOLVER_2_1,
+        _ => panic!("missing static verification vector"),
+    };
+    super::EntitlementVerifier::new([(
+        super::ProductEntitlementKeyId::new("k".into()).unwrap(),
+        PUBLIC_KEY,
+    )])
+    .unwrap()
+    .reverify_cached(
+        raw.as_bytes(),
+        &super::ProductEntitlementSubjectId::new("account-001".into()).unwrap(),
     )
+    .unwrap()
 }
 
-fn evidence_rows(fields: &ProductEntitlementStringFields) -> [ObservedEntitlementEvidence<'_>; 6] {
+fn evidence_rows(fields: &VerifiedProductEntitlement) -> [ObservedEntitlementEvidence<'_>; 6] {
     [
         Missing,
         Corrupt,
