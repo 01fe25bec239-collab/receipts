@@ -1,4 +1,5 @@
 mod adapter;
+mod attempt;
 mod auth_status;
 mod codex_failure_classification;
 mod codex_jsonl;
@@ -8,9 +9,12 @@ mod codex_probe_execution;
 mod codex_probe_failure_classification;
 mod codex_task_execution;
 mod failure;
+mod raw_failure;
 
 #[cfg(test)]
 mod adapter_tests;
+#[cfg(test)]
+mod attempt_tests;
 #[cfg(test)]
 mod codex_failure_classification_tests;
 #[cfg(test)]
@@ -27,8 +31,19 @@ mod codex_probe_tests;
 mod codex_task_execution_tests;
 #[cfg(test)]
 mod conformance_tests;
+#[cfg(test)]
+mod raw_failure_tests;
 
 pub use adapter::RuntimeAdapter;
+pub use attempt::{AttemptHandle, AttemptId, AttemptIdError, AttemptResult};
+pub use raw_failure::{RawFailure, RawFailureEvidence, RawFailureSource};
+
+/// Codex technical capability binding: the existing probe report, not a mirror.
+/// Supported/UNKNOWN evidence remains probe-derived; no auth, policy, entitlement
+/// or routing inference is added. Production probe capture bounds retained version
+/// evidence; direct caller construction retains the existing report's contract.
+/// Probe failure remains `CodexProbeExecutionError`, never a fabricated report.
+pub type RuntimeCapabilities = CodexCapabilityProbeReport;
 pub use auth_status::RuntimeAuthStatus;
 pub use codex_failure_classification::{
     classify_codex_task_execution_error, classify_codex_task_execution_result,
