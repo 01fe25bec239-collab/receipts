@@ -215,7 +215,7 @@ fn real_git_invalid_utf8_index_path_fails_closed() {
     assert!(matches!(
         capture_workspace_checkpoint_evidence(request(repo.path())),
         Err(E::InvalidUtf8 {
-            observation: Observation::StagedPaths
+            observation: Observation::TrackedStatus
         })
     ));
 }
@@ -245,7 +245,7 @@ fn preparation_and_git_failures_are_typed() {
 }
 
 #[test]
-fn head_success_followed_by_diff_failure_returns_no_partial_core() {
+fn head_success_followed_by_status_failure_returns_no_partial_core() {
     let repo = TestRepo::new("checkpoint-broken-tree");
     repo.commit_file("file", "original");
     let tree = String::from_utf8(git(repo.path(), &["rev-parse", "HEAD^{tree}"]).stdout).unwrap();
@@ -273,7 +273,7 @@ fn head_success_followed_by_diff_failure_returns_no_partial_core() {
     assert!(matches!(
         capture_workspace_checkpoint_evidence(request(repo.path())),
         Err(E::GitCommandFailed {
-            observation: Observation::StagedPaths,
+            observation: Observation::TrackedStatus,
             ..
         })
     ));
@@ -649,16 +649,22 @@ fn bound_real_git_untracked_staged_and_unstaged_each_fail_closed() {
     for name in &names {
         fs::write(repo.path().join(name), "content").unwrap();
     }
-    let total = (count * 241) as u64;
     for observation in [
         Observation::UntrackedPaths,
         Observation::StagedPaths,
         Observation::UnstagedPaths,
     ] {
         let result = capture_workspace_checkpoint_evidence(request(repo.path()));
+        // Tracked status has three extra raw bytes (XY SP) per path. The
+        // complete raw bound still applies before stripping those prefixes.
+        let (expected, total) = if observation == Observation::UntrackedPaths {
+            (Observation::UntrackedPaths, count * 241)
+        } else {
+            (Observation::TrackedStatus, count * 244)
+        };
         assert!(
             matches!(result, Err(E::GitEvidenceTooLarge { observation: actual, total_bytes, limit_bytes })
-            if actual == observation && total_bytes == total && limit_bytes == STREAM_CAPTURE_LIMIT_BYTES)
+            if actual == expected && total_bytes == total as u64 && limit_bytes == STREAM_CAPTURE_LIMIT_BYTES)
         );
         match observation {
             Observation::UntrackedPaths => {
@@ -719,5 +725,211 @@ fn bound_real_git_large_stderr_is_separate_and_does_not_deadlock() {
         assert_eq!(retained.bytes.len() as u64, STREAM_CAPTURE_LIMIT_BYTES);
         assert_eq!(retained.total_bytes, STREAM_CAPTURE_LIMIT_BYTES * 2);
         assert!(retained.truncated);
+    }
+}
+
+#[cfg(unix)]
+fn index_snapshot(path: &Path) -> (Vec<u8>, [u64; 3], [i64; 4]) {
+    use std::os::unix::fs::MetadataExt;
+    let bytes = fs::read(path).unwrap();
+    let metadata = fs::metadata(path).unwrap();
+    (
+        bytes,
+        [metadata.dev(), metadata.ino(), metadata.len()],
+        [
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        ],
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn accurate_status_preserves_index_bytes_and_metadata_under_hostile_config() {
+    use crate::WorkspaceProvisionRequest;
+    use std::time::{Duration, UNIX_EPOCH};
+    for linked in [false, true] {
+        for refresh in ["true", "false"] {
+            let repo = TestRepo::new_nested("checkpoint-index-immutability", "repo");
+            repo.commit_file("tracked", "original");
+            let handle = linked.then(|| {
+                WorkspaceProvisionRequest::new(
+                    repo.path(),
+                    "workspace",
+                    None,
+                    "task-branch",
+                    fs::canonicalize(repo.root.path()).unwrap().join("linked"),
+                    &repo.head_sha(),
+                )
+                .unwrap()
+                .provision()
+                .unwrap()
+            });
+            let root = handle.as_ref().map_or(repo.path(), |h| h.worktree_path());
+            for (key, value) in [
+                ("diff.autoRefreshIndex", refresh),
+                ("diff.relative", "true"),
+                ("diff.renames", "true"),
+                ("status.relativePaths", "true"),
+                ("status.renames", "copies"),
+                ("status.showUntrackedFiles", "all"),
+                ("status.showStash", "true"),
+                ("color.status", "always"),
+            ] {
+                git(root, &["config", key, value]);
+            }
+            // Resolve the correct main/linked index ONCE, in fixture code.
+            let index =
+                String::from_utf8(git(root, &["rev-parse", "--git-path", "index"]).stdout).unwrap();
+            let index = root.join(index.strip_suffix('\n').unwrap());
+            let assert_capture = |modified: &[&str], untracked: &[&str]| {
+                let before = index_snapshot(&index);
+                let result = capture(root);
+                let after = index_snapshot(&index);
+                assert!(
+                    before.0 == after.0,
+                    "index bytes changed: linked={linked}, refresh={refresh}"
+                );
+                assert_eq!(before.1, after.1, "index device/inode/size changed");
+                assert_eq!(before.2, after.2, "index mtime/ctime changed");
+                assert_eq!(result.modified_files(), modified);
+                assert_eq!(result.untracked_files(), untracked);
+            };
+            // An old mtime deterministically differs from cached stat data;
+            // no sleep or timestamp-resolution assumption is needed.
+            fs::File::options()
+                .write(true)
+                .open(root.join("tracked"))
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1)))
+                .unwrap();
+            assert_capture(&[], &[]);
+            fs::write(root.join("tracked"), "unstaged").unwrap();
+            assert_capture(&["tracked"], &[]);
+            git(root, &["add", "tracked"]);
+            assert_capture(&["tracked"], &[]);
+            fs::write(root.join("tracked"), "after staging").unwrap();
+            assert_capture(&["tracked"], &[]);
+            fs::write(root.join("loose"), "untracked").unwrap();
+            assert_capture(&["tracked"], &["loose"]);
+        }
+    }
+}
+
+#[test]
+fn tracked_status_parser_preserves_raw_names_and_rejects_unexpected_formats() {
+    assert_eq!(
+        parse_tracked_status(raw(b" M space \0A  tab\tline\n\0UU conflict\0")).unwrap(),
+        ["space ", "tab\tline\n", "conflict"]
+    );
+    for status in [
+        " M", " T", " A", " D", "M ", "MM", "MT", "MD", "T ", "A ", "AD", "D ", "DD", "AU", "UD",
+        "UA", "DU", "AA", "UU",
+    ] {
+        assert_eq!(
+            parse_tracked_status(raw(format!("{status} name\0").as_bytes())).unwrap(),
+            ["name"]
+        );
+    }
+    for bytes in [
+        b" M \0".as_slice(),
+        b"M path\0",
+        b" Mxname\0",
+        b"   name\0",
+        b"?? new\0",
+        b"!! ignored\0",
+        b"R  to\0from\0",
+        b"C  copy\0from\0",
+        b"## branch\0",
+        b"ZZ name\0",
+        b" M name",
+    ] {
+        assert!(matches!(
+            parse_tracked_status(raw(bytes)),
+            Err(E::MalformedEvidence { .. })
+        ));
+    }
+    assert!(matches!(
+        parse_tracked_status(raw(b" M \xff\0")),
+        Err(E::InvalidUtf8 { .. })
+    ));
+}
+
+#[test]
+fn tracked_status_bound_precedes_prefix_removal_and_deduplication() {
+    let exact = b" M p\0".repeat(STREAM_CAPTURE_LIMIT_BYTES as usize / 5);
+    let mut exact = exact;
+    // Add the remainder to the final path, preserving complete framing.
+    let remainder = STREAM_CAPTURE_LIMIT_BYTES as usize - exact.len();
+    exact.splice(exact.len() - 1..exact.len() - 1, vec![b'x'; remainder]);
+    assert_eq!(exact.len() as u64, STREAM_CAPTURE_LIMIT_BYTES);
+    assert!(parse_tracked_status(raw(&exact)).is_ok());
+    exact.insert(exact.len() - 1, b'x');
+    assert!(matches!(
+        parse_tracked_status(raw(&exact)),
+        Err(E::GitEvidenceTooLarge {
+            observation: Observation::TrackedStatus,
+            ..
+        })
+    ));
+    // Even though deduplication or stripping XY would make it fit, the raw
+    // stream is oversized and cannot be admitted.
+    let duplicate = b" M p\0".repeat(STREAM_CAPTURE_LIMIT_BYTES as usize / 5 + 1);
+    assert!(matches!(
+        parse_tracked_status(raw(&duplicate)),
+        Err(E::GitEvidenceTooLarge { .. })
+    ));
+    assert!(matches!(
+        parse_tracked_status(RawStream {
+            bytes: b" M p\0".to_vec(),
+            total_bytes: 6,
+            truncated: false
+        }),
+        Err(E::MalformedEvidence { .. })
+    ));
+}
+
+#[test]
+fn intent_to_add_and_unmerged_paths_remain_truthful() {
+    let repo = TestRepo::new("checkpoint-status-unmerged");
+    repo.commit_file("conflict", "base\n");
+    fs::write(repo.path().join("intent"), "intent").unwrap();
+    git(repo.path(), &["add", "-N", "intent"]);
+    assert_eq!(capture(repo.path()).modified_files(), &["intent"]);
+    git(repo.path(), &["add", "intent"]);
+    git(repo.path(), &["commit", "--quiet", "-m", "intent fixture"]);
+    git(repo.path(), &["checkout", "--quiet", "-b", "other"]);
+    repo.commit_file("conflict", "other\n");
+    git(repo.path(), &["checkout", "--quiet", "main"]);
+    repo.commit_file("conflict", "main\n");
+    assert!(
+        !crate::test_support::git_raw(repo.path(), &["merge", "--no-edit", "other"])
+            .status
+            .success()
+    );
+    let before = index_snapshot(&repo.path().join(".git/index"));
+    assert_eq!(capture(repo.path()).modified_files(), &["conflict"]);
+    assert_eq!(index_snapshot(&repo.path().join(".git/index")), before);
+}
+
+#[test]
+fn configured_filters_fail_closed_without_executing_them() {
+    let repo = TestRepo::new("checkpoint-filter-guard");
+    repo.commit_file("tracked", "original");
+    repo.commit_file(".gitattributes", "tracked filter=untrusted\n");
+    fs::write(repo.path().join("tracked"), "changed").unwrap();
+    for key in ["filter.untrusted.clean", "filter.untrusted.process"] {
+        git(
+            repo.path(),
+            &["config", key, "/nonexistent-checkpoint-filter"],
+        );
+        let before = snapshot(repo.path());
+        assert!(matches!(
+            capture_workspace_checkpoint_evidence(request(repo.path())),
+            Err(E::UnsupportedConfiguredFilters)
+        ));
+        assert_eq!(snapshot(repo.path()), before);
     }
 }

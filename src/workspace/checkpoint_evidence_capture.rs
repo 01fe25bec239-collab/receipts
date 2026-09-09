@@ -34,6 +34,10 @@ pub enum WorkspaceCheckpointGitObservation {
     StagedPaths,
     UnstagedPaths,
     UntrackedPaths,
+    TrackedStatus,
+    FilterConfiguration,
+    RecoveryBranch,
+    RecoveryCommit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +66,7 @@ pub enum WorkspaceCheckpointEvidenceCaptureError {
         stderr_total_bytes: u64,
         stderr_truncated: bool,
     },
+    UnsupportedConfiguredFilters,
     InvalidHeadSha,
     InvalidBaseSha,
     GitEvidenceTooLarge {
@@ -129,6 +134,7 @@ use WorkspaceCheckpointGitStream as Stream;
 /// Recovery remains unselected. The caller must exclude concurrent writers if
 /// it needs a consistent snapshot across these observations; this is not a Git
 /// transaction. Path records must be strict UTF-8 on every supported host.
+/// Configured clean/process filters fail closed; capture never executes them.
 pub fn capture_workspace_checkpoint_evidence(
     request: WorkspaceCheckpointEvidenceCaptureRequest<'_>,
 ) -> Result<WorkspaceCheckpointCaptureCore, E> {
@@ -148,27 +154,27 @@ pub fn capture_workspace_checkpoint_evidence(
         &["rev-parse", "--verify", "HEAD^{commit}"],
     )?;
     let head_sha = parse_head(head)?;
-    let mut modified_files = Vec::new();
-    for observation in [Observation::StagedPaths, Observation::UnstagedPaths] {
-        let mut args = vec![
-            "diff",
-            "--name-only",
+    reject_configured_filters(&root)?;
+    // Porcelain diff can persist a stat refresh even with optional locks off.
+    // Status computes accurate content status in memory; optional locks off
+    // suppresses its index write. Untracked evidence remains a separate fixed
+    // ls-files query, preserving full untracked names and ignored semantics.
+    let mut modified_files = parse_tracked_status(observe(
+        &root,
+        Observation::TrackedStatus,
+        &[
+            "status",
+            "--porcelain=v1",
             "-z",
-            "--no-ext-diff",
-            "--no-textconv",
+            "--untracked-files=no",
+            "--ignored=no",
             "--no-renames",
-            "--no-relative",
             "--ignore-submodules=none",
-        ];
-        if observation == Observation::StagedPaths {
-            args.extend(["--cached", head_sha.as_str()]);
-        }
-        args.push("--");
-        modified_files.extend(parse_paths(
-            observe(&root, observation, &args)?,
-            observation,
-        )?);
-    }
+            "--no-branch",
+            "--no-show-stash",
+            "--",
+        ],
+    )?)?;
     let mut untracked_files = parse_paths(
         observe(
             &root,
@@ -210,7 +216,7 @@ pub fn capture_workspace_checkpoint_evidence(
 // Git Command. This Git-only prefix retention drains through EOF and shares the
 // public Execution limit; truncated bytes never enter the path parser.
 #[derive(Debug)]
-struct RawStream {
+pub(crate) struct RawStream {
     bytes: Vec<u8>,
     total_bytes: u64,
     truncated: bool,
@@ -250,7 +256,7 @@ impl RawStream {
         Ok(())
     }
 
-    fn require_complete(self, observation: Observation) -> Result<Vec<u8>, E> {
+    pub(crate) fn require_complete(self, observation: Observation) -> Result<Vec<u8>, E> {
         if self.truncated || self.total_bytes > STREAM_CAPTURE_LIMIT_BYTES {
             return Err(E::GitEvidenceTooLarge {
                 observation,
@@ -291,15 +297,24 @@ fn drain(
     }
 }
 
-fn observe(root: &Path, observation: Observation, args: &[&str]) -> Result<RawStream, E> {
+pub(crate) fn observe(
+    root: &Path,
+    observation: Observation,
+    args: &[&str],
+) -> Result<RawStream, E> {
     let args: Vec<&OsStr> = [
         "--no-pager",
         "--no-replace-objects",
         "--no-optional-locks",
+        // Missing promisor objects must fail locally, even when repository
+        // config permits a particular transport. Never fetch during observation.
+        "--no-lazy-fetch",
         "-c",
         "core.fsmonitor=false",
         "-c",
         "core.untrackedCache=false",
+        "-c",
+        "status.relativePaths=false",
         "-c",
         "protocol.allow=never",
     ]
@@ -366,14 +381,14 @@ fn observe(root: &Path, observation: Observation, args: &[&str]) -> Result<RawSt
     Ok(stdout)
 }
 
-fn parse_head(raw: RawStream) -> Result<CommitSha, E> {
+pub(crate) fn parse_head(raw: RawStream) -> Result<CommitSha, E> {
     let bytes = raw.require_complete(Observation::Head)?;
     let sha = bytes.strip_suffix(b"\n").ok_or(E::InvalidHeadSha)?;
     let sha = std::str::from_utf8(sha).map_err(|_| E::InvalidHeadSha)?;
     CommitSha::parse(sha).map_err(|_| E::InvalidHeadSha)
 }
 
-fn parse_root(raw: RawStream) -> Result<PathBuf, E> {
+pub(crate) fn parse_root(raw: RawStream) -> Result<PathBuf, E> {
     let observation = Observation::WorktreeRoot;
     let bytes = raw.require_complete(observation)?;
     // rev-parse emits one raw absolute root followed by one LF. Remove only
@@ -419,3 +434,60 @@ fn parse_paths(raw: RawStream, observation: Observation) -> Result<Vec<String>, 
 #[cfg(test)]
 #[path = "checkpoint_evidence_capture_tests.rs"]
 mod tests;
+
+// --no-renames ensures each v1 record is exactly XY SP path NUL. Reject
+// headers, ignored/untracked records, rename pairs and malformed status codes.
+fn parse_tracked_status(raw: RawStream) -> Result<Vec<String>, E> {
+    // parse_paths admits only the complete bounded raw stream, before any
+    // status-prefix removal, filtering or deduplication, and requires UTF-8.
+    let mut paths = parse_paths(raw, Observation::TrackedStatus)?;
+    for record in &mut paths {
+        let bytes = record.as_bytes();
+        let valid_status = bytes.len() >= 4
+            && bytes[2] == b' '
+            && matches!(
+                (bytes[0], bytes[1]),
+                (b' ', b'M' | b'T' | b'A' | b'D')
+                    | (b'M' | b'T' | b'A', b' ' | b'M' | b'T' | b'D')
+                    | (b'D', b' ' | b'D')
+                    | (b'A', b'U' | b'A')
+                    | (b'U', b'D' | b'A' | b'U')
+                    | (b'D', b'U')
+            );
+        if !valid_status {
+            return Err(E::MalformedEvidence {
+                observation: Observation::TrackedStatus,
+                reason: "invalid tracked porcelain-v1 status record",
+            });
+        }
+        record.drain(..3);
+    }
+    Ok(paths)
+}
+
+// Status can invoke clean/process filters while comparing content. There is no
+// fixed Git switch disabling every named filter while preserving its semantics.
+// Fail closed for configured filters, without reading their command values or
+// replacing their transformations with potentially inaccurate evidence.
+fn reject_configured_filters(root: &Path) -> Result<(), E> {
+    match observe(
+        root,
+        Observation::FilterConfiguration,
+        &[
+            "config",
+            "--null",
+            "--name-only",
+            "--get-regexp",
+            "^filter\\.",
+        ],
+    ) {
+        Err(E::GitCommandFailed {
+            status: Some(1), ..
+        }) => Ok(()), // no matching keys
+        Err(error) => Err(error),
+        Ok(output) => {
+            output.require_complete(Observation::FilterConfiguration)?;
+            Err(E::UnsupportedConfiguredFilters)
+        }
+    }
+}
