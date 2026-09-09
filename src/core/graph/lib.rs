@@ -41,9 +41,20 @@ pub mod node_result_vocabulary;
 pub mod node_state;
 pub mod node_state_transition;
 pub mod passed_acceptance_transition;
+pub mod records;
 pub mod rejected_repair_transition;
 pub mod repair_completion_transition;
 pub mod review_verdict_transition;
+pub mod version;
+
+pub use records::{
+    GraphMutation, GraphMutationActor, GraphMutationOperation, GraphRecordError, GraphSnapshot,
+    GraphSnapshotNodeState,
+};
+pub use version::{GraphVersionError, GraphVersionV1};
+
+#[cfg(test)]
+mod records_tests;
 
 #[cfg(test)]
 mod accepted_integration_transition_tests;
