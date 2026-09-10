@@ -7,7 +7,7 @@ use crate::{
     start_codex_live_attempt,
 };
 use receipts_workspace_execution::execution::{
-    LiveProcessAttemptError, LiveProcessCancelAcceptance as Acceptance,
+    LiveProcessAttemptError, LiveProcessCancelAcceptance as Acceptance, LiveProcessStartError,
     LiveProcessTerminalCause as Cause, ProcessTimeoutPolicy, STREAM_CAPTURE_LIMIT_BYTES,
 };
 use std::{
@@ -492,6 +492,11 @@ fn exact_shared_request_modes_prompts_and_validation_reach_real_boundary() {
                 error,
                 CodexLiveStartError::Request(CodexTaskExecutionError::EmptyPrompt)
             ));
+        } else if matches!(&error, CodexLiveStartError::Workspace(_)) {
+            assert!(matches!(
+                error,
+                CodexLiveStartError::Workspace(LiveProcessStartError::Execution(_))
+            ));
         }
         assert!(!ws.0.join("ready").exists());
     }
@@ -727,4 +732,15 @@ fn bound_attempt_snapshots_truncation_and_drop_reuse_the_real_live_attempt() {
     ws.ready();
     drop(handle);
     ws.prove_empty();
+}
+
+#[test]
+fn codex_live_start_and_collection_error_types_remain_distinct() {
+    let _: fn(&CodexLiveAttempt) -> Result<crate::CodexLiveOutcome, LiveProcessAttemptError> =
+        CodexLiveAttempt::wait_collect;
+    let start = CodexLiveStartError::Workspace(LiveProcessStartError::ControllerFailed);
+    assert!(matches!(
+        start,
+        CodexLiveStartError::Workspace(LiveProcessStartError::ControllerFailed)
+    ));
 }

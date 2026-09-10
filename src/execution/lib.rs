@@ -20,8 +20,10 @@
 //! * the child inherits nothing from the parent environment: construction
 //!   starts from `env_clear` and the allowlist is intentionally empty,
 //!   because the absolute executable needs no `PATH` to be located;
-//! * stdin is null (immediate EOF for the child), stdout and stderr are
-//!   null: this slice returns exit metadata only.
+//! * stdin defaults to null (immediate EOF), or accepts one immutable raw
+//!   [`ProcessStdin`] payload up to [`MAX_STDIN_BYTES`]. Delivery uses private
+//!   nonblocking writes inside the existing monitor; no writer thread or handle
+//!   escapes. Uncaptured stdout/stderr remain null.
 //!
 //! The result is typed exit-status metadata ([`ProcessRunOutcome`]): a
 //! child exiting non-zero is normal runner output, never an error.
@@ -48,8 +50,8 @@
 //! [`STREAM_TAIL_RETENTION_BYTES`] bytes, with nothing synthetic inserted
 //! between them. Retention buffers are reserved fallibly before the child
 //! exists, so a bound that cannot be honored fails closed with nothing
-//! spawned. [`run`] and [`run_with_timeout`] keep their accepted null-stdio
-//! behavior: capture is opt-in through the new API only.
+//! spawned. [`run`] and [`run_with_timeout`] keep null stdout/stderr;
+//! capture is opt-in.
 //!
 //! Deliberately excluded here (later runner slices): output digests,
 //! durable output storage, checkpoints, recovery. Also excluded by
@@ -63,6 +65,8 @@ mod live_attempt;
 mod outcome;
 mod request;
 mod runner;
+#[cfg(unix)]
+mod stdin;
 mod timeout;
 #[cfg(unix)]
 mod unix_signal;
@@ -73,7 +77,7 @@ pub use capture::{
 };
 pub use error::ExecutionError;
 pub use outcome::{ProcessRunOutcome, ProcessTermination};
-pub use request::ProcessRunRequest;
+pub use request::{BoundedStdinBytes, MAX_STDIN_BYTES, ProcessRunRequest, ProcessStdin};
 pub use runner::{run, run_with_timeout, run_with_timeout_and_capture};
 pub use timeout::ProcessTimeoutPolicy;
 
@@ -91,8 +95,11 @@ mod capture_tests;
 
 pub use live_attempt::{
     LiveProcessAttempt, LiveProcessAttemptError, LiveProcessCancelAcceptance, LiveProcessOutcome,
-    LiveProcessOutput, LiveProcessTerminalCause, start_live_process_attempt,
+    LiveProcessOutput, LiveProcessStartError, LiveProcessTerminalCause, start_live_process_attempt,
 };
 
 #[cfg(all(test, unix))]
 mod live_attempt_tests;
+
+#[cfg(all(test, unix))]
+mod stdin_tests;

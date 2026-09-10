@@ -7,7 +7,8 @@ use std::{
 };
 
 use receipts_workspace_execution::execution::{
-    ExecutionError, LiveProcessAttemptError, ProcessTermination,
+    ExecutionError, LiveProcessAttemptError, LiveProcessStartError, LiveProcessTerminalCause,
+    ProcessTermination,
 };
 
 use crate::{
@@ -43,6 +44,15 @@ pub enum RawFailureSource {
 pub enum RawFailureEvidence {
     /// Shared task request rejected an empty prompt.
     EmptyPrompt,
+    /// Scalar startup-terminal evidence; captured streams are deliberately omitted.
+    LiveTerminalBeforeReady {
+        terminal_cause: LiveProcessTerminalCause,
+        forced_kill_required: bool,
+        process_success: bool,
+        exit_code: Option<i32>,
+    },
+    /// Future non-exhaustive Workspace startup variant, without payloads.
+    UnrecognizedLiveStart(Discriminant<LiveProcessStartError>),
     /// Workspace error variant only; all potentially secret-bearing fields omitted.
     WorkspaceExecution(Discriminant<ExecutionError>),
     /// Existing explicit timeout error, preserving graceful versus forced cleanup.
@@ -66,8 +76,8 @@ pub enum RawFailureEvidence {
 /// One immutable, allocation-free Runtime failure projection for future trait binding.
 /// Constructors accept only existing typed errors. Original strings, output, paths,
 /// credentials and error chains are neither retained nor formatted. Evidence and the
-/// existing conservative FailureClass are independent: no lifecycle outcome, stderr,
-/// exit code or unknown provider event is accepted as an error by this API.
+/// existing conservative FailureClass are independent. Startup terminal errors
+/// retain only scalar evidence; output and provider events never supply classifications.
 /// No admission, routing, credential acquisition or recovery action is implemented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RawFailure {
@@ -91,8 +101,8 @@ impl RawFailure {
     pub fn probe(&self) -> Option<CodexProbeKind> {
         self.probe
     }
-    /// Reuse the accepted task/probe classification, otherwise preserve UNKNOWN.
-    /// No new live-lifecycle or protocol mapping is introduced.
+    /// Reuse task/probe classification; only startup TimedOut maps to Timeout.
+    /// Collection errors and all other startup terminals remain Unknown.
     pub fn classify_failure(&self) -> FailureClass {
         self.class
     }
@@ -180,6 +190,37 @@ impl From<&LiveProcessAttemptError> for RawFailure {
             LiveProcessAttemptError::ControllerFailed => RawFailureEvidence::ControllerFailed,
         };
         Self::unknown(RawFailureSource::WorkspaceLive, evidence)
+    }
+}
+
+impl From<&LiveProcessStartError> for RawFailure {
+    fn from(error: &LiveProcessStartError) -> Self {
+        let evidence = match error {
+            LiveProcessStartError::Execution(error) => {
+                RawFailureEvidence::WorkspaceExecution(discriminant(error))
+            }
+            LiveProcessStartError::ControllerFailed => RawFailureEvidence::ControllerFailed,
+            LiveProcessStartError::TerminalBeforeReady(outcome) => {
+                RawFailureEvidence::LiveTerminalBeforeReady {
+                    terminal_cause: outcome.terminal_cause(),
+                    forced_kill_required: outcome.forced_kill_required(),
+                    process_success: outcome.success(),
+                    exit_code: outcome.exit_code(),
+                }
+            }
+            _ => RawFailureEvidence::UnrecognizedLiveStart(discriminant(error)),
+        };
+        let mut failure = Self::unknown(RawFailureSource::CodexLiveStart, evidence);
+        if matches!(
+            evidence,
+            RawFailureEvidence::LiveTerminalBeforeReady {
+                terminal_cause: LiveProcessTerminalCause::TimedOut,
+                ..
+            }
+        ) {
+            failure.class = FailureClass::Timeout;
+        }
+        failure
     }
 }
 

@@ -48,9 +48,8 @@
 //!   other ambient state. Because the executable is an absolute validated
 //!   path, no environment entry is required to locate it, and none is
 //!   required by the spawn mechanism itself on supported platforms.
-//! * **Non-interactive silent child.** stdin is null (the child observes
-//!   immediate EOF), and stdout/stderr are null: this slice returns exit
-//!   metadata only and deliberately implements no output capture.
+//! * **Non-interactive child.** stdin defaults to immediate EOF or delivers
+//!   one admitted immutable byte payload. Uncaptured stdout/stderr remain null.
 //! * **Attempt-owned process group (timed path).** Each timed execution
 //!   attempt is spawned as the leader of its own dedicated process group
 //!   (`setpgid` semantics applied inside the child before `exec`, so
@@ -312,8 +311,42 @@ pub fn run(request: &ProcessRunRequest) -> Result<ProcessRunOutcome, ExecutionEr
     // Arguments travel verbatim as individual argv values; nothing joins,
     // splits, quotes, or interprets them because no shell exists here.
     command.args(request.arguments());
+    #[cfg(unix)]
+    if !matches!(request.stdin(), super::ProcessStdin::Closed) {
+        command.process_group(0);
+    }
 
+    #[cfg(not(unix))]
+    if !matches!(request.stdin(), super::ProcessStdin::Closed) {
+        return Err(ExecutionError::UnsupportedTimeoutPlatform);
+    }
+    #[cfg(unix)]
+    let mut stdin = super::stdin::StdinDelivery::prepare(&mut command, request.stdin())?;
     let mut child = command.spawn().map_err(spawn_failed)?;
+    drop(command); // Release the parent's copy of the stdin read end immediately.
+    #[cfg(unix)]
+    if !matches!(request.stdin(), super::ProcessStdin::Closed) {
+        let Some(group) = owned_process_group(child.id()) else {
+            return Err(process_group_ownership_failed(child));
+        };
+        if let Err(error) = deliver_stdin_until(&mut stdin, None) {
+            return Err(failure_after_spawn(child, group, error));
+        }
+        // No hidden timeout for run(). Retain group ownership until the same
+        // verified completion boundary used by timed execution is reached.
+        loop {
+            match try_complete_owned_child(&mut child, group, None) {
+                Ok(Some(status)) => {
+                    return Ok(ProcessRunOutcome::new(status.success(), status.code()));
+                }
+                Ok(None) => std::thread::sleep(POLL_INTERVAL),
+                Err(OwnedWaitError::Owned(error)) => {
+                    return Err(failure_after_spawn(child, group, error));
+                }
+                Err(OwnedWaitError::NoFurtherSignal(error)) => return Err(error),
+            }
+        }
+    }
     let status = child.wait().map_err(wait_failed)?;
 
     Ok(ProcessRunOutcome::new(status.success(), status.code()))
@@ -325,7 +358,7 @@ pub fn run(request: &ProcessRunRequest) -> Result<ProcessRunOutcome, ExecutionEr
 /// The bounded path reuses exactly the same validation foundation as the
 /// unbounded [`run`] — absolute canonical executable, common-shell
 /// rejection, realpath workspace containment, empty child environment,
-/// null stdio — so no less-safe duplicate launcher exists. The timed child
+/// closed-by-default stdin and null output — so no less-safe duplicate launcher exists. The timed child
 /// is additionally spawned as the leader of its own dedicated process
 /// group (`setpgid` semantics applied inside the child before `exec`),
 /// which the child's own descendants then inherit, making process-group
@@ -386,7 +419,9 @@ pub fn run_with_timeout(
     command.process_group(0);
     command.args(request.arguments());
 
+    let mut stdin = super::stdin::StdinDelivery::prepare(&mut command, request.stdin())?;
     let mut child = command.spawn().map_err(spawn_failed)?;
+    drop(command);
 
     // Fail-closed ownership proof: timeout enforcement may target only a
     // group the safety guards certify as this invocation's dedicated
@@ -396,6 +431,12 @@ pub fn run_with_timeout(
         Some(group) => group,
         None => return Err(process_group_ownership_failed(child)),
     };
+
+    match deliver_stdin_until(&mut stdin, Some(deadline)) {
+        Ok(true) => {}
+        Ok(false) => return enforce_timeout(child, group, policy),
+        Err(error) => return Err(failure_after_spawn(child, group, error)),
+    }
 
     let awaited = match await_owned_child_until(&mut child, group, deadline, false) {
         Ok(awaited) => awaited,
@@ -441,7 +482,7 @@ const STDERR: &str = "stderr";
 /// terminate → bounded-grace → force-kill → verify → reap lifecycle, all
 /// reused rather than reimplemented — plus separate bounded capture of the
 /// two child pipes. The unbounded [`run`] and the uncaptured
-/// [`run_with_timeout`] keep their accepted null-stdio behavior untouched;
+/// [`run_with_timeout`] keep their accepted null-output behavior;
 /// capture is opt-in through this API only.
 ///
 /// Ordering, in full:
@@ -452,12 +493,12 @@ const STDERR: &str = "stderr";
 /// 3. allocate both bounded retention buffers **before** the child exists,
 ///    so a machine that cannot honor the retention bound fails closed with
 ///    nothing spawned;
-/// 4. prepare the child with stdin null and both output streams piped;
+/// 4. prepare physical stdin and both output streams piped;
 /// 5. spawn as the leader of its own dedicated process group;
 /// 6. take both pipe handles immediately and start one dedicated reader
 ///    thread per stream, so the two pipes drain **concurrently** and
 ///    neither can block the child by filling while the other is read;
-/// 7. preserve the unreaped direct child while waiting for both readers to
+/// 7. advance nonblocking stdin delivery while waiting for both readers to
 ///    reach EOF under the original run deadline;
 /// 8. after both readers finish, non-reapingly observe the leader and prove
 ///    the owned group has no live descendants under that same deadline;
@@ -499,15 +540,15 @@ pub fn run_with_timeout_and_capture(
     let stderr_retention = frozen_retention(STDERR)?;
 
     let mut command = prepared_command(&executable, &cwd);
-    // stdin stays null (immediate EOF); only the two output streams change
-    // from the accepted null shape, and they stay separate pipes — stderr
-    // is never redirected into stdout.
+    // Output streams stay separate pipes; stderr is never redirected into stdout.
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     command.process_group(0);
     command.args(request.arguments());
 
+    let mut stdin = super::stdin::StdinDelivery::prepare(&mut command, request.stdin())?;
     let mut child = command.spawn().map_err(spawn_failed)?;
+    drop(command);
 
     let group = match owned_process_group(child.id()) {
         Some(group) => group,
@@ -576,6 +617,11 @@ pub fn run_with_timeout_and_capture(
     // here: it reaps an exited leader and would leave only a stale numeric
     // PGID if an inherited writer kept either reader pending.
     loop {
+        if Instant::now() < deadline
+            && let Err(error) = stdin.advance()
+        {
+            return Err(capture_failure_after_spawn(child, group, error));
+        }
         if stdout.is_none() {
             match take_finished_reader(STDOUT, &mut stdout_reader) {
                 Ok(captured) => stdout = captured,
@@ -592,7 +638,7 @@ pub fn run_with_timeout_and_capture(
                 }
             }
         }
-        if stdout.is_some() && stderr.is_some() {
+        if stdout.is_some() && stderr.is_some() && stdin.complete() {
             break;
         }
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
@@ -849,7 +895,7 @@ pub(crate) fn failure_after_spawn(
     group: OwnedProcessGroup,
     primary: ExecutionError,
 ) -> ExecutionError {
-    match cleanup_owned_attempt(child, group) {
+    match cleanup_owned_attempt(child, group, Some(&primary)) {
         Ok(()) => primary,
         Err(control_error) => control_error,
     }
@@ -860,10 +906,28 @@ pub(crate) fn failure_after_spawn(
 pub(crate) fn cleanup_owned_attempt(
     mut child: Child,
     group: OwnedProcessGroup,
+    primary: Option<&ExecutionError>,
 ) -> Result<(), ExecutionError> {
     match deliver_group_sigkill_for_attempt(group) {
         GroupSignalDelivery::Delivered | GroupSignalDelivery::GroupAlreadyGone => {}
         GroupSignalDelivery::Failed { detail } => {
+            // Darwin can refuse signals to a group containing only a zombie.
+            // For a selected stdin failure, preserve that failure if stable
+            // group proof and verified reap discharge ownership. Keep existing
+            // control/capture error precedence unchanged for all other callers.
+            if matches!(
+                primary,
+                Some(
+                    ExecutionError::StdinWriteFailed { .. }
+                        | ExecutionError::StdinDeliveryFailed { .. }
+                )
+            ) {
+                match try_complete_owned_child(&mut child, group, None) {
+                    Ok(Some(_)) => return Ok(()),
+                    Err(OwnedWaitError::NoFurtherSignal(error)) => return Err(error),
+                    _ => {}
+                }
+            }
             return Err(force_kill_failed_with_cleanup(child, group, detail));
         }
     }
@@ -919,7 +983,7 @@ fn await_owned_child_until(
         }
     }
     loop {
-        if let Some(status) = try_complete_owned_child(child, group, deadline)? {
+        if let Some(status) = try_complete_owned_child(child, group, Some(deadline))? {
             return Ok(Awaited::Exited(status));
         }
 
@@ -938,7 +1002,7 @@ fn await_owned_child_until(
 pub(crate) fn try_complete_owned_child(
     child: &mut Child,
     group: OwnedProcessGroup,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> Result<Option<ExitStatus>, OwnedWaitError> {
     let leader = child.id();
     if observe_leader_without_reaping(leader)
@@ -956,7 +1020,7 @@ pub(crate) fn try_complete_owned_child(
         match preliminary {
             GroupQuiescence::Empty => match quiesce_owned_group(group, leader) {
                 Ok(false) => {
-                    if Instant::now() >= deadline {
+                    if deadline.is_some_and(|end| Instant::now() >= end) {
                         return Ok(None);
                     }
                     let reap = bounded_child_reap(child);
@@ -1788,4 +1852,25 @@ pub(crate) fn prepared_command(executable: &Path, cwd: &Path) -> Command {
     command.stdout(Stdio::null());
     command.stderr(Stdio::null());
     command
+}
+
+/// Delivery runs inside the caller's existing lifecycle. No write can block
+/// its deadline, and every retry returns through the monotonic deadline check.
+#[cfg(unix)]
+fn deliver_stdin_until(
+    stdin: &mut super::stdin::StdinDelivery,
+    deadline: Option<Instant>,
+) -> Result<bool, ExecutionError> {
+    while !stdin.complete() {
+        if deadline.is_some_and(|end| Instant::now() >= end) {
+            return Ok(false);
+        }
+        if stdin.advance()? {
+            break;
+        }
+        std::thread::sleep(deadline.map_or(POLL_INTERVAL, |end| {
+            POLL_INTERVAL.min(end.saturating_duration_since(Instant::now()))
+        }));
+    }
+    Ok(true)
 }

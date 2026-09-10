@@ -5,6 +5,56 @@ use std::path::{Path, PathBuf};
 
 use crate::execution::error::ExecutionError;
 
+/// Maximum raw stdin payload, checked before a request can admit it.
+pub const MAX_STDIN_BYTES: usize = 1_048_576;
+
+/// Immutable admitted bytes. There is no public mutable view or append operation.
+///
+/// ```compile_fail
+/// use receipts_workspace_execution::execution::ProcessStdin;
+/// let ProcessStdin::Bytes(mut bytes) = ProcessStdin::bytes(b"input").unwrap() else { unreachable!() };
+/// bytes.as_bytes()[0] = 0;
+/// ```
+#[derive(Clone, PartialEq, Eq)]
+pub struct BoundedStdinBytes(Box<[u8]>);
+
+impl BoundedStdinBytes {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for BoundedStdinBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoundedStdinBytes")
+            .field("len", &self.0.len())
+            .field("redacted", &true)
+            .finish()
+    }
+}
+
+/// Physical stdin only: immediate EOF or one bounded immutable raw payload.
+/// Empty bytes remain distinct from Closed. No encoding or newline conversion occurs.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ProcessStdin {
+    #[default]
+    Closed,
+    Bytes(BoundedStdinBytes),
+}
+
+impl ProcessStdin {
+    pub fn bytes(bytes: impl AsRef<[u8]>) -> Result<Self, ExecutionError> {
+        let bytes = bytes.as_ref();
+        if bytes.len() > MAX_STDIN_BYTES {
+            return Err(ExecutionError::StdinPayloadTooLarge {
+                len: bytes.len(),
+                max: MAX_STDIN_BYTES,
+            });
+        }
+        Ok(Self::Bytes(BoundedStdinBytes(bytes.into())))
+    }
+}
+
 /// A fully structured request to run exactly one local child process.
 ///
 /// Construction enforces the frozen structural contract:
@@ -28,6 +78,7 @@ pub struct ProcessRunRequest {
     arguments: Vec<OsString>,
     workspace_root: PathBuf,
     cwd: PathBuf,
+    stdin: ProcessStdin,
 }
 
 impl ProcessRunRequest {
@@ -66,6 +117,7 @@ impl ProcessRunRequest {
             arguments: arguments.into_iter().map(Into::into).collect(),
             workspace_root,
             cwd,
+            stdin: ProcessStdin::Closed,
         })
     }
 
@@ -91,5 +143,15 @@ impl ProcessRunRequest {
     /// The absolute requested child working directory.
     pub fn cwd(&self) -> &Path {
         &self.cwd
+    }
+
+    /// Select one already-admitted physical stdin value.
+    pub fn with_stdin(mut self, stdin: ProcessStdin) -> Self {
+        self.stdin = stdin;
+        self
+    }
+
+    pub fn stdin(&self) -> &ProcessStdin {
+        &self.stdin
     }
 }

@@ -465,7 +465,7 @@ fn live_shell_cwd_and_unsupported_platform_fail_closed() {
     let shell = ProcessRunRequest::new("/bin/sh", ["-c", "exit 0"], &ws.0, &ws.0).unwrap();
     assert!(matches!(
         start_live_process_attempt(&shell, &policy),
-        Err(LiveProcessAttemptError::Execution(
+        Err(LiveProcessStartError::Execution(
             ExecutionError::ShellExecutableRejected { .. }
         ))
     ));
@@ -476,7 +476,7 @@ fn live_shell_cwd_and_unsupported_platform_fail_closed() {
             .unwrap();
         assert!(matches!(
             start_live_process_attempt(&req, &policy),
-            Err(LiveProcessAttemptError::Execution(
+            Err(LiveProcessStartError::Execution(
                 ExecutionError::CwdOutsideWorkspace { .. }
             ))
         ));
@@ -484,7 +484,7 @@ fn live_shell_cwd_and_unsupported_platform_fail_closed() {
     let _unsupported = super::runner::inject_unsupported_timeout_platform();
     assert!(matches!(
         start_live_process_attempt(&ws.request(), &policy),
-        Err(LiveProcessAttemptError::Execution(
+        Err(LiveProcessStartError::Execution(
             ExecutionError::UnsupportedTimeoutPlatform
         ))
     ));
