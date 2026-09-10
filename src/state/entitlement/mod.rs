@@ -3,12 +3,19 @@
 mod activation_identity_consistency;
 mod activation_identity_fields;
 mod entitlement_state_resolution;
+mod install_store;
+mod install_store_migrations;
 mod physical_contracts;
 mod product_entitlement_string_fields;
 mod product_entitlement_values;
 mod verification;
 mod vocabulary;
 mod wire;
+
+pub use install_store::{
+    InstallCachedEntitlement, InstallCachedEntitlementFailure, InstallEntitlementIngestOutcome,
+    InstallEntitlementRepository, InstallEntitlementSnapshot, InstallEntitlementStoreError,
+};
 
 pub use verification::{
     EntitlementCacheDecision, EntitlementVerificationError, EntitlementVerifier,
@@ -60,3 +67,6 @@ mod verification_vectors;
 
 #[cfg(test)]
 mod verification_tests;
+
+#[cfg(test)]
+mod install_store_tests;
