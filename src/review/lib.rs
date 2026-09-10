@@ -49,3 +49,12 @@ pub use repair_cycle_control::{
 
 #[cfg(test)]
 mod repair_cycle_control_tests;
+
+pub mod exact_sha_acceptance_gate;
+pub use exact_sha_acceptance_gate::{
+    AcceptanceEvidenceRecord, DependencyShaFreshnessLink, ExactShaAcceptanceGate,
+    ExactShaAcceptanceGateError, ExactShaAcceptanceGateInput, ExactShaAcceptanceGatePass,
+};
+
+#[cfg(test)]
+mod exact_sha_acceptance_gate_tests;
