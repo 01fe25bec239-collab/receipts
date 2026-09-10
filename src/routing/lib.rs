@@ -32,3 +32,8 @@ pub use routing_request::{
 };
 
 pub mod policy_eligibility;
+
+#[path = "../intelligence/mod.rs"]
+pub mod intelligence;
+#[path = "../registry/mod.rs"]
+pub mod registry;
