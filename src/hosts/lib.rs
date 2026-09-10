@@ -44,6 +44,7 @@ pub mod host_capability_report_vocabulary;
 pub mod host_capability_selected_mode_consistency;
 pub mod host_detection;
 pub mod host_id;
+pub mod host_session_activation;
 pub mod normalized_host_event;
 pub mod normalized_host_event_source_class;
 
@@ -149,3 +150,8 @@ pub use host_detection::{HostDetectionError, HostDetectionSignals, resolve_host}
 pub use host_id::HostId;
 pub use normalized_host_event::{NormalizedHostEventConfidence, NormalizedHostEventType};
 pub use normalized_host_event_source_class::NormalizedHostEventSourceClass;
+
+pub use host_session_activation::{
+    HostSessionActivationError, HostSessionActivationOutcome, HostSessionActivationRequest,
+    prepare_host_session,
+};
