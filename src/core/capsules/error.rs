@@ -14,6 +14,10 @@ pub enum CapsuleError {
         max: usize,
     },
     RepairParentMissing,
+    InvalidRepairInteger {
+        field: &'static str,
+    },
+    RepairQualityFloorWeakened,
     EmptyField {
         field: &'static str,
     },
@@ -53,6 +57,13 @@ impl std::fmt::Display for CapsuleError {
                 f,
                 "{field} has {length} Unicode scalar values; maximum is {max}"
             ),
+            Self::InvalidRepairInteger { field } => write!(
+                f,
+                "{field} is not a canonical integer in its repair snapshot domain"
+            ),
+            Self::RepairQualityFloorWeakened => {
+                f.write_str("repair quality floor must not be lower than the parent's")
+            }
             Self::RepairParentMissing => f.write_str("REPAIR requires parent_task_id"),
             Self::EmptyField { field } => write!(f, "{field} must not be empty"),
             Self::IntegerBelowMinimum {
