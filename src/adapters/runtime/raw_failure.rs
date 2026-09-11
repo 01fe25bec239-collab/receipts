@@ -21,6 +21,10 @@ use crate::{
 /// Fixed-size tags carry no payload and grant no authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RawFailureSource {
+    ClaudeTask,
+    ClaudeLiveStart,
+    ClaudeProtocol,
+    ClaudeAuthStatus,
     /// One-shot task execution.
     CodexTask,
     /// Capability probing, with the original probe kind where available.
@@ -42,6 +46,8 @@ pub enum RawFailureSource {
 /// No variant authorizes execution, routing or acceptance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RawFailureEvidence {
+    /// Claude protocol availability only, never an inferred InvalidOutput class.
+    ClaudeProtocol(crate::ClaudeStreamJsonError),
     /// Shared task request rejected an empty prompt.
     EmptyPrompt,
     /// Scalar startup-terminal evidence; captured streams are deliberately omitted.
@@ -241,5 +247,54 @@ impl From<&CodexLiveProtocolError> for RawFailure {
             RawFailureSource::CodexLiveProtocol,
             RawFailureEvidence::Protocol(*error),
         )
+    }
+}
+
+impl From<&crate::ClaudeTaskExecutionError> for RawFailure {
+    fn from(error: &crate::ClaudeTaskExecutionError) -> Self {
+        let mut failure = Self::from(&error.0);
+        failure.source = RawFailureSource::ClaudeTask;
+        failure
+    }
+}
+
+impl From<&crate::ClaudeLiveStartError> for RawFailure {
+    fn from(error: &crate::ClaudeLiveStartError) -> Self {
+        let mut failure = match error {
+            crate::ClaudeLiveStartError::Request(error) => Self::from(error),
+            crate::ClaudeLiveStartError::Workspace(error) => Self::from(error),
+        };
+        failure.source = RawFailureSource::ClaudeLiveStart;
+        failure
+    }
+}
+
+impl From<&crate::ClaudeStreamJsonError> for RawFailure {
+    fn from(error: &crate::ClaudeStreamJsonError) -> Self {
+        Self::unknown(
+            RawFailureSource::ClaudeProtocol,
+            RawFailureEvidence::ClaudeProtocol(*error),
+        )
+    }
+}
+
+impl From<&crate::ClaudeAuthStatusError> for RawFailure {
+    fn from(error: &crate::ClaudeAuthStatusError) -> Self {
+        let mut failure = match error {
+            crate::ClaudeAuthStatusError::Workspace(error) => Self::from(error),
+            crate::ClaudeAuthStatusError::TimedOut(termination) => {
+                let mut failure = Self::unknown(
+                    RawFailureSource::ClaudeAuthStatus,
+                    RawFailureEvidence::TimedOut(*termination),
+                );
+                // Publicly constructible errors must not let Completed inject Timeout.
+                if termination.is_timed_out() {
+                    failure.class = FailureClass::Timeout;
+                }
+                failure
+            }
+        };
+        failure.source = RawFailureSource::ClaudeAuthStatus;
+        failure
     }
 }

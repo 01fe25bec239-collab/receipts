@@ -249,24 +249,22 @@ pub fn interpret_codex_jsonl(
 /// Single parser core for complete one-shot stdout and bounded live observations.
 pub(crate) fn interpret_stdout(stdout: &[u8]) -> Result<CodexJsonlProtocol<'_>, CodexJsonlError> {
     let mut events = Vec::new();
-    for (index, raw_record) in stdout.split_inclusive(|b| *b == b'\n').enumerate() {
-        let error = |kind| CodexJsonlError {
-            line: index + 1,
-            kind,
-        };
-        let text =
-            std::str::from_utf8(raw_record).map_err(|_| error(CodexJsonlErrorKind::InvalidUtf8))?;
-        let value: Value = serde_json::from_str(text).map_err(|e| {
-            error(if e.is_eof() {
-                CodexJsonlErrorKind::IncompleteJson
-            } else {
-                CodexJsonlErrorKind::InvalidJson
-            })
+    for record in crate::jsonl::records(stdout) {
+        let record = record.map_err(|e| CodexJsonlError {
+            line: e.line,
+            kind: match e.kind {
+                crate::jsonl::JsonlErrorKind::InvalidUtf8 => CodexJsonlErrorKind::InvalidUtf8,
+                crate::jsonl::JsonlErrorKind::InvalidJson => CodexJsonlErrorKind::InvalidJson,
+                crate::jsonl::JsonlErrorKind::IncompleteJson => CodexJsonlErrorKind::IncompleteJson,
+            },
         })?;
-        let kind =
-            event_kind(&value).ok_or_else(|| error(CodexJsonlErrorKind::InvalidEventShape))?;
+        let value = record.value;
+        let kind = event_kind(&value).ok_or(CodexJsonlError {
+            line: record.line,
+            kind: CodexJsonlErrorKind::InvalidEventShape,
+        })?;
         events.push(CodexJsonlEvent {
-            raw_record,
+            raw_record: record.raw,
             value,
             kind,
         });
