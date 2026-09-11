@@ -54,6 +54,45 @@ impl From<ExecutionError> for LiveProcessAttemptError {
     }
 }
 
+/// Start failure is distinct from collection of an already-created attempt.
+#[non_exhaustive]
+pub enum LiveProcessStartError {
+    Execution(ExecutionError),
+    TerminalBeforeReady(Box<LiveProcessOutcome>),
+    ControllerFailed,
+}
+impl fmt::Debug for LiveProcessStartError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Execution(error) => f
+                .debug_tuple("Execution")
+                .field(&std::mem::discriminant(error))
+                .finish(),
+            Self::ControllerFailed => f.write_str("ControllerFailed"),
+            Self::TerminalBeforeReady(outcome) => f
+                .debug_struct("TerminalBeforeReady")
+                .field("terminal_cause", &outcome.terminal_cause())
+                .field("forced_kill_required", &outcome.forced_kill_required())
+                .field("process_success", &outcome.success())
+                .field("exit_code", &outcome.exit_code())
+                .field("stdout_bytes", &outcome.stdout().total_bytes())
+                .field("stderr_bytes", &outcome.stderr().total_bytes())
+                .finish(),
+        }
+    }
+}
+impl fmt::Display for LiveProcessStartError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+impl std::error::Error for LiveProcessStartError {}
+impl From<ExecutionError> for LiveProcessStartError {
+    fn from(error: ExecutionError) -> Self {
+        Self::Execution(error)
+    }
+}
+
 /// Separate bounded stream snapshots. Counts describe bytes drained at snapshot time;
 /// the two pipes have no shared byte ordering. Polling remains legal after collection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +160,7 @@ impl LiveProcessOutcome {
 struct Lifecycle {
     cause: Option<LiveProcessTerminalCause>,
     closed: bool,
+    ready: bool,
 }
 impl Lifecycle {
     fn claim(&mut self, cause: LiveProcessTerminalCause) -> bool {
@@ -208,10 +248,14 @@ fn snapshot(stdout: &Retention, stderr: &Retention) -> Result<LiveProcessOutput,
 
 /// Validates and starts a real attempt with explicit orchestrator-owned timeout and grace.
 /// No default timeout, shell, inherited environment, or process-control authority is added.
+/// Closed stdin retains immediate startup. Bytes require exact initial delivery,
+/// successful close, and a READY commit under the terminal-claim mutex. If a
+/// terminal cause wins first, bounded cleanup completes before returning
+/// `LiveProcessStartError::TerminalBeforeReady`; no attempt handle escapes.
 pub fn start_live_process_attempt(
     request: &ProcessRunRequest,
     policy: &ProcessTimeoutPolicy,
-) -> Result<LiveProcessAttempt, LiveProcessAttemptError> {
+) -> Result<LiveProcessAttempt, LiveProcessStartError> {
     #[cfg(unix)]
     {
         platform::start(request, policy)
@@ -247,6 +291,9 @@ thread_local! {
     pub(super) static READER_EOF_GATES: std::cell::RefCell<Vec<(&'static str, TestGate)>> = const { std::cell::RefCell::new(Vec::new()) };
     pub(super) static EOF_OBSERVATION: std::cell::RefCell<Option<ReaderObservation>> = const { std::cell::RefCell::new(None) };
     pub(super) static CONTROLLER_FAULTS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    pub(super) static START_CONTROLLER_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static AFTER_START_FAILURE: std::cell::RefCell<Option<TestGate>> = const { std::cell::RefCell::new(None) };
+    pub(super) static BEFORE_READY: std::cell::RefCell<Option<TestGate>> = const { std::cell::RefCell::new(None) };
     pub(super) static BEFORE_MONITOR: std::cell::RefCell<Option<TestGate>> = const { std::cell::RefCell::new(None) };
     pub(super) static AFTER_CLAIM: std::cell::RefCell<Option<TestGate>> = const { std::cell::RefCell::new(None) };
 }
@@ -269,11 +316,12 @@ mod platform {
         child: Option<Child>,
         group: OwnedProcessGroup,
         readers: Vec<(&'static str, Reader)>,
+        stdin: super::super::stdin::StdinDelivery,
     }
     impl Resources {
-        fn cleanup(&mut self) -> Result<(), ExecutionError> {
+        fn cleanup(&mut self, primary: Option<&ExecutionError>) -> Result<(), ExecutionError> {
             if let Some(child) = self.child.take() {
-                runner::cleanup_owned_attempt(child, self.group)?;
+                runner::cleanup_owned_attempt(child, self.group, primary)?;
             }
             Ok(())
         }
@@ -316,7 +364,7 @@ mod platform {
     }
     impl Drop for Resources {
         fn drop(&mut self) {
-            let _ = self.cleanup();
+            let _ = self.cleanup(None);
             let _ = self.join_readers();
         }
     }
@@ -375,8 +423,11 @@ mod platform {
         command: &mut Command,
         stdout: Retention,
         stderr: Retention,
+        stdin: super::super::stdin::StdinDelivery,
     ) -> Result<Resources, ExecutionError> {
         let child = command.spawn().map_err(runner::spawn_failed)?;
+        command.stdin(Stdio::null()); // Release the parent's stdin read end.
+
         let Some(group) = runner::owned_process_group(child.id()) else {
             return Err(runner::process_group_ownership_failed(child));
         };
@@ -384,6 +435,7 @@ mod platform {
             child: Some(child),
             group,
             readers: Vec::with_capacity(2),
+            stdin,
         };
         let setup = (|| {
             let child = resources.child.as_mut().unwrap();
@@ -410,7 +462,7 @@ mod platform {
             Ok(())
         })();
         if let Err(error) = setup {
-            resources.cleanup()?;
+            resources.cleanup(Some(&error))?;
             resources.join_readers()?;
             return Err(error);
         }
@@ -420,7 +472,7 @@ mod platform {
     pub(super) fn start(
         request: &ProcessRunRequest,
         policy: &ProcessTimeoutPolicy,
-    ) -> Result<LiveProcessAttempt, LiveProcessAttemptError> {
+    ) -> Result<LiveProcessAttempt, LiveProcessStartError> {
         runner::ensure_timeout_platform_supported()?;
         let deadline = runner::validated_run_deadline(policy)?;
         let executable = runner::validated_executable(request.executable())?;
@@ -433,12 +485,20 @@ mod platform {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0);
+        let stdin = super::super::stdin::StdinDelivery::prepare(&mut command, request.stdin())?;
+        let closed_stdin = matches!(request.stdin(), super::super::ProcessStdin::Closed);
         let lifecycle = Arc::new(Mutex::new(Lifecycle::default()));
         let (out, err, state, policy) =
             (stdout.clone(), stderr.clone(), lifecycle.clone(), *policy);
         let (ready, started) = std::sync::mpsc::sync_channel(1);
         #[cfg(test)]
         let before_monitor = BEFORE_MONITOR.take();
+        #[cfg(test)]
+        let before_ready = BEFORE_READY.take();
+        #[cfg(test)]
+        let after_start_failure = AFTER_START_FAILURE.take();
+        #[cfg(test)]
+        let startup_panic = START_CONTROLLER_PANIC.replace(false);
         #[cfg(test)]
         let faults = CONTROLLER_FAULTS.replace(0);
         #[cfg(test)]
@@ -453,28 +513,41 @@ mod platform {
                 #[cfg(test)]
                 AFTER_CLAIM.set(after_claim);
                 #[cfg(test)]
+                BEFORE_READY.set(before_ready);
+                #[cfg(test)]
                 READER_EOF_GATES.set(eof_gates);
                 #[cfg(test)]
                 EOF_OBSERVATION.set(eof_observation);
                 #[cfg(test)]
                 let _faults = runner::inject_capture_test_faults(faults);
                 let _closed = CloseLifecycle(state.clone());
-                let mut resources = match setup(&mut command, out.clone(), err.clone()) {
+                let mut resources = match setup(&mut command, out.clone(), err.clone(), stdin) {
                     Ok(resources) => resources,
                     Err(error) => {
                         let _ = ready.send(false);
                         return Err(error);
                     }
                 };
-                let _ = ready.send(true);
+                if closed_stdin {
+                    lock(&state).ready = true;
+                    let _ = ready.send(true);
+                }
                 #[cfg(test)]
                 if let Some(gate) = before_monitor {
                     gate.wait();
                 }
-                let result = monitor(&mut resources, &state, deadline, &policy);
+                #[cfg(test)]
+                assert!(!startup_panic, "injected startup controller failure");
+                let result = monitor(&mut resources, &state, deadline, &policy, &ready);
                 lock(&state).closed = true;
+                #[cfg(test)]
+                if result.is_err()
+                    && let Some(gate) = after_start_failure
+                {
+                    gate.wait();
+                }
                 // Control errors outrank capture errors. Never signal after a completed reap.
-                let cleanup = resources.cleanup();
+                let cleanup = resources.cleanup(result.as_ref().err());
                 let readers = resources.join_readers();
                 cleanup?;
                 let (termination, exit_code) = result?;
@@ -497,7 +570,10 @@ mod platform {
             }),
             _ => match controller.join() {
                 Ok(Err(error)) => Err(error.into()),
-                _ => Err(LiveProcessAttemptError::ControllerFailed),
+                Ok(Ok(outcome)) => Err(LiveProcessStartError::TerminalBeforeReady(Box::new(
+                    outcome,
+                ))),
+                Err(_) => Err(LiveProcessStartError::ControllerFailed),
             },
         }
     }
@@ -507,6 +583,7 @@ mod platform {
         lifecycle: &Mutex<Lifecycle>,
         deadline: Instant,
         policy: &ProcessTimeoutPolicy,
+        ready: &std::sync::mpsc::SyncSender<bool>,
     ) -> Result<(TerminalEvidence, Option<i32>), ExecutionError> {
         loop {
             let mut state = lock(lifecycle);
@@ -544,7 +621,7 @@ mod platform {
                 match runner::try_complete_owned_child(
                     resources.child.as_mut().unwrap(),
                     resources.group,
-                    deadline,
+                    Some(deadline),
                 ) {
                     Ok(Some(status)) => {
                         resources.child.take(); // Already reaped; never signal this PGID again.
@@ -588,10 +665,40 @@ mod platform {
                         detail: runner::reader_panic_detail(panic.as_ref()),
                     })??;
             }
+            if !state.ready && resources.stdin.advance()? {
+                // Exact write and successful close precede READY, committed under
+                // the same mutex as every terminal claim. No handle exists yet.
+                #[cfg(test)]
+                if !ready_permitted_for_test() {
+                    drop(state);
+                    std::thread::sleep(POLL);
+                    continue;
+                }
+                state.ready = true;
+                let _ = ready.send(true);
+            }
             drop(state);
             std::thread::sleep(POLL.min(deadline.saturating_duration_since(Instant::now())));
         }
     }
+}
+
+#[cfg(test)]
+fn ready_permitted_for_test() -> bool {
+    BEFORE_READY.with_borrow_mut(|slot| {
+        let Some(gate) = slot else { return true };
+        let _ = gate.reached.try_send(());
+        match gate.release.try_recv() {
+            Ok(()) => {
+                *slot = None;
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                panic!("READY test gate disconnected")
+            }
+        }
+    })
 }
 
 #[cfg(test)]

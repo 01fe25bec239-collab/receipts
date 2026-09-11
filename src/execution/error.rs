@@ -17,6 +17,16 @@ use std::fmt;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ExecutionError {
+    /// The raw payload exceeded the admission bound; no child was spawned.
+    StdinPayloadTooLarge { len: usize, max: usize },
+    /// Creating the private physical pipe failed before spawn.
+    StdinPipeCreationFailed { kind: std::io::ErrorKind },
+    /// Nonblocking delivery could not be established before spawn.
+    StdinConfigurationFailed { kind: std::io::ErrorKind },
+    /// An actual nonblocking pipe write failed. No payload is retained.
+    StdinWriteFailed { kind: std::io::ErrorKind },
+    /// Complete delivery and close could not be proven.
+    StdinDeliveryFailed { kind: std::io::ErrorKind },
     /// The supplied executable path was not syntactically absolute.
     ///
     /// This runner never performs `PATH` lookups, so unqualified names
@@ -242,6 +252,17 @@ pub enum ExecutionError {
 impl fmt::Display for ExecutionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::StdinPayloadTooLarge { len, max } => {
+                write!(f, "stdin payload length {len} exceeds {max}")
+            }
+            Self::StdinPipeCreationFailed { kind } => {
+                write!(f, "stdin pipe creation failed: {kind:?}")
+            }
+            Self::StdinConfigurationFailed { kind } => {
+                write!(f, "stdin nonblocking configuration failed: {kind:?}")
+            }
+            Self::StdinWriteFailed { kind } => write!(f, "stdin write failed: {kind:?}"),
+            Self::StdinDeliveryFailed { kind } => write!(f, "stdin delivery failed: {kind:?}"),
             ExecutionError::ExecutablePathNotAbsolute { value } => write!(
                 f,
                 "executable path {value:?} is not absolute; this runner requires one explicit absolute executable and performs no PATH lookup"

@@ -6,8 +6,8 @@ use std::{error::Error, fmt};
 
 use receipts_workspace_execution::execution::{
     CapturedStream, ExecutionError, LiveProcessAttempt, LiveProcessAttemptError,
-    LiveProcessCancelAcceptance, LiveProcessOutcome, LiveProcessOutput, LiveProcessTerminalCause,
-    start_live_process_attempt,
+    LiveProcessCancelAcceptance, LiveProcessOutcome, LiveProcessOutput, LiveProcessStartError,
+    LiveProcessTerminalCause, start_live_process_attempt,
 };
 
 use crate::codex_jsonl::interpret_stdout;
@@ -23,7 +23,7 @@ pub enum CodexLiveStartError {
     /// Shared Codex request validation failed before launch.
     Request(CodexTaskExecutionError),
     /// The authoritative Workspace live start failed.
-    Workspace(LiveProcessAttemptError),
+    Workspace(LiveProcessStartError),
 }
 impl fmt::Display for CodexLiveStartError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
