@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_support::{TempDir, TestRepo, git};
+use std::ffi::OsStr;
 
 fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
@@ -113,21 +114,21 @@ fn candidate_validation_is_structural_not_pattern_grammar() {
 
 #[test]
 fn raw_nul_parser_is_strict_lossless_and_sorted() {
-    assert!(parse_paths(vec![]).unwrap().is_empty());
+    assert!(parse_bytes(vec![]).unwrap().is_empty());
     for raw in [b"a".as_slice(), b"a\0b", b"\0", b"a\0\0"] {
         assert!(matches!(
-            parse_paths(raw.to_vec()),
+            parse_bytes(raw.to_vec()),
             Err(WriteScopeVerificationError::MalformedGitOutput { .. })
         ));
     }
     assert!(
-        matches!(parse_paths(vec![b'a', 0xff, 0]), Err(WriteScopeVerificationError::InvalidUtf8Candidate { bytes }) if bytes == [b'a', 0xff])
+        matches!(parse_bytes(vec![b'a', 0xff, 0]), Err(WriteScopeVerificationError::InvalidUtf8Candidate { bytes }) if bytes == [b'a', 0xff])
     );
     assert!(
-        matches!(parse_paths(b"a\\b\0".to_vec()), Err(WriteScopeVerificationError::MalformedCandidatePath { path, .. }) if path == "a\\b")
+        matches!(parse_bytes(b"a\\b\0".to_vec()), Err(WriteScopeVerificationError::MalformedCandidatePath { path, .. }) if path == "a\\b")
     );
     assert_eq!(
-        parse_paths(b"z\0a\nb\0a b\0a\tb\0z\0".to_vec()).unwrap(),
+        parse_bytes(b"z\0a\nb\0a b\0a\tb\0z\0".to_vec()).unwrap(),
         strings(&["a\tb", "a\nb", "a b", "z"])
     );
 }
@@ -554,4 +555,169 @@ fn hostile_diff_config_cannot_hide_paths_or_invoke_helpers() {
         .status
         .success()
     );
+}
+
+#[test]
+fn write_scope_real_git_complete_raw_volume_below_exact_and_one_over() {
+    use crate::checkpoint_evidence_capture::GIT_EVIDENCE_LIMIT_BYTES;
+    let repo = TestRepo::new("scope-real-raw-bound");
+    let base = repo.head_sha();
+    let limit = GIT_EVIDENCE_LIMIT_BYTES as usize;
+    let count = limit / 241;
+    for i in 0..count {
+        std::fs::write(repo.path().join(format!("{i:08}{}", "x".repeat(232))), "x").unwrap();
+    }
+    let remainder = limit - count * 241;
+    assert!(remainder > 2);
+    let mut tail = "t".repeat(remainder - 2);
+    std::fs::write(repo.path().join(&tail), "x").unwrap();
+    for length in [limit - 1, limit, limit + 1] {
+        let candidate = commit_all(&repo);
+        let result = verify(&repo, &base, &candidate, &["**"], &[]);
+        if length <= limit {
+            let evidence = result.unwrap();
+            assert_eq!(evidence.verification(), WriteScopeVerificationStatus::Pass);
+            assert_eq!(
+                evidence
+                    .changed_paths()
+                    .iter()
+                    .map(|p| p.len() + 1)
+                    .sum::<usize>(),
+                length
+            );
+        } else {
+            assert!(matches!(
+                result,
+                Err(WriteScopeVerificationError::Evidence {
+                    operation: WriteScopeGitOperation::ChangedPaths,
+                    source: WorkspaceCheckpointEvidenceCaptureError::GitEvidenceTooLarge {
+                        total_bytes: 1_048_577,
+                        limit_bytes: 1_048_576,
+                        ..
+                    }
+                })
+            ));
+            // Policy filtering cannot rescue an oversized complete query.
+            assert!(matches!(
+                verify(&repo, &base, &candidate, &[], &["**"]),
+                Err(WriteScopeVerificationError::Evidence { .. })
+            ));
+        }
+        let next = format!("{tail}t");
+        std::fs::rename(repo.path().join(&tail), repo.path().join(&next)).unwrap();
+        tail = next;
+    }
+}
+
+#[test]
+fn write_scope_missing_promisor_objects_never_retrieve_or_mutate() {
+    let repo = TestRepo::new("scope-promisor");
+    let base = repo.head_sha();
+    let candidate = repo.commit_file("file", "x");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/repo", listener.local_addr().unwrap());
+    for (key, value) in [
+        ("remote.origin.url", url.as_str()),
+        ("remote.origin.promisor", "true"),
+        ("remote.origin.partialclonefilter", "blob:none"),
+        ("protocol.http.allow", "always"),
+    ] {
+        git(repo.path(), &["config", key, value]);
+    }
+    assert!(matches!(
+        verify(&repo, &base, &"0".repeat(40), &["**"], &[]),
+        Err(WriteScopeVerificationError::CommitUnavailable { .. })
+    ));
+    let tree =
+        crate::test_support::stdout_trimmed(&git(repo.path(), &["rev-parse", "HEAD^{tree}"]));
+    let object = repo
+        .path()
+        .join(".git/objects")
+        .join(&tree[..2])
+        .join(&tree[2..]);
+    std::fs::remove_file(&object).unwrap();
+    assert!(matches!(
+        verify(&repo, &base, &candidate, &["**"], &[]),
+        Err(WriteScopeVerificationError::GitCommandFailed {
+            operation: WriteScopeGitOperation::ChangedPaths,
+            ..
+        })
+    ));
+    assert!(!object.exists());
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn write_scope_gitlink_changes_are_explicit_even_with_ignore_all() {
+    let repo = TestRepo::new("scope-gitlink");
+    let first = repo.head_sha();
+    let second = repo.commit_file("file", "x");
+    git(
+        repo.path(),
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000",
+            &first,
+            "module",
+        ],
+    );
+    git(repo.path(), &["commit", "--quiet", "-m", "first gitlink"]);
+    let base = repo.head_sha();
+    git(
+        repo.path(),
+        &["update-index", "--cacheinfo", "160000", &second, "module"],
+    );
+    git(repo.path(), &["commit", "--quiet", "-m", "second gitlink"]);
+    git(repo.path(), &["config", "diff.ignoreSubmodules", "all"]);
+    let evidence = verify(&repo, &base, &repo.head_sha(), &["src/**"], &[]).unwrap();
+    assert_eq!(evidence.changed_paths(), ["module"]);
+    assert_eq!(evidence.unauthorized_paths(), ["module"]);
+}
+
+#[test]
+fn write_scope_failure_display_omits_raw_git_diagnostics() {
+    let error = WriteScopeVerificationError::GitCommandFailed {
+        operation: WriteScopeGitOperation::ChangedPaths,
+        status: Some(1),
+        stderr: b"secret-value".to_vec(),
+    };
+    assert!(!error.to_string().contains("secret-value"));
+    assert!(!error.to_string().contains("115, 101"));
+}
+
+fn parse_bytes(bytes: Vec<u8>) -> Result<Vec<String>, WriteScopeVerificationError> {
+    super::parse_paths(RawStream::test_evidence(&bytes, bytes.len() as u64, false))
+}
+
+#[test]
+fn write_scope_raw_bound_precedes_utf8_nul_and_deduplication() {
+    let limit = 1_048_576;
+    for length in [2, limit - 2, limit] {
+        assert_eq!(parse_bytes(b"p\0".repeat(length / 2)).unwrap(), ["p"]);
+    }
+    for length in [limit + 1, limit * 8] {
+        for record in [b"p\0".as_slice(), b"\xff\0", b"\0\0", b"xx"] {
+            let mut bytes = record.repeat(length / 2 + 1);
+            bytes.truncate(length);
+            assert!(
+                matches!(parse_bytes(bytes), Err(WriteScopeVerificationError::Evidence {
+                operation: WriteScopeGitOperation::ChangedPaths,
+                source: WorkspaceCheckpointEvidenceCaptureError::GitEvidenceTooLarge { total_bytes, limit_bytes: 1_048_576, .. }
+            }) if total_bytes == length as u64)
+            );
+        }
+    }
+    for (total, truncated) in [(2, true), (4, false)] {
+        let result = super::parse_paths(RawStream::test_evidence(b"p\0", total, truncated));
+        assert!(matches!(
+            result,
+            Err(WriteScopeVerificationError::Evidence { .. })
+        ));
+    }
 }

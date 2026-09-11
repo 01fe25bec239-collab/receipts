@@ -47,6 +47,7 @@
 //! path values. No remote operation is implemented: no credential handling,
 //! no fetch, no push, no remote publication, no force-push.
 
+pub mod attempt_finalization;
 pub mod checkpoint_capture_core;
 pub mod checkpoint_evidence_capture;
 pub mod checkpoint_evidence_vocabulary;
@@ -119,4 +120,9 @@ pub use teardown::WorkspaceTeardownRequest;
 pub use write_scope::{
     ForbiddenWriteMatch, WriteScopeGitOperation, WriteScopePatternSet, WriteScopeVerification,
     WriteScopeVerificationError, WriteScopeVerificationStatus, verify_write_scope,
+};
+
+pub use attempt_finalization::{
+    WorkspaceAttemptFinalizationError, WorkspaceAttemptFinalizationEvidence,
+    WorkspaceAttemptFinalizationRequest, finalize_workspace_attempt,
 };

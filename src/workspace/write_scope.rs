@@ -2,11 +2,13 @@
 //! Git path identities stay strict UTF-8 strings; no filesystem normalization
 //! or alternative glob dialect participates in matching.
 
-use std::ffi::OsStr;
 use std::path::Path;
-use std::process::Output;
 
-use crate::{CommitSha, WorkspaceError, git};
+use crate::checkpoint_evidence_capture::{RawStream, observe};
+use crate::{
+    CommitSha, WorkspaceCheckpointEvidenceCaptureError, WorkspaceCheckpointGitObservation,
+    WorkspaceError,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteScopeVerificationStatus {
@@ -88,6 +90,10 @@ pub enum WriteScopeGitOperation {
 /// Path and stderr evidence are retained without lossy decoding.
 #[derive(Debug)]
 pub enum WriteScopeVerificationError {
+    Evidence {
+        operation: WriteScopeGitOperation,
+        source: WorkspaceCheckpointEvidenceCaptureError,
+    },
     InvalidBaselineSha,
     InvalidCandidateSha,
     CommitUnavailable {
@@ -130,7 +136,18 @@ pub enum WriteScopeVerificationError {
 
 impl std::fmt::Display for WriteScopeVerificationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "write-scope verification error: {self:?}")
+        match self {
+            Self::Evidence { operation, source } => {
+                write!(f, "write-scope {operation:?}: {source}")
+            }
+            Self::CommitUnavailable { operation, .. } => {
+                write!(f, "write-scope {operation:?}: commit unavailable")
+            }
+            Self::GitCommandFailed {
+                operation, status, ..
+            } => write!(f, "write-scope {operation:?}: Git failed ({status:?})"),
+            _ => write!(f, "write-scope verification error: {self:?}"),
+        }
     }
 }
 impl std::error::Error for WriteScopeVerificationError {}
@@ -165,9 +182,6 @@ pub fn verify_write_scope(
         repository_root,
         operation,
         &[
-            "--no-pager",
-            "--no-replace-objects",
-            "--no-optional-locks",
             "diff",
             "--name-only",
             "-z",
@@ -181,14 +195,7 @@ pub fn verify_write_scope(
             "--",
         ],
     )?;
-    if !output.status.success() {
-        return Err(E::GitCommandFailed {
-            operation,
-            status: output.status.code(),
-            stderr: output.stderr,
-        });
-    }
-    let changed_paths = parse_paths(output.stdout)?;
+    let changed_paths = parse_paths(output)?;
     let mut unauthorized_paths = Vec::new();
     let mut forbidden_matches = Vec::new();
     for path in &changed_paths {
@@ -226,13 +233,21 @@ fn run_git(
     root: &Path,
     operation: WriteScopeGitOperation,
     args: &[&str],
-) -> Result<Output, WriteScopeVerificationError> {
-    let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
-    let mut command = git::prepared_command(root, "verify write scope", &args)
-        .map_err(|source| WriteScopeVerificationError::GitPreparation { operation, source })?;
-    command
-        .output()
-        .map_err(|source| WriteScopeVerificationError::GitExecution { operation, source })
+) -> Result<RawStream, WriteScopeVerificationError> {
+    use WorkspaceCheckpointEvidenceCaptureError as C;
+    use WriteScopeVerificationError as E;
+    // Reuse the private bounded collector; the outer operation is authoritative
+    // for write-scope diagnostics, without adding checkpoint vocabulary.
+    let observation = WorkspaceCheckpointGitObservation::StagedPaths;
+    observe(root, observation, args).map_err(|source| match source {
+        C::GitPreparation { source, .. } => E::GitPreparation { operation, source },
+        C::GitCommandFailed { status, stderr, .. } => E::GitCommandFailed {
+            operation,
+            status,
+            stderr,
+        },
+        source => E::Evidence { operation, source },
+    })
 }
 
 fn verify_commit(
@@ -240,30 +255,24 @@ fn verify_commit(
     sha: &CommitSha,
     operation: WriteScopeGitOperation,
 ) -> Result<(), WriteScopeVerificationError> {
-    // Inspect the exact object's type: peeling with ^{commit} alone would also
-    // admit an annotated tag object's SHA, which is not a commit identity.
-    let output = run_git(
-        root,
+    // Exact object type, never tag peeling.
+    let output = run_git(root, operation, &["cat-file", "-t", sha.as_str()])
+        .and_then(|raw| complete(raw, operation));
+    let (status, stdout, stderr) = match output {
+        Ok(stdout) if stdout == b"commit\n" => return Ok(()),
+        Ok(stdout) => (Some(0), stdout, vec![]),
+        Err(WriteScopeVerificationError::GitCommandFailed { status, stderr, .. }) => {
+            (status, vec![], stderr)
+        }
+        Err(error) => return Err(error),
+    };
+    Err(WriteScopeVerificationError::CommitUnavailable {
         operation,
-        &[
-            "--no-pager",
-            "--no-replace-objects",
-            "--no-optional-locks",
-            "cat-file",
-            "-t",
-            sha.as_str(),
-        ],
-    )?;
-    if !output.status.success() || output.stdout != b"commit\n" {
-        return Err(WriteScopeVerificationError::CommitUnavailable {
-            operation,
-            sha: sha.clone(),
-            status: output.status.code(),
-            stdout: output.stdout,
-            stderr: output.stderr,
-        });
-    }
-    Ok(())
+        sha: sha.clone(),
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn validate_structure(value: &str) -> Result<(), &'static str> {
@@ -284,8 +293,18 @@ fn validate_structure(value: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn parse_paths(bytes: Vec<u8>) -> Result<Vec<String>, WriteScopeVerificationError> {
+fn complete(
+    raw: RawStream,
+    operation: WriteScopeGitOperation,
+) -> Result<Vec<u8>, WriteScopeVerificationError> {
+    raw.require_complete(WorkspaceCheckpointGitObservation::StagedPaths)
+        .map_err(|source| WriteScopeVerificationError::Evidence { operation, source })
+}
+
+fn parse_paths(raw: RawStream) -> Result<Vec<String>, WriteScopeVerificationError> {
     use WriteScopeVerificationError as E;
+    // Complete raw query admission precedes decoding, framing, sorting and matching.
+    let bytes = complete(raw, WriteScopeGitOperation::ChangedPaths)?;
     if bytes.is_empty() {
         return Ok(Vec::new());
     }
