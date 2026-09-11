@@ -456,8 +456,8 @@ fn bound_zero_below_and_exact_limit_are_complete_valid_nul_data() {
     for length in [
         0,
         2,
-        STREAM_CAPTURE_LIMIT_BYTES as usize - 2,
-        STREAM_CAPTURE_LIMIT_BYTES as usize,
+        GIT_EVIDENCE_LIMIT_BYTES as usize - 2,
+        GIT_EVIDENCE_LIMIT_BYTES as usize,
     ] {
         let bytes = b"p\0".repeat(length / 2);
         assert_eq!(bytes.len(), length);
@@ -474,16 +474,13 @@ fn bound_zero_below_and_exact_limit_are_complete_valid_nul_data() {
 fn assert_oversize(result: Result<Vec<String>, E>, observation: Observation, total: u64) {
     assert!(
         matches!(result, Err(E::GitEvidenceTooLarge { observation: actual, total_bytes, limit_bytes })
-        if actual == observation && total_bytes == total && limit_bytes == STREAM_CAPTURE_LIMIT_BYTES)
+        if actual == observation && total_bytes == total && limit_bytes == GIT_EVIDENCE_LIMIT_BYTES)
     );
 }
 
 #[test]
 fn bound_one_over_and_much_larger_are_deterministic_typed_failures() {
-    for length in [
-        STREAM_CAPTURE_LIMIT_BYTES + 1,
-        STREAM_CAPTURE_LIMIT_BYTES * 8,
-    ] {
+    for length in [GIT_EVIDENCE_LIMIT_BYTES + 1, GIT_EVIDENCE_LIMIT_BYTES * 8] {
         let retained = drain(
             io::repeat(b'x').take(length),
             RawStream::new(Observation::UntrackedPaths).unwrap(),
@@ -491,7 +488,7 @@ fn bound_one_over_and_much_larger_are_deterministic_typed_failures() {
             Stream::Stdout,
         )
         .unwrap();
-        assert_eq!(retained.bytes.len() as u64, STREAM_CAPTURE_LIMIT_BYTES);
+        assert_eq!(retained.bytes.len() as u64, GIT_EVIDENCE_LIMIT_BYTES);
         assert_eq!(retained.total_bytes, length);
         assert!(retained.truncated);
         assert_oversize(
@@ -505,7 +502,7 @@ fn bound_one_over_and_much_larger_are_deterministic_typed_failures() {
 #[test]
 fn bound_precedes_decode_framing_filtering_and_deduplication() {
     for record in [b"p\0".as_slice(), b"\0\0", b"\xff\0"] {
-        let bytes = record.repeat(STREAM_CAPTURE_LIMIT_BYTES as usize / 2 + 1);
+        let bytes = record.repeat(GIT_EVIDENCE_LIMIT_BYTES as usize / 2 + 1);
         assert_oversize(
             paths(&bytes),
             Observation::UntrackedPaths,
@@ -518,8 +515,8 @@ fn bound_precedes_decode_framing_filtering_and_deduplication() {
 fn bound_truncated_head_tail_or_partial_retention_never_parses() {
     for (total_bytes, truncated) in [
         (4, true),
-        (STREAM_CAPTURE_LIMIT_BYTES + 1, false),
-        (STREAM_CAPTURE_LIMIT_BYTES + 1, true),
+        (GIT_EVIDENCE_LIMIT_BYTES + 1, false),
+        (GIT_EVIDENCE_LIMIT_BYTES + 1, true),
     ] {
         // Inject a plausible retained head+tail that itself is valid NUL data.
         let retained = RawStream {
@@ -642,7 +639,7 @@ fn bound_real_git_untracked_staged_and_unstaged_each_fail_closed() {
     let repo = TestRepo::new("checkpoint-real-overflow");
     // Each actual filename is 240 bytes, plus its NUL. A fixed query must fail;
     // splitting this set into pages would wrongly make this test succeed.
-    let count = STREAM_CAPTURE_LIMIT_BYTES as usize / 241 + 1;
+    let count = GIT_EVIDENCE_LIMIT_BYTES as usize / 241 + 1;
     let names: Vec<_> = (0..count)
         .map(|i| format!("{i:08}{}", "x".repeat(232)))
         .collect();
@@ -664,7 +661,7 @@ fn bound_real_git_untracked_staged_and_unstaged_each_fail_closed() {
         };
         assert!(
             matches!(result, Err(E::GitEvidenceTooLarge { observation: actual, total_bytes, limit_bytes })
-            if actual == expected && total_bytes == total as u64 && limit_bytes == STREAM_CAPTURE_LIMIT_BYTES)
+            if actual == expected && total_bytes == total as u64 && limit_bytes == GIT_EVIDENCE_LIMIT_BYTES)
         );
         match observation {
             Observation::UntrackedPaths => {
@@ -689,7 +686,7 @@ fn bound_real_git_large_stderr_is_separate_and_does_not_deadlock() {
     let repo = TestRepo::new("checkpoint-stderr-bound");
     // Git's unknown-command diagnostic is sourced from an on-disk alias key,
     // avoiding OS argv limits. Invalid config itself generates long stderr.
-    let invalid = "x".repeat(STREAM_CAPTURE_LIMIT_BYTES as usize * 2);
+    let invalid = "x".repeat(GIT_EVIDENCE_LIMIT_BYTES as usize * 2);
     fs::write(
         repo.path().join(".git/config"),
         format!("[invalid{invalid}\n"),
@@ -703,11 +700,11 @@ fn bound_real_git_large_stderr_is_separate_and_does_not_deadlock() {
             stderr_truncated,
             ..
         } => {
-            assert!(stderr.len() as u64 <= STREAM_CAPTURE_LIMIT_BYTES);
+            assert!(stderr.len() as u64 <= GIT_EVIDENCE_LIMIT_BYTES);
             assert!(stderr_total_bytes > 0);
             assert_eq!(
                 stderr_truncated,
-                stderr_total_bytes > STREAM_CAPTURE_LIMIT_BYTES
+                stderr_total_bytes > GIT_EVIDENCE_LIMIT_BYTES
             );
         }
         other => panic!("unexpected: {other:?}"),
@@ -716,14 +713,14 @@ fn bound_real_git_large_stderr_is_separate_and_does_not_deadlock() {
     // Git versions differ in how much invalid config they print.
     for stream in [Stream::Stdout, Stream::Stderr] {
         let retained = drain(
-            io::repeat(0xff).take(STREAM_CAPTURE_LIMIT_BYTES * 2),
+            io::repeat(0xff).take(GIT_EVIDENCE_LIMIT_BYTES * 2),
             RawStream::new(Observation::Head).unwrap(),
             Observation::Head,
             stream,
         )
         .unwrap();
-        assert_eq!(retained.bytes.len() as u64, STREAM_CAPTURE_LIMIT_BYTES);
-        assert_eq!(retained.total_bytes, STREAM_CAPTURE_LIMIT_BYTES * 2);
+        assert_eq!(retained.bytes.len() as u64, GIT_EVIDENCE_LIMIT_BYTES);
+        assert_eq!(retained.total_bytes, GIT_EVIDENCE_LIMIT_BYTES * 2);
         assert!(retained.truncated);
     }
 }
@@ -859,12 +856,12 @@ fn tracked_status_parser_preserves_raw_names_and_rejects_unexpected_formats() {
 
 #[test]
 fn tracked_status_bound_precedes_prefix_removal_and_deduplication() {
-    let exact = b" M p\0".repeat(STREAM_CAPTURE_LIMIT_BYTES as usize / 5);
+    let exact = b" M p\0".repeat(GIT_EVIDENCE_LIMIT_BYTES as usize / 5);
     let mut exact = exact;
     // Add the remainder to the final path, preserving complete framing.
-    let remainder = STREAM_CAPTURE_LIMIT_BYTES as usize - exact.len();
+    let remainder = GIT_EVIDENCE_LIMIT_BYTES as usize - exact.len();
     exact.splice(exact.len() - 1..exact.len() - 1, vec![b'x'; remainder]);
-    assert_eq!(exact.len() as u64, STREAM_CAPTURE_LIMIT_BYTES);
+    assert_eq!(exact.len() as u64, GIT_EVIDENCE_LIMIT_BYTES);
     assert!(parse_tracked_status(raw(&exact)).is_ok());
     exact.insert(exact.len() - 1, b'x');
     assert!(matches!(
@@ -876,7 +873,7 @@ fn tracked_status_bound_precedes_prefix_removal_and_deduplication() {
     ));
     // Even though deduplication or stripping XY would make it fit, the raw
     // stream is oversized and cannot be admitted.
-    let duplicate = b" M p\0".repeat(STREAM_CAPTURE_LIMIT_BYTES as usize / 5 + 1);
+    let duplicate = b" M p\0".repeat(GIT_EVIDENCE_LIMIT_BYTES as usize / 5 + 1);
     assert!(matches!(
         parse_tracked_status(raw(&duplicate)),
         Err(E::GitEvidenceTooLarge { .. })
@@ -931,5 +928,67 @@ fn configured_filters_fail_closed_without_executing_them() {
             Err(E::UnsupportedConfiguredFilters)
         ));
         assert_eq!(snapshot(repo.path()), before);
+    }
+}
+
+#[test]
+#[ignore = "subprocess fixture for the shared Git pipe collector"]
+fn bounded_collector_dual_pipe_probe() {
+    use std::io::Write;
+    let writer = std::thread::spawn(|| {
+        let mut stderr = io::stderr().lock();
+        for _ in 0..512 {
+            stderr.write_all(&[b'e'; 8192]).unwrap();
+        }
+    });
+    let mut stdout = io::stdout().lock();
+    for _ in 0..512 {
+        stdout.write_all(&[b'o'; 8192]).unwrap();
+    }
+    drop(stdout);
+    writer.join().unwrap();
+    if std::env::var_os("COLLECTOR_PROBE_FAIL").is_some() {
+        std::process::exit(17);
+    }
+}
+
+#[test]
+fn bound_shared_collector_drains_large_stdout_and_stderr_and_reaps() {
+    for fail in [false, true] {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.env_clear().args([
+            "checkpoint_evidence_capture::tests::bounded_collector_dual_pipe_probe",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ]);
+        if fail {
+            command.env("COLLECTOR_PROBE_FAIL", "1");
+        }
+        let result = collect_git(command, Observation::StagedPaths);
+        if fail {
+            let E::GitCommandFailed {
+                status,
+                stderr,
+                stderr_total_bytes,
+                stderr_truncated,
+                ..
+            } = result.unwrap_err()
+            else {
+                panic!("unexpected collector failure")
+            };
+            assert_eq!(status, Some(17));
+            assert_eq!(stderr.len() as u64, GIT_EVIDENCE_LIMIT_BYTES);
+            assert_eq!(stderr_total_bytes, 4 * GIT_EVIDENCE_LIMIT_BYTES);
+            assert!(stderr_truncated);
+        } else {
+            let raw = result.unwrap();
+            assert_eq!(raw.bytes.len() as u64, GIT_EVIDENCE_LIMIT_BYTES);
+            assert!(raw.total_bytes >= 4 * GIT_EVIDENCE_LIMIT_BYTES);
+            assert!(matches!(
+                raw.require_complete(Observation::StagedPaths),
+                Err(E::GitEvidenceTooLarge { .. })
+            ));
+        }
     }
 }

@@ -5,7 +5,8 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use crate::execution::STREAM_CAPTURE_LIMIT_BYTES;
+/// Complete raw Git evidence limit, independent of process stdin policy.
+pub(crate) const GIT_EVIDENCE_LIMIT_BYTES: u64 = 1_048_576;
 use crate::{
     CommitSha, WorkspaceCheckpointCaptureCore, WorkspaceCheckpointCaptureCoreError,
     WorkspaceCheckpointExecutedCheckCore, WorkspaceCheckpointKind, WorkspaceCheckpointRef,
@@ -154,46 +155,7 @@ pub fn capture_workspace_checkpoint_evidence(
         &["rev-parse", "--verify", "HEAD^{commit}"],
     )?;
     let head_sha = parse_head(head)?;
-    reject_configured_filters(&root)?;
-    // Porcelain diff can persist a stat refresh even with optional locks off.
-    // Status computes accurate content status in memory; optional locks off
-    // suppresses its index write. Untracked evidence remains a separate fixed
-    // ls-files query, preserving full untracked names and ignored semantics.
-    let mut modified_files = parse_tracked_status(observe(
-        &root,
-        Observation::TrackedStatus,
-        &[
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=no",
-            "--ignored=no",
-            "--no-renames",
-            "--ignore-submodules=none",
-            "--no-branch",
-            "--no-show-stash",
-            "--",
-        ],
-    )?)?;
-    let mut untracked_files = parse_paths(
-        observe(
-            &root,
-            Observation::UntrackedPaths,
-            &[
-                "ls-files",
-                "--others",
-                "--exclude-standard",
-                "--full-name",
-                "-z",
-                "--",
-            ],
-        )?,
-        Observation::UntrackedPaths,
-    )?;
-    modified_files.sort();
-    modified_files.dedup();
-    untracked_files.sort();
-    untracked_files.dedup();
+    let (modified_files, untracked_files) = observe_state(&root)?;
     WorkspaceCheckpointCaptureCore::new(
         request.checkpoint_id,
         request.workspace_id,
@@ -212,9 +174,52 @@ pub fn capture_workspace_checkpoint_evidence(
     .map_err(E::Core)
 }
 
-// Execution's retention module is private and its runner cannot take a prepared
-// Git Command. This Git-only prefix retention drains through EOF and shares the
-// public Execution limit; truncated bytes never enter the path parser.
+/// Fresh bounded Git-visible state; ignored files are outside this contract.
+pub(crate) fn observe_state(root: &Path) -> Result<(Vec<String>, Vec<String>), E> {
+    reject_configured_filters(root)?;
+    // Porcelain diff can persist a stat refresh even with optional locks off.
+    // Status computes accurate content status in memory; optional locks off
+    // suppresses its index write. Untracked evidence remains a separate fixed
+    // ls-files query, preserving full untracked names and ignored semantics.
+    let mut modified_files = parse_tracked_status(observe(
+        root,
+        Observation::TrackedStatus,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=no",
+            "--ignored=no",
+            "--no-renames",
+            "--ignore-submodules=none",
+            "--no-branch",
+            "--no-show-stash",
+            "--",
+        ],
+    )?)?;
+    let mut untracked_files = parse_paths(
+        observe(
+            root,
+            Observation::UntrackedPaths,
+            &[
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "--full-name",
+                "-z",
+                "--",
+            ],
+        )?,
+        Observation::UntrackedPaths,
+    )?;
+    modified_files.sort();
+    modified_files.dedup();
+    untracked_files.sort();
+    untracked_files.dedup();
+    Ok((modified_files, untracked_files))
+}
+
+// Git-only retention drains through EOF; truncated bytes never enter parsers.
 #[derive(Debug)]
 pub(crate) struct RawStream {
     bytes: Vec<u8>,
@@ -223,10 +228,19 @@ pub(crate) struct RawStream {
 }
 
 impl RawStream {
+    #[cfg(test)]
+    pub(crate) fn test_evidence(bytes: &[u8], total_bytes: u64, truncated: bool) -> Self {
+        Self {
+            bytes: bytes.to_vec(),
+            total_bytes,
+            truncated,
+        }
+    }
+
     fn new(observation: Observation) -> Result<Self, E> {
         let mut bytes = Vec::new();
         bytes
-            .try_reserve_exact(STREAM_CAPTURE_LIMIT_BYTES as usize)
+            .try_reserve_exact(GIT_EVIDENCE_LIMIT_BYTES as usize)
             .map_err(|source| E::StreamAllocation {
                 observation,
                 source,
@@ -250,18 +264,18 @@ impl RawStream {
                 })?;
         let take = chunk
             .len()
-            .min(STREAM_CAPTURE_LIMIT_BYTES as usize - self.bytes.len());
+            .min(GIT_EVIDENCE_LIMIT_BYTES as usize - self.bytes.len());
         self.bytes.extend_from_slice(&chunk[..take]);
-        self.truncated = self.total_bytes > STREAM_CAPTURE_LIMIT_BYTES;
+        self.truncated = self.total_bytes > GIT_EVIDENCE_LIMIT_BYTES;
         Ok(())
     }
 
     pub(crate) fn require_complete(self, observation: Observation) -> Result<Vec<u8>, E> {
-        if self.truncated || self.total_bytes > STREAM_CAPTURE_LIMIT_BYTES {
+        if self.truncated || self.total_bytes > GIT_EVIDENCE_LIMIT_BYTES {
             return Err(E::GitEvidenceTooLarge {
                 observation,
                 total_bytes: self.total_bytes,
-                limit_bytes: STREAM_CAPTURE_LIMIT_BYTES,
+                limit_bytes: GIT_EVIDENCE_LIMIT_BYTES,
             });
         }
         if self.total_bytes != self.bytes.len() as u64 {
@@ -322,13 +336,20 @@ pub(crate) fn observe(
     .chain(args)
     .map(OsStr::new)
     .collect();
-    let mut command =
+    let command =
         git::prepared_command(root, "capture checkpoint evidence", &args).map_err(|source| {
             E::GitPreparation {
                 observation,
                 source,
             }
         })?;
+    collect_git(command, observation)
+}
+
+fn collect_git(
+    mut command: std::process::Command,
+    observation: Observation,
+) -> Result<RawStream, E> {
     let stdout_retention = RawStream::new(observation)?;
     let stderr_retention = RawStream::new(observation)?;
     let mut child = command
