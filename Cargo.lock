@@ -318,6 +318,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "receipts-runtime-bindings"
+version = "0.1.0"
+dependencies = [
+ "receipts-orchestration",
+ "receipts-review-integration",
+]
+
+[[package]]
 name = "receipts-state"
 version = "0.1.0"
 dependencies = [
