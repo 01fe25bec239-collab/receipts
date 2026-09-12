@@ -301,6 +301,9 @@ version = "0.1.0"
 [[package]]
 name = "receipts-orchestration"
 version = "0.1.0"
+dependencies = [
+ "receipts-workspace-execution",
+]
 
 [[package]]
 name = "receipts-review-integration"
