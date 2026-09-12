@@ -8,6 +8,7 @@ use crate::edge::{ControlKind, EdgeClass, GraphEdge, PrecedenceKind};
 use crate::error::GraphError;
 use crate::execution_graph::ExecutionGraph;
 use crate::node::{CapabilityName, GraphNode, GraphNodeKind};
+use crate::node_state::GraphNodeState;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -15,7 +16,13 @@ use crate::node::{CapabilityName, GraphNode, GraphNodeKind};
 
 /// Creates a plain node of an arbitrary kind with no required capabilities.
 fn task(node_id: &str) -> GraphNode {
-    GraphNode::new(node_id, GraphNodeKind::TASK, Vec::new()).expect("valid fixture node")
+    GraphNode::new(
+        node_id,
+        GraphNodeKind::TASK,
+        GraphNodeState::Planned,
+        Vec::new(),
+    )
+    .expect("valid fixture node")
 }
 
 fn prec(edge_id: &str, from: &str, to: &str) -> GraphEdge {
@@ -66,6 +73,115 @@ fn cycle_error(
             .map(|id| (*id).to_owned())
             .collect(),
     }
+}
+
+#[test]
+fn all_node_states_are_stored_and_read_exactly() {
+    let mut incremental = ExecutionGraph::new("states").unwrap();
+    let mut nodes = Vec::new();
+    for state in GraphNodeState::ALL {
+        let node = GraphNode::new(state.as_str(), GraphNodeKind::TASK, state, vec![]).unwrap();
+        assert_eq!(node.state(), state);
+        let cloned = node.clone();
+        assert_eq!(cloned, node);
+        assert_eq!(cloned.state(), state);
+        incremental.add_node(cloned).unwrap();
+        assert_eq!(incremental.node_state(node.node_id()), Some(state));
+        nodes.push(node);
+    }
+    let batched = ExecutionGraph::from_parts("states", nodes.clone(), vec![]).unwrap();
+    assert_eq!(batched, incremental);
+    let cloned = batched.clone();
+    assert_eq!(cloned, batched);
+    for graph in [&incremental, &batched, &cloned] {
+        for node in &nodes {
+            assert_eq!(graph.node(node.node_id()), Some(node));
+            assert_eq!(graph.node_state(node.node_id()), Some(node.state()));
+        }
+        for _ in 0..3 {
+            assert_eq!(graph.node_state("unknown"), None);
+            assert_eq!(graph.node_state(""), None);
+        }
+    }
+    let planned =
+        GraphNode::new("same", GraphNodeKind::TASK, GraphNodeState::Planned, vec![]).unwrap();
+    let ready = GraphNode::new("same", GraphNodeKind::TASK, GraphNodeState::Ready, vec![]).unwrap();
+    assert_ne!(planned, ready, "node equality includes stored state");
+    assert_ne!(
+        ExecutionGraph::from_parts("same", vec![planned], vec![]).unwrap(),
+        ExecutionGraph::from_parts("same", vec![ready], vec![]).unwrap(),
+        "graph equality includes stored state"
+    );
+}
+
+#[test]
+fn structural_operations_preserve_live_node_states() {
+    let nodes: Vec<_> = [
+        ("a", GraphNodeState::Ready),
+        ("b", GraphNodeState::Accepted),
+        ("c", GraphNodeState::Integrated),
+    ]
+    .into_iter()
+    .map(|(id, state)| GraphNode::new(id, GraphNodeKind::TASK, state, vec![]).unwrap())
+    .collect();
+    let edges = vec![
+        prec("p_a_b", "a", "b"),
+        ctrl("c_b_a", "b", "a", ControlKind::OnPass),
+    ];
+    let mut graph = ExecutionGraph::from_parts("structural", nodes.clone(), edges.clone()).unwrap();
+    let assert_states = |graph: &ExecutionGraph| {
+        for node in &nodes {
+            assert_eq!(graph.node(node.node_id()), Some(node));
+            assert_eq!(graph.node_state(node.node_id()), Some(node.state()));
+        }
+        assert_eq!(graph.nodes().cloned().collect::<Vec<_>>(), nodes);
+    };
+    assert_states(&graph);
+    for edge in [
+        prec("p_b_c", "b", "c"),
+        ctrl("c_c_a", "c", "a", ControlKind::OnReject),
+    ] {
+        let before = graph.clone();
+        assert_eq!(graph.validate_edge_addition(&edge), Ok(()));
+        assert_eq!(graph, before);
+        graph.add_edge(edge).unwrap();
+        assert_states(&graph);
+    }
+    let before = graph.clone();
+    for (edge, error) in [
+        (
+            prec("p_c_a", "c", "a"),
+            cycle_error("p_c_a", "c", "a", &["a", "b", "c"], &["p_a_b", "p_b_c"]),
+        ),
+        (
+            edges[0].clone(),
+            GraphError::DuplicateEdgeId {
+                edge_id: "p_a_b".into(),
+            },
+        ),
+        (
+            prec("missing", "a", "unknown"),
+            GraphError::UnknownNodeReference {
+                edge_id: "missing".into(),
+                node_id: "unknown".into(),
+            },
+        ),
+    ] {
+        assert_eq!(graph.validate_edge_addition(&edge), Err(error.clone()));
+        assert_eq!(graph.add_edge(edge), Err(error));
+        assert_eq!(graph, before);
+        assert_states(&graph);
+    }
+    let replacement =
+        GraphNode::new("a", GraphNodeKind::TASK, GraphNodeState::Cancelled, vec![]).unwrap();
+    assert_eq!(
+        graph.add_node(replacement),
+        Err(GraphError::DuplicateNodeId {
+            node_id: "a".into()
+        })
+    );
+    assert_eq!(graph, before);
+    assert_states(&graph);
 }
 
 // ---------------------------------------------------------------------------
@@ -522,12 +638,17 @@ fn malformed_graph_identifiers_fail_explicitly() {
 #[test]
 fn malformed_nodes_fail_explicitly() {
     assert_eq!(
-        GraphNode::new("", GraphNodeKind::TASK, Vec::new()),
+        GraphNode::new("", GraphNodeKind::TASK, GraphNodeState::Planned, Vec::new()),
         Err(GraphError::EmptyIdentifier { field: "node_id" }),
     );
     let oversized: String = "n".repeat(201);
     assert!(matches!(
-        GraphNode::new(oversized, GraphNodeKind::TASK, Vec::new()),
+        GraphNode::new(
+            oversized,
+            GraphNodeKind::TASK,
+            GraphNodeState::Planned,
+            Vec::new()
+        ),
         Err(GraphError::IdentifierTooLong {
             field: "node_id",
             ..
@@ -540,7 +661,8 @@ fn malformed_nodes_fail_explicitly() {
         Err(GraphError::EmptyIdentifier { field: "kind" }),
     );
     let fresh = GraphNodeKind::new(Cow::Owned("BRAND_NEW_KIND_42".to_owned())).expect("open kind");
-    let node = GraphNode::new("n1", fresh, Vec::new()).expect("valid node");
+    let node =
+        GraphNode::new("n1", fresh, GraphNodeState::Planned, Vec::new()).expect("valid node");
     assert_eq!(node.kind().as_str(), "BRAND_NEW_KIND_42");
 
     assert_eq!(
@@ -759,8 +881,13 @@ fn required_capabilities_remain_data_only() {
         CapabilityName::new("review.independent_a4").expect("valid capability"),
         CapabilityName::new("graph.core").expect("verbatim duplicates allowed"),
     ];
-    let node = GraphNode::new("cap-node", GraphNodeKind::IMPLEMENTATION, capabilities)
-        .expect("valid node");
+    let node = GraphNode::new(
+        "cap-node",
+        GraphNodeKind::IMPLEMENTATION,
+        GraphNodeState::Planned,
+        capabilities,
+    )
+    .expect("valid node");
 
     // Stored verbatim, order preserved, returned unchanged: nothing here
     // interprets, filters, admits, routes, or tiers on capability data.
@@ -801,6 +928,7 @@ fn well_known_node_kinds_are_extensible_strings_not_an_enum() {
     let exotic = GraphNode::new(
         "future-node",
         GraphNodeKind::new(Cow::Owned("KIND_NOT_YET_INVENTED".to_owned())).expect("open kind"),
+        GraphNodeState::Planned,
         Vec::new(),
     )
     .expect("valid node");

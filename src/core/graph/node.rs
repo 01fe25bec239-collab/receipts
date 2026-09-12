@@ -12,6 +12,7 @@
 use std::borrow::Cow;
 
 use crate::error::GraphError;
+use crate::node_state::GraphNodeState;
 
 /// Extensible node-kind string (frozen contract: not an enum).
 ///
@@ -113,6 +114,7 @@ impl AsRef<str> for CapabilityName {
 pub struct GraphNode {
     node_id: String,
     kind: GraphNodeKind,
+    state: GraphNodeState,
     required_capabilities: Vec<CapabilityName>,
 }
 
@@ -124,11 +126,13 @@ impl GraphNode {
     /// * capability entries are [`CapabilityName`] values, which are
     ///   validated against the namespaced ASCII syntax at their own construction.
     ///
+    /// `state` is required and stored exactly as supplied.
     /// `required_capabilities` is stored verbatim (order preserved) and is
     /// data only in this slice.
     pub fn new(
         node_id: impl Into<String>,
         kind: GraphNodeKind,
+        state: GraphNodeState,
         required_capabilities: Vec<CapabilityName>,
     ) -> Result<Self, GraphError> {
         let node_id = node_id.into();
@@ -136,6 +140,7 @@ impl GraphNode {
         Ok(Self {
             node_id,
             kind,
+            state,
             required_capabilities,
         })
     }
@@ -148,6 +153,11 @@ impl GraphNode {
     /// The extensible node kind.
     pub fn kind(&self) -> &GraphNodeKind {
         &self.kind
+    }
+
+    /// The exact stored current state.
+    pub fn state(&self) -> GraphNodeState {
+        self.state
     }
 
     /// Required capabilities, verbatim and data only. Empty means

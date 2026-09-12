@@ -1,6 +1,6 @@
 //! Behavioral coverage for the frozen, open capability-id syntax.
 
-use crate::{CapabilityName, GraphError, GraphNode, GraphNodeKind};
+use crate::{CapabilityName, GraphError, GraphNode, GraphNodeKind, GraphNodeState};
 
 #[test]
 fn valid_capability_names_preserve_exact_values_and_open_namespaces() {
@@ -118,7 +118,13 @@ fn capability_name_has_no_graph_identifier_length_limit() {
 
 #[test]
 fn graph_node_accepts_empty_required_capability_names() {
-    let node = GraphNode::new("empty", GraphNodeKind::TASK, vec![]).expect("valid node");
+    let node = GraphNode::new(
+        "empty",
+        GraphNodeKind::TASK,
+        GraphNodeState::Planned,
+        vec![],
+    )
+    .expect("valid node");
     assert!(node.required_capabilities().is_empty());
 }
 
@@ -134,7 +140,13 @@ fn graph_node_preserves_capability_names_order_and_duplicates() {
         .iter()
         .map(|value| CapabilityName::new(*value).expect("valid capability"))
         .collect();
-    let node = GraphNode::new("ordered", GraphNodeKind::TASK, capabilities).expect("valid node");
+    let node = GraphNode::new(
+        "ordered",
+        GraphNodeKind::TASK,
+        GraphNodeState::Planned,
+        capabilities,
+    )
+    .expect("valid node");
     let actual: Vec<_> = node
         .required_capabilities()
         .iter()
