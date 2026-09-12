@@ -49,6 +49,7 @@ pub mod host_id;
 pub mod host_session_activation;
 pub mod normalized_host_event;
 pub mod normalized_host_event_source_class;
+pub mod normalized_host_event_source_policy;
 
 #[cfg(test)]
 mod adapter_tests;
@@ -100,6 +101,9 @@ mod normalized_host_event_tests;
 
 #[cfg(test)]
 mod normalized_host_event_source_class_tests;
+
+#[cfg(test)]
+mod normalized_host_event_source_policy_tests;
 
 pub use adapter::HostAdapter;
 pub use host_capability_consistency::{
@@ -156,6 +160,7 @@ pub use normalized_host_event::{
     NormalizedHostEventRawRef, NormalizedHostEventRawRefType, NormalizedHostEventType,
 };
 pub use normalized_host_event_source_class::NormalizedHostEventSourceClass;
+pub use normalized_host_event_source_policy::source_class_allowed;
 
 pub use host_session_activation::{
     HostSessionActivationError, HostSessionActivationOutcome, HostSessionActivationRequest,
