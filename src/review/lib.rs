@@ -58,3 +58,13 @@ pub use exact_sha_acceptance_gate::{
 
 #[cfg(test)]
 mod exact_sha_acceptance_gate_tests;
+
+pub mod assurance_profile;
+pub use assurance_profile::{
+    AssuranceProfile, AssuranceProfileRequirements, AssuranceReviewerQualityFloor,
+    AssuranceTaskCategory, DistinctProviderPolicy, SecurityPipelinePolicy,
+    default_for_task_category, is_assurance_profile_blocking_floor,
+};
+
+#[cfg(test)]
+mod assurance_profile_tests;
