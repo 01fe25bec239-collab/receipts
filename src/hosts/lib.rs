@@ -23,9 +23,11 @@
 //! * no installation, hook mutation, trust approval, credential authority,
 //!   networking, rendering, event normalization, or runtime worker execution;
 //! * adjacent frozen contracts (`InstallPlan`, `CoreHandle`,
-//!   `NormalizedHostEvent`, `CoreView`, `UserPrompt`, `UserResponse`,
+//!   `CoreView`, `UserPrompt`, `UserResponse`,
 //!   `HostCapabilityReport`, shutdown reason) remain externally owned and
 //!   appear here only as unbound associated-type placeholders;
+//! * the in-process [`NormalizedHostEvent`] carrier validates structure only;
+//!   the adapter's event associated type remains unbound;
 //! * no authoritative state read or write path exists here.
 
 pub mod adapter;
@@ -148,7 +150,11 @@ pub use host_capability_selected_mode_consistency::{
 };
 pub use host_detection::{HostDetectionError, HostDetectionSignals, resolve_host};
 pub use host_id::HostId;
-pub use normalized_host_event::{NormalizedHostEventConfidence, NormalizedHostEventType};
+pub use normalized_host_event::{
+    NormalizedHostEvent, NormalizedHostEventConfidence, NormalizedHostEventError,
+    NormalizedHostEventHost, NormalizedHostEventId, NormalizedHostEventInputs,
+    NormalizedHostEventRawRef, NormalizedHostEventRawRefType, NormalizedHostEventType,
+};
 pub use normalized_host_event_source_class::NormalizedHostEventSourceClass;
 
 pub use host_session_activation::{

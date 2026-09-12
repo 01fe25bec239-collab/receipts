@@ -288,6 +288,7 @@ dependencies = [
 name = "receipts-host-integration"
 version = "0.1.0"
 dependencies = [
+ "receipts-orchestration",
  "serde",
  "serde_json",
  "toml",
