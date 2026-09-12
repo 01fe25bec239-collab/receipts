@@ -1,5 +1,13 @@
 mod availability_state_core;
 mod availability_vocabulary;
+mod candidate_eligibility;
+
+#[cfg(test)]
+mod candidate_eligibility_tests;
+
+pub use candidate_eligibility::{
+    CandidateEligibilityOutcome, CandidateEligibilityRejection, evaluate_candidate_eligibility,
+};
 
 #[cfg(test)]
 mod availability_state_core_tests;
