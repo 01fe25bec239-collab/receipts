@@ -1,6 +1,6 @@
 //! Behavioral tests use only the public capsule API, including from this sibling module.
 use crate::capsules::*;
-use crate::graph::{CapabilityName, GraphError, GraphNode, GraphNodeKind};
+use crate::graph::{CapabilityName, GraphError, GraphNode, GraphNodeKind, GraphNodeState};
 
 const BASE: &str = "0123456789abcdef0123456789abcdef01234567";
 const START: &str = "abcdef0123456789abcdef0123456789abcdef01";
@@ -396,7 +396,13 @@ fn canonical_graph_capabilities_transfer_verbatim_without_domain_weakening() {
         CapabilityName::new("graph.core").unwrap(),
         CapabilityName::new("future_engine.some_capability").unwrap(),
     ];
-    let node = GraphNode::new("node", GraphNodeKind::TASK, caps.clone()).unwrap();
+    let node = GraphNode::new(
+        "node",
+        GraphNodeKind::TASK,
+        GraphNodeState::Planned,
+        caps.clone(),
+    )
+    .unwrap();
     let mut i = Input::valid();
     i.required_capabilities = node.required_capabilities().to_vec();
     i.preferred_capabilities = Some(node.required_capabilities().to_vec());

@@ -1,7 +1,7 @@
 //! `ExecutionGraph` — the versioned-plan graph core of this slice.
 //!
-//! This slice owns exactly one thing: the structural precedence-DAG core plus
-//! deterministic precedence-cycle detection and rejection.
+//! This slice owns the structural precedence-DAG core, deterministic
+//! precedence-cycle detection and rejection, and live node-state storage/read.
 //!
 //! Mutation rules honored here (frozen contract):
 //!
@@ -29,6 +29,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use crate::edge::{EdgeClass, GraphEdge};
 use crate::error::GraphError;
 use crate::node::GraphNode;
+use crate::node_state::GraphNodeState;
 
 /// Adjacency view of the precedence subgraph: source node -> ordered set of
 /// `(target node, edge id)`. Sorted structures keep traversal order a pure
@@ -248,6 +249,11 @@ impl ExecutionGraph {
     /// Looks up a node by id.
     pub fn node(&self, node_id: &str) -> Option<&GraphNode> {
         self.nodes.get(node_id)
+    }
+
+    /// Returns the node's exact stored current state, or `None` for an unknown id.
+    pub fn node_state(&self, node_id: &str) -> Option<GraphNodeState> {
+        self.node(node_id).map(GraphNode::state)
     }
 
     /// Looks up an edge by id.
