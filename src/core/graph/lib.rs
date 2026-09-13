@@ -36,6 +36,7 @@ pub mod edge;
 pub mod error;
 pub mod execution_graph;
 pub mod graph_mutation_actor_policy;
+pub mod graph_mutation_parent_version_policy;
 pub mod graph_mutation_vocabulary;
 pub mod node;
 pub mod node_result_vocabulary;
@@ -66,6 +67,8 @@ mod execution_graph_tests;
 #[cfg(test)]
 mod graph_mutation_actor_policy_tests;
 #[cfg(test)]
+mod graph_mutation_parent_version_policy_tests;
+#[cfg(test)]
 mod graph_mutation_vocabulary_tests;
 #[cfg(test)]
 mod node_result_vocabulary_tests;
@@ -91,6 +94,9 @@ pub use error::{GraphError, MAX_IDENTIFIER_LENGTH};
 pub use execution_graph::ExecutionGraph;
 pub use graph_mutation_actor_policy::{
     GraphMutationActorAuthorizationError, validate_graph_mutation_actor,
+};
+pub use graph_mutation_parent_version_policy::{
+    GraphMutationParentVersionError, validate_graph_mutation_parent_version,
 };
 pub use graph_mutation_vocabulary::GraphMutationOperationKind;
 pub use node::{CapabilityName, GraphNode, GraphNodeKind};
