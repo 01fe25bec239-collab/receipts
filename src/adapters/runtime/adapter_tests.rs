@@ -1,4 +1,6 @@
-use crate::{FailureClass, RuntimeAdapter, RuntimeAuthStatus};
+use crate::{
+    AttemptId, CodexTaskExecutionError, FailureClass, RawFailure, RuntimeAdapter, RuntimeAuthStatus,
+};
 
 struct SurfaceWitness;
 struct OpaqueEventStream;
@@ -14,8 +16,6 @@ impl RuntimeAdapter for SurfaceWitness {
     type AttemptEvent = ();
     type EventStream<'a> = OpaqueEventStream;
     type AttemptResult = ();
-    type RawFailure = ();
-    type AttemptId = ();
     type CancelReason = ();
 
     fn runtime_id(&self) -> &str {
@@ -42,7 +42,7 @@ impl RuntimeAdapter for SurfaceWitness {
 
     fn cancel(&self, _handle: &(), _reason: &()) {}
 
-    fn classify_failure(&self, _error: &()) -> FailureClass {
+    fn classify_failure(&self, _error: &RawFailure) -> FailureClass {
         FailureClass::Unknown
     }
 }
@@ -52,12 +52,17 @@ fn public_trait_preserves_typed_surface_and_optional_resume() {
     let adapter = SurfaceWitness;
 
     let auth: RuntimeAuthStatus = adapter.authenticate_status();
-    let failure: FailureClass = adapter.classify_failure(&());
+    let failure: FailureClass =
+        adapter.classify_failure(&RawFailure::from(&CodexTaskExecutionError::EmptyPrompt));
     let _stream: OpaqueEventStream = adapter.stream_events(&());
 
     assert_eq!(auth, RuntimeAuthStatus::Unknown);
     assert_eq!(failure, FailureClass::Unknown);
-    assert_eq!(adapter.resume(&()), None, "None means unsupported resume");
+    assert_eq!(
+        adapter.resume(&AttemptId::new("surface-attempt").unwrap()),
+        None,
+        "None means unsupported resume"
+    );
 }
 
 #[test]
@@ -88,6 +93,43 @@ fn declaration_has_exact_frozen_operation_set() {
         .collect();
 
     assert_eq!(observed, EXPECTED);
+}
+
+#[test]
+fn canonical_parameters_leave_only_the_other_associated_placeholders() {
+    // These witnesses compile for every implementer without associated-type
+    // equality constraints: neither parameter can be substituted by an adapter.
+    fn parameters<A: RuntimeAdapter>() {
+        let _: fn(&A, &crate::RawFailure) -> FailureClass = A::classify_failure;
+        let _: fn(&A, &crate::AttemptId) -> Option<A::AttemptHandle> = A::resume;
+    }
+    parameters::<SurfaceWitness>();
+
+    let source = include_str!("adapter.rs");
+    let observed: Vec<_> = source
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("type "))
+        .collect();
+    assert_eq!(
+        observed,
+        [
+            "HealthReport;",
+            "RuntimeCapabilities;",
+            "Models;",
+            "Capsule;",
+            "WorkspaceHandle;",
+            "ExecutionPolicy;",
+            "AttemptHandle;",
+            "AttemptEvent;",
+            "EventStream<'a>",
+            "AttemptResult;",
+            "CancelReason;",
+        ]
+    );
+    assert!(source.contains("fn classify_failure(&self, error: &RawFailure) -> FailureClass;"));
+    assert!(
+        source.contains("fn resume(&self, _attempt_id: &AttemptId) -> Option<Self::AttemptHandle>")
+    );
 }
 
 #[test]

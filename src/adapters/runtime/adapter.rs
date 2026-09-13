@@ -3,7 +3,7 @@
 //! This module declares vocabulary only. It implements no runtime behavior,
 //! grants no execution authority, and defines no externally owned contracts.
 
-use crate::{FailureClass, RuntimeAuthStatus};
+use crate::{AttemptId, FailureClass, RawFailure, RuntimeAuthStatus};
 
 /// Interface shared by every agent runtime.
 pub trait RuntimeAdapter {
@@ -56,12 +56,6 @@ pub trait RuntimeAdapter {
     /// Unbound placeholder for the frozen attempt result.
     type AttemptResult;
 
-    /// Unbound placeholder for a raw runtime failure.
-    type RawFailure;
-
-    /// Unbound placeholder for the frozen attempt identifier.
-    type AttemptId;
-
     /// Unbound placeholder for the frozen cancellation reason.
     type CancelReason;
 
@@ -92,7 +86,7 @@ pub trait RuntimeAdapter {
 
     fn cancel(&self, handle: &Self::AttemptHandle, reason: &Self::CancelReason);
 
-    fn classify_failure(&self, error: &Self::RawFailure) -> FailureClass;
+    fn classify_failure(&self, error: &RawFailure) -> FailureClass;
 
     /// Attempts to resume a prior attempt when this adapter supports resume.
     ///
@@ -100,7 +94,7 @@ pub trait RuntimeAdapter {
     /// means success without a handle, a swallowed failure, or a missing
     /// provider session. Supporting adapters must deliberately override this
     /// default, and no core operation may depend on resume support.
-    fn resume(&self, _attempt_id: &Self::AttemptId) -> Option<Self::AttemptHandle> {
+    fn resume(&self, _attempt_id: &AttemptId) -> Option<Self::AttemptHandle> {
         None
     }
 }

@@ -1,6 +1,8 @@
 use std::cell::RefCell;
 
-use crate::{FailureClass, RuntimeAdapter, RuntimeAuthStatus};
+use crate::{
+    AttemptId, CodexTaskExecutionError, FailureClass, RawFailure, RuntimeAdapter, RuntimeAuthStatus,
+};
 
 #[derive(Debug, PartialEq, Eq)]
 struct FixtureHealthReport(&'static str);
@@ -18,8 +20,6 @@ struct FixtureAttemptEvent;
 struct OpaqueEventStream;
 #[derive(Debug, PartialEq, Eq)]
 struct FixtureAttemptResult(&'static str);
-struct FixtureRawFailure;
-struct FixtureAttemptId;
 struct FixtureCancelReason;
 
 struct TrackingRuntimeAdapter {
@@ -49,8 +49,6 @@ impl RuntimeAdapter for TrackingRuntimeAdapter {
     type AttemptEvent = FixtureAttemptEvent;
     type EventStream<'a> = OpaqueEventStream;
     type AttemptResult = FixtureAttemptResult;
-    type RawFailure = FixtureRawFailure;
-    type AttemptId = FixtureAttemptId;
     type CancelReason = FixtureCancelReason;
 
     fn runtime_id(&self) -> &str {
@@ -102,13 +100,17 @@ impl RuntimeAdapter for TrackingRuntimeAdapter {
         self.record(8);
     }
 
-    fn classify_failure(&self, _error: &FixtureRawFailure) -> FailureClass {
+    fn classify_failure(&self, error: &RawFailure) -> FailureClass {
         self.record(9);
-        FailureClass::Unknown
+        assert_eq!(error.evidence(), crate::RawFailureEvidence::EmptyPrompt);
+        assert_eq!(error.classify_failure(), FailureClass::Unknown);
+        // Fixture choice proves adapter control without changing RawFailure mapping.
+        FailureClass::PolicyBlocked
     }
 
-    fn resume(&self, _attempt_id: &FixtureAttemptId) -> Option<FixtureAttemptHandle> {
+    fn resume(&self, attempt_id: &AttemptId) -> Option<FixtureAttemptHandle> {
         self.record(10);
+        assert_eq!(attempt_id.as_str(), " exact-試行-e\u{301} ");
         Some(FixtureAttemptHandle("resumed-attempt"))
     }
 }
@@ -126,8 +128,6 @@ impl RuntimeAdapter for DefaultResumeRuntimeAdapter {
     type AttemptEvent = FixtureAttemptEvent;
     type EventStream<'a> = OpaqueEventStream;
     type AttemptResult = FixtureAttemptResult;
-    type RawFailure = FixtureRawFailure;
-    type AttemptId = FixtureAttemptId;
     type CancelReason = FixtureCancelReason;
 
     fn runtime_id(&self) -> &str {
@@ -169,7 +169,7 @@ impl RuntimeAdapter for DefaultResumeRuntimeAdapter {
 
     fn cancel(&self, _handle: &FixtureAttemptHandle, _reason: &FixtureCancelReason) {}
 
-    fn classify_failure(&self, _error: &FixtureRawFailure) -> FailureClass {
+    fn classify_failure(&self, _error: &RawFailure) -> FailureClass {
         FailureClass::Unknown
     }
 }
@@ -199,11 +199,11 @@ fn frozen_surface_is_exercised_once_with_deterministic_results() {
     );
     adapter.cancel(&started, &FixtureCancelReason);
     assert_eq!(
-        adapter.classify_failure(&FixtureRawFailure),
-        FailureClass::Unknown
+        adapter.classify_failure(&RawFailure::from(&CodexTaskExecutionError::EmptyPrompt)),
+        FailureClass::PolicyBlocked
     );
     assert_eq!(
-        adapter.resume(&FixtureAttemptId),
+        adapter.resume(&AttemptId::new(" exact-試行-e\u{301} ").unwrap()),
         Some(FixtureAttemptHandle("resumed-attempt"))
     );
     assert_eq!(*adapter.calls.borrow(), [1; 11]);
@@ -213,5 +213,8 @@ fn frozen_surface_is_exercised_once_with_deterministic_results() {
 fn omitted_resume_override_means_unsupported() {
     let adapter = DefaultResumeRuntimeAdapter;
 
-    assert_eq!(adapter.resume(&FixtureAttemptId), None);
+    assert_eq!(
+        adapter.resume(&AttemptId::new(" exact-試行-e\u{301} ").unwrap()),
+        None
+    );
 }
