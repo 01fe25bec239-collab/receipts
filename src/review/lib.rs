@@ -68,3 +68,12 @@ pub use assurance_profile::{
 
 #[cfg(test)]
 mod assurance_profile_tests;
+
+pub mod review_request_structured_core;
+pub use review_request_structured_core::{
+    ReviewRequestAttemptNumber, ReviewRequestConstructionError, ReviewRequestNonNegativeInteger,
+    ReviewRequestNonTemporalCore, ReviewRequestPolicy, ReviewRequestReviewerFloor,
+};
+
+#[cfg(test)]
+mod review_request_structured_core_tests;
