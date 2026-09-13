@@ -544,3 +544,359 @@ fn explicit_remote_policies_are_preserved_without_remote_behavior() {
         assert!(unusable_remote.is_file());
     }
 }
+
+thread_local! {
+    static POST_REMOVAL_GATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn run_post_removal_gate() {
+    POST_REMOVAL_GATE.with(|gate| {
+        if let Some(action) = gate.borrow_mut().take() {
+            action();
+        }
+    });
+}
+
+fn finalized_fixture(
+    policy: Option<WorkspaceRemotePublishPolicy>,
+) -> (TestRepo, crate::WorkspaceAttemptFinalizationEvidence) {
+    use crate::execution::{ProcessRunRequest, ProcessTimeoutPolicy, start_live_process_attempt};
+    use crate::{
+        WorkspaceAttemptFinalizationRequest, WorkspaceCheckpointCaptureCore,
+        WorkspaceCheckpointKind, finalize_workspace_attempt,
+    };
+    use std::time::Duration;
+
+    let repo = TestRepo::new_nested("finalized teardown", "repo with spaces");
+    repo.commit_file("implementation.txt", "base");
+    let path = std::fs::canonicalize(repo.root.path())
+        .unwrap()
+        .join("task worktree");
+    let mut request = WorkspaceProvisionRequest::new(
+        repo.path(),
+        "workspace-finalized",
+        Some("task-finalized"),
+        "task/finalized",
+        path,
+        &repo.head_sha(),
+    )
+    .unwrap();
+    if let Some(policy) = policy {
+        request = request.with_remote_publish_policy(policy);
+    }
+    let handle = request.provision().unwrap();
+    commit_in_worktree(
+        handle.worktree_path(),
+        "implementation.txt",
+        "legitimate implementation",
+    );
+    let final_sha = stdout_trimmed(&git(handle.worktree_path(), &["rev-parse", "HEAD"]));
+    let checkpoint = WorkspaceCheckpointCaptureCore::new(
+        "preceding",
+        handle.workspace_id(),
+        handle.task_id().map(str::to_owned),
+        Some("attempt-finalized".into()),
+        WorkspaceCheckpointKind::Progress,
+        handle.base_sha().clone(),
+        None,
+        None,
+        vec![],
+        vec![],
+        vec![],
+        None,
+        None,
+    )
+    .unwrap();
+    let process = ProcessRunRequest::new(
+        "/usr/bin/true",
+        std::iter::empty::<&str>(),
+        handle.worktree_path(),
+        handle.worktree_path(),
+    )
+    .unwrap();
+    let terminal = start_live_process_attempt(
+        &process,
+        &ProcessTimeoutPolicy::new(Duration::from_secs(10), Duration::from_millis(100)).unwrap(),
+    )
+    .unwrap()
+    .wait_collect()
+    .unwrap();
+    let evidence = finalize_workspace_attempt(WorkspaceAttemptFinalizationRequest {
+        handle: &handle,
+        workspace_id: handle.workspace_id(),
+        task_id: handle.task_id(),
+        attempt_id: Some("attempt-finalized"),
+        expected_worktree: handle.worktree_path(),
+        expected_branch: handle.branch(),
+        start_sha: handle.base_sha().as_str(),
+        final_sha: &final_sha,
+        allowed_write_paths: &["implementation.txt".into()],
+        forbidden_write_paths: &[],
+        checkpoint: &checkpoint,
+        terminal: &terminal,
+    })
+    .unwrap();
+    assert_ne!(evidence.final_sha(), handle.base_sha());
+    assert_eq!(evidence.handle(), &handle);
+    (repo, evidence)
+}
+
+// Snapshot file bytes, including Git metadata, to detect repairs and index writes.
+fn teardown_snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    fn visit(root: &Path, path: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                visit(root, &entry.path(), out);
+            } else {
+                out.push((
+                    entry.path().strip_prefix(root).unwrap().into(),
+                    std::fs::read(entry.path()).unwrap(),
+                ));
+            }
+        }
+    }
+    let mut out = vec![];
+    visit(root, root, &mut out);
+    out.sort();
+    out
+}
+
+#[test]
+fn finalized_teardown_preserves_identity_base_and_policy_at_exact_final_commit() {
+    for policy in [
+        None,
+        Some(WorkspaceRemotePublishPolicy::LocalOnly),
+        Some(WorkspaceRemotePublishPolicy::PushOnAccept),
+        Some(WorkspaceRemotePublishPolicy::PushAlways),
+    ] {
+        let (repo, evidence) = finalized_fixture(policy);
+        let handle = evidence.handle();
+        // No acceptance input exists. A configured unusable remote cannot affect removal.
+        git(
+            repo.path(),
+            &[
+                "config",
+                "remote.origin.url",
+                "/nonexistent-finalized-remote",
+            ],
+        );
+        let before = teardown_snapshot(repo.root.path());
+        for _ in 0..2 {
+            let error = teardown_request(&repo).teardown(handle).unwrap_err();
+            assert!(
+                matches!(error, WorkspaceError::TeardownHeadMismatch { expected, observed }
+                if expected == handle.base_sha().as_str() && observed == evidence.final_sha().as_str())
+            );
+            assert_eq!(teardown_snapshot(repo.root.path()), before);
+        }
+        let torn = teardown_request(&repo)
+            .teardown_finalized(&evidence)
+            .unwrap();
+        assert_eq!(torn.state(), WorkspaceState::TornDown);
+        assert_eq!(torn.head_sha(), Some(evidence.final_sha()));
+        assert_eq!(torn.base_sha(), handle.base_sha());
+        assert_eq!(torn.workspace_id(), handle.workspace_id());
+        assert_eq!(torn.task_id(), handle.task_id());
+        assert_eq!(torn.branch(), handle.branch());
+        assert_eq!(torn.worktree_path(), handle.worktree_path());
+        assert_eq!(torn.isolation(), handle.isolation());
+        assert_eq!(torn.remote_publish_policy(), policy);
+        assert_eq!(handle.head_sha(), Some(handle.base_sha()));
+        assert!(!handle.worktree_path().exists());
+        assert!(!worktree_registered(&repo, handle.worktree_path()));
+        assert!(branch_exists(&repo, handle.branch()));
+        assert_eq!(
+            retained_branch_target(&repo, handle.branch()),
+            evidence.final_sha().as_str()
+        );
+    }
+}
+
+#[test]
+fn finalized_teardown_fresh_failures_are_typed_and_repeatedly_nonmutating() {
+    for case in [
+        "head",
+        "branch",
+        "detached",
+        "tracked",
+        "staged",
+        "untracked",
+        "hidden-untracked",
+        "absent",
+        "unregistered",
+        "wrong-repository",
+        "missing-root",
+    ] {
+        let (repo, evidence) = finalized_fixture(None);
+        let path = evidence.handle().worktree_path();
+        let other = TestRepo::new("finalized-wrong-repository");
+        let request = match case {
+            "wrong-repository" => teardown_request(&other),
+            "missing-root" => WorkspaceTeardownRequest::new(repo.path().join("missing")),
+            _ => teardown_request(&repo),
+        };
+        match case {
+            "head" => commit_in_worktree(path, "implementation.txt", "later commit"),
+            "branch" => {
+                git(path, &["checkout", "--quiet", "-b", "task/other"]);
+            }
+            "detached" => {
+                git(path, &["checkout", "--quiet", "--detach", "HEAD"]);
+            }
+            "tracked" | "staged" => {
+                std::fs::write(path.join("implementation.txt"), "dirty").unwrap();
+                if case == "staged" {
+                    git(path, &["add", "implementation.txt"]);
+                }
+            }
+            "untracked" | "hidden-untracked" => {
+                std::fs::write(path.join("untracked.txt"), "preserve").unwrap();
+                if case == "hidden-untracked" {
+                    git(path, &["config", "status.showUntrackedFiles", "no"]);
+                }
+            }
+            "absent" => {
+                std::fs::rename(path, path.with_file_name("moved worktree")).unwrap();
+            }
+            "unregistered" => {
+                std::fs::remove_dir_all(worktree_meta_dir(&repo, path).unwrap()).unwrap();
+            }
+            _ => {}
+        }
+        let before = teardown_snapshot(repo.root.path());
+        let other_before = teardown_snapshot(other.root.path());
+        for _ in 0..2 {
+            let error = request.teardown_finalized(&evidence).unwrap_err();
+            let expected = match (&error, case) {
+                (WorkspaceError::TeardownHeadMismatch { expected, .. }, "head") => {
+                    expected == evidence.final_sha().as_str()
+                }
+                (
+                    WorkspaceError::TeardownBranchMismatch {
+                        expected_branch, ..
+                    },
+                    "branch" | "detached",
+                ) => expected_branch == evidence.handle().branch(),
+                (
+                    WorkspaceError::TeardownWorktreeDirty { .. },
+                    "tracked" | "staged" | "untracked" | "hidden-untracked",
+                ) => true,
+                (WorkspaceError::WorktreeUnresolvable { .. }, "absent") => true,
+                (
+                    WorkspaceError::TeardownWorktreeNotRegistered { .. },
+                    "unregistered" | "wrong-repository",
+                ) => true,
+                (WorkspaceError::RepositoryRootUnresolvable { .. }, "missing-root") => true,
+                _ => false,
+            };
+            assert!(expected, "case {case}: {error:?}");
+            assert_eq!(teardown_snapshot(repo.root.path()), before, "case {case}");
+            assert_eq!(
+                teardown_snapshot(other.root.path()),
+                other_before,
+                "case {case}"
+            );
+        }
+    }
+}
+
+#[test]
+fn finalized_teardown_verifies_post_removal_state_without_repairs() {
+    for case in ["missing-branch", "wrong-target", "still-registered"] {
+        let (repo, evidence) = finalized_fixture(None);
+        let branch_file = repo
+            .path()
+            .join(".git/refs/heads")
+            .join(evidence.handle().branch());
+        let base = evidence.handle().base_sha().as_str().to_owned();
+        let meta = worktree_meta_dir(&repo, evidence.handle().worktree_path()).unwrap();
+        let registration = teardown_snapshot(&meta);
+        let saved_branch_file = branch_file.clone();
+        let saved_base = base.clone();
+        // Corrupt only the fixture after the real removal, before real verification.
+        POST_REMOVAL_GATE.with(|gate| {
+            *gate.borrow_mut() = Some(Box::new(move || match case {
+                "missing-branch" => std::fs::remove_file(&branch_file).unwrap(),
+                "wrong-target" => std::fs::write(&branch_file, format!("{base}\n")).unwrap(),
+                "still-registered" => {
+                    for (relative, bytes) in registration {
+                        let file = meta.join(relative);
+                        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                        std::fs::write(file, bytes).unwrap();
+                    }
+                }
+                _ => unreachable!(),
+            }))
+        });
+        let error = teardown_request(&repo)
+            .teardown_finalized(&evidence)
+            .unwrap_err();
+        assert!(!evidence.handle().worktree_path().exists());
+        match case {
+            "missing-branch" => {
+                assert!(
+                    matches!(error, WorkspaceError::TeardownRetainedBranchMissing { branch }
+                    if branch == evidence.handle().branch())
+                );
+                assert!(!saved_branch_file.exists());
+                assert!(!branch_exists(&repo, evidence.handle().branch()));
+            }
+            "wrong-target" => {
+                assert!(
+                    matches!(error, WorkspaceError::TeardownRetainedBranchShaMismatch { branch, expected, observed }
+                    if branch == evidence.handle().branch() && expected == evidence.final_sha().as_str() && observed == saved_base)
+                );
+                assert_eq!(
+                    retained_branch_target(&repo, evidence.handle().branch()),
+                    saved_base
+                );
+            }
+            "still-registered" => {
+                assert!(matches!(
+                    error,
+                    WorkspaceError::TeardownRegistrationVerificationFailed { .. }
+                ));
+                assert!(worktree_registered(
+                    &repo,
+                    evidence.handle().worktree_path()
+                ));
+                assert_eq!(
+                    retained_branch_target(&repo, evidence.handle().branch()),
+                    evidence.final_sha().as_str()
+                );
+            }
+            _ => unreachable!(),
+        }
+        if case != "still-registered" {
+            assert!(!worktree_registered(
+                &repo,
+                evidence.handle().worktree_path()
+            ));
+        }
+    }
+}
+
+#[test]
+fn finalized_teardown_has_only_local_git_operations() {
+    let source = include_str!("teardown.rs");
+    for command in [
+        "fetch",
+        "pull",
+        "push",
+        "ls-remote",
+        "branch",
+        "update-ref",
+        "reset",
+        "clean",
+        "checkout",
+        "restore",
+    ] {
+        assert!(
+            !source.contains(&format!("OsStr::new({command:?})")),
+            "forbidden Git command: {command}"
+        );
+    }
+    assert!(source.contains("self.teardown_verified_head(handle, evidence.final_sha())"));
+    assert!(!source.contains("std::process::Command"));
+}

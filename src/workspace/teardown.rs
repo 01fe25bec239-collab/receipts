@@ -7,6 +7,9 @@
 //! should be torn down at all is a higher-level policy decision made by the
 //! caller; this module only performs the narrow, fully verified local
 //! removal once that decision has been made.
+//! [`WorkspaceTeardownRequest::teardown_finalized`] adds the same mechanical
+//! removal using `evidence.handle()` for identity and `evidence.final_sha()`
+//! for the expected HEAD. Finalization evidence conveys no policy approval.
 //!
 //! The successful flow is strictly ordered:
 //!
@@ -20,7 +23,7 @@
 //! 6. read the exact current HEAD and require it to equal the handle's
 //!    verified head evidence (a `PROVISIONED` handle carries its base
 //!    commit as verified evidence, so any post-provisioning change fails
-//!    closed);
+//!    closed), or the final SHA for the finalized-evidence entry point;
 //! 7. require a clean `git status --porcelain` immediately before removal;
 //! 8. remove the registered worktree without any force flag;
 //! 9. independently verify the worktree is no longer registered and that
@@ -29,7 +32,7 @@
 //! 10. return a handle in the `TORN_DOWN` state preserving all immutable
 //!     identity fields.
 //!
-//! Every verification failure leaves the repository untouched: a dirty,
+//! Every pre-removal verification failure leaves the repository untouched: a dirty,
 //! stale-evidence, mismatched, or unregistered worktree is never removed.
 //! Dirty or inconsistent workspaces remain available for later recovery,
 //! which is a separate milestone outside this slice. No remote operation is
@@ -46,6 +49,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+use crate::WorkspaceAttemptFinalizationEvidence;
 use crate::error::WorkspaceError;
 use crate::git;
 use crate::handle::{CommitSha, WorkspaceHandle, WorkspaceState};
@@ -80,9 +84,9 @@ impl WorkspaceTeardownRequest {
     /// Executes the teardown flow for `handle` and returns the derived
     /// `TORN_DOWN` handle.
     ///
-    /// Every step fails closed with a typed error and leaves the worktree,
-    /// its registration, and the retained branch untouched unless full
-    /// verification succeeded. Removal uses explicit argv with the
+    /// Pre-removal failures leave the worktree, registration and branch
+    /// untouched. Post-removal failures report a typed error without repair.
+    /// Removal uses explicit argv with the
     /// canonical worktree path and never any force flag; Git performs the
     /// registered-worktree removal itself.
     pub fn teardown(&self, handle: &WorkspaceHandle) -> Result<WorkspaceHandle, WorkspaceError> {
@@ -100,6 +104,34 @@ impl WorkspaceTeardownRequest {
             None => return Err(WorkspaceError::TeardownHeadEvidenceMissing),
         };
 
+        self.teardown_verified_head(handle, &expected_head)
+    }
+
+    /// Removes a finalized worktree using only the evidence's handle and final SHA.
+    ///
+    /// Evidence is mechanical, not acceptance, review, integration, publication,
+    /// security, deployment, or teardown policy approval. The caller decides
+    /// whether removal should happen. Identity, HEAD and cleanliness are freshly
+    /// checked; evidence is not a lock against concurrent writers.
+    /// Post-removal verification errors do not restore or repair removed state.
+    pub fn teardown_finalized(
+        &self,
+        evidence: &WorkspaceAttemptFinalizationEvidence,
+    ) -> Result<WorkspaceHandle, WorkspaceError> {
+        let handle = evidence.handle();
+        if handle.state() != WorkspaceState::Provisioned {
+            return Err(WorkspaceError::TeardownUnsupportedState {
+                state: handle.state().as_str(),
+            });
+        }
+        self.teardown_verified_head(handle, evidence.final_sha())
+    }
+
+    fn teardown_verified_head(
+        &self,
+        handle: &WorkspaceHandle,
+        expected_head: &CommitSha,
+    ) -> Result<WorkspaceHandle, WorkspaceError> {
         // Step 2: resolve the requested repository root to its canonical
         // (realpath) location before any Git command runs, so registration
         // and retention checks operate on the repository's true location
@@ -163,7 +195,7 @@ impl WorkspaceTeardownRequest {
         }
 
         // Step 6: read the exact current HEAD from the canonical worktree
-        // path and require it to equal the handle's verified head evidence
+        // path and require it to equal the entry point's verified head evidence
         // exactly. Cleanliness alone proves nothing about staleness: a
         // worktree with freshly committed work would still be clean, and
         // removing it here would destroy partial results under outdated
@@ -186,7 +218,7 @@ impl WorkspaceTeardownRequest {
                 ),
             }
         })?;
-        if observed_head != expected_head {
+        if &observed_head != expected_head {
             return Err(WorkspaceError::TeardownHeadMismatch {
                 expected: expected_head.as_str().to_string(),
                 observed: observed.to_string(),
@@ -198,10 +230,18 @@ impl WorkspaceTeardownRequest {
         // output — tracked modifications, staged modifications, untracked
         // files — refuses removal so the evidence stays intact for later
         // recovery.
+        // Explicit flags prevent repository configuration from hiding dirt;
+        // optional index refresh writes are unnecessary for this observation.
         let status = git::capture(
             &canonical_worktree,
             "inspect worktree status",
-            &[OsStr::new("status"), OsStr::new("--porcelain")],
+            &[
+                OsStr::new("--no-optional-locks"),
+                OsStr::new("status"),
+                OsStr::new("--porcelain"),
+                OsStr::new("--untracked-files=all"),
+                OsStr::new("--ignore-submodules=none"),
+            ],
         )?;
         let status = status.require_success("inspect worktree status")?;
         if !status.stdout.trim().is_empty() {
@@ -224,6 +264,9 @@ impl WorkspaceTeardownRequest {
             ],
         )?
         .require_success("remove worktree")?;
+
+        #[cfg(test)]
+        crate::teardown_tests::run_post_removal_gate();
 
         // Step 9a: success is not inferred from the removal command's exit
         // status alone — re-listing must show the checkout is no longer
