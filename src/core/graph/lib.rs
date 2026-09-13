@@ -35,6 +35,7 @@ pub mod accepted_integration_transition;
 pub mod edge;
 pub mod error;
 pub mod execution_graph;
+pub mod graph_mutation_actor_policy;
 pub mod graph_mutation_vocabulary;
 pub mod node;
 pub mod node_result_vocabulary;
@@ -63,6 +64,8 @@ mod capability_name_tests;
 #[cfg(test)]
 mod execution_graph_tests;
 #[cfg(test)]
+mod graph_mutation_actor_policy_tests;
+#[cfg(test)]
 mod graph_mutation_vocabulary_tests;
 #[cfg(test)]
 mod node_result_vocabulary_tests;
@@ -86,6 +89,9 @@ pub use accepted_integration_transition::{
 pub use edge::{ControlKind, EdgeClass, GraphEdge, GraphEdgeRelation, PrecedenceKind};
 pub use error::{GraphError, MAX_IDENTIFIER_LENGTH};
 pub use execution_graph::ExecutionGraph;
+pub use graph_mutation_actor_policy::{
+    GraphMutationActorAuthorizationError, validate_graph_mutation_actor,
+};
 pub use graph_mutation_vocabulary::GraphMutationOperationKind;
 pub use node::{CapabilityName, GraphNode, GraphNodeKind};
 pub use node_result_vocabulary::{GraphNodeCheckResult, GraphNodeResultOutcome};
