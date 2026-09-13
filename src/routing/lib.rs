@@ -1,13 +1,17 @@
 mod availability_state_core;
 mod availability_vocabulary;
 mod candidate_eligibility;
+mod candidate_set;
 
 #[cfg(test)]
 mod candidate_eligibility_tests;
+#[cfg(test)]
+mod candidate_set_tests;
 
 pub use candidate_eligibility::{
     CandidateEligibilityOutcome, CandidateEligibilityRejection, evaluate_candidate_eligibility,
 };
+pub use candidate_set::{RegistryCandidateIdentity, enumerate_registry_candidates};
 
 #[cfg(test)]
 mod availability_state_core_tests;
