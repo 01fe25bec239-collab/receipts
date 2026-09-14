@@ -48,6 +48,7 @@ pub mod host_detection;
 pub mod host_id;
 pub mod host_session_activation;
 pub mod normalized_host_event;
+pub mod normalized_host_event_emission;
 pub mod normalized_host_event_source_class;
 pub mod normalized_host_event_source_policy;
 
@@ -98,6 +99,9 @@ mod host_id_tests;
 
 #[cfg(test)]
 mod normalized_host_event_tests;
+
+#[cfg(test)]
+mod normalized_host_event_emission_tests;
 
 #[cfg(test)]
 mod normalized_host_event_source_class_tests;
@@ -158,6 +162,9 @@ pub use normalized_host_event::{
     NormalizedHostEvent, NormalizedHostEventConfidence, NormalizedHostEventError,
     NormalizedHostEventHost, NormalizedHostEventId, NormalizedHostEventInputs,
     NormalizedHostEventRawRef, NormalizedHostEventRawRefType, NormalizedHostEventType,
+};
+pub use normalized_host_event_emission::{
+    NormalizedHostEventEmissionSourceError, validate_normalized_host_event_source,
 };
 pub use normalized_host_event_source_class::NormalizedHostEventSourceClass;
 pub use normalized_host_event_source_policy::source_class_allowed;
