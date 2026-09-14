@@ -77,3 +77,13 @@ pub use review_request_structured_core::{
 
 #[cfg(test)]
 mod review_request_structured_core_tests;
+
+pub mod integration_decision_structured_core;
+pub use integration_decision_structured_core::{
+    IntegrationDecisionCheck, IntegrationDecisionCheckResult, IntegrationDecisionConstructionError,
+    IntegrationDecisionNonTemporalCore, IntegrationDecisionNullableString,
+    IntegrationDecisionOutcome, IntegrationDecisionProvenance,
+};
+
+#[cfg(test)]
+mod integration_decision_structured_core_tests;
