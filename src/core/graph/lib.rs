@@ -37,6 +37,7 @@ pub mod error;
 pub mod execution_graph;
 pub mod graph_mutation_actor_policy;
 pub mod graph_mutation_parent_version_policy;
+pub mod graph_mutation_target_graph_policy;
 pub mod graph_mutation_vocabulary;
 pub mod node;
 pub mod node_result_vocabulary;
@@ -69,6 +70,8 @@ mod graph_mutation_actor_policy_tests;
 #[cfg(test)]
 mod graph_mutation_parent_version_policy_tests;
 #[cfg(test)]
+mod graph_mutation_target_graph_policy_tests;
+#[cfg(test)]
 mod graph_mutation_vocabulary_tests;
 #[cfg(test)]
 mod node_result_vocabulary_tests;
@@ -97,6 +100,9 @@ pub use graph_mutation_actor_policy::{
 };
 pub use graph_mutation_parent_version_policy::{
     GraphMutationParentVersionError, validate_graph_mutation_parent_version,
+};
+pub use graph_mutation_target_graph_policy::{
+    GraphMutationTargetGraphError, validate_graph_mutation_target_graph,
 };
 pub use graph_mutation_vocabulary::GraphMutationOperationKind;
 pub use node::{CapabilityName, GraphNode, GraphNodeKind};
