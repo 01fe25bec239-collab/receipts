@@ -3,6 +3,8 @@
 //! This module declares vocabulary only. It implements no runtime behavior,
 //! grants no execution authority, and defines no externally owned contracts.
 
+use receipts_workspace_execution::WorkspaceHandle;
+
 use crate::{AttemptId, FailureClass, RawFailure, RuntimeAuthStatus};
 
 /// Interface shared by every agent runtime.
@@ -25,9 +27,6 @@ pub trait RuntimeAdapter {
     /// `ReviewCapsule`; this crate defines none of those contracts' shapes.
     /// The one frozen `start` semantic remains one operation.
     type Capsule;
-
-    /// Unbound placeholder for the externally owned frozen `WorkspaceHandle`.
-    type WorkspaceHandle;
 
     /// Unbound placeholder for the frozen execution policy.
     ///
@@ -76,7 +75,7 @@ pub trait RuntimeAdapter {
     fn start(
         &self,
         task: &Self::Capsule,
-        workspace: &Self::WorkspaceHandle,
+        workspace: &WorkspaceHandle,
         policy: &Self::ExecutionPolicy,
     ) -> Self::AttemptHandle;
 
