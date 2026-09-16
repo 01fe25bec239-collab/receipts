@@ -923,3 +923,62 @@ fn capture_errors_are_typed_and_standard() {
         "workspace checkpoint capture attempt_id is empty"
     );
 }
+
+#[test]
+fn crash_classification_is_optional_and_preserves_every_supplied_value() {
+    use crate::WorkspaceCheckpointCrashClassification as C;
+
+    let absent = minimal_core();
+    assert_eq!(absent.crash_classification(), None);
+    assert_eq!(absent.clone().with_crash_classification(None), absent);
+    for classification in C::ALL {
+        let present = absent
+            .clone()
+            .with_crash_classification(Some(classification));
+        assert_eq!(present.crash_classification(), Some(classification));
+        assert_eq!(present.clone().crash_classification(), Some(classification));
+        assert_eq!(present.with_crash_classification(None), absent);
+    }
+}
+
+#[test]
+fn crash_classification_is_independent_of_kind_checks_and_recovery() {
+    use crate::WorkspaceCheckpointCrashClassification as C;
+
+    for kind in WorkspaceCheckpointKind::ALL {
+        for decision in WorkspaceRecoveryDecision::ALL {
+            for exit_code in [0, 1, -1, i64::MAX] {
+                let checks = vec![fixture_check(
+                    WorkspaceCheckpointCheckSource::WorkerExecution,
+                    vec!["auth_failed", "timed_out", "cancelled"],
+                    exit_code,
+                )];
+                let absent = build_core(
+                    "checkpoint-1",
+                    "workspace-1",
+                    Some("task".into()),
+                    Some("attempt".into()),
+                    kind,
+                    fixture_head_sha(),
+                    Some(fixture_base_sha()),
+                    None,
+                    vec!["modified".into()],
+                    vec!["untracked".into()],
+                    checks,
+                    Some(decision),
+                    Some("TIMEOUT AUTH_REQUIRED USER_CANCELLED".into()),
+                )
+                .unwrap();
+                assert_eq!(absent.crash_classification(), None);
+                for classification in C::ALL {
+                    let present = absent
+                        .clone()
+                        .with_crash_classification(Some(classification));
+                    assert_eq!(present.crash_classification(), Some(classification));
+                    // Whole-object equality proves every other field remains unchanged.
+                    assert_eq!(present.with_crash_classification(None), absent);
+                }
+            }
+        }
+    }
+}

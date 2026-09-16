@@ -1,16 +1,16 @@
 use std::fmt;
 
 use crate::{
-    CommitSha, WorkspaceCheckpointExecutedCheckCore, WorkspaceCheckpointKind,
-    WorkspaceCheckpointRef, WorkspaceRecoveryDecision,
+    CommitSha, WorkspaceCheckpointCrashClassification, WorkspaceCheckpointExecutedCheckCore,
+    WorkspaceCheckpointKind, WorkspaceCheckpointRef, WorkspaceRecoveryDecision,
 };
 
 /// Bounded inert captured-state value object for one workspace checkpoint.
 ///
 /// This is intentionally `WorkspaceCheckpointCaptureCore`, not the full
-/// `WorkspaceCheckpoint` schema record: `captured_at` and
-/// `crash_classification` are deliberately deferred and must not be added
-/// here. All supplied values are already-observed evidence and are stored
+/// `WorkspaceCheckpoint` schema record: `captured_at` remains deferred.
+/// Crash classification is optional and caller supplied only.
+/// All supplied values are already-observed evidence and are stored
 /// exactly; no filesystem discovery, Git inspection, check execution,
 /// reference resolution, digest calculation, recovery execution, or
 /// persistence is performed.
@@ -21,6 +21,7 @@ pub struct WorkspaceCheckpointCaptureCore {
     task_id: Option<String>,
     attempt_id: Option<String>,
     kind: WorkspaceCheckpointKind,
+    crash_classification: Option<WorkspaceCheckpointCrashClassification>,
     head_sha: CommitSha,
     base_sha: Option<CommitSha>,
     dirty_diff_ref: Option<WorkspaceCheckpointRef>,
@@ -68,6 +69,7 @@ impl WorkspaceCheckpointCaptureCore {
             task_id,
             attempt_id,
             kind,
+            crash_classification: None,
             head_sha,
             base_sha,
             dirty_diff_ref,
@@ -77,6 +79,20 @@ impl WorkspaceCheckpointCaptureCore {
             recovery_decision,
             recovery_rationale,
         })
+    }
+
+    /// Stores exactly the caller-supplied classification, including absence.
+    /// No other checkpoint field is interpreted or validated by this method.
+    pub fn with_crash_classification(
+        mut self,
+        crash_classification: Option<WorkspaceCheckpointCrashClassification>,
+    ) -> Self {
+        self.crash_classification = crash_classification;
+        self
+    }
+
+    pub const fn crash_classification(&self) -> Option<WorkspaceCheckpointCrashClassification> {
+        self.crash_classification
     }
 
     pub fn checkpoint_id(&self) -> &str {

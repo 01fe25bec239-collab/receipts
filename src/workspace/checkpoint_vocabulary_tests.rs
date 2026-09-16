@@ -75,3 +75,67 @@ fn total_closed_vocabulary_contains_exactly_six_values() {
         6
     );
 }
+
+#[test]
+fn crash_classification_vocabulary_is_exact_closed_ordered_and_unique() {
+    use crate::WorkspaceCheckpointCrashClassification as C;
+
+    fn assert_exhaustive(value: C) {
+        match value {
+            C::RateLimited
+            | C::SessionExhausted
+            | C::AuthRequired
+            | C::ProviderDown
+            | C::Timeout
+            | C::SandboxDenied
+            | C::SafetyCheckPending
+            | C::PolicyBlocked
+            | C::RuntimeCrash
+            | C::InvalidOutput
+            | C::UserCancelled
+            | C::Unknown => {}
+        }
+    }
+
+    assert_eq!(
+        C::ALL,
+        [
+            C::RateLimited,
+            C::SessionExhausted,
+            C::AuthRequired,
+            C::ProviderDown,
+            C::Timeout,
+            C::SandboxDenied,
+            C::SafetyCheckPending,
+            C::PolicyBlocked,
+            C::RuntimeCrash,
+            C::InvalidOutput,
+            C::UserCancelled,
+            C::Unknown,
+        ]
+    );
+    assert_eq!(
+        C::ALL.map(C::as_str),
+        [
+            "RATE_LIMITED",
+            "SESSION_EXHAUSTED",
+            "AUTH_REQUIRED",
+            "PROVIDER_DOWN",
+            "TIMEOUT",
+            "SANDBOX_DENIED",
+            "SAFETY_CHECK_PENDING",
+            "POLICY_BLOCKED",
+            "RUNTIME_CRASH",
+            "INVALID_OUTPUT",
+            "USER_CANCELLED",
+            "UNKNOWN",
+        ]
+    );
+    for (index, value) in C::ALL.iter().enumerate() {
+        assert_exhaustive(*value);
+        for other in &C::ALL[index + 1..] {
+            assert_ne!(value, other);
+            assert_ne!(value.as_str(), other.as_str());
+        }
+    }
+}
