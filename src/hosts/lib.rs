@@ -24,8 +24,10 @@
 //!   networking, rendering, event normalization, or runtime worker execution;
 //! * adjacent frozen contracts (`InstallPlan`, `CoreHandle`,
 //!   `CoreView`, `UserPrompt`, `UserResponse`,
-//!   `HostCapabilityReport`, shutdown reason) remain externally owned and
+//!   shutdown reason) remain externally owned and
 //!   appear here only as unbound associated-type placeholders;
+//! * [`HostCapabilityReport`] composes caller-supplied physical evidence only;
+//!   the adapter's report associated type remains unbound;
 //! * the in-process [`NormalizedHostEvent`] carrier validates structure only;
 //!   the adapter's event associated type remains unbound;
 //! * no authoritative state read or write path exists here.
@@ -39,6 +41,7 @@ pub mod host_capability_mode_override;
 pub mod host_capability_mode_selection;
 pub mod host_capability_native_prerequisite;
 pub mod host_capability_observation;
+pub mod host_capability_report;
 pub mod host_capability_report_core;
 pub mod host_capability_report_refresh;
 pub mod host_capability_report_selection_composition;
@@ -78,6 +81,9 @@ mod host_capability_mode_selection_tests;
 
 #[cfg(test)]
 mod host_capability_native_prerequisite_tests;
+
+#[cfg(test)]
+mod host_capability_report_tests;
 
 #[cfg(test)]
 mod host_capability_report_core_tests;
@@ -135,6 +141,7 @@ pub use host_capability_native_prerequisite::{
     HostCapabilityNativePrerequisiteInputs, HostCapabilityNativePrerequisiteState,
     assess_native_path_prerequisites,
 };
+pub use host_capability_report::HostCapabilityReport;
 pub use host_capability_report_core::{
     HostCapabilityReportNonTemporalCore, HostCapabilityReportNonTemporalCoreError,
     HostCapabilityReportNonTemporalCoreInputs,
