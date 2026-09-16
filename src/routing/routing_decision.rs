@@ -1,7 +1,8 @@
-//! Frozen RoutingDecision physical vocabulary and non-temporal in-process storage only.
+//! Frozen RoutingDecision physical vocabulary and bounded in-process storage only.
 //! No routing, scoring, inference, registry access, or temporal parsing.
 
 use crate::RoutingQualityFloor;
+use crate::policy_eligibility::ModelRoutingDateTimeV1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoutingDecisionOutcome {
@@ -318,13 +319,13 @@ impl EvidenceSourceRef {
     }
 }
 
-/// Non-temporal evidence storage. The unrestricted `value` property is
-/// deferred without an authoritative any-JSON carrier, and `observed_at` is
-/// deferred without an authoritative timestamp binding.
+/// Evidence storage with a caller-supplied canonical timestamp. The unrestricted
+/// `value` property remains deferred without an authoritative any-JSON carrier.
 /// `sample_size` distinguishes absent/null/value and uses a bounded u64
 /// carrier rather than an arbitrary-precision JSON integer codec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityEvidenceNonTemporalCore {
+    observed_at: ModelRoutingDateTimeV1,
     capability: String,
     confidence: EvidenceConfidence,
     source_ref: Option<EvidenceSourceRef>,
@@ -333,17 +334,23 @@ pub struct CapabilityEvidenceNonTemporalCore {
 
 impl CapabilityEvidenceNonTemporalCore {
     pub fn new(
+        observed_at: ModelRoutingDateTimeV1,
         capability: String,
         confidence: EvidenceConfidence,
         source_ref: Option<EvidenceSourceRef>,
         sample_size: Option<Option<u64>>,
     ) -> Self {
         Self {
+            observed_at,
             capability,
             confidence,
             source_ref,
             sample_size,
         }
+    }
+
+    pub fn observed_at(&self) -> &ModelRoutingDateTimeV1 {
+        &self.observed_at
     }
 
     pub fn capability(&self) -> &str {
@@ -473,12 +480,12 @@ impl RegistryFreshness {
     }
 }
 
-/// In-process non-temporal core, NOT the complete wire RoutingDecision.
-/// `occurred_at` and evidence `observed_at` are deferred without an
-/// authoritative timestamp binding. Evidence `value` is deferred without an
-/// authoritative dependency-free any-JSON representation.
+/// Bounded in-process carrier, NOT the complete wire RoutingDecision.
+/// Timestamps are caller-supplied canonical values. Evidence `value` remains
+/// deferred without an authoritative dependency-free any-JSON representation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RoutingDecisionNonTemporalCore {
+    occurred_at: ModelRoutingDateTimeV1,
     decision_id: String,
     request_id: String,
     task_id: Option<String>,
@@ -518,6 +525,7 @@ impl RoutingDecisionNonTemporalCore {
     /// Validates only physical schema invariants and preserves accepted input.
     #[allow(clippy::too_many_arguments)] // Explicit schema fields; no hidden defaults.
     pub fn try_new(
+        occurred_at: ModelRoutingDateTimeV1,
         decision_id: String,
         request_id: String,
         task_id: Option<String>,
@@ -557,6 +565,7 @@ impl RoutingDecisionNonTemporalCore {
             validate_bounded_id(value, EmptyFallbackFrom, FallbackFromTooLong)?;
         }
         Ok(Self {
+            occurred_at,
             decision_id,
             request_id,
             task_id,
@@ -576,6 +585,10 @@ impl RoutingDecisionNonTemporalCore {
             user_pin_applied,
             fallback_from,
         })
+    }
+
+    pub fn occurred_at(&self) -> &ModelRoutingDateTimeV1 {
+        &self.occurred_at
     }
 
     pub fn decision_id(&self) -> &str {

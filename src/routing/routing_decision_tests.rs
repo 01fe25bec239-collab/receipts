@@ -1,3 +1,4 @@
+use crate::policy_eligibility::ModelRoutingDateTimeV1;
 use crate::{
     AlternativeCandidate, AlternativeCandidateError, CapabilityEvidenceNonTemporalCore,
     DecisionConfidence, EstimatedCostClass, EvidenceConfidence, EvidenceSourceRef,
@@ -13,6 +14,7 @@ fn minimal_decision(
     fallback_from: Option<String>,
 ) -> Result<RoutingDecisionNonTemporalCore, RoutingDecisionCoreError> {
     RoutingDecisionNonTemporalCore::try_new(
+        ModelRoutingDateTimeV1::try_new("2026-09-16T12:00:00Z".into()).unwrap(),
         decision_id,
         request_id,
         task_id,
@@ -167,6 +169,7 @@ fn selected_identities_are_optional_open_unbounded_strings() {
 
     let make = |provider: Option<&str>, model: Option<&str>, runtime: Option<&str>| {
         RoutingDecisionNonTemporalCore::try_new(
+            ModelRoutingDateTimeV1::try_new("2026-09-16T12:00:00Z".into()).unwrap(),
             "d".into(),
             "r".into(),
             None,
@@ -313,6 +316,7 @@ fn evidence_preserves_open_capabilities_sources_and_nullable_sample_sizes() {
     for capability in ["", " \t", "能力", "future.capability/v2+beta"] {
         for sample_size in [None, Some(None), Some(Some(0)), Some(Some(u64::MAX))] {
             let evidence = CapabilityEvidenceNonTemporalCore::new(
+                ModelRoutingDateTimeV1::try_new("2026-09-15T10:30:00Z".into()).unwrap(),
                 capability.into(),
                 EvidenceConfidence::Unverified,
                 None,
@@ -362,6 +366,7 @@ fn alternatives_preserve_open_ids_empty_reasons_nullable_scores_order_and_duplic
     let second = make("second", "m2", "r2", None).unwrap();
     let alternatives = vec![first.clone(), second, first.clone()];
     let decision = RoutingDecisionNonTemporalCore::try_new(
+        ModelRoutingDateTimeV1::try_new("2026-09-16T12:00:00Z".into()).unwrap(),
         "d".into(),
         "r".into(),
         None,
@@ -408,12 +413,14 @@ fn required_and_optional_top_level_fields_are_independent_storage_without_policy
 
     let evidence = vec![
         CapabilityEvidenceNonTemporalCore::new(
+            ModelRoutingDateTimeV1::try_new("2026-09-15T10:30:00Z".into()).unwrap(),
             "".into(),
             EvidenceConfidence::UserDeclared,
             None,
             None,
         ),
         CapabilityEvidenceNonTemporalCore::new(
+            ModelRoutingDateTimeV1::try_new("2026-09-15T10:30:00Z".into()).unwrap(),
             "".into(),
             EvidenceConfidence::UserDeclared,
             None,
@@ -436,6 +443,7 @@ fn required_and_optional_top_level_fields_are_independent_storage_without_policy
                     Some(EstimatedCostClass::Unknown),
                 ] {
                     let value = RoutingDecisionNonTemporalCore::try_new(
+                        ModelRoutingDateTimeV1::try_new("2026-09-16T12:00:00Z".into()).unwrap(),
                         "d".into(),
                         "r".into(),
                         None,
@@ -482,6 +490,7 @@ fn required_and_optional_top_level_fields_are_independent_storage_without_policy
 
     for availability in ["", " \t\n", "可用/未来"] {
         let value = RoutingDecisionNonTemporalCore::try_new(
+            ModelRoutingDateTimeV1::try_new("2026-09-16T12:00:00Z".into()).unwrap(),
             "d".into(),
             "r".into(),
             None,
@@ -503,5 +512,128 @@ fn required_and_optional_top_level_fields_are_independent_storage_without_policy
         )
         .unwrap();
         assert_eq!(value.availability_at_decision(), Some(availability));
+    }
+}
+
+fn temporal_decision(
+    occurred_at: ModelRoutingDateTimeV1,
+    evidence: Vec<CapabilityEvidenceNonTemporalCore>,
+) -> RoutingDecisionNonTemporalCore {
+    RoutingDecisionNonTemporalCore::try_new(
+        occurred_at,
+        "d".into(),
+        "r".into(),
+        None,
+        RoutingDecisionOutcome::Selected,
+        None,
+        None,
+        None,
+        None,
+        Some(evidence),
+        None,
+        None,
+        None,
+        None,
+        RegistryFreshness::new(None, None, None, false),
+        RoutingDecisionMode::AutoCurrent,
+        None,
+        None,
+        None,
+    )
+    .unwrap()
+}
+
+#[test]
+fn temporal_fields_preserve_exact_canonical_lexical_forms() {
+    for text in [
+        "2026-09-16T12:00:00Z",
+        "2026-09-16t12:00:00z",
+        "2026-09-16T12:00:00+05:30",
+        "2026-09-16T12:00:00-07:00",
+        "2026-09-16T12:00:00-00:00",
+        "2026-09-16T12:00:00.1200Z",
+        "2026-09-16t12:00:00.123456789012345678901234567890z",
+        "2016-12-31T23:59:60Z",
+    ] {
+        let timestamp = ModelRoutingDateTimeV1::try_new(text.into()).unwrap();
+        let evidence = CapabilityEvidenceNonTemporalCore::new(
+            timestamp.clone(),
+            "能力".into(),
+            EvidenceConfidence::Unverified,
+            None,
+            None,
+        );
+        assert_eq!(evidence.observed_at(), &timestamp);
+        assert_eq!(evidence.observed_at().as_str().as_bytes(), text.as_bytes());
+        let decision = temporal_decision(timestamp.clone(), vec![evidence.clone()]);
+        assert_eq!(decision.occurred_at(), &timestamp);
+        assert_eq!(decision.occurred_at().as_str().as_bytes(), text.as_bytes());
+        assert_eq!(decision.capability_evidence(), Some([evidence].as_slice()));
+        assert_eq!(decision.clone(), decision);
+    }
+}
+
+#[test]
+fn temporal_fields_remain_independent_preserving_evidence_order_and_duplicates() {
+    let occurred_at = ModelRoutingDateTimeV1::try_new("2026-09-16T12:00:00Z".into()).unwrap();
+    let times = [
+        "2099-01-01T00:00:00+05:30",
+        "1900-01-01t00:00:00.000z",
+        "2099-01-01T00:00:00+05:30",
+    ];
+    let evidence: Vec<_> = times
+        .iter()
+        .map(|text| {
+            CapabilityEvidenceNonTemporalCore::new(
+                ModelRoutingDateTimeV1::try_new((*text).into()).unwrap(),
+                "same capability".into(),
+                EvidenceConfidence::Unverified,
+                None,
+                None,
+            )
+        })
+        .collect();
+    assert_eq!(evidence[0], evidence[2]);
+    assert_ne!(evidence[0], evidence[1]);
+    assert_eq!(evidence[0].clone(), evidence[0]);
+    let decision = temporal_decision(occurred_at.clone(), evidence.clone());
+    assert_eq!(decision.occurred_at(), &occurred_at);
+    assert_eq!(decision.capability_evidence(), Some(evidence.as_slice()));
+    for (item, text) in decision.capability_evidence().unwrap().iter().zip(times) {
+        assert_eq!(item.observed_at().as_str(), text);
+        assert_ne!(item.observed_at(), decision.occurred_at());
+    }
+    assert!(!decision.registry_freshness().stale());
+    assert_eq!(decision.registry_freshness().capability_age_seconds(), None);
+    assert_eq!(decision.registry_freshness().model_list_age_seconds(), None);
+
+    // Lexically distinct representations remain unequal even for the same instant.
+    let other = ModelRoutingDateTimeV1::try_new("2026-09-16t12:00:00z".into()).unwrap();
+    assert_ne!(decision, temporal_decision(other, evidence.clone()));
+    let mut changed_evidence = evidence;
+    changed_evidence[0] = changed_evidence[1].clone();
+    assert_ne!(decision, temporal_decision(occurred_at, changed_evidence));
+}
+
+#[test]
+fn invalid_temporal_text_is_rejected_at_canonical_construction_boundary() {
+    for text in [
+        "2026-13-16T12:00:00Z",
+        "2026-02-30T12:00:00Z",
+        "2026-09-16T24:00:00Z",
+        "2026-09-16T12:60:00Z",
+        "2026-09-16T12:00:61Z",
+        "2026-09-16T12:00:00.Z",
+        "2026-09-16T12:00:00+0530",
+        "2026-09-16T12:00:00+24:00",
+        "2026-09-16T12:00:00-00:60",
+        " 2026-09-16T12:00:00Z",
+        "2026-09-16T12:00:00Z ",
+        "2026-09-16 12:00:00Z",
+    ] {
+        assert!(
+            ModelRoutingDateTimeV1::try_new(text.into()).is_err(),
+            "{text}"
+        );
     }
 }
