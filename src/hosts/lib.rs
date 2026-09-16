@@ -29,7 +29,8 @@
 //! * [`HostCapabilityReport`] composes caller-supplied physical evidence only;
 //!   the adapter's report associated type remains unbound;
 //! * the in-process [`NormalizedHostEvent`] carrier validates structure only;
-//!   the adapter's event associated type remains unbound;
+//!   the adapter's canonical event input is physically bound, while emit
+//!   behavior remains unimplemented and its outcome associated type unbound;
 //! * no authoritative state read or write path exists here.
 
 pub mod adapter;

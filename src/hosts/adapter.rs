@@ -13,7 +13,7 @@
 
 use std::future::Future;
 
-use crate::host_id::HostId;
+use crate::{NormalizedHostEvent, host_id::HostId};
 
 /// Translation boundary between the Receipts core and one external host.
 ///
@@ -38,10 +38,6 @@ pub trait HostAdapter {
     /// Unbound placeholder for the externally owned frozen `CoreHandle`
     /// contract.
     type CoreHandle;
-
-    /// Unbound placeholder for the externally owned frozen
-    /// `NormalizedHostEvent` contract.
-    type NormalizedHostEvent;
 
     /// Unbound placeholder for the outcome of forwarding one normalized
     /// host event.
@@ -99,8 +95,24 @@ pub trait HostAdapter {
     /// Semantic operation: forward one normalized host event toward the
     /// core.
     ///
-    /// Declared only; normalization is not performed at this boundary.
-    fn emit(&self, event: &Self::NormalizedHostEvent) -> Self::EmitOutcome;
+    /// The canonical event input is physically bound; behavior is declared
+    /// only. No normalization or source validation is performed here, and
+    /// `EmitOutcome` remains unbound.
+    ///
+    /// An adapter cannot substitute a private event type:
+    /// ```compile_fail,E0308
+    /// use receipts_host_integration::HostAdapter;
+    /// struct PrivateEvent;
+    /// fn substitute<A: HostAdapter>(adapter: &A, event: &PrivateEvent) {
+    ///     adapter.emit(event);
+    /// }
+    /// ```
+    /// The former event associated type is unavailable:
+    /// ```compile_fail,E0220
+    /// use receipts_host_integration::HostAdapter;
+    /// fn substitute<A: HostAdapter<NormalizedHostEvent = ()>>() {}
+    /// ```
+    fn emit(&self, event: &NormalizedHostEvent) -> Self::EmitOutcome;
 
     /// Semantic operation: present a core view to the user through the
     /// host.
