@@ -41,3 +41,54 @@ impl WorkspaceRecoveryDecision {
         }
     }
 }
+
+/// Closed vocabulary for caller-supplied crash classification; never inferred by Workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceCheckpointCrashClassification {
+    RateLimited,
+    SessionExhausted,
+    AuthRequired,
+    ProviderDown,
+    Timeout,
+    SandboxDenied,
+    SafetyCheckPending,
+    PolicyBlocked,
+    RuntimeCrash,
+    InvalidOutput,
+    UserCancelled,
+    Unknown,
+}
+
+impl WorkspaceCheckpointCrashClassification {
+    pub const ALL: [Self; 12] = [
+        Self::RateLimited,
+        Self::SessionExhausted,
+        Self::AuthRequired,
+        Self::ProviderDown,
+        Self::Timeout,
+        Self::SandboxDenied,
+        Self::SafetyCheckPending,
+        Self::PolicyBlocked,
+        Self::RuntimeCrash,
+        Self::InvalidOutput,
+        Self::UserCancelled,
+        Self::Unknown,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RateLimited => "RATE_LIMITED",
+            Self::SessionExhausted => "SESSION_EXHAUSTED",
+            Self::AuthRequired => "AUTH_REQUIRED",
+            Self::ProviderDown => "PROVIDER_DOWN",
+            Self::Timeout => "TIMEOUT",
+            Self::SandboxDenied => "SANDBOX_DENIED",
+            Self::SafetyCheckPending => "SAFETY_CHECK_PENDING",
+            Self::PolicyBlocked => "POLICY_BLOCKED",
+            Self::RuntimeCrash => "RUNTIME_CRASH",
+            Self::InvalidOutput => "INVALID_OUTPUT",
+            Self::UserCancelled => "USER_CANCELLED",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+}

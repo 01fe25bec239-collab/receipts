@@ -107,7 +107,9 @@ pub use checkpoint_executed_check::{
     WorkspaceCheckpointExecutedCheckCore, WorkspaceCheckpointExecutedCheckCoreError,
 };
 pub use checkpoint_reference::{WorkspaceCheckpointRef, WorkspaceCheckpointRefError};
-pub use checkpoint_vocabulary::{WorkspaceCheckpointKind, WorkspaceRecoveryDecision};
+pub use checkpoint_vocabulary::{
+    WorkspaceCheckpointCrashClassification, WorkspaceCheckpointKind, WorkspaceRecoveryDecision,
+};
 pub use error::WorkspaceError;
 pub use handle::{CommitSha, WorkspaceHandle, WorkspaceIsolation, WorkspaceState};
 pub use provision::{WorkspaceProvisionRequest, validate_branch_name};

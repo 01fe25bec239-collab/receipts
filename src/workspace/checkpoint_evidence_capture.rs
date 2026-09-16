@@ -9,8 +9,8 @@ use std::process::Stdio;
 pub(crate) const GIT_EVIDENCE_LIMIT_BYTES: u64 = 1_048_576;
 use crate::{
     CommitSha, WorkspaceCheckpointCaptureCore, WorkspaceCheckpointCaptureCoreError,
-    WorkspaceCheckpointExecutedCheckCore, WorkspaceCheckpointKind, WorkspaceCheckpointRef,
-    WorkspaceError, git,
+    WorkspaceCheckpointCrashClassification, WorkspaceCheckpointExecutedCheckCore,
+    WorkspaceCheckpointKind, WorkspaceCheckpointRef, WorkspaceError, git,
 };
 
 /// Caller-authorized context and inert evidence. `directory` must be in the
@@ -26,6 +26,18 @@ pub struct WorkspaceCheckpointEvidenceCaptureRequest<'a> {
     pub base_sha: Option<&'a str>,
     pub dirty_diff_ref: Option<WorkspaceCheckpointRef>,
     pub executed_checks: Vec<WorkspaceCheckpointExecutedCheckCore>,
+}
+
+impl WorkspaceCheckpointEvidenceCaptureRequest<'_> {
+    /// Captures Git evidence and carries the explicit classification unchanged.
+    /// Classification is never derived from observed state or completed checks.
+    pub fn capture_with_crash_classification(
+        self,
+        crash_classification: Option<WorkspaceCheckpointCrashClassification>,
+    ) -> Result<WorkspaceCheckpointCaptureCore, WorkspaceCheckpointEvidenceCaptureError> {
+        capture_workspace_checkpoint_evidence(self)
+            .map(|core| core.with_crash_classification(crash_classification))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -992,3 +992,65 @@ fn bound_shared_collector_drains_large_stdout_and_stderr_and_reaps() {
         }
     }
 }
+
+#[test]
+fn caller_supplied_crash_classification_and_absence_survive_evidence_capture() {
+    use crate::WorkspaceCheckpointCrashClassification as C;
+
+    let repo = TestRepo::new("checkpoint-crash-classification");
+    repo.commit_file("tracked", "original");
+    let head = repo.head_sha();
+    for dirty in [false, true] {
+        if dirty {
+            fs::write(repo.path().join("tracked"), "TIMEOUT AUTH_REQUIRED").unwrap();
+            fs::write(repo.path().join("USER_CANCELLED"), "RUNTIME_CRASH").unwrap();
+        }
+        for kind in WorkspaceCheckpointKind::ALL {
+            for exit_code in [0, 1, -1] {
+                let make_request = || {
+                    let mut input = request(repo.path());
+                    input.kind = kind;
+                    input.base_sha = Some(&head);
+                    input.dirty_diff_ref = Some(
+                        WorkspaceCheckpointRef::new(
+                            WorkspaceCheckpointRefType::StateQuery,
+                            "TIMEOUT",
+                            None,
+                            None,
+                        )
+                        .unwrap(),
+                    );
+                    input.executed_checks = vec![
+                        WorkspaceCheckpointExecutedCheckCore::new(
+                            WorkspaceCheckpointCheckSource::WorkerExecution,
+                            vec!["auth_failed".into(), "timed_out".into(), "cancelled".into()],
+                            exit_code,
+                            CommitSha::parse(&head).unwrap(),
+                            None,
+                            None,
+                        )
+                        .unwrap(),
+                    ];
+                    input
+                };
+                let absent = capture_workspace_checkpoint_evidence(make_request()).unwrap();
+                assert_eq!(absent.crash_classification(), None);
+                assert_eq!(
+                    make_request()
+                        .capture_with_crash_classification(None)
+                        .unwrap(),
+                    absent
+                );
+                for classification in C::ALL {
+                    let present = make_request()
+                        .capture_with_crash_classification(Some(classification))
+                        .unwrap();
+                    assert_eq!(present.crash_classification(), Some(classification));
+                    assert_eq!(present.recovery_decision(), None);
+                    assert_eq!(present.recovery_rationale(), None);
+                    assert_eq!(present.with_crash_classification(None), absent);
+                }
+            }
+        }
+    }
+}
