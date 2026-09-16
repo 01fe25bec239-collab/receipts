@@ -1,11 +1,14 @@
 mod availability_state_core;
 mod availability_vocabulary;
 mod candidate_eligibility;
+mod candidate_identity_constraint_composition;
 mod candidate_identity_constraints;
 mod candidate_set;
 
 #[cfg(test)]
 mod candidate_eligibility_tests;
+#[cfg(test)]
+mod candidate_identity_constraint_composition_tests;
 #[cfg(test)]
 mod candidate_identity_constraints_tests;
 #[cfg(test)]
@@ -13,6 +16,9 @@ mod candidate_set_tests;
 
 pub use candidate_eligibility::{
     CandidateEligibilityOutcome, CandidateEligibilityRejection, evaluate_candidate_eligibility,
+};
+pub use candidate_identity_constraint_composition::{
+    RegistryCandidateIdentityConstraintAssessment, evaluate_registry_candidate_identity_constraints,
 };
 pub use candidate_identity_constraints::{
     CandidateIdentityConstraintOutcome, CandidateIdentityConstraintRejection,
