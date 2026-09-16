@@ -1,4 +1,6 @@
-use std::cell::RefCell;
+use std::{cell::RefCell, path::PathBuf, process::Command};
+
+use receipts_workspace_execution::{WorkspaceHandle, WorkspaceProvisionRequest};
 
 use crate::{
     AttemptId, CodexTaskExecutionError, FailureClass, RawFailure, RuntimeAdapter, RuntimeAuthStatus,
@@ -11,7 +13,6 @@ struct FixtureRuntimeCapabilities(&'static str);
 #[derive(Debug, PartialEq, Eq)]
 struct FixtureModels(&'static str);
 struct FixtureCapsule;
-struct FixtureWorkspaceHandle;
 struct FixtureExecutionPolicy;
 #[derive(Debug, PartialEq, Eq)]
 struct FixtureAttemptHandle(&'static str);
@@ -43,7 +44,6 @@ impl RuntimeAdapter for TrackingRuntimeAdapter {
     type RuntimeCapabilities = FixtureRuntimeCapabilities;
     type Models = FixtureModels;
     type Capsule = FixtureCapsule;
-    type WorkspaceHandle = FixtureWorkspaceHandle;
     type ExecutionPolicy = FixtureExecutionPolicy;
     type AttemptHandle = FixtureAttemptHandle;
     type AttemptEvent = FixtureAttemptEvent;
@@ -79,7 +79,7 @@ impl RuntimeAdapter for TrackingRuntimeAdapter {
     fn start(
         &self,
         _task: &FixtureCapsule,
-        _workspace: &FixtureWorkspaceHandle,
+        _workspace: &WorkspaceHandle,
         _policy: &FixtureExecutionPolicy,
     ) -> FixtureAttemptHandle {
         self.record(5);
@@ -122,7 +122,6 @@ impl RuntimeAdapter for DefaultResumeRuntimeAdapter {
     type RuntimeCapabilities = FixtureRuntimeCapabilities;
     type Models = FixtureModels;
     type Capsule = FixtureCapsule;
-    type WorkspaceHandle = FixtureWorkspaceHandle;
     type ExecutionPolicy = FixtureExecutionPolicy;
     type AttemptHandle = FixtureAttemptHandle;
     type AttemptEvent = FixtureAttemptEvent;
@@ -153,7 +152,7 @@ impl RuntimeAdapter for DefaultResumeRuntimeAdapter {
     fn start(
         &self,
         _task: &FixtureCapsule,
-        _workspace: &FixtureWorkspaceHandle,
+        _workspace: &WorkspaceHandle,
         _policy: &FixtureExecutionPolicy,
     ) -> FixtureAttemptHandle {
         FixtureAttemptHandle("unused")
@@ -176,12 +175,20 @@ impl RuntimeAdapter for DefaultResumeRuntimeAdapter {
 
 #[test]
 fn frozen_surface_is_exercised_once_with_deterministic_results() {
+    let repository = TestRepository::new();
+    let workspace = WorkspaceProvisionRequest::new(
+        &repository.0,
+        "conformance-workspace",
+        None,
+        "conformance-task",
+        repository.0.join("worktree"),
+        &repository.git(&["rev-parse", "HEAD"]),
+    )
+    .unwrap()
+    .provision()
+    .unwrap();
     let adapter = TrackingRuntimeAdapter::new();
-    let started = adapter.start(
-        &FixtureCapsule,
-        &FixtureWorkspaceHandle,
-        &FixtureExecutionPolicy,
-    );
+    let started = adapter.start(&FixtureCapsule, &workspace, &FixtureExecutionPolicy);
 
     assert_eq!(adapter.runtime_id(), "tracking-fixture");
     assert_eq!(adapter.health(), FixtureHealthReport("healthy-fixture"));
@@ -217,4 +224,50 @@ fn omitted_resume_override_means_unsupported() {
         adapter.resume(&AttemptId::new(" exact-試行-e\u{301} ").unwrap()),
         None
     );
+}
+
+// A throwaway repository keeps the eleven-operation call test intact without
+// fabricating Workspace-owned evidence or adding production lifecycle behavior.
+struct TestRepository(PathBuf);
+
+impl TestRepository {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "receipts-runtime-conformance-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        let repository = Self(path);
+        repository.git(&["init", "--quiet"]);
+        repository.git(&["commit", "--quiet", "--allow-empty", "-m", "seed"]);
+        repository
+    }
+
+    fn git(&self, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .current_dir(&self.0)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args([
+                "-c",
+                "user.name=Runtime Tests",
+                "-c",
+                "user.email=runtime@receipts.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {:?}", output);
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+}
+
+impl Drop for TestRepository {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }

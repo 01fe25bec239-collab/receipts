@@ -1,3 +1,5 @@
+use receipts_workspace_execution::WorkspaceHandle;
+
 use crate::{
     AttemptId, CodexTaskExecutionError, FailureClass, RawFailure, RuntimeAdapter, RuntimeAuthStatus,
 };
@@ -10,7 +12,6 @@ impl RuntimeAdapter for SurfaceWitness {
     type RuntimeCapabilities = ();
     type Models = ();
     type Capsule = ();
-    type WorkspaceHandle = ();
     type ExecutionPolicy = ();
     type AttemptHandle = ();
     type AttemptEvent = ();
@@ -32,7 +33,7 @@ impl RuntimeAdapter for SurfaceWitness {
 
     fn models(&self) {}
 
-    fn start(&self, _task: &(), _workspace: &(), _policy: &()) {}
+    fn start(&self, _task: &(), _workspace: &WorkspaceHandle, _policy: &()) {}
 
     fn stream_events<'a>(&'a self, _handle: &'a ()) -> Self::EventStream<'a> {
         OpaqueEventStream
@@ -98,8 +99,10 @@ fn declaration_has_exact_frozen_operation_set() {
 #[test]
 fn canonical_parameters_leave_only_the_other_associated_placeholders() {
     // These witnesses compile for every implementer without associated-type
-    // equality constraints: neither parameter can be substituted by an adapter.
+    // equality constraints: no canonical parameter can be substituted by an adapter.
     fn parameters<A: RuntimeAdapter>() {
+        let _: fn(&A, &A::Capsule, &WorkspaceHandle, &A::ExecutionPolicy) -> A::AttemptHandle =
+            A::start;
         let _: fn(&A, &crate::RawFailure) -> FailureClass = A::classify_failure;
         let _: fn(&A, &crate::AttemptId) -> Option<A::AttemptHandle> = A::resume;
     }
@@ -117,7 +120,6 @@ fn canonical_parameters_leave_only_the_other_associated_placeholders() {
             "RuntimeCapabilities;",
             "Models;",
             "Capsule;",
-            "WorkspaceHandle;",
             "ExecutionPolicy;",
             "AttemptHandle;",
             "AttemptEvent;",
