@@ -87,3 +87,15 @@ pub use integration_decision_structured_core::{
 
 #[cfg(test)]
 mod integration_decision_structured_core_tests;
+
+pub mod integration_request_structured_core;
+pub use integration_request_structured_core::{
+    IntegrationRequestA4Verdict, IntegrationRequestAttestations,
+    IntegrationRequestConstructionError, IntegrationRequestGateLevel,
+    IntegrationRequestNonTemporalCore, IntegrationRequestOpenFinding,
+    IntegrationRequestPositiveInteger, IntegrationRequestPostMergeCheck,
+    IntegrationRequestSignedInteger, IntegrationRequestTask,
+};
+
+#[cfg(test)]
+mod integration_request_structured_core_tests;
