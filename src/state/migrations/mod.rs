@@ -15,6 +15,7 @@ mod v0007_context_epoch;
 mod v0008_context_epoch_invalidation;
 mod v0009_context_rehydration;
 mod v0010_trusted_time_watermark;
+mod v0011_context_epoch_changed_sources;
 
 use crate::error::StateError;
 
@@ -42,6 +43,7 @@ static REGISTERED: &[Migration] = &[
     v0008_context_epoch_invalidation::MIGRATION,
     v0009_context_rehydration::MIGRATION,
     v0010_trusted_time_watermark::MIGRATION,
+    v0011_context_epoch_changed_sources::MIGRATION,
 ];
 
 /// The registered migration chain in application order.

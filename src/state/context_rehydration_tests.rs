@@ -692,7 +692,7 @@ fn reference_is_materialized_only_with_scoped_demand() {
 #[test]
 fn migration_v9_is_registered_with_immutable_attempt_tables() {
     let (_tmp, repo) = opened("rehydration-schema");
-    assert_eq!(repo.schema_version().expect("version"), 10);
+    assert_eq!(repo.schema_version().expect("version"), 11);
     for table in [
         "context_rehydration_attempt",
         "context_rehydration_repository_snapshot",

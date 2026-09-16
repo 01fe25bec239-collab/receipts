@@ -106,28 +106,28 @@ fn direct_exec(repo: &mut SqliteStateRepository, sql: &str, params: &[&dyn ToSql
         .expect("test corruption statement");
 }
 
-// T01 — a fresh version-0 database bootstraps 0 → 1 → 2 → 3 → 4 → 5 → 6 → 7,
-// with exactly seven registered migrations ending at version 7 and exactly
+// T01 — a fresh version-0 database bootstraps through version 11,
+// with exactly eleven registered migrations and exactly
 // one metadata row per migration.
 #[test]
 fn t01_fresh_database_bootstraps_to_schema_version_7() {
     let registered = migrations::registered();
     assert_eq!(
         registered.len(),
-        10,
-        "exactly ten registered migrations (v0001–v0010) may exist"
+        11,
+        "exactly eleven registered migrations (v0001–v0011) may exist"
     );
     assert_eq!(
         registered.last().expect("chain is non-empty").version,
-        10,
-        "the registered chain must end at version 10"
+        11,
+        "the registered chain must end at version 11"
     );
     let tmp = TempDir::new("cm-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 10);
+    assert_eq!(repo.schema_version().expect("version read"), 11);
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        10,
+        11,
         "one metadata row per applied migration"
     );
 }
@@ -138,10 +138,10 @@ fn t02_version_7_database_reopens_idempotently() {
     let tmp = TempDir::new("cm-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 10);
+        assert_eq!(repo.schema_version().expect("version read"), 11);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            10,
+            11,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -164,7 +164,7 @@ fn t03_ordinary_open_of_version_5_fails_closed() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 5,
-                supported: 10
+                supported: 11
             }
         ),
         "unexpected error: {error}"
@@ -273,8 +273,12 @@ fn t04_migration_v6_creates_exactly_the_authorized_schema() {
 fn t05_no_forbidden_future_schema_exists() {
     let tmp = TempDir::new("cm-t05");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
+    assert!(
+        !migrations::registered()[5]
+            .sql
+            .contains("context_epoch_changed_source")
+    );
     for forbidden in [
-        "context_epoch_changed_source",
         "context_epoch_history",
         "derived_state",
         "context_manifest_derived_state",

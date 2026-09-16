@@ -40,7 +40,7 @@
 //!   `replace_context_epoch`, or `upsert_context_epoch`, and no
 //!   `INSERT OR REPLACE` / `UPSERT` / `ON CONFLICT DO UPDATE` / `UPDATE` /
 //!   `DELETE` anywhere in this slice's SQL;
-//! * no `changed_sources` field, column, table, or calculation;
+//! * v11 stores caller-supplied changed sources; no automatic calculation;
 //! * no `chrono`, `time`, `SystemTime`, `Instant`, or other clock
 //!   dependency: timestamps are opaque strings, never parsed, compared,
 //!   or regenerated;
@@ -210,29 +210,29 @@ fn direct_exec(repo: &mut SqliteStateRepository, sql: &str, params: &[&dyn ToSql
 #[test]
 fn t01_schema_remains_version_8() {
     let (tmp, mut repo) = opened_repo("cea-t01");
-    assert_eq!(repo.schema_version().expect("version read"), 10);
+    assert_eq!(repo.schema_version().expect("version read"), 11);
     advance(&mut repo, "project-1", ContextEpochTrigger::A1Init).expect("advance");
     assert_eq!(
         repo.schema_version().expect("version read"),
-        10,
+        11,
         "advancement must not change the schema version"
     );
     drop(repo);
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("reopen");
-    assert_eq!(repo.schema_version().expect("version read"), 10);
+    assert_eq!(repo.schema_version().expect("version read"), 11);
 }
 
-// T02 — migration v10 is the exact registered chain head.
+// T02 — migration v11 is the exact registered chain head.
 #[test]
 fn t02_migration_v8_registered() {
     let registered = migrations::registered();
     assert_eq!(
         registered.len(),
-        10,
-        "exactly ten registered migrations may exist"
+        11,
+        "exactly eleven registered migrations may exist"
     );
     let versions: Vec<u32> = registered.iter().map(|m| m.version).collect();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
 }
 
 // T03 — the first advancement for a project with no history returns and
@@ -1165,10 +1165,9 @@ fn t43_t44_no_event_emission() {
     );
 }
 
-// T45/T46 — no changed_sources persistence; the parent keeps its four
-// core columns.
+// T45/T46 — v11 provides storage; advancement never creates schema.
 #[test]
-fn t45_t46_no_changed_sources_and_parent_shape_unchanged() {
+fn t45_t46_v11_parent_shape_unchanged_by_advance() {
     let (_tmp, mut repo) = opened_repo("cea-t45");
     let columns = repo.table_columns("context_epoch").expect("columns");
     assert_eq!(
@@ -1177,9 +1176,10 @@ fn t45_t46_no_changed_sources_and_parent_shape_unchanged() {
             "project_id".to_string(),
             "epoch".to_string(),
             "advanced_at".to_string(),
-            "trigger".to_string()
+            "trigger".to_string(),
+            "changed_sources_present".to_string()
         ],
-        "the epoch table keeps exactly its four conceptual columns"
+        "the epoch table has four core columns plus the v11 presence marker"
     );
     advance(
         &mut repo,
@@ -1192,15 +1192,12 @@ fn t45_t46_no_changed_sources_and_parent_shape_unchanged() {
         columns,
         "advancement never widens the stored shape"
     );
-    for forbidden in [
-        "context_epoch_changed_source",
-        "context_epoch_source_digest",
-    ] {
-        assert!(
-            !repo.table_exists(forbidden).expect("table check"),
-            "no {forbidden} storage may exist"
-        );
-    }
+    assert!(
+        !repo
+            .table_exists("context_epoch_source_digest")
+            .expect("table check"),
+        "no context_epoch_source_digest storage may exist"
+    );
 }
 
 // T62/T63 — the trigger enum remains exact: no new variants decode, and
@@ -1263,6 +1260,7 @@ fn t64_no_new_schema_object() {
         "context_manifest_source_required_for",
         "context_epoch",
         "context_epoch_invalidated_role",
+        "context_epoch_changed_source",
         "context_rehydration_attempt",
         "context_rehydration_repository_snapshot",
         "context_rehydration_source_evidence",

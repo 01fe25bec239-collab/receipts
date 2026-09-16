@@ -69,15 +69,15 @@ fn direct_child(
 fn v8_bootstrap_reopen_and_v7_open_fail_closed() {
     let fresh = TempDir::new("cei-v8-fresh");
     let repo = SqliteStateRepository::open(fresh.db_path()).expect("bootstrap v9");
-    assert_eq!(repo.schema_version().expect("version"), 10);
-    assert_eq!(migrations::registered().len(), 10);
+    assert_eq!(repo.schema_version().expect("version"), 11);
+    assert_eq!(migrations::registered().len(), 11);
     drop(repo);
     assert_eq!(
         SqliteStateRepository::open(fresh.db_path())
             .expect("reopen v9")
             .schema_version()
             .expect("version"),
-        10
+        11
     );
 
     let old = TempDir::new("cei-v7-open");
@@ -89,7 +89,7 @@ fn v8_bootstrap_reopen_and_v7_open_fail_closed() {
         SqliteStateRepository::open(old.db_path()).expect_err("ordinary open refuses upgrade"),
         StateError::SchemaVersionMismatch {
             found: 7,
-            supported: 10
+            supported: 11
         }
     ));
 }
@@ -134,12 +134,12 @@ fn v8_schema_is_exact_and_has_both_composite_foreign_keys() {
         vec!["idx_logical_role_role_id_project_id"]
     );
     let migration_sql = migrations::registered()[7].sql;
+    assert!(!migration_sql.contains("context_epoch_changed_source"));
     assert_eq!(migration_sql.matches("CREATE TABLE").count(), 1);
     assert_eq!(migration_sql.matches("CREATE UNIQUE INDEX").count(), 1);
     assert_eq!(migration_sql.matches("CREATE TRIGGER").count(), 0);
     assert_eq!(migration_sql.matches("CREATE VIEW").count(), 0);
     for forbidden in [
-        "context_epoch_changed_source",
         "context_epoch_current",
         "context_epoch_reconciliation",
         "context_epoch_invalidation_status",

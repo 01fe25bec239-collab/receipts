@@ -1,5 +1,5 @@
 //! Deterministic tests for durable ContextEpoch history persistence
-//! (migration 0007 parent-record slice).
+//! (migration 0007 parent record, with migration 0011 changed-source capture).
 //!
 //! All tests use real temporary SQLite database files under the system
 //! temporary directory (never inside the repository). Storage-backstop and
@@ -22,8 +22,8 @@
 //!   `ON CONFLICT DO UPDATE` / `UPDATE` / `DELETE` anywhere in this
 //!   slice's SQL (duplicates are refused by pre-check + primary-key
 //!   backstop);
-//! * beyond the single authorized
-//!   `advance_context_epoch(project_id, advanced_at, trigger, invalidated_role_ids)`, no
+//! * beyond `advance_context_epoch` and
+//!   `advance_context_epoch_with_changed_sources`, no
 //!   `increment_context_epoch`, `next_context_epoch`, `peek_next_epoch`,
 //!   `reserve_epoch`, `allocate_epoch`, `set_current_epoch`,
 //!   `increment_epoch_without_insert`, `invalidate_context`,
@@ -38,8 +38,8 @@
 //!   an artifact reference), and no hashing dependency;
 //! * no `rehydrate`, `reconcile`, `resume_role`, `rebuild_context`,
 //!   `mark_rehydrated`, or `set_last_rehydrated_at`;
-//! * no `changed_sources` persistence and no invalidation data embedded in
-//!   the four-field parent record;
+//! * v11 persists supplied changed sources without automatic detection;
+//!   child data is not embedded in the four-field public carrier;
 //! * no `chrono`, `time`, `SystemTime`, `Instant`, or other clock
 //!   dependency: timestamps are opaque strings;
 //! * no ContextManifest/LogicalRole/ExecutorBinding mutation method and
@@ -181,28 +181,28 @@ fn direct_exec(repo: &mut SqliteStateRepository, sql: &str, params: &[&dyn ToSql
         .expect("test corruption statement");
 }
 
-// T01 — a fresh version-0 database bootstraps 0 → 1 → 2 → 3 → 4 → 5 → 6 → 7,
-// with exactly seven registered migrations ending at version 7 and exactly
+// T01 — a fresh version-0 database bootstraps through version 11,
+// with exactly eleven registered migrations and exactly
 // one metadata row per migration.
 #[test]
 fn t01_fresh_database_bootstraps_to_schema_version_7() {
     let registered = migrations::registered();
     assert_eq!(
         registered.len(),
-        10,
-        "exactly ten registered migrations (v0001–v0010) may exist"
+        11,
+        "exactly eleven registered migrations (v0001–v0011) may exist"
     );
     assert_eq!(
         registered.last().expect("chain is non-empty").version,
-        10,
-        "the registered chain must end at version 10"
+        11,
+        "the registered chain must end at version 11"
     );
     let tmp = TempDir::new("ce-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 10);
+    assert_eq!(repo.schema_version().expect("version read"), 11);
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        10,
+        11,
         "one metadata row per applied migration"
     );
 }
@@ -213,10 +213,10 @@ fn t02_version_7_database_reopens_idempotently() {
     let tmp = TempDir::new("ce-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 10);
+        assert_eq!(repo.schema_version().expect("version read"), 11);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            10,
+            11,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -239,7 +239,7 @@ fn t03_ordinary_open_of_version_6_fails_closed() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 6,
-                supported: 10
+                supported: 11
             }
         ),
         "unexpected error: {error}"
@@ -256,8 +256,8 @@ fn t03_ordinary_open_of_version_6_fails_closed() {
 }
 
 // T04 — migration 7 creates exactly one `context_epoch` table with exactly
-// its four conceptual columns in declared order, and no trigger or view on
-// it; the full chain still creates exactly its own nine tables.
+// its four core columns in declared order, and no trigger or view on it;
+// v11 adds the presence marker, and the full chain has its exact table set.
 #[test]
 fn t04_migration_v7_creates_exactly_the_authorized_schema() {
     let tmp = TempDir::new("ce-t04");
@@ -272,8 +272,14 @@ fn t04_migration_v7_creates_exactly_the_authorized_schema() {
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>(),
-        vec!["project_id", "epoch", "advanced_at", "trigger"],
-        "context_epoch must have exactly its conceptual columns"
+        vec![
+            "project_id",
+            "epoch",
+            "advanced_at",
+            "trigger",
+            "changed_sources_present"
+        ],
+        "context_epoch must have exactly four core columns plus the v11 presence marker"
     );
     assert!(
         repo.sqlite_master_entries("trigger", "context_epoch")
@@ -290,11 +296,27 @@ fn t04_migration_v7_creates_exactly_the_authorized_schema() {
     // The migration-7 SQL creates exactly one table (one CREATE TABLE, no
     // CREATE INDEX / TRIGGER / VIEW).
     let migration_sql = migrations::registered()[6].sql;
+    assert!(!migration_sql.contains("changed_sources_present"));
+    assert!(!migration_sql.contains("context_epoch_changed_source"));
+    let historical = rusqlite::Connection::open_in_memory().expect("historical schema");
+    historical
+        .execute_batch(migrations::registered()[0].sql)
+        .expect("metadata");
+    historical.execute_batch(migration_sql).expect("v7");
+    let mut columns = historical
+        .prepare("PRAGMA table_info(context_epoch)")
+        .expect("columns");
+    let columns = columns
+        .query_map([], |row| row.get::<_, String>(1))
+        .expect("query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("column names");
+    assert_eq!(columns, ["project_id", "epoch", "advanced_at", "trigger"]);
     assert_eq!(migration_sql.matches("CREATE TABLE").count(), 1);
     assert_eq!(migration_sql.matches("CREATE INDEX").count(), 0);
     assert_eq!(migration_sql.matches("CREATE TRIGGER").count(), 0);
     assert_eq!(migration_sql.matches("CREATE VIEW").count(), 0);
-    // The full chain creates exactly its own nine tables.
+    // The full chain creates exactly its own registered tables.
     let mut expected = vec![
         "state_schema_version",
         "logical_role",
@@ -306,6 +328,7 @@ fn t04_migration_v7_creates_exactly_the_authorized_schema() {
         "context_manifest_source_required_for",
         "context_epoch",
         "context_epoch_invalidated_role",
+        "context_epoch_changed_source",
         "context_rehydration_attempt",
         "context_rehydration_repository_snapshot",
         "context_rehydration_source_evidence",
@@ -319,13 +342,12 @@ fn t04_migration_v7_creates_exactly_the_authorized_schema() {
     );
 }
 
-// T05 — no changed-source or reconciliation storage is introduced.
+// T05 — v11 stores supplied changed sources, without reconciliation storage.
 #[test]
-fn t05_no_changed_source_or_reconciliation_schema() {
+fn t05_no_automatic_reconciliation_schema() {
     let tmp = TempDir::new("ce-t05");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
     for forbidden in [
-        "context_epoch_changed_source",
         "context_epoch_reconciliation",
         "context_epoch_current",
         "context_epoch_state",
@@ -1479,12 +1501,23 @@ fn t62_append_emits_no_event() {
     );
 }
 
-// T63/T64 — no changed_sources or embedded invalidation persistence exists
-// on the context_epoch parent: it remains exactly its four core columns.
+// T63/T64 — the v11 parent has only its four core columns and presence
+// marker; append never widens it or embeds source or invalidation content.
 #[test]
-fn t63_t64_no_changed_sources_or_invalidated_roles_columns() {
+fn t63_t64_only_presence_marker_no_embedded_changed_sources_or_invalidated_roles() {
     let (_tmp, mut repo) = opened_repo("ce-t63");
-    let columns = repo.table_columns("context_epoch").expect("columns");
+    let columns_before = repo.table_columns("context_epoch").expect("columns before");
+    assert_eq!(
+        columns_before,
+        vec![
+            "project_id".to_string(),
+            "epoch".to_string(),
+            "advanced_at".to_string(),
+            "trigger".to_string(),
+            "changed_sources_present".to_string(),
+        ],
+        "v11 parent has exactly four core columns and one presence marker"
+    );
     for forbidden in [
         "changed_sources",
         "changed_sources_json",
@@ -1497,21 +1530,16 @@ fn t63_t64_no_changed_sources_or_invalidated_roles_columns() {
         "context_epoch_id",
     ] {
         assert!(
-            !columns.iter().any(|column| column == forbidden),
+            !columns_before.iter().any(|column| column == forbidden),
             "no {forbidden} column may exist on context_epoch"
         );
     }
     repo.append_context_epoch(minimal_epoch("project-1", 1, ContextEpochTrigger::NewWave))
         .expect("append");
     assert_eq!(
-        repo.table_columns("context_epoch").expect("columns"),
-        vec![
-            "project_id".to_string(),
-            "epoch".to_string(),
-            "advanced_at".to_string(),
-            "trigger".to_string()
-        ],
-        "appending never widens the stored shape"
+        columns_before,
+        repo.table_columns("context_epoch").expect("columns after"),
+        "appending never mutates the complete stored shape"
     );
 }
 
@@ -1823,4 +1851,369 @@ fn t75_logical_role_behavior_unchanged() {
         matches!(error, StateError::LogicalRoleAlreadyExists { .. }),
         "unexpected error: {error}"
     );
+}
+
+// A3-032: exact, caller-supplied changed-source persistence.
+fn changed_source(ref_type: crate::ChangedSourceRefType) -> crate::ChangedSource {
+    crate::ChangedSource {
+        ref_type,
+        target: "  opaque/../target\0é  ".to_string(),
+        digest: None,
+        section: Some(String::new()),
+    }
+}
+
+#[test]
+fn changed_sources_roundtrip_presence_order_duplicates_and_unbounded_strings() {
+    use crate::{ChangedSourceRefType as Ref, ChangedSources};
+    let (tmp, mut repo) = opened_repo("cs-roundtrip");
+    let mut items = vec![
+        changed_source(Ref::Url),
+        changed_source(Ref::ArtifactId),
+        changed_source(Ref::StateQuery),
+        changed_source(Ref::RepoPath),
+        changed_source(Ref::Url),
+    ];
+    items[1].digest = Some(String::new());
+    items[1].section = None;
+    items[2].digest = Some("  digest\0  ".into());
+    items[2].section = Some("  section  ".into());
+    items[3].target = "x".repeat(20_000);
+    let values = [
+        ChangedSources::Omitted,
+        ChangedSources::Present(vec![]),
+        ChangedSources::Present(items),
+    ];
+    for (i, value) in values.iter().enumerate() {
+        repo.append_context_epoch_with_changed_sources(
+            minimal_epoch("project-1", i as i64, ContextEpochTrigger::NewWave),
+            value.clone(),
+        )
+        .expect("append");
+    }
+    let many = ChangedSources::Present(vec![changed_source(Ref::Url); 4097]);
+    repo.append_context_epoch_with_changed_sources(
+        minimal_epoch("project-1", 9, ContextEpochTrigger::NewWave),
+        many.clone(),
+    )
+    .expect("no product count ceiling");
+    repo.append_context_epoch(minimal_epoch("project-1", 10, ContextEpochTrigger::NewWave))
+        .expect("four-field append");
+    drop(repo);
+    let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("reopen");
+    for (i, value) in values.iter().enumerate() {
+        assert_eq!(
+            repo.find_context_epoch_changed_sources("project-1", i as i64)
+                .expect("exact read"),
+            Some(value.clone())
+        );
+    }
+    assert_eq!(
+        repo.find_context_epoch_changed_sources("project-1", 9)
+            .expect("many"),
+        Some(many)
+    );
+    assert_eq!(
+        repo.find_context_epoch_changed_sources("project-1", 10)
+            .expect("compat"),
+        Some(ChangedSources::Omitted)
+    );
+    assert_eq!(
+        repo.find_context_epoch_changed_sources("project-1", 11)
+            .expect("missing"),
+        None
+    );
+    assert!(matches!(
+        repo.append_context_epoch_with_changed_sources(
+            minimal_epoch("project-1", 2, ContextEpochTrigger::A1Init),
+            ChangedSources::Omitted,
+        ),
+        Err(StateError::ContextEpochAlreadyExists { .. })
+    ));
+    assert_eq!(
+        repo.find_context_epoch_changed_sources("project-1", 2)
+            .expect("unchanged"),
+        Some(values[2].clone())
+    );
+    assert_eq!(
+        repo.find_latest_context_epoch("project-1")
+            .expect("latest")
+            .expect("exists")
+            .epoch,
+        10
+    );
+}
+
+#[test]
+fn changed_sources_empty_target_fails_before_writing() {
+    use crate::{ChangedSourceRefType as Ref, ChangedSources};
+    let (_tmp, mut repo) = opened_repo("cs-empty");
+    let mut item = changed_source(Ref::RepoPath);
+    item.target.clear();
+    assert!(matches!(
+        repo.append_context_epoch_with_changed_sources(
+            minimal_epoch("project-1", 0, ContextEpochTrigger::A1Init),
+            ChangedSources::Present(vec![item.clone()]),
+        ),
+        Err(StateError::ContextEpochValidation { .. })
+    ));
+    assert!(matches!(
+        repo.advance_context_epoch_with_changed_sources(
+            "project-1",
+            "opaque",
+            ContextEpochTrigger::A1Init,
+            &[],
+            ChangedSources::Present(vec![item]),
+        ),
+        Err(StateError::ContextEpochValidation { .. })
+    ));
+    assert_eq!(repo.count_table_rows("context_epoch").expect("parents"), 0);
+    assert_eq!(
+        repo.count_table_rows("context_epoch_changed_source")
+            .expect("children"),
+        0
+    );
+}
+
+#[test]
+fn changed_sources_v10_to_v11_legacy_is_uncaptured_and_four_field_reads_survive() {
+    let tmp = TempDir::new("cs-legacy");
+    let mut repo =
+        SqliteStateRepository::open_with_migrations(tmp.db_path(), &migrations::registered()[..10])
+            .expect("v10");
+    let original = minimal_epoch("project-1", 7, ContextEpochTrigger::NewWave);
+    repo.append_context_epoch(original.clone())
+        .expect("v10 parent");
+    assert_eq!(repo.schema_version().expect("version"), 10);
+    let migration = migrations::registered()[10];
+    assert_eq!(migration.version, 11);
+    assert_eq!(migration.name, "context_epoch_changed_sources");
+    repo.run_transaction(|uow| uow.execute_batch(migration.sql))
+        .expect("v10 -> v11");
+    drop(repo);
+    let repo = SqliteStateRepository::open(tmp.db_path()).expect("v11 reopen");
+    assert_eq!(repo.schema_version().expect("version"), 11);
+    assert_eq!(
+        repo.count_table_rows("context_epoch_changed_source")
+            .expect("children"),
+        0
+    );
+    let marker: Option<i64> = repo
+        .connection()
+        .query_row(
+            "SELECT changed_sources_present FROM context_epoch",
+            [],
+            |row| row.get(0),
+        )
+        .expect("marker");
+    assert_eq!(marker, None);
+    assert_eq!(
+        repo.find_context_epoch("project-1", 7).expect("core"),
+        Some(original.clone())
+    );
+    assert_eq!(
+        repo.find_latest_context_epoch("project-1").expect("latest"),
+        Some(original)
+    );
+    assert!(matches!(
+        repo.find_context_epoch_changed_sources("project-1", 7),
+        Err(StateError::ContextEpochChangedSourcesNotCaptured { epoch: 7, .. })
+    ));
+}
+
+#[test]
+fn changed_sources_migration_failure_rolls_back_parent_column_and_version() {
+    let tmp = TempDir::new("cs-migration-rollback");
+    let mut repo =
+        SqliteStateRepository::open_with_migrations(tmp.db_path(), &migrations::registered()[..10])
+            .expect("v10");
+    repo.append_context_epoch(minimal_epoch("project-1", 0, ContextEpochTrigger::A1Init))
+        .expect("history");
+    direct_exec(
+        &mut repo,
+        "CREATE TABLE context_epoch_changed_source (collision TEXT)",
+        &[],
+    );
+    repo.run_transaction(|uow| uow.execute_batch(migrations::registered()[10].sql))
+        .expect_err("collision");
+    assert_eq!(repo.schema_version().expect("version"), 10);
+    assert_eq!(
+        repo.table_columns("context_epoch").expect("columns"),
+        ["project_id", "epoch", "advanced_at", "trigger"]
+    );
+    assert_eq!(repo.count_table_rows("context_epoch").expect("history"), 1);
+}
+
+#[test]
+fn changed_sources_exact_child_schema_and_storage_backstops() {
+    let (_tmp, mut repo) = opened_repo("cs-schema");
+    assert_eq!(
+        repo.table_columns("context_epoch_changed_source")
+            .expect("columns"),
+        [
+            "project_id",
+            "epoch",
+            "source_ordinal",
+            "ref_type",
+            "target",
+            "digest",
+            "section"
+        ]
+    );
+    let sql = repo
+        .sqlite_master_entries("table", "context_epoch_changed_source")
+        .expect("sql")
+        .pop()
+        .expect("table")
+        .1;
+    assert!(sql.contains("PRIMARY KEY (project_id, epoch, source_ordinal)"));
+    assert!(sql.contains("REFERENCES context_epoch (project_id, epoch)"));
+    let nullable: i64 = repo.connection().query_row("SELECT \"notnull\" FROM pragma_table_info('context_epoch') WHERE name = 'changed_sources_present'", [], |r| r.get(0)).expect("nullable");
+    assert_eq!(nullable, 0);
+    repo.append_context_epoch(minimal_epoch("project-1", 0, ContextEpochTrigger::A1Init))
+        .expect("parent");
+    for sql in [
+        "UPDATE context_epoch SET changed_sources_present = 2",
+        "INSERT INTO context_epoch_changed_source VALUES ('project-1', 0, -1, 'URL', 'x', NULL, NULL)",
+        "INSERT INTO context_epoch_changed_source VALUES ('project-1', 0, 0, 'OTHER', 'x', NULL, NULL)",
+        "INSERT INTO context_epoch_changed_source VALUES ('project-1', 0, 0, 'URL', '', NULL, NULL)",
+        "INSERT INTO context_epoch_changed_source VALUES ('missing', 0, 0, 'URL', 'x', NULL, NULL)",
+    ] {
+        repo.run_transaction(|uow| uow.execute_batch(sql))
+            .expect_err("storage rejects invalid value");
+    }
+    direct_exec(
+        &mut repo,
+        "INSERT INTO context_epoch_changed_source VALUES ('project-1', 0, 0, 'URL', 'x', NULL, NULL)",
+        &[],
+    );
+    repo.run_transaction(|uow| uow.execute_batch("INSERT INTO context_epoch_changed_source VALUES ('project-1', 0, 0, 'URL', 'x', NULL, NULL)")).expect_err("duplicate ordinal");
+}
+
+#[test]
+fn changed_sources_corrupt_compositions_fail_closed() {
+    // Deliberately remove child constraints to exercise the decoder independently.
+    for corruption in [
+        "UPDATE context_epoch SET changed_sources_present = 2",
+        "UPDATE context_epoch SET changed_sources_present = 'bad'",
+        "UPDATE context_epoch SET changed_sources_present = 0",
+        "UPDATE context_epoch SET changed_sources_present = NULL",
+        "UPDATE context_epoch_changed_source SET ref_type = 'UNKNOWN'",
+        "UPDATE context_epoch_changed_source SET target = ''",
+        "UPDATE context_epoch_changed_source SET source_ordinal = -1",
+        "UPDATE context_epoch_changed_source SET source_ordinal = 1",
+        "UPDATE context_epoch_changed_source SET source_ordinal = 0.5",
+        "UPDATE context_epoch_changed_source SET source_ordinal = 'bad'",
+        "INSERT INTO context_epoch_changed_source SELECT * FROM context_epoch_changed_source",
+        "INSERT INTO context_epoch_changed_source VALUES ('project-1', 0, 2, 'URL', 'x', NULL, NULL)",
+        "UPDATE context_epoch_changed_source SET digest = x'FF'",
+        "UPDATE context_epoch_changed_source SET section = x'FF'",
+        "DELETE FROM context_epoch",
+    ] {
+        let (_tmp, mut repo) = opened_repo("cs-corrupt");
+        repo.append_context_epoch_with_changed_sources(
+            minimal_epoch("project-1", 0, ContextEpochTrigger::A1Init),
+            crate::ChangedSources::Present(vec![]),
+        )
+        .expect("parent");
+        repo.connection().execute_batch("PRAGMA ignore_check_constraints = ON;
+            DROP TABLE context_epoch_changed_source;
+            CREATE TABLE context_epoch_changed_source (project_id, epoch, source_ordinal, ref_type, target, digest, section);
+            INSERT INTO context_epoch_changed_source VALUES ('project-1', 0, 0, 'URL', 'x', NULL, NULL);").expect("corruptible child");
+        direct_exec(&mut repo, corruption, &[]);
+        assert!(
+            matches!(
+                repo.find_context_epoch_changed_sources("project-1", 0),
+                Err(StateError::ContextEpochChangedSourcesDecodeFailed { .. })
+            ),
+            "{corruption}"
+        );
+    }
+}
+
+#[test]
+fn changed_sources_append_and_advancement_rollback_all_children_and_parent() {
+    use crate::{ChangedSourceRefType as Ref, ChangedSources};
+    for (advance, failure) in [
+        (false, "source"),
+        (true, "source"),
+        (true, "role"),
+        (false, "commit"),
+        (true, "commit"),
+    ] {
+        let (tmp, mut repo) = opened_repo("cs-atomic");
+        repo.create_logical_role(minimal_role("role-1"))
+            .expect("role");
+        let tables_before = repo.list_tables().expect("schema");
+        let columns_before = repo.table_columns("context_epoch").expect("columns");
+        let injection = match failure {
+            "source" => "CREATE TRIGGER fail_source BEFORE INSERT ON context_epoch_changed_source WHEN NEW.source_ordinal = 1 BEGIN SELECT RAISE(ABORT, 'source failure'); END;",
+            "role" => "CREATE TRIGGER fail_role BEFORE INSERT ON context_epoch_invalidated_role BEGIN SELECT RAISE(ABORT, 'role failure'); END;",
+            _ => "CREATE TABLE commit_failure (project_id TEXT, epoch INTEGER, FOREIGN KEY (project_id, epoch) REFERENCES context_epoch(project_id, epoch) DEFERRABLE INITIALLY DEFERRED);
+                CREATE TRIGGER fail_commit AFTER INSERT ON context_epoch_changed_source BEGIN INSERT INTO commit_failure VALUES ('missing', 0); END;",
+        };
+        repo.connection().execute_batch(injection).expect("inject");
+        let sources = ChangedSources::Present(vec![changed_source(Ref::Url); 2]);
+        let result = if advance {
+            repo.advance_context_epoch_with_changed_sources(
+                "project-1",
+                "opaque",
+                ContextEpochTrigger::NewWave,
+                &["role-1".into()],
+                sources.clone(),
+            )
+            .map(|_| ())
+        } else {
+            repo.append_context_epoch_with_changed_sources(
+                minimal_epoch("project-1", 0, ContextEpochTrigger::NewWave),
+                sources.clone(),
+            )
+        };
+        assert!(result.is_err(), "{advance}/{failure}");
+        drop(repo);
+        let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("reopen after failure");
+        for table in [
+            "context_epoch",
+            "context_epoch_changed_source",
+            "context_epoch_invalidated_role",
+        ] {
+            assert_eq!(
+                repo.count_table_rows(table).expect("rows"),
+                0,
+                "{advance}/{failure}/{table}"
+            );
+        }
+        repo.connection()
+            .execute_batch(match failure {
+                "source" => "DROP TRIGGER fail_source",
+                "role" => "DROP TRIGGER fail_role",
+                _ => "DROP TRIGGER fail_commit; DROP TABLE commit_failure",
+            })
+            .expect("remove injection");
+        let created = repo
+            .advance_context_epoch_with_changed_sources(
+                "project-1",
+                "opaque",
+                ContextEpochTrigger::NewWave,
+                &["role-1".into()],
+                sources.clone(),
+            )
+            .expect("atomic advance");
+        assert_eq!(created.epoch, 0);
+        assert_eq!(
+            repo.find_context_epoch_changed_sources("project-1", 0)
+                .expect("sources"),
+            Some(sources)
+        );
+        assert_eq!(
+            repo.find_context_epoch_invalidated_role_ids("project-1", 0)
+                .expect("roles"),
+            Some(vec!["role-1".into()])
+        );
+        assert_eq!(repo.list_tables().expect("schema"), tables_before);
+        assert_eq!(
+            repo.table_columns("context_epoch").expect("columns"),
+            columns_before
+        );
+    }
 }

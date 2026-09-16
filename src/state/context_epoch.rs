@@ -1,5 +1,6 @@
 //! Durable ContextEpoch history and invalidation persistence (migrations
-//! 0007–0008), including the transactional advancement primitive.
+//! 0007–0008 and 0011), including ordered changed-source capture and
+//! transactional advancement.
 //!
 //! [`ContextEpoch`] is the immutable, project-scoped history record for a
 //! context-epoch transition: which project reached which epoch number, the
@@ -11,8 +12,9 @@
 //! (highest numeric `epoch`), never a duplicated fact.
 //!
 //! Scope of this slice: append + exact read + latest read, plus exactly
-//! one bounded advancement mutation,
-//! [`SqliteStateRepository::advance_context_epoch`]. State stores epoch
+//! transactional advancement through [`SqliteStateRepository::advance_context_epoch`]
+//! and [`SqliteStateRepository::advance_context_epoch_with_changed_sources`].
+//! State stores epoch
 //! records the trusted core boundary has already constructed; it never
 //! decides that an epoch should advance — the advancement operation is
 //! invoked only after trusted core/orchestration logic has already made
@@ -33,8 +35,7 @@
 //! implements none of the behavior any trigger name represents.
 //!
 //! This module loads no source contents and computes or compares no
-//! digests (`changed_sources` belongs to the later rehydration slice and
-//! is deliberately not persisted). The caller supplies the complete
+//! digests. The caller supplies ordered changed sources and the complete
 //! invalidated-role set; State only validates and persists it atomically
 //! with the new epoch. It mutates no ContextManifest, LogicalRole, or
 //! ExecutorBinding; and it emits no events — `CONTEXT_EPOCH_ADVANCED` production belongs to the
@@ -183,9 +184,10 @@ impl ContextEpochTrigger {
 /// State neither increments it nor enforces any contiguity or ordering
 /// rule against other records. `advanced_at` is an opaque contract
 /// timestamp string stored exactly as supplied and never parsed,
-/// normalized, compared, or regenerated. `changed_sources` remains absent;
+/// normalized, compared, or regenerated. Changed sources and
 /// invalidated role identities live in immutable normalized child rows and
-/// do not alter this four-field parent record.
+/// do not alter this four-field carrier. Exact changed-source reads use a
+/// separate presence-aware API that rejects uncaptured legacy values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextEpoch {
     /// Owning project identity. Non-empty, at most
@@ -200,8 +202,57 @@ pub struct ContextEpoch {
     pub trigger: ContextEpochTrigger,
 }
 
+/// Closed changed-source reference categories; URL is opaque metadata only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangedSourceRefType {
+    RepoPath,
+    StateQuery,
+    ArtifactId,
+    Url,
+}
+
+impl ChangedSourceRefType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RepoPath => "REPO_PATH",
+            Self::StateQuery => "STATE_QUERY",
+            Self::ArtifactId => "ARTIFACT_ID",
+            Self::Url => "URL",
+        }
+    }
+
+    fn from_storage(value: &str) -> Result<Self, StateError> {
+        match value {
+            "REPO_PATH" => Ok(Self::RepoPath),
+            "STATE_QUERY" => Ok(Self::StateQuery),
+            "ARTIFACT_ID" => Ok(Self::ArtifactId),
+            "URL" => Ok(Self::Url),
+            _ => Err(changed_sources_decode(format!(
+                "invalid ref_type {value:?}"
+            ))),
+        }
+    }
+}
+
+/// One caller-supplied item. Strings are preserved byte-for-byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedSource {
+    pub ref_type: ChangedSourceRefType,
+    pub target: String,
+    pub digest: Option<String>,
+    pub section: Option<String>,
+}
+
+/// Valid captured values only. Legacy unavailable values are read errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangedSources {
+    Omitted,
+    Present(Vec<ChangedSource>),
+}
+
 impl SqliteStateRepository {
-    /// Durably appends one immutable ContextEpoch history record.
+    /// Durably appends one immutable ContextEpoch with changed_sources Omitted.
+    /// On v11 the column default records this presence state atomically.
     ///
     /// The append is atomic: validation, the duplicate pre-check, and the
     /// insert commit together in one transaction or not at all; there is
@@ -230,6 +281,62 @@ impl SqliteStateRepository {
     pub fn append_context_epoch(&mut self, context_epoch: ContextEpoch) -> Result<(), StateError> {
         validate_for_append(&context_epoch)?;
         self.run_transaction(|uow| uow.insert_context_epoch(&context_epoch))
+    }
+
+    /// Atomically appends a parent, presence state and ordered source children.
+    pub fn append_context_epoch_with_changed_sources(
+        &mut self,
+        context_epoch: ContextEpoch,
+        changed_sources: ChangedSources,
+    ) -> Result<(), StateError> {
+        validate_for_append(&context_epoch)?;
+        validate_changed_sources(&changed_sources)?;
+        self.run_transaction(|uow| insert_context_epoch(uow.tx(), &context_epoch, &changed_sources))
+    }
+
+    /// Exact captured changed_sources for an epoch, on one read snapshot.
+    /// Missing parent returns None; legacy uncaptured values fail closed.
+    pub fn find_context_epoch_changed_sources(
+        &self,
+        project_id: &str,
+        epoch: i64,
+    ) -> Result<Option<ChangedSources>, StateError> {
+        validate_project_id(project_id)?;
+        if epoch < 0 {
+            return Err(StateError::ContextEpochValidation {
+                detail: format!("epoch must be >= 0, found {epoch}"),
+            });
+        }
+        let tx = self
+            .connection()
+            .unchecked_transaction()
+            .map_err(internal_query_failure)?;
+        let parent = read_context_epoch(&tx, project_id, epoch)?;
+        let sources = read_changed_source_items(&tx, project_id, epoch)?;
+        let found = if parent.is_some() {
+            let marker: Option<i64> = tx.query_row(
+                "SELECT changed_sources_present FROM context_epoch WHERE project_id = ?1 AND epoch = ?2",
+                params![project_id, epoch], |row| row.get(0),
+            ).map_err(|e| changed_sources_decode(e.to_string()))?;
+            Some(match marker {
+                Some(1) => ChangedSources::Present(sources),
+                Some(0) if sources.is_empty() => ChangedSources::Omitted,
+                None if sources.is_empty() => {
+                    return Err(StateError::ContextEpochChangedSourcesNotCaptured {
+                        project_id: project_id.to_string(),
+                        epoch,
+                    });
+                }
+                _ => return Err(changed_sources_decode("invalid presence/child composition")),
+            })
+        } else {
+            if !sources.is_empty() {
+                return Err(changed_sources_decode("changed sources without parent"));
+            }
+            None
+        };
+        tx.commit().map_err(internal_query_failure)?;
+        Ok(found)
     }
 
     /// Derives and durably appends exactly one next ContextEpoch record
@@ -291,6 +398,25 @@ impl SqliteStateRepository {
         trigger: ContextEpochTrigger,
         invalidated_role_ids: &[String],
     ) -> Result<ContextEpoch, StateError> {
+        self.advance_context_epoch_with_changed_sources(
+            project_id,
+            advanced_at,
+            trigger,
+            invalidated_role_ids,
+            ChangedSources::Omitted,
+        )
+    }
+
+    /// Advances atomically with caller-supplied changed sources and invalidated roles.
+    pub fn advance_context_epoch_with_changed_sources(
+        &mut self,
+        project_id: &str,
+        advanced_at: &str,
+        trigger: ContextEpochTrigger,
+        invalidated_role_ids: &[String],
+        changed_sources: ChangedSources,
+    ) -> Result<ContextEpoch, StateError> {
+        validate_changed_sources(&changed_sources)?;
         validate_project_id(project_id)?;
         ensure_non_empty("advanced_at", advanced_at)?;
         validate_invalidated_role_ids(invalidated_role_ids)?;
@@ -304,7 +430,7 @@ impl SqliteStateRepository {
                 advanced_at: advanced_at.to_string(),
                 trigger,
             };
-            uow.insert_context_epoch(&created)?;
+            insert_context_epoch(uow.tx(), &created, &changed_sources)?;
             insert_invalidated_roles(uow.tx(), project_id, epoch, invalidated_role_ids)?;
             Ok(created)
         })
@@ -411,7 +537,7 @@ impl UnitOfWork<'_> {
         &self,
         context_epoch: &ContextEpoch,
     ) -> Result<(), StateError> {
-        insert_context_epoch(self.tx(), context_epoch)
+        insert_context_epoch(self.tx(), context_epoch, &ChangedSources::Omitted)
     }
 
     /// Reads the latest ContextEpoch for `project_id` on the open
@@ -615,7 +741,11 @@ fn derive_next_epoch(project_id: &str, latest_epoch: Option<i64>) -> Result<i64,
 /// [`StateError::ContextEpochAlreadyExists`] result; the failed statement
 /// leaves the still-open transaction rolled back by the caller's error
 /// path, so no partial record can persist.
-fn insert_context_epoch(conn: &Connection, epoch: &ContextEpoch) -> Result<(), StateError> {
+fn insert_context_epoch(
+    conn: &Connection,
+    epoch: &ContextEpoch,
+    sources: &ChangedSources,
+) -> Result<(), StateError> {
     let duplicate: Option<i64> = conn
         .query_row(
             EPOCH_EXISTS_SQL,
@@ -631,7 +761,14 @@ fn insert_context_epoch(conn: &Connection, epoch: &ContextEpoch) -> Result<(), S
         });
     }
     conn.execute(
-        INSERT_EPOCH_SQL,
+        match sources {
+            ChangedSources::Omitted => INSERT_EPOCH_SQL,
+            ChangedSources::Present(_) => {
+                "INSERT INTO context_epoch
+                (project_id, epoch, advanced_at, trigger, changed_sources_present)
+                VALUES (?1, ?2, ?3, ?4, 1)"
+            }
+        },
         params![
             epoch.project_id,
             epoch.epoch,
@@ -649,7 +786,89 @@ fn insert_context_epoch(conn: &Connection, epoch: &ContextEpoch) -> Result<(), S
             write_failure(error)
         }
     })?;
+    if let ChangedSources::Present(items) = sources {
+        let mut statement = conn
+            .prepare(
+                "INSERT INTO context_epoch_changed_source
+            (project_id, epoch, source_ordinal, ref_type, target, digest, section)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )
+            .map_err(write_failure)?;
+        for (ordinal, item) in items.iter().enumerate() {
+            let ordinal =
+                i64::try_from(ordinal).map_err(|e| StateError::ContextEpochWriteFailed {
+                    detail: e.to_string(),
+                })?;
+            statement
+                .execute(params![
+                    epoch.project_id,
+                    epoch.epoch,
+                    ordinal,
+                    item.ref_type.as_str(),
+                    item.target,
+                    item.digest,
+                    item.section
+                ])
+                .map_err(write_failure)?;
+        }
+    }
     Ok(())
+}
+
+fn validate_changed_sources(sources: &ChangedSources) -> Result<(), StateError> {
+    if let ChangedSources::Present(items) = sources {
+        for item in items {
+            ensure_non_empty("changed_source.target", &item.target)?;
+        }
+    }
+    Ok(())
+}
+
+fn changed_sources_decode(detail: impl Into<String>) -> StateError {
+    StateError::ContextEpochChangedSourcesDecodeFailed {
+        detail: detail.into(),
+    }
+}
+
+fn read_changed_source_items(
+    conn: &Connection,
+    project_id: &str,
+    epoch: i64,
+) -> Result<Vec<ChangedSource>, StateError> {
+    let mut statement = conn.prepare("SELECT source_ordinal, ref_type, target, digest, section
+        FROM context_epoch_changed_source WHERE project_id = ?1 AND epoch = ?2 ORDER BY source_ordinal")
+        .map_err(|e| changed_sources_decode(e.to_string()))?;
+    let mut rows = statement
+        .query(params![project_id, epoch])
+        .map_err(|e| changed_sources_decode(e.to_string()))?;
+    let mut items = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| changed_sources_decode(e.to_string()))?
+    {
+        let (ordinal, ref_type, target, digest, section) = (|| -> rusqlite::Result<_> {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })()
+        .map_err(|e| changed_sources_decode(e.to_string()))?;
+        if usize::try_from(ordinal).ok() != Some(items.len()) || target.is_empty() {
+            return Err(changed_sources_decode(
+                "invalid ordinal sequence or empty target",
+            ));
+        }
+        items.push(ChangedSource {
+            ref_type: ChangedSourceRefType::from_storage(&ref_type)?,
+            target,
+            digest,
+            section,
+        });
+    }
+    Ok(items)
 }
 
 /// Reads one epoch record on the caller's snapshot and applies contract

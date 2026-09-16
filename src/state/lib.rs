@@ -83,7 +83,9 @@ mod trusted_time_watermark_tests;
 mod tests;
 
 pub use canonical_timestamp::CanonicalTimestampV1;
-pub use context_epoch::{ContextEpoch, ContextEpochTrigger};
+pub use context_epoch::{
+    ChangedSource, ChangedSourceRefType, ChangedSources, ContextEpoch, ContextEpochTrigger,
+};
 pub use context_manifest::{
     ContextManifest, ContextManifestSource, ContextSourceRef, ContextSourceRefType, RequiredFor,
     SourceClass,

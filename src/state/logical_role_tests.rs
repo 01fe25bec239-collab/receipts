@@ -30,13 +30,13 @@ fn minimal_role(role_id: &str, role_type: LogicalRoleType) -> LogicalRole {
     }
 }
 
-// T01 — a fresh database bootstraps through the registered chain, which
-// since migration 0007 ends at schema version 7.
+// T01 — a fresh database bootstraps through the registered chain,
+// which ends at schema version 11.
 #[test]
 fn t01_fresh_database_reaches_schema_version_7() {
     let tmp = TempDir::new("lr-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 10);
+    assert_eq!(repo.schema_version().expect("version read"), 11);
     assert!(
         repo.table_exists("logical_role").expect("table check"),
         "logical_role must exist after migration 2"
@@ -71,10 +71,10 @@ fn t02_version_7_reopen_idempotent() {
     let tmp = TempDir::new("lr-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 10);
+        assert_eq!(repo.schema_version().expect("version read"), 11);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            10,
+            11,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -97,7 +97,7 @@ fn t03_ordinary_open_of_version_1_database_fails() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 1,
-                supported: 10
+                supported: 11
             }
         ),
         "unexpected error: {error}"

@@ -174,7 +174,7 @@ fn check_values(sql: &str, column: &str) -> Vec<String> {
 fn t01_fresh_database_bootstraps_to_schema_version_7() {
     let tmp = TempDir::new("ev-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 10);
+    assert_eq!(repo.schema_version().expect("version read"), 11);
     assert!(
         repo.table_exists("event").expect("table check"),
         "event must exist after migration 4"
@@ -182,7 +182,7 @@ fn t01_fresh_database_bootstraps_to_schema_version_7() {
     // Exactly one metadata row per applied migration.
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        10
+        11
     );
 }
 
@@ -192,17 +192,17 @@ fn t02_version_7_database_reopens() {
     let tmp = TempDir::new("ev-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 10);
+        assert_eq!(repo.schema_version().expect("version read"), 11);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            10,
+            11,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
 }
 
 // T03 — ordinary open of an existing version-3 database fails closed
-// instead of silently migrating it to version 7.
+// instead of silently migrating it to version 11.
 #[test]
 fn t03_ordinary_open_of_version_3_database_fails() {
     let tmp = TempDir::new("ev-t03");
@@ -218,7 +218,7 @@ fn t03_ordinary_open_of_version_3_database_fails() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 3,
-                supported: 10
+                supported: 11
             }
         ),
         "unexpected error: {error}"
@@ -959,7 +959,7 @@ fn t45_migration4_preserves_logical_roles() {
         repo.run_transaction(|uow| uow.execute_batch(migration.sql))
             .expect("apply migration 4");
     }
-    // The ordinary registered chain now ends at version 7 and refuses to
+    // The ordinary registered chain now ends at version 11 and refuses to
     // open a version-4 database, so the migrated database is verified
     // through the version-4 prefix of the same chain.
     let version_4_chain = &migrations::registered()[..4];
@@ -1028,6 +1028,7 @@ fn t47_migration4_creates_only_event_schema() {
         "context_manifest_source_required_for",
         "context_epoch",
         "context_epoch_invalidated_role",
+        "context_epoch_changed_source",
         "context_rehydration_attempt",
         "context_rehydration_repository_snapshot",
         "context_rehydration_source_evidence",
@@ -1055,7 +1056,7 @@ fn t47_migration4_creates_only_event_schema() {
             .expect("apply migration 4");
     }
     // Verified through the version-4 prefix of the registered chain; the
-    // ordinary chain now ends at version 7 and refuses a version-4 database.
+    // ordinary chain now ends at version 11 and refuses a version-4 database.
     let version_4_chain = &migrations::registered()[..4];
     let repo = SqliteStateRepository::open_with_migrations(tmp.db_path(), version_4_chain)
         .expect("open at version 4");
