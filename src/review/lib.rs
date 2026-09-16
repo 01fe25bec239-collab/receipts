@@ -99,3 +99,12 @@ pub use integration_request_structured_core::{
 
 #[cfg(test)]
 mod integration_request_structured_core_tests;
+
+pub mod safety_interruption_structured_core;
+pub use safety_interruption_structured_core::{
+    SafetyInterruptionConstructionError, SafetyInterruptionDetectionConfidence,
+    SafetyInterruptionNonTemporalCore, SafetyInterruptionState, SafetyInterruptionTerminalOutcome,
+};
+
+#[cfg(test)]
+mod safety_interruption_structured_core_tests;
