@@ -3,7 +3,10 @@ use std::future::{Future, Ready, ready};
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
-use super::{HostAdapter, HostId, NormalizedHostEvent, adapter_tests::canonical_event};
+use super::{
+    HostAdapter, HostCapabilityReport, HostId, NormalizedHostEvent,
+    adapter_tests::{canonical_event, canonical_report},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Operation {
@@ -27,7 +30,6 @@ struct FixtureCoreView;
 struct FixturePresentOutcome;
 struct FixtureUserPrompt;
 struct FixtureUserResponse;
-struct FixtureHostCapabilityReport;
 struct FixtureShutdownReason;
 struct FixtureShutdownOutcome;
 
@@ -53,7 +55,6 @@ impl HostAdapter for ConformanceAdapter {
     type UserPrompt = FixtureUserPrompt;
     type UserResponse = FixtureUserResponse;
     type UserInputPending = Ready<FixtureUserResponse>;
-    type HostCapabilityReport = FixtureHostCapabilityReport;
     type ShutdownReason = FixtureShutdownReason;
     type ShutdownOutcome = FixtureShutdownOutcome;
 
@@ -92,9 +93,9 @@ impl HostAdapter for ConformanceAdapter {
         ready(FixtureUserResponse)
     }
 
-    fn capabilities(&self) -> Self::HostCapabilityReport {
+    fn capabilities(&self) -> HostCapabilityReport {
         self.record(Operation::Capabilities);
-        FixtureHostCapabilityReport
+        canonical_report()
     }
 
     fn shutdown(self, _reason: Self::ShutdownReason) -> Self::ShutdownOutcome {
@@ -126,7 +127,8 @@ fn exercise_all_operations<A: HostAdapter>(
         Poll::Ready(_)
     ));
 
-    let _ = <A as HostAdapter>::capabilities(&adapter);
+    let report: HostCapabilityReport = <A as HostAdapter>::capabilities(&adapter);
+    assert_eq!(report, canonical_report());
     let _ = <A as HostAdapter>::shutdown(adapter, reason);
     id
 }
@@ -183,5 +185,23 @@ fn generic_emit_records_only_emit_for_every_host_identity() {
         let _: FixtureEmitOutcome = emit(&adapter, &event);
         assert_eq!(trace.borrow().as_slice(), [Operation::Emit]);
         assert_eq!(event, original);
+    }
+}
+
+#[test]
+fn generic_capabilities_records_only_capabilities_for_every_host_identity() {
+    fn capabilities<A: HostAdapter>(adapter: &A) -> HostCapabilityReport {
+        adapter.capabilities()
+    }
+
+    for id in [HostId::ClaudeCode, HostId::Codex, HostId::Headless] {
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let adapter = ConformanceAdapter {
+            id,
+            trace: Rc::clone(&trace),
+        };
+        let report: HostCapabilityReport = capabilities(&adapter);
+        assert_eq!(report, canonical_report());
+        assert_eq!(trace.borrow().as_slice(), [Operation::Capabilities]);
     }
 }

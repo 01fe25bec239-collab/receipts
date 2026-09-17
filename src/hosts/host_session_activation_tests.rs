@@ -26,7 +26,6 @@ impl HostAdapter for Adapter {
     type UserPrompt = ();
     type UserResponse = ();
     type UserInputPending = Ready<()>;
-    type HostCapabilityReport = ();
     type ShutdownReason = ();
     type ShutdownOutcome = ();
     fn id(&self) -> HostId {
@@ -50,7 +49,7 @@ impl HostAdapter for Adapter {
     fn request_user_input(&mut self, _: ()) -> Ready<()> {
         panic!("unbound input")
     }
-    fn capabilities(&self) {
+    fn capabilities(&self) -> crate::HostCapabilityReport {
         panic!("unbound capabilities")
     }
     fn shutdown(self, _: ()) {
