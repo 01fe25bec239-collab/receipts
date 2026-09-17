@@ -1054,3 +1054,66 @@ fn caller_supplied_crash_classification_and_absence_survive_evidence_capture() {
         }
     }
 }
+
+#[test]
+fn git_evidence_preserves_caller_supplied_check_results_without_inference() {
+    use crate::WorkspaceCheckpointExecutedCheckResult as R;
+    let repo = TestRepo::new("checkpoint-check-results");
+    let old_head = repo.head_sha();
+    repo.commit_file("tracked", "original");
+    let head = repo.head_sha();
+    let marker = repo.path().join("must-not-execute");
+    let reference = WorkspaceCheckpointRef::new(
+        WorkspaceCheckpointRefType::RepoPath,
+        marker.to_str().unwrap(),
+        Some(" FAIL timeout ".into()),
+        Some(" UNKNOWN ".into()),
+    )
+    .unwrap();
+    let mut checks = Vec::new();
+    for result in std::iter::once(None).chain(R::ALL.map(Some)) {
+        for source in WorkspaceCheckpointCheckSource::ALL {
+            for exit_code in [0, 1, -1] {
+                for timed_out in [None, Some(false), Some(true)] {
+                    for output_ref in [None, Some(reference.clone())] {
+                        for code_sha in [&old_head, &head] {
+                            for command in [
+                                vec!["/usr/bin/touch".into(), marker.to_str().unwrap().into()],
+                                vec!["FAIL PASS ERROR SKIPPED UNKNOWN timeout".into()],
+                            ] {
+                                let absent = WorkspaceCheckpointExecutedCheckCore::new(
+                                    source,
+                                    command,
+                                    exit_code,
+                                    CommitSha::parse(code_sha).unwrap(),
+                                    timed_out,
+                                    output_ref.clone(),
+                                )
+                                .unwrap();
+                                assert_eq!(absent.result(), None);
+                                checks.push(absent.with_result(result));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for dirty in [false, true] {
+        if dirty {
+            fs::write(repo.path().join("tracked"), "FAIL ERROR timeout").unwrap();
+            fs::write(repo.path().join("UNKNOWN"), "PASS SKIPPED").unwrap();
+        }
+        let mut input = request(repo.path());
+        input.executed_checks = checks.clone();
+        let core = capture_workspace_checkpoint_evidence(input).unwrap();
+        assert_eq!(core.executed_checks(), checks);
+        for (observed, supplied) in core.executed_checks().iter().zip(&checks) {
+            assert_eq!(observed.result(), supplied.result());
+        }
+        assert_eq!(core.head_sha().as_str(), head);
+        assert_eq!(core.modified_files().is_empty(), !dirty);
+        assert_eq!(core.untracked_files().is_empty(), !dirty);
+        assert!(!marker.exists());
+    }
+}

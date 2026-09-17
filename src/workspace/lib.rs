@@ -101,7 +101,8 @@ pub use checkpoint_evidence_capture::{
     capture_workspace_checkpoint_evidence,
 };
 pub use checkpoint_evidence_vocabulary::{
-    WorkspaceCheckpointCheckSource, WorkspaceCheckpointRefType,
+    WorkspaceCheckpointCheckSource, WorkspaceCheckpointExecutedCheckResult,
+    WorkspaceCheckpointRefType,
 };
 pub use checkpoint_executed_check::{
     WorkspaceCheckpointExecutedCheckCore, WorkspaceCheckpointExecutedCheckCoreError,

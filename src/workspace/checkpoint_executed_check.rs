@@ -1,12 +1,15 @@
 use std::fmt;
 
-use crate::{CommitSha, WorkspaceCheckpointCheckSource, WorkspaceCheckpointRef};
+use crate::{
+    CommitSha, WorkspaceCheckpointCheckSource, WorkspaceCheckpointExecutedCheckResult,
+    WorkspaceCheckpointRef,
+};
 
 /// Bounded core of one `WorkspaceCheckpoint.executed_checks[]` entry.
 ///
 /// Records evidence of an explicitly-invoked argv command and its observed
 /// outcome. This is the deliberately bounded `Core` slice: `started_at`,
-/// `finished_at`, and `result` are out of scope and must not be added here.
+/// `finished_at` remain out of scope. Result is optional and caller supplied only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceCheckpointExecutedCheckCore {
     source: WorkspaceCheckpointCheckSource,
@@ -15,6 +18,7 @@ pub struct WorkspaceCheckpointExecutedCheckCore {
     code_sha: CommitSha,
     timed_out: Option<bool>,
     output_ref: Option<WorkspaceCheckpointRef>,
+    result: Option<WorkspaceCheckpointExecutedCheckResult>,
 }
 
 impl WorkspaceCheckpointExecutedCheckCore {
@@ -41,7 +45,19 @@ impl WorkspaceCheckpointExecutedCheckCore {
             code_sha,
             timed_out,
             output_ref,
+            result: None,
         })
+    }
+
+    /// Stores exactly the caller-supplied result, including absence.
+    /// No other evidence field is interpreted or validated by this method.
+    pub fn with_result(mut self, result: Option<WorkspaceCheckpointExecutedCheckResult>) -> Self {
+        self.result = result;
+        self
+    }
+
+    pub const fn result(&self) -> Option<WorkspaceCheckpointExecutedCheckResult> {
+        self.result
     }
 
     pub const fn source(&self) -> WorkspaceCheckpointCheckSource {

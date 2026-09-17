@@ -1,4 +1,7 @@
-use crate::{WorkspaceCheckpointCheckSource, WorkspaceCheckpointRefType};
+use crate::{
+    WorkspaceCheckpointCheckSource, WorkspaceCheckpointExecutedCheckResult,
+    WorkspaceCheckpointRefType,
+};
 
 fn assert_check_source_exhaustive(value: WorkspaceCheckpointCheckSource) {
     match value {
@@ -73,9 +76,47 @@ fn ref_type_vocabulary_is_exact_ordered_and_unique() {
 }
 
 #[test]
-fn checkpoint_evidence_vocabularies_contain_exactly_eight_values() {
+fn checkpoint_evidence_vocabularies_contain_exactly_thirteen_values() {
     assert_eq!(
-        WorkspaceCheckpointCheckSource::ALL.len() + WorkspaceCheckpointRefType::ALL.len(),
-        8
+        WorkspaceCheckpointCheckSource::ALL.len()
+            + WorkspaceCheckpointRefType::ALL.len()
+            + WorkspaceCheckpointExecutedCheckResult::ALL.len(),
+        13
     );
+}
+
+fn assert_executed_check_result_exhaustive(value: WorkspaceCheckpointExecutedCheckResult) {
+    match value {
+        WorkspaceCheckpointExecutedCheckResult::Pass
+        | WorkspaceCheckpointExecutedCheckResult::Fail
+        | WorkspaceCheckpointExecutedCheckResult::Error
+        | WorkspaceCheckpointExecutedCheckResult::Skipped
+        | WorkspaceCheckpointExecutedCheckResult::Unknown => {}
+    }
+}
+
+#[test]
+fn executed_check_result_vocabulary_is_exact_ordered_and_unique() {
+    use WorkspaceCheckpointExecutedCheckResult::{Error, Fail, Pass, Skipped, Unknown};
+
+    assert_eq!(WorkspaceCheckpointExecutedCheckResult::ALL.len(), 5);
+    assert_eq!(
+        WorkspaceCheckpointExecutedCheckResult::ALL,
+        [Pass, Fail, Error, Skipped, Unknown]
+    );
+    assert_eq!(
+        WorkspaceCheckpointExecutedCheckResult::ALL
+            .map(WorkspaceCheckpointExecutedCheckResult::as_str),
+        ["PASS", "FAIL", "ERROR", "SKIPPED", "UNKNOWN"]
+    );
+    for (index, value) in WorkspaceCheckpointExecutedCheckResult::ALL
+        .iter()
+        .enumerate()
+    {
+        assert_executed_check_result_exhaustive(*value);
+        for other in &WorkspaceCheckpointExecutedCheckResult::ALL[index + 1..] {
+            assert_ne!(value, other);
+            assert_ne!(value.as_str(), other.as_str());
+        }
+    }
 }

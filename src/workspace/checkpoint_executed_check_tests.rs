@@ -1,6 +1,7 @@
 use crate::{
     CommitSha, WorkspaceCheckpointCheckSource, WorkspaceCheckpointExecutedCheckCore,
-    WorkspaceCheckpointExecutedCheckCoreError, WorkspaceCheckpointRef, WorkspaceCheckpointRefType,
+    WorkspaceCheckpointExecutedCheckCoreError, WorkspaceCheckpointExecutedCheckResult,
+    WorkspaceCheckpointRef, WorkspaceCheckpointRefType,
 };
 
 const CODE_SHA_FIXTURE: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -49,6 +50,7 @@ fn constructs_normal_core_value_and_exposes_each_accessor() {
     assert_eq!(core.code_sha().as_str(), CODE_SHA_FIXTURE);
     assert_eq!(core.timed_out(), None);
     assert_eq!(core.output_ref(), None);
+    assert_eq!(core.result(), None);
 }
 
 #[test]
@@ -304,4 +306,68 @@ fn empty_command_error_is_typed_and_standard() {
         WorkspaceCheckpointExecutedCheckCoreError::EmptyCommand.to_string(),
         "workspace checkpoint executed-check command is empty"
     );
+}
+
+#[test]
+fn caller_supplied_results_are_independent_of_every_evidence_field() {
+    let reference = WorkspaceCheckpointRef::new(
+        WorkspaceCheckpointRefType::ArtifactId,
+        "FAIL timeout output",
+        Some(" supplied digest ".into()),
+        Some(" section ".into()),
+    )
+    .unwrap();
+    for result in std::iter::once(None).chain(WorkspaceCheckpointExecutedCheckResult::ALL.map(Some))
+    {
+        for source in WorkspaceCheckpointCheckSource::ALL {
+            for exit_code in [-1, 0, 1] {
+                for timed_out in [None, Some(false), Some(true)] {
+                    for output_ref in [None, Some(reference.clone())] {
+                        let absent = core_fixture(
+                            source,
+                            vec!["FAIL".into(), "PASS timeout".into()],
+                            exit_code,
+                            fixture_sha(),
+                            timed_out,
+                            output_ref.clone(),
+                        );
+                        assert_eq!(absent.result(), None);
+                        let core = absent.clone().with_result(result);
+                        assert_eq!(core.result(), result);
+                        assert_eq!(core.source(), source);
+                        assert_eq!(core.command(), absent.command());
+                        assert_eq!(core.exit_code(), exit_code);
+                        assert_eq!(core.code_sha(), absent.code_sha());
+                        assert_eq!(core.timed_out(), timed_out);
+                        assert_eq!(core.output_ref(), output_ref.as_ref());
+                        assert_eq!(core.clone(), core);
+                        assert_eq!(core.clone().result(), result);
+                        if result.is_some() {
+                            assert_ne!(core, absent);
+                        }
+                        assert_eq!(core.with_result(None), absent);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn unknown_is_present_and_result_can_be_replaced_or_cleared() {
+    use WorkspaceCheckpointExecutedCheckResult::{Pass, Unknown};
+    let absent = core_fixture(
+        WorkspaceCheckpointCheckSource::WorkerExecution,
+        vec!["cargo".into()],
+        0,
+        fixture_sha(),
+        None,
+        None,
+    );
+    let unknown = absent.clone().with_result(Some(Unknown));
+    assert_eq!(unknown.result(), Some(Unknown));
+    assert_ne!(unknown, absent);
+    let replaced = unknown.with_result(Some(Pass));
+    assert_eq!(replaced.result(), Some(Pass));
+    assert_eq!(replaced.with_result(None), absent);
 }
