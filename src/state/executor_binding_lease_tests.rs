@@ -169,16 +169,16 @@ fn forced_failure() -> StateError {
     }
 }
 
-// T01 — the schema version remains exactly 10 before and after lease
+// T01 — the schema version remains exactly 11 before and after lease
 // renewals, including across close/reopen.
 #[test]
-fn t01_schema_version_remains_10() {
+fn t01_schema_version_remains_11() {
     let tmp = TempDir::new("ebl-t01");
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
     assert_eq!(
         repo.schema_version().expect("version read"),
-        10,
-        "the supported schema version must be 10 before any renewal"
+        11,
+        "the supported schema version must be 11 before any renewal"
     );
     repo.create_logical_role(minimal_role("role-ver-001", LogicalRoleType::RuntimeA1))
         .expect("role create");
@@ -188,16 +188,16 @@ fn t01_schema_version_remains_10() {
         .expect("renew");
     assert_eq!(
         repo.schema_version().expect("version read"),
-        10,
+        11,
         "a lease renewal must not change the schema version"
     );
     drop(repo);
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("reopen");
-    assert_eq!(repo.schema_version().expect("version read"), 10);
+    assert_eq!(repo.schema_version().expect("version read"), 11);
 }
 
 // T02 — lease renewal itself introduces no migration beyond the authorized
-// watermark migration: the registered chain ends at version 10, and the
+// watermark migration: the registered chain ends at version 11, and the
 // durable metadata carries exactly one row per applied migration after
 // renewals.
 #[test]
@@ -205,13 +205,13 @@ fn t02_no_migration_introduced_by_lease_renewal() {
     let registered = migrations::registered();
     assert_eq!(
         registered.len(),
-        10,
-        "exactly ten registered migrations (v0001–v0010) may exist"
+        11,
+        "exactly eleven registered migrations (v0001–v0011) may exist"
     );
     assert_eq!(
         registered.last().expect("chain is non-empty").version,
-        10,
-        "the registered chain must end at version 10"
+        11,
+        "the registered chain must end at version 11"
     );
     let tmp = TempDir::new("ebl-t02");
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
@@ -223,7 +223,7 @@ fn t02_no_migration_introduced_by_lease_renewal() {
         .expect("renew");
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        10,
+        11,
         "no extra migration metadata row may appear"
     );
 }

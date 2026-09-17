@@ -420,6 +420,10 @@ pub enum StateError {
         /// What could not be decoded.
         detail: String,
     },
+    /// Historical changed_sources was not captured; no valid value can be returned.
+    ContextEpochChangedSourcesNotCaptured { project_id: String, epoch: i64 },
+    /// Persisted changed-source composition violates the frozen contract.
+    ContextEpochChangedSourcesDecodeFailed { detail: String },
     /// A context-rehydration request violated the closed typed boundary.
     ContextRehydrationValidation { detail: String },
     /// The immutable project-scoped attempt identity already exists.
@@ -699,6 +703,15 @@ impl fmt::Display for StateError {
             }
             StateError::ContextEpochDecodeFailed { detail } => {
                 write!(f, "failed to decode persisted ContextEpoch: {detail}")
+            }
+            StateError::ContextEpochChangedSourcesNotCaptured { project_id, epoch } => {
+                write!(
+                    f,
+                    "changed_sources was not captured for {project_id:?} epoch {epoch}"
+                )
+            }
+            StateError::ContextEpochChangedSourcesDecodeFailed { detail } => {
+                write!(f, "failed to decode ContextEpoch changed_sources: {detail}")
             }
             StateError::ContextRehydrationValidation { detail } => {
                 write!(f, "invalid context rehydration: {detail}")
