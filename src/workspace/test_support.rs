@@ -187,6 +187,7 @@ pub(crate) fn git_raw(directory: &Path, args: &[&str]) -> Output {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", dev_null())
         .env("GIT_CONFIG_SYSTEM", dev_null())
+        .args(["-c", "maintenance.auto=false"])
         .args(args)
         .output()
         .expect("git executable must be available for workspace tests")
@@ -198,6 +199,24 @@ pub(crate) fn stdout_trimmed(output: &Output) -> String {
 
 pub(crate) fn stderr_text(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).trim().to_string()
+}
+
+#[test]
+fn fixture_git_disables_automatic_maintenance() {
+    let repo = TestRepo::new("maintenance-auto");
+    assert_eq!(
+        stdout_trimmed(&git(repo.path(), &["config", "--get", "maintenance.auto"])),
+        "false"
+    );
+    assert_eq!(
+        git_raw(
+            repo.path(),
+            &["config", "--local", "--get", "maintenance.auto"]
+        )
+        .status
+        .code(),
+        Some(1)
+    );
 }
 
 /// Whether the given branch exists as a local ref in the repository.
