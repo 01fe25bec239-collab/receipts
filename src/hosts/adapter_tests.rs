@@ -1,6 +1,6 @@
 //! Test-only proof that the [`HostAdapter`] boundary is implementable in
-//! full with `std` only, for all three host identities, without any
-//! concrete Claude Code, Codex, or headless behavior.
+//! full using the canonical event and `std` facilities, for all three host
+//! identities, without any concrete Claude Code, Codex, or headless behavior.
 //!
 //! The dummy below is deliberately fake: every placeholder slot binds a
 //! unit struct that carries no semantics, and every operation returns it
@@ -29,7 +29,6 @@ impl HostAdapter for TestAdapter {
     type InstallPlan = Placeholder;
     type InstallOutcome = Placeholder;
     type CoreHandle = Placeholder;
-    type NormalizedHostEvent = Placeholder;
     type EmitOutcome = Placeholder;
     type CoreView = Placeholder;
     type PresentOutcome = Placeholder;
@@ -56,7 +55,7 @@ impl HostAdapter for TestAdapter {
         Placeholder
     }
 
-    fn emit(&self, _event: &Placeholder) -> Placeholder {
+    fn emit(&self, _event: &NormalizedHostEvent) -> Placeholder {
         Placeholder
     }
 
@@ -83,7 +82,7 @@ impl HostAdapter for TestAdapter {
 fn exercise_all_operations<A: HostAdapter>(
     mut adapter: A,
     plan: A::InstallPlan,
-    event: A::NormalizedHostEvent,
+    event: NormalizedHostEvent,
     view: A::CoreView,
     prompt: A::UserPrompt,
     reason: A::ShutdownReason,
@@ -130,7 +129,7 @@ fn complete_interface_is_implementable_for_every_host_identity() {
         let reported = exercise_all_operations(
             adapter,
             Placeholder,
-            Placeholder,
+            canonical_event(),
             Placeholder,
             Placeholder,
             Placeholder,
@@ -155,7 +154,7 @@ fn all_nine_operations_are_individually_callable() {
     let plan = Placeholder;
     let _install = adapter.install(&plan);
     let _start = adapter.start();
-    let event = Placeholder;
+    let event = canonical_event();
     let _emit = adapter.emit(&event);
     let view = Placeholder;
     let _present = adapter.present(&view);
@@ -175,15 +174,58 @@ fn all_nine_operations_are_individually_callable() {
     let _shutdown = adapter.shutdown(Placeholder);
 }
 
-/// The interface is implementable without importing anything beyond
-/// `std`: this module itself compiles with zero external dependencies,
-/// mirroring the crate manifest's empty dependency list.
+/// The adapter implementation needs only Host contracts and std facilities.
 #[test]
-fn interface_requires_only_std() {
-    // Compile-time statement: exercising the whole boundary needs only the
-    // items re-exported from this crate plus std task/future facilities
-    // imported above. Nothing else is available or required.
+fn interface_uses_host_contracts_and_std() {
     fn assert_host_adapter<A: HostAdapter>(_: &A) {}
     let adapter = TestAdapter { id: HostId::Codex };
     assert_host_adapter(&adapter);
+}
+
+/// Fixed structural fixture only; no claim about a physical host event.
+pub(super) fn canonical_event() -> NormalizedHostEvent {
+    use receipts_orchestration::orchestration::{
+        OrchestrationDateTimeV1, OrchestrationJsonObjectV1,
+    };
+
+    NormalizedHostEvent::try_new(NormalizedHostEventInputs {
+        event_id: NormalizedHostEventId::try_new("Z123456789ABCDEFGHJKMNPQRS").unwrap(),
+        event_type: NormalizedHostEventType::HostSessionStarted,
+        host: HostId::Headless.into(),
+        host_session_id: "session".to_owned(),
+        project_id: None,
+        occurred_at: OrchestrationDateTimeV1::try_new("2026-09-12T00:00:00Z").unwrap(),
+        payload: OrchestrationJsonObjectV1::default(),
+        raw_ref: None,
+        confidence: NormalizedHostEventConfidence::Observed,
+    })
+    .unwrap()
+}
+
+#[test]
+fn only_event_input_is_bound_on_adapter_surface() {
+    let source = include_str!("adapter.rs");
+    let surface = source.split("pub trait HostAdapter {").nth(1).unwrap();
+    assert!(!surface.contains("type NormalizedHostEvent;"));
+    assert!(surface.contains("fn emit(&self, event: &NormalizedHostEvent) -> Self::EmitOutcome;"));
+    for name in [
+        "DetectOutcome",
+        "InstallPlan",
+        "InstallOutcome",
+        "CoreHandle",
+        "EmitOutcome",
+        "CoreView",
+        "PresentOutcome",
+        "UserPrompt",
+        "UserResponse",
+        "HostCapabilityReport",
+        "ShutdownReason",
+        "ShutdownOutcome",
+    ] {
+        assert!(surface.contains(&format!("type {name};")));
+    }
+    assert!(surface.contains("type UserInputPending: Future<Output = Self::UserResponse>;"));
+    assert!(!surface.contains("source_class"));
+    assert!(!surface.contains("validate_normalized_host_event_source("));
+    assert!(!surface.contains("source_class_allowed("));
 }

@@ -20,7 +20,6 @@ impl HostAdapter for Adapter {
     type InstallPlan = ();
     type InstallOutcome = ();
     type CoreHandle = ();
-    type NormalizedHostEvent = ();
     type EmitOutcome = ();
     type CoreView = ();
     type PresentOutcome = ();
@@ -42,7 +41,7 @@ impl HostAdapter for Adapter {
     fn start(&self) {
         panic!("unbound start")
     }
-    fn emit(&self, _: &()) {
+    fn emit(&self, _: &crate::NormalizedHostEvent) {
         panic!("unbound emit")
     }
     fn present(&self, _: &()) {

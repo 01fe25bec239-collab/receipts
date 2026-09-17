@@ -3,7 +3,7 @@ use std::future::{Future, Ready, ready};
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
-use super::{HostAdapter, HostId};
+use super::{HostAdapter, HostId, NormalizedHostEvent, adapter_tests::canonical_event};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Operation {
@@ -22,7 +22,6 @@ struct FixtureDetectOutcome;
 struct FixtureInstallPlan;
 struct FixtureInstallOutcome;
 struct FixtureCoreHandle;
-struct FixtureNormalizedHostEvent;
 struct FixtureEmitOutcome;
 struct FixtureCoreView;
 struct FixturePresentOutcome;
@@ -48,7 +47,6 @@ impl HostAdapter for ConformanceAdapter {
     type InstallPlan = FixtureInstallPlan;
     type InstallOutcome = FixtureInstallOutcome;
     type CoreHandle = FixtureCoreHandle;
-    type NormalizedHostEvent = FixtureNormalizedHostEvent;
     type EmitOutcome = FixtureEmitOutcome;
     type CoreView = FixtureCoreView;
     type PresentOutcome = FixturePresentOutcome;
@@ -79,7 +77,7 @@ impl HostAdapter for ConformanceAdapter {
         FixtureCoreHandle
     }
 
-    fn emit(&self, _event: &Self::NormalizedHostEvent) -> Self::EmitOutcome {
+    fn emit(&self, _event: &NormalizedHostEvent) -> Self::EmitOutcome {
         self.record(Operation::Emit);
         FixtureEmitOutcome
     }
@@ -108,7 +106,7 @@ impl HostAdapter for ConformanceAdapter {
 fn exercise_all_operations<A: HostAdapter>(
     mut adapter: A,
     plan: A::InstallPlan,
-    event: A::NormalizedHostEvent,
+    event: NormalizedHostEvent,
     view: A::CoreView,
     prompt: A::UserPrompt,
     reason: A::ShutdownReason,
@@ -145,7 +143,7 @@ fn real_trait_records_all_nine_operations_in_order() {
     let actual_id = exercise_all_operations(
         adapter,
         FixtureInstallPlan,
-        FixtureNormalizedHostEvent,
+        canonical_event(),
         FixtureCoreView,
         FixtureUserPrompt,
         FixtureShutdownReason,
@@ -166,4 +164,24 @@ fn real_trait_records_all_nine_operations_in_order() {
             Operation::Shutdown,
         ]
     );
+}
+
+#[test]
+fn generic_emit_records_only_emit_for_every_host_identity() {
+    fn emit<A: HostAdapter>(adapter: &A, event: &NormalizedHostEvent) -> A::EmitOutcome {
+        adapter.emit(event)
+    }
+
+    let event = canonical_event();
+    let original = event.clone();
+    for id in [HostId::ClaudeCode, HostId::Codex, HostId::Headless] {
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let adapter = ConformanceAdapter {
+            id,
+            trace: Rc::clone(&trace),
+        };
+        let _: FixtureEmitOutcome = emit(&adapter, &event);
+        assert_eq!(trace.borrow().as_slice(), [Operation::Emit]);
+        assert_eq!(event, original);
+    }
 }
