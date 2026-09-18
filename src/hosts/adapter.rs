@@ -13,7 +13,7 @@
 
 use std::future::Future;
 
-use crate::{NormalizedHostEvent, host_id::HostId};
+use crate::{HostCapabilityReport, NormalizedHostEvent, host_id::HostId};
 
 /// Translation boundary between the Receipts core and one external host.
 ///
@@ -61,10 +61,6 @@ pub trait HostAdapter {
     /// Pending completion of one [`request_user_input`](Self::request_user_input)
     /// call, built with `std`/`core` [`Future`] facilities only.
     type UserInputPending: Future<Output = Self::UserResponse>;
-
-    /// Unbound placeholder for the externally owned frozen
-    /// `HostCapabilityReport` contract.
-    type HostCapabilityReport;
 
     /// Unbound placeholder for the externally owned frozen shutdown-reason
     /// contract.
@@ -129,8 +125,16 @@ pub trait HostAdapter {
 
     /// Semantic operation: report what the host can do.
     ///
-    /// Declared only; no capability probing or claims exist in this slice.
-    fn capabilities(&self) -> Self::HostCapabilityReport;
+    /// The canonical report output is physically bound; behavior is declared
+    /// only. No capability probing or claims exist in this slice.
+    ///
+    /// An adapter cannot substitute a private report associated type:
+    /// ```compile_fail,E0220
+    /// use receipts_host_integration::HostAdapter;
+    /// struct PrivateReport;
+    /// fn substitute<A: HostAdapter<HostCapabilityReport = PrivateReport>>() {}
+    /// ```
+    fn capabilities(&self) -> HostCapabilityReport;
 
     /// Semantic operation: shut the host session down for the given reason.
     ///

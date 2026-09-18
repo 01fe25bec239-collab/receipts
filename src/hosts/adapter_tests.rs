@@ -1,12 +1,11 @@
 //! Test-only proof that the [`HostAdapter`] boundary is implementable in
-//! full using the canonical event and `std` facilities, for all three host
-//! identities, without any concrete Claude Code, Codex, or headless behavior.
+//! full using the canonical event, report, and `std` facilities, for all
+//! three host identities, without any concrete host behavior.
 //!
 //! The dummy below is deliberately fake: every placeholder slot binds a
-//! unit struct that carries no semantics, and every operation returns it
-//! untouched. This demonstrates exactly what the interface slice claims —
-//! the nine semantic operations are representable and callable — and
-//! nothing more.
+//! unit struct that carries no semantics. Capabilities returns a fixed
+//! structural canonical report; no physical evidence is observed. This proves
+//! the nine semantic operations are representable and callable, nothing more.
 
 use std::collections::HashSet;
 use std::future::{Ready, ready};
@@ -35,7 +34,6 @@ impl HostAdapter for TestAdapter {
     type UserPrompt = Placeholder;
     type UserResponse = Placeholder;
     type UserInputPending = Ready<Placeholder>;
-    type HostCapabilityReport = Placeholder;
     type ShutdownReason = Placeholder;
     type ShutdownOutcome = Placeholder;
 
@@ -67,8 +65,8 @@ impl HostAdapter for TestAdapter {
         ready(Placeholder)
     }
 
-    fn capabilities(&self) -> Placeholder {
-        Placeholder
+    fn capabilities(&self) -> HostCapabilityReport {
+        canonical_report()
     }
 
     fn shutdown(self, _reason: Placeholder) -> Placeholder {
@@ -106,7 +104,8 @@ fn exercise_all_operations<A: HostAdapter>(
         "the pending user-input future must complete"
     );
 
-    let _report = adapter.capabilities();
+    let report: HostCapabilityReport = adapter.capabilities();
+    assert_eq!(report, canonical_report());
     let _shutdown = adapter.shutdown(reason);
 
     reported_id
@@ -170,7 +169,8 @@ fn all_nine_operations_are_individually_callable() {
     };
     let _response_guard = response;
 
-    let _capabilities = adapter.capabilities();
+    let capabilities: HostCapabilityReport = adapter.capabilities();
+    assert_eq!(capabilities, canonical_report());
     let _shutdown = adapter.shutdown(Placeholder);
 }
 
@@ -202,11 +202,60 @@ pub(super) fn canonical_event() -> NormalizedHostEvent {
     .unwrap()
 }
 
+/// Fixed caller-supplied structural evidence only; no capability truth,
+/// fingerprint validity, timestamp freshness, or physical probing is claimed.
+pub(super) fn canonical_report() -> HostCapabilityReport {
+    use receipts_orchestration::orchestration::OrchestrationDateTimeV1;
+
+    let core =
+        HostCapabilityReportNonTemporalCore::new(HostCapabilityReportNonTemporalCoreInputs {
+            host_id: "synthetic".to_owned(),
+            host_version: None,
+            probe_status: HostCapabilityProbeStatus::Partial,
+            validity_fingerprint: None,
+            hook_definition_digest: None,
+            relevant_config_digest: None,
+            stale_reason: HostCapabilityStaleReason::None,
+            plugin_supported: None,
+            plugin_installed: None,
+            manifest_path: None,
+            supports_skills: None,
+            supports_commands: None,
+            supports_subagents: None,
+            supports_mcp: None,
+            hooks_supported: None,
+            hooks_configured: None,
+            hook_trust_required: None,
+            hooks_trusted: None,
+            hooks_enabled: None,
+            hooks_allowed_by_admin_policy: None,
+            hook_events: None,
+            blocking_hook_events: None,
+            hook_coverage_class: HostCapabilityHookCoverageClass::Unknown,
+            required_hook_coverage_satisfied: None,
+            selected_mode: HostCapabilitySelectedMode::Supervised,
+            mode_override: None,
+            inactive_reason: None,
+            plugin_data_path: None,
+            sandbox_modes: None,
+            evidence_label: None,
+            source_claim_id: None,
+        })
+        .unwrap();
+    HostCapabilityReport::new(
+        core,
+        OrchestrationDateTimeV1::try_new("2026-09-12T00:00:00Z").unwrap(),
+        OrchestrationDateTimeV1::try_new("2026-09-12T00:00:00Z").unwrap(),
+    )
+}
+
 #[test]
-fn only_event_input_is_bound_on_adapter_surface() {
+fn canonical_event_input_and_report_output_are_bound_on_adapter_surface() {
     let source = include_str!("adapter.rs");
     let surface = source.split("pub trait HostAdapter {").nth(1).unwrap();
     assert!(!surface.contains("type NormalizedHostEvent;"));
+    assert!(!surface.contains("type HostCapabilityReport;"));
+    assert!(surface.contains("fn capabilities(&self) -> HostCapabilityReport;"));
     assert!(surface.contains("fn emit(&self, event: &NormalizedHostEvent) -> Self::EmitOutcome;"));
     for name in [
         "DetectOutcome",
@@ -218,7 +267,6 @@ fn only_event_input_is_bound_on_adapter_surface() {
         "PresentOutcome",
         "UserPrompt",
         "UserResponse",
-        "HostCapabilityReport",
         "ShutdownReason",
         "ShutdownOutcome",
     ] {
