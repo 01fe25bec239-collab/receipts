@@ -982,3 +982,45 @@ fn crash_classification_is_independent_of_kind_checks_and_recovery() {
         }
     }
 }
+
+#[test]
+fn preserves_absent_and_all_present_nested_executed_check_results() {
+    use crate::WorkspaceCheckpointExecutedCheckResult as R;
+    let results: Vec<_> = std::iter::once(None).chain(R::ALL.map(Some)).collect();
+    let checks: Vec<_> = results
+        .iter()
+        .map(|result| {
+            fixture_check(
+                WorkspaceCheckpointCheckSource::GitProvenance,
+                vec!["FAIL"],
+                0,
+            )
+            .with_result(*result)
+        })
+        .collect();
+    let core = build_core(
+        "checkpoint-1",
+        "workspace-1",
+        None,
+        None,
+        WorkspaceCheckpointKind::Progress,
+        fixture_head_sha(),
+        None,
+        None,
+        Vec::new(),
+        Vec::new(),
+        checks.clone(),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(core.executed_checks(), checks);
+    assert_eq!(
+        core.executed_checks()
+            .iter()
+            .map(|check| check.result())
+            .collect::<Vec<_>>(),
+        results
+    );
+    assert_eq!(core.clone(), core);
+}

@@ -51,3 +51,33 @@ impl WorkspaceCheckpointRefType {
         }
     }
 }
+
+/// Closed caller-supplied result of an executed checkpoint check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceCheckpointExecutedCheckResult {
+    Pass,
+    Fail,
+    Error,
+    Skipped,
+    Unknown,
+}
+
+impl WorkspaceCheckpointExecutedCheckResult {
+    pub const ALL: [Self; 5] = [
+        Self::Pass,
+        Self::Fail,
+        Self::Error,
+        Self::Skipped,
+        Self::Unknown,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Fail => "FAIL",
+            Self::Error => "ERROR",
+            Self::Skipped => "SKIPPED",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+}
