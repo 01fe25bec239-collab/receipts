@@ -2,13 +2,15 @@ use std::fmt;
 
 use crate::{
     CommitSha, WorkspaceCheckpointCrashClassification, WorkspaceCheckpointExecutedCheckCore,
-    WorkspaceCheckpointKind, WorkspaceCheckpointRef, WorkspaceRecoveryDecision,
+    WorkspaceCheckpointKind, WorkspaceCheckpointRef, WorkspaceDateTimeV1,
+    WorkspaceRecoveryDecision,
 };
 
 /// Bounded inert captured-state value object for one workspace checkpoint.
 ///
 /// This is intentionally `WorkspaceCheckpointCaptureCore`, not the full
-/// `WorkspaceCheckpoint` schema record: `captured_at` remains deferred.
+/// `WorkspaceCheckpoint` schema record: `captured_at` is composed separately
+/// through [`WorkspaceCheckpointTemporalCaptureCore`].
 /// Crash classification is optional and caller supplied only.
 /// All supplied values are already-observed evidence and are stored
 /// exactly; no filesystem discovery, Git inspection, check execution,
@@ -145,6 +147,38 @@ impl WorkspaceCheckpointCaptureCore {
 
     pub fn recovery_rationale(&self) -> Option<&str> {
         self.recovery_rationale.as_deref()
+    }
+}
+
+/// Inert composition of captured evidence and a required caller-supplied timestamp.
+/// No temporal relationship between the supplied evidence values is validated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceCheckpointTemporalCaptureCore {
+    core: WorkspaceCheckpointCaptureCore,
+    captured_at: WorkspaceDateTimeV1,
+}
+
+impl WorkspaceCheckpointTemporalCaptureCore {
+    /// Requires an already-validated timestamp; no timestamp is generated.
+    ///
+    /// ```compile_fail
+    /// use receipts_workspace_execution::{
+    ///     WorkspaceCheckpointCaptureCore, WorkspaceCheckpointTemporalCaptureCore,
+    /// };
+    /// fn missing_timestamp(core: WorkspaceCheckpointCaptureCore) {
+    ///     WorkspaceCheckpointTemporalCaptureCore::new(core, None);
+    /// }
+    /// ```
+    pub fn new(core: WorkspaceCheckpointCaptureCore, captured_at: WorkspaceDateTimeV1) -> Self {
+        Self { core, captured_at }
+    }
+
+    pub fn core(&self) -> &WorkspaceCheckpointCaptureCore {
+        &self.core
+    }
+
+    pub fn captured_at(&self) -> &WorkspaceDateTimeV1 {
+        &self.captured_at
     }
 }
 

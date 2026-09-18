@@ -54,6 +54,7 @@ pub mod checkpoint_evidence_vocabulary;
 pub mod checkpoint_executed_check;
 pub mod checkpoint_reference;
 pub mod checkpoint_vocabulary;
+pub mod date_time;
 pub mod error;
 pub mod git;
 pub mod handle;
@@ -82,6 +83,8 @@ mod checkpoint_reference_tests;
 #[cfg(test)]
 mod checkpoint_vocabulary_tests;
 #[cfg(test)]
+mod date_time_tests;
+#[cfg(test)]
 mod provision_tests;
 #[cfg(test)]
 mod recovery_preparation_tests;
@@ -94,6 +97,7 @@ mod test_support;
 
 pub use checkpoint_capture_core::{
     WorkspaceCheckpointCaptureCore, WorkspaceCheckpointCaptureCoreError,
+    WorkspaceCheckpointTemporalCaptureCore,
 };
 pub use checkpoint_evidence_capture::{
     WorkspaceCheckpointEvidenceCaptureError, WorkspaceCheckpointEvidenceCaptureRequest,
@@ -111,6 +115,7 @@ pub use checkpoint_reference::{WorkspaceCheckpointRef, WorkspaceCheckpointRefErr
 pub use checkpoint_vocabulary::{
     WorkspaceCheckpointCrashClassification, WorkspaceCheckpointKind, WorkspaceRecoveryDecision,
 };
+pub use date_time::{WorkspaceDateTimeError, WorkspaceDateTimeV1};
 pub use error::WorkspaceError;
 pub use handle::{CommitSha, WorkspaceHandle, WorkspaceIsolation, WorkspaceState};
 pub use provision::{WorkspaceProvisionRequest, validate_branch_name};

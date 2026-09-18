@@ -1024,3 +1024,94 @@ fn preserves_absent_and_all_present_nested_executed_check_results() {
     );
     assert_eq!(core.clone(), core);
 }
+
+#[test]
+fn temporal_capture_requires_validated_timestamp_and_preserves_lexical_values() {
+    use crate::{WorkspaceCheckpointTemporalCaptureCore, WorkspaceDateTimeV1};
+
+    let core = minimal_core();
+    for spelling in [
+        "2026-09-08T00:00:00Z",
+        "2026-09-08t00:00:00z",
+        "2026-09-08T00:00:00.100Z",
+        "2026-09-08T00:00:00.123456789123456789+05:30",
+        "2026-09-08T00:00:00-00:00",
+    ] {
+        let timestamp = WorkspaceDateTimeV1::try_new(spelling).unwrap();
+        let temporal = WorkspaceCheckpointTemporalCaptureCore::new(core.clone(), timestamp.clone());
+        assert_eq!(temporal.core(), &core);
+        assert_eq!(temporal.captured_at(), &timestamp);
+        assert_eq!(temporal.captured_at().as_str(), spelling);
+        assert_eq!(temporal.clone(), temporal);
+        let different = WorkspaceCheckpointTemporalCaptureCore::new(
+            core.clone(),
+            WorkspaceDateTimeV1::try_new("0000-01-01T00:00:00Z").unwrap(),
+        );
+        assert_ne!(temporal, different);
+    }
+}
+
+#[test]
+fn temporal_capture_preserves_nested_evidence_and_accepts_reverse_chronology() {
+    use crate::{
+        WorkspaceCheckpointCrashClassification as C, WorkspaceCheckpointExecutedCheckResult as R,
+        WorkspaceCheckpointTemporalCaptureCore, WorkspaceDateTimeV1,
+    };
+
+    for classification in std::iter::once(None).chain(C::ALL.map(Some)) {
+        for result in std::iter::once(None).chain(R::ALL.map(Some)) {
+            let check = fixture_check(
+                WorkspaceCheckpointCheckSource::WorkerExecution,
+                vec!["cargo", "test"],
+                0,
+            )
+            .with_started_at(Some(
+                WorkspaceDateTimeV1::try_new("2026-09-18T13:00:00Z").unwrap(),
+            ))
+            .with_finished_at(Some(
+                WorkspaceDateTimeV1::try_new("2026-09-18T12:00:00Z").unwrap(),
+            ))
+            .with_result(result);
+            let core = build_core(
+                "checkpoint-1",
+                "workspace-1",
+                None,
+                None,
+                WorkspaceCheckpointKind::Progress,
+                fixture_head_sha(),
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                vec![check.clone()],
+                None,
+                None,
+            )
+            .unwrap()
+            .with_crash_classification(classification);
+            let temporal = WorkspaceCheckpointTemporalCaptureCore::new(
+                core.clone(),
+                WorkspaceDateTimeV1::try_new("2026-09-18T11:00:00Z").unwrap(),
+            );
+            assert_eq!(temporal.core(), &core);
+            assert_eq!(temporal.core().executed_checks(), &[check]);
+            assert_eq!(
+                temporal.core().executed_checks()[0]
+                    .started_at()
+                    .unwrap()
+                    .as_str(),
+                "2026-09-18T13:00:00Z"
+            );
+            assert_eq!(
+                temporal.core().executed_checks()[0]
+                    .finished_at()
+                    .unwrap()
+                    .as_str(),
+                "2026-09-18T12:00:00Z"
+            );
+            assert_eq!(temporal.core().executed_checks()[0].result(), result);
+            assert_eq!(temporal.core().crash_classification(), classification);
+            assert_eq!(temporal.captured_at().as_str(), "2026-09-18T11:00:00Z");
+        }
+    }
+}
