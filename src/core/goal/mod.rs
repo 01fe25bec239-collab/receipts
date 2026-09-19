@@ -1,4 +1,4 @@
-//! Deterministic, non-temporal projection of `GoalEvaluation.schema.json`.
+//! Deterministic projection of `GoalEvaluation.schema.json`.
 //!
 //! `GLOBAL_GOAL_EVALUATOR.md` requires deterministic gates before semantic
 //! evaluation. This module validates supplied layer results and state; it does
@@ -6,11 +6,14 @@
 //! required evidence and blocking facts as deterministic failures.
 //!
 //! This is not the complete physical GoalEvaluation or completion authority:
-//! `evaluated_at`, semantic evaluation, gaps, and convergence are deferred.
+//! `evaluated_at` is physically carried as caller-supplied data only.
+//! Semantic evaluation, gaps, and convergence remain deferred.
 //! In particular, accepting a caller-supplied COMPLETE state only establishes
 //! deterministic consistency, not that human-language criteria are satisfied.
 //! A full evaluator must still establish semantic satisfaction before completion.
 //! No model, routing, clock, persistence, or external operations are involved.
+
+use crate::orchestration::OrchestrationDateTimeV1;
 
 /// Closed GoalEvaluation state vocabulary, owned independently of graph states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -155,7 +158,8 @@ impl DeterministicLayer {
     }
 }
 
-/// Validated, non-temporal deterministic core, not a full completion decision.
+/// Validated deterministic core with caller-supplied evaluation time, not a full
+/// completion decision. Evaluation time establishes no freshness or temporal policy.
 ///
 /// State is supplied by an authoritative caller, never inferred from condition
 /// text. COMPLETE requires deterministic success, but this necessary condition
@@ -185,11 +189,13 @@ pub struct DeterministicGoalEvaluationCore {
     deterministic_layer: DeterministicLayer,
     integrated_sha: Option<String>,
     context_epoch: Option<i64>,
+    evaluated_at: OrchestrationDateTimeV1,
 }
 
 impl DeterministicGoalEvaluationCore {
     /// Validates identifiers, SHA syntax, nonnegative epoch, then state/layer
     /// consistency. Stores all accepted input exactly, without reconciliation.
+    #[allow(clippy::too_many_arguments)] // Explicit schema fields; no hidden defaults.
     pub fn try_new(
         evaluation_id: String,
         goal_id: String,
@@ -198,6 +204,7 @@ impl DeterministicGoalEvaluationCore {
         deterministic_layer: DeterministicLayer,
         integrated_sha: Option<String>,
         context_epoch: Option<i64>,
+        evaluated_at: OrchestrationDateTimeV1,
     ) -> Result<Self, GoalEvaluationCoreError> {
         for (field, value) in [
             ("evaluation_id", Some(evaluation_id.as_str())),
@@ -235,6 +242,7 @@ impl DeterministicGoalEvaluationCore {
             deterministic_layer,
             integrated_sha,
             context_epoch,
+            evaluated_at,
         })
     }
 
@@ -262,6 +270,11 @@ impl DeterministicGoalEvaluationCore {
 
     pub fn integrated_sha(&self) -> Option<&str> {
         self.integrated_sha.as_deref()
+    }
+
+    /// Exact caller-supplied data; carries no completion or temporal authority.
+    pub fn evaluated_at(&self) -> &OrchestrationDateTimeV1 {
+        &self.evaluated_at
     }
 
     pub fn context_epoch(&self) -> Option<i64> {

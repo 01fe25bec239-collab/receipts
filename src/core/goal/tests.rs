@@ -19,6 +19,7 @@ fn core(
         layer,
         None,
         None,
+        OrchestrationDateTimeV1::try_new("2026-09-08T00:00:00Z").unwrap(),
     )
 }
 
@@ -165,6 +166,7 @@ fn identifiers_use_exact_scalar_bounds_and_preserve_values() {
                 DeterministicLayer::try_new(false, None).unwrap(),
                 None,
                 None,
+                OrchestrationDateTimeV1::try_new("2026-09-08T00:00:00Z").unwrap(),
             );
             let character_count = text.chars().count();
             if !(1..=200).contains(&character_count) {
@@ -206,6 +208,7 @@ fn metadata(
         DeterministicLayer::try_new(true, None).unwrap(),
         sha,
         epoch,
+        OrchestrationDateTimeV1::try_new("2026-09-08T00:00:00Z").unwrap(),
     )
 }
 
@@ -257,5 +260,121 @@ fn passing_layer_does_not_promote_supplied_noncomplete_states() {
     ] {
         let actual = core(state, DeterministicLayer::try_new(true, None).unwrap()).unwrap();
         assert_eq!(actual.state(), state);
+    }
+}
+
+const EVALUATED_AT_VALUES: [&str; 4] = [
+    "2026-09-08T00:00:00Z",
+    "2026-09-08t00:00:00z",
+    "2026-09-08t00:00:00.100z",
+    "2000-01-01T12:34:56+05:30",
+];
+
+#[test]
+fn evaluated_at_preserves_exact_canonical_values_and_determinism() {
+    for text in EVALUATED_AT_VALUES {
+        let supplied = OrchestrationDateTimeV1::try_new(text).unwrap();
+        let construct = || {
+            DeterministicGoalEvaluationCore::try_new(
+                "evaluation".into(),
+                "goal".into(),
+                None,
+                GoalEvaluationState::Incomplete,
+                DeterministicLayer::try_new(true, None).unwrap(),
+                None,
+                None,
+                supplied.clone(),
+            )
+        };
+        let actual = construct().unwrap();
+        let retained: &OrchestrationDateTimeV1 = actual.evaluated_at();
+        assert_eq!(retained, &supplied);
+        assert_eq!(retained.as_str(), text);
+        assert_eq!(Ok(actual), construct());
+    }
+}
+
+#[test]
+fn evaluated_at_does_not_change_state_or_deterministic_preconditions() {
+    for text in EVALUATED_AT_VALUES {
+        let evaluated_at = OrchestrationDateTimeV1::try_new(text).unwrap();
+        for state in GoalEvaluationState::ALL {
+            for passed in [false, true] {
+                for result in DeterministicConditionResult::ALL {
+                    let actual = DeterministicLayer::try_new(
+                        passed,
+                        Some(vec![condition("supplied fact", result)]),
+                    )
+                    .and_then(|layer| {
+                        DeterministicGoalEvaluationCore::try_new(
+                            "evaluation".into(),
+                            "goal".into(),
+                            None,
+                            state,
+                            layer,
+                            None,
+                            None,
+                            evaluated_at.clone(),
+                        )
+                    });
+                    if passed && result == DeterministicConditionResult::Fail {
+                        assert_eq!(
+                            actual,
+                            Err(GoalEvaluationCoreError::PassedWithFailedCondition {
+                                index: 0,
+                                condition: "supplied fact".into(),
+                            })
+                        );
+                    } else if state == GoalEvaluationState::Complete && !passed {
+                        assert_eq!(
+                            actual,
+                            Err(GoalEvaluationCoreError::CompleteWithFailedLayer)
+                        );
+                    } else {
+                        let actual = actual.unwrap();
+                        assert_eq!(actual.state(), state);
+                        assert_eq!(actual.deterministic_layer().passed(), passed);
+                        assert_eq!(actual.evaluated_at(), &evaluated_at);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn evaluated_at_does_not_change_sha_or_epoch_validation() {
+    for text in EVALUATED_AT_VALUES {
+        let evaluated_at = OrchestrationDateTimeV1::try_new(text).unwrap();
+        let construct = |sha, epoch| {
+            DeterministicGoalEvaluationCore::try_new(
+                "evaluation".into(),
+                "goal".into(),
+                None,
+                GoalEvaluationState::HumanRequired,
+                DeterministicLayer::try_new(true, None).unwrap(),
+                sha,
+                epoch,
+                evaluated_at.clone(),
+            )
+        };
+        assert_eq!(
+            construct(Some("A".repeat(40)), None),
+            Err(GoalEvaluationCoreError::InvalidIntegratedSha)
+        );
+        for value in [-1, i64::MIN] {
+            assert_eq!(
+                construct(None, Some(value)),
+                Err(GoalEvaluationCoreError::NegativeContextEpoch { value })
+            );
+        }
+        for sha in [None, Some("a".repeat(40))] {
+            for epoch in [None, Some(0), Some(1), Some(i64::MAX)] {
+                let actual = construct(sha.clone(), epoch).unwrap();
+                assert_eq!(actual.integrated_sha(), sha.as_deref());
+                assert_eq!(actual.context_epoch(), epoch);
+                assert_eq!(actual.evaluated_at(), &evaluated_at);
+            }
+        }
     }
 }
