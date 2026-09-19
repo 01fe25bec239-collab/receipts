@@ -5,6 +5,12 @@ mod candidate_eligibility;
 mod candidate_identity_constraint_composition;
 mod candidate_identity_constraints;
 mod candidate_set;
+mod quota_state;
+
+#[cfg(test)]
+mod quota_state_tests;
+
+pub use quota_state::{QuotaScope, QuotaStateRequiredCore};
 
 #[cfg(test)]
 mod candidate_eligibility_tests;
