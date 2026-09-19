@@ -5,6 +5,7 @@
 
 pub mod dispatch_admission_axis_references;
 pub mod dispatch_admission_core;
+pub mod dispatch_admission_decision;
 pub mod dispatch_admission_decision_non_temporal_core;
 pub mod dispatch_admission_provider_auth_axis;
 pub mod dispatch_admission_provider_policy_axis;
@@ -18,6 +19,7 @@ pub use dispatch_admission_axis_references::{
 pub use dispatch_admission_core::{
     DispatchAdmissionDecisionCore, DispatchAdmissionDecisionCoreError,
 };
+pub use dispatch_admission_decision::DispatchAdmissionDecision;
 pub use dispatch_admission_decision_non_temporal_core::{
     DispatchAdmissionAxisResults, DispatchAdmissionDecisionNonTemporalCore,
     DispatchAdmissionDecisionNonTemporalCoreError,
@@ -38,6 +40,8 @@ mod dispatch_admission_axis_references_tests;
 mod dispatch_admission_core_tests;
 #[cfg(test)]
 mod dispatch_admission_decision_non_temporal_core_tests;
+#[cfg(test)]
+mod dispatch_admission_decision_tests;
 #[cfg(test)]
 mod dispatch_admission_provider_auth_axis_tests;
 #[cfg(test)]
