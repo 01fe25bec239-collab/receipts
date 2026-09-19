@@ -1,4 +1,4 @@
-//! Review Integration: closed vocabularies and a non-temporal structured core.
+//! Review Integration: closed vocabularies and structured physical data.
 
 pub mod a4_review_vocabulary;
 
@@ -108,3 +108,15 @@ pub use safety_interruption_structured_core::{
 
 #[cfg(test)]
 mod safety_interruption_structured_core_tests;
+
+pub mod date_time;
+pub use date_time::{ReviewDateTimeError, ReviewDateTimeV1};
+
+#[cfg(test)]
+mod date_time_tests;
+
+pub mod safety_interruption;
+pub use safety_interruption::SafetyInterruption;
+
+#[cfg(test)]
+mod safety_interruption_tests;
