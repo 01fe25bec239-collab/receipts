@@ -2,6 +2,150 @@ use super::*;
 use receipts_orchestration::orchestration::{
     OrchestrationDateTimeV1, OrchestrationJsonObjectV1, OrchestrationJsonValueV1,
 };
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
+struct EmissionAdapter<'a, T> {
+    expected_event: &'a NormalizedHostEvent,
+    calls: Cell<usize>,
+    outcome: RefCell<Option<T>>,
+}
+
+impl<T> HostAdapter for EmissionAdapter<'_, T> {
+    type DetectOutcome = ();
+    type InstallPlan = ();
+    type InstallOutcome = ();
+    type CoreHandle = ();
+    type EmitOutcome = T;
+    type CoreView = ();
+    type PresentOutcome = ();
+    type UserPrompt = ();
+    type UserResponse = ();
+    type UserInputPending = std::future::Ready<()>;
+    type ShutdownReason = ();
+    type ShutdownOutcome = ();
+
+    fn id(&self) -> HostId {
+        panic!("validated emission must not consult adapter identity")
+    }
+
+    fn detect(&self) {
+        panic!("unexpected detect")
+    }
+
+    fn install(&self, _: &()) {
+        panic!("unexpected install")
+    }
+
+    fn start(&self) {
+        panic!("unexpected start")
+    }
+
+    fn emit(&self, event: &NormalizedHostEvent) -> T {
+        self.calls.set(self.calls.get() + 1);
+        assert!(std::ptr::eq(event, self.expected_event));
+        self.outcome.borrow_mut().take().expect("emit only once")
+    }
+
+    fn present(&self, _: &()) {
+        panic!("unexpected present")
+    }
+
+    fn request_user_input(&mut self, _: ()) -> Self::UserInputPending {
+        panic!("unexpected request_user_input")
+    }
+
+    fn capabilities(&self) -> HostCapabilityReport {
+        panic!("unexpected capabilities")
+    }
+
+    fn shutdown(self, _: ()) {
+        panic!("unexpected shutdown")
+    }
+}
+
+// No Clone, Debug, Eq, Send, Sync, Future, or Result contract; borrows are allowed.
+struct OpaqueOutcome<'a> {
+    marker: &'a str,
+    identity: Rc<Cell<u32>>,
+}
+
+fn assert_validated_emission(event: &NormalizedHostEvent) -> (usize, usize) {
+    let before = event.clone();
+    let marker = String::from("distinctive adapter outcome: A3-028");
+    let mut allowed = 0;
+    let mut rejected = 0;
+    for source_class in NormalizedHostEventSourceClass::ALL {
+        let identity = Rc::new(Cell::new(0xA3028));
+        let adapter = EmissionAdapter {
+            expected_event: event,
+            calls: Cell::new(0),
+            outcome: RefCell::new(Some(OpaqueOutcome {
+                marker: &marker,
+                identity: Rc::clone(&identity),
+            })),
+        };
+        let expected = validate_normalized_host_event_source(source_class, event);
+        let actual = emit_validated_normalized_host_event(&adapter, source_class, event);
+        match (expected, actual) {
+            (Ok(()), Ok(outcome)) => {
+                assert_eq!(adapter.calls.get(), 1);
+                assert!(adapter.outcome.borrow().is_none());
+                assert!(std::ptr::eq(outcome.marker, marker.as_str()));
+                assert!(Rc::ptr_eq(&outcome.identity, &identity));
+                assert_eq!(outcome.identity.get(), 0xA3028);
+                allowed += 1;
+            }
+            (Err(expected), Err(actual)) => {
+                assert_eq!(actual, expected);
+                assert_eq!(adapter.calls.get(), 0);
+                assert!(adapter.outcome.borrow().is_some());
+                rejected += 1;
+            }
+            _ => panic!("bridge disagrees with validator: {source_class:?}"),
+        }
+        assert_eq!(event, &before);
+    }
+    (allowed, rejected)
+}
+
+#[test]
+fn validated_emit_preserves_reference_outcome_and_event_for_all_64_pairs() {
+    let mut totals = (0, 0);
+    for event_type in NormalizedHostEventType::ALL {
+        let event = NormalizedHostEvent::try_new(inputs(event_type)).unwrap();
+        let (allowed, rejected) = assert_validated_emission(&event);
+        totals.0 += allowed;
+        totals.1 += rejected;
+    }
+    assert_eq!(totals, (17, 47));
+}
+
+#[test]
+fn validated_emit_uses_explicit_source_despite_source_like_event_contents() {
+    for confidence in NormalizedHostEventConfidence::ALL {
+        for source_hint in NormalizedHostEventSourceClass::ALL {
+            let mut fields = inputs(NormalizedHostEventType::ToolExecuted);
+            fields.confidence = confidence;
+            fields.host = NormalizedHostEventHost::try_new(source_hint.as_str()).unwrap();
+            fields.payload = OrchestrationJsonObjectV1::new(std::collections::BTreeMap::from([(
+                "source_class".to_owned(),
+                OrchestrationJsonValueV1::String(source_hint.as_str().to_owned()),
+            )]));
+            fields.raw_ref = Some(
+                NormalizedHostEventRawRef::try_new(
+                    NormalizedHostEventRawRefType::ArtifactId,
+                    source_hint.as_str().to_owned(),
+                    Some("unchanged-digest".to_owned()),
+                    Some("unchanged-section".to_owned()),
+                )
+                .unwrap(),
+            );
+            let event = NormalizedHostEvent::try_new(fields).unwrap();
+            assert_eq!(assert_validated_emission(&event), (2, 2));
+        }
+    }
+}
 
 fn inputs(event_type: NormalizedHostEventType) -> NormalizedHostEventInputs {
     NormalizedHostEventInputs {

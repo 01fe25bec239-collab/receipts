@@ -32,6 +32,9 @@
 //! * the in-process [`NormalizedHostEvent`] carrier validates structure only;
 //!   the adapter's canonical event input is physically bound, while emit
 //!   behavior remains unimplemented and its outcome associated type unbound;
+//! * [`emit_validated_normalized_host_event`] composes source compatibility
+//!   validation with one adapter call; it provides no live host event producer
+//!   and establishes no delivery or persistence;
 //! * no authoritative state read or write path exists here.
 
 pub mod adapter;
@@ -173,7 +176,8 @@ pub use normalized_host_event::{
     NormalizedHostEventRawRef, NormalizedHostEventRawRefType, NormalizedHostEventType,
 };
 pub use normalized_host_event_emission::{
-    NormalizedHostEventEmissionSourceError, validate_normalized_host_event_source,
+    NormalizedHostEventEmissionSourceError, emit_validated_normalized_host_event,
+    validate_normalized_host_event_source,
 };
 pub use normalized_host_event_source_class::NormalizedHostEventSourceClass;
 pub use normalized_host_event_source_policy::source_class_allowed;
