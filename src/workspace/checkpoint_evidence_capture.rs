@@ -1,4 +1,4 @@
-//! Read-only local Git evidence for a non-temporal checkpoint.
+//! Read-only local Git checkpoint evidence with optional temporal composition.
 
 use std::ffi::OsStr;
 use std::io::{self, Read};
@@ -10,7 +10,8 @@ pub(crate) const GIT_EVIDENCE_LIMIT_BYTES: u64 = 1_048_576;
 use crate::{
     CommitSha, WorkspaceCheckpointCaptureCore, WorkspaceCheckpointCaptureCoreError,
     WorkspaceCheckpointCrashClassification, WorkspaceCheckpointExecutedCheckCore,
-    WorkspaceCheckpointKind, WorkspaceCheckpointRef, WorkspaceError, git,
+    WorkspaceCheckpointKind, WorkspaceCheckpointRef, WorkspaceCheckpointTemporalCaptureCore,
+    WorkspaceDateTimeV1, WorkspaceError, git,
 };
 
 /// Caller-authorized context and inert evidence. `directory` must be in the
@@ -184,6 +185,16 @@ pub fn capture_workspace_checkpoint_evidence(
         None,
     )
     .map_err(E::Core)
+}
+
+/// Captures real Git evidence with a required caller-supplied timestamp.
+/// The timestamp and captured core are preserved unchanged; capture errors pass through.
+pub fn capture_workspace_checkpoint_temporal_evidence(
+    request: WorkspaceCheckpointEvidenceCaptureRequest<'_>,
+    captured_at: WorkspaceDateTimeV1,
+) -> Result<WorkspaceCheckpointTemporalCaptureCore, E> {
+    capture_workspace_checkpoint_evidence(request)
+        .map(|core| WorkspaceCheckpointTemporalCaptureCore::new(core, captured_at))
 }
 
 /// Fresh bounded Git-visible state; ignored files are outside this contract.

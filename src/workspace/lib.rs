@@ -102,7 +102,7 @@ pub use checkpoint_capture_core::{
 pub use checkpoint_evidence_capture::{
     WorkspaceCheckpointEvidenceCaptureError, WorkspaceCheckpointEvidenceCaptureRequest,
     WorkspaceCheckpointGitObservation, WorkspaceCheckpointGitStream,
-    capture_workspace_checkpoint_evidence,
+    capture_workspace_checkpoint_evidence, capture_workspace_checkpoint_temporal_evidence,
 };
 pub use checkpoint_evidence_vocabulary::{
     WorkspaceCheckpointCheckSource, WorkspaceCheckpointExecutedCheckResult,
