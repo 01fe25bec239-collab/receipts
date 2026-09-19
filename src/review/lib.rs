@@ -120,3 +120,9 @@ pub use safety_interruption::SafetyInterruption;
 
 #[cfg(test)]
 mod safety_interruption_tests;
+
+pub mod review_request;
+pub use review_request::ReviewRequest;
+
+#[cfg(test)]
+mod review_request_tests;
