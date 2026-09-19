@@ -3,6 +3,7 @@ mod attempt;
 mod auth_status;
 mod claude_execution;
 mod claude_stream_json;
+mod codex_auth_status;
 mod codex_failure_classification;
 mod codex_jsonl;
 mod codex_live_attempt;
@@ -18,6 +19,8 @@ mod raw_failure;
 mod adapter_tests;
 #[cfg(test)]
 mod attempt_tests;
+#[cfg(all(test, unix))]
+mod codex_auth_status_tests;
 #[cfg(test)]
 mod codex_failure_classification_tests;
 #[cfg(test)]
@@ -60,6 +63,9 @@ pub use raw_failure::{RawFailure, RawFailureEvidence, RawFailureSource};
 /// Probe failure remains `CodexProbeExecutionError`, never a fabricated report.
 pub type RuntimeCapabilities = CodexCapabilityProbeReport;
 pub use auth_status::RuntimeAuthStatus;
+pub use codex_auth_status::{
+    CodexAuthStatusError, classify_codex_auth_status_error, observe_codex_auth_status,
+};
 pub use codex_failure_classification::{
     classify_codex_task_execution_error, classify_codex_task_execution_result,
 };
