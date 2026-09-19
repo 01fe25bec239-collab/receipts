@@ -606,8 +606,17 @@ fn branch_is_opaque_and_may_be_empty() {
 }
 
 #[test]
-fn context_epoch_zero_one_and_arbitrary_magnitude() {
-    for digits in ["0".into(), "1".into(), HUGE.into(), "9".repeat(10_000)] {
+fn request_and_capsule_share_the_complete_context_epoch_value_domain() {
+    for digits in [
+        "0".into(),
+        "1".into(),
+        i64::MAX.to_string(),
+        "9223372036854775808".into(),
+        u64::MAX.to_string(),
+        "18446744073709551616".into(),
+        HUGE.into(),
+        "9".repeat(10_000),
+    ] {
         let value = ReviewRequestNonNegativeInteger::from_decimal(&digits).unwrap();
         let v = Input {
             context_epoch: value.clone(),
@@ -617,8 +626,59 @@ fn context_epoch_zero_one_and_arbitrary_magnitude() {
         .unwrap();
         assert_eq!(v.context_epoch(), &value);
         assert_eq!(v.context_epoch().decimal_digits(), digits);
+        // Only the epoch is reused: this is not request-to-capsule composition.
+        let capsule = ReviewCapsuleNonTemporalCore::new_with_context_epoch(
+            "review".into(),
+            "task".into(),
+            "attempt".into(),
+            BASE.into(),
+            IMPLEMENTATION.into(),
+            "objective".into(),
+            vec![criterion()],
+            None,
+            None,
+            None,
+            WorkspaceCheckpointRef::new(WorkspaceCheckpointRefType::RepoPath, "diff", None, None)
+                .unwrap(),
+            vec!["src/review/**".into()],
+            None,
+            None,
+            ReviewCapsuleReviewScope::Regression,
+            ReviewCapsuleSeverityPolicy::new(vec!["BLOCKING".into()], None).unwrap(),
+            false,
+            None,
+            v.context_epoch().clone(),
+        )
+        .unwrap();
+        let stored: &ReviewRequestNonNegativeInteger = capsule.context_epoch();
+        assert_eq!(stored, v.context_epoch());
+        assert_eq!(stored.decimal_digits(), digits);
+        assert_eq!(capsule.review_id(), "review");
+        assert_eq!(capsule.task_id(), "task");
+        assert_eq!(capsule.attempt_id(), "attempt");
+        assert_eq!(capsule.baseline_sha().as_str(), BASE);
+        assert_eq!(capsule.implementation_sha().as_str(), IMPLEMENTATION);
+        assert_eq!(capsule.objective(), "objective");
+        assert_eq!(capsule.acceptance_criteria(), [criterion()]);
+        assert_eq!(capsule.allowed_write_paths(), ["src/review/**"]);
+        assert_eq!(capsule.review_scope(), ReviewCapsuleReviewScope::Regression);
+        assert_eq!(
+            capsule.severity_policy().blocking_categories(),
+            ["BLOCKING"]
+        );
+        assert_eq!(capsule.severity_policy().nonblocking_categories(), None);
     }
     assert!(HUGE.parse::<u128>().is_err());
+}
+
+#[test]
+fn legacy_i64_conversion_uses_the_existing_integer_semantics() {
+    for value in [i64::MIN, -1, 0, 1, i64::MAX] {
+        assert_eq!(
+            ReviewRequestNonNegativeInteger::try_from(value),
+            ReviewRequestNonNegativeInteger::from_decimal(&value.to_string())
+        );
+    }
 }
 
 #[test]

@@ -72,6 +72,99 @@ fn capsule(
 }
 
 #[test]
+#[allow(clippy::useless_conversion)] // The contextual `.into()` is the API regression.
+fn legacy_constructor_preserves_contextual_i64_typing() {
+    macro_rules! construct {
+        ($epoch:expr) => {
+            ReviewCapsuleNonTemporalCore::new(
+                "review".into(),
+                "task".into(),
+                "attempt".into(),
+                BASE_SHA.into(),
+                IMPLEMENTATION_SHA.into(),
+                "objective".into(),
+                vec![criterion()],
+                None,
+                None,
+                None,
+                reference(WorkspaceCheckpointRefType::RepoPath, "diff"),
+                vec!["src/review/**".into()],
+                None,
+                None,
+                ReviewCapsuleReviewScope::Full,
+                severity(),
+                false,
+                None,
+                $epoch,
+            )
+        };
+    }
+    let epoch: i64 = 0;
+    for result in [construct!(0), construct!(epoch), construct!(0.into())] {
+        assert_eq!(result.unwrap().context_epoch().decimal_digits(), "0");
+    }
+    for result in [construct!(-1), construct!(i64::MIN)] {
+        assert_eq!(
+            result,
+            Err(ReviewCapsuleConstructionError::NegativeContextEpoch)
+        );
+    }
+}
+
+#[test]
+fn legacy_negative_epoch_does_not_preempt_other_validation() {
+    use ReviewCapsuleConstructionError::*;
+    for (position, expected) in [
+        EmptyReviewId,
+        EmptyTaskId,
+        EmptyAttemptId,
+        MalformedBaselineSha,
+        MalformedImplementationSha,
+        EmptyObjective,
+        EmptyAcceptanceCriteria,
+        EmptyAllowedWritePaths,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut fields = [
+            "review",
+            "task",
+            "attempt",
+            BASE_SHA,
+            IMPLEMENTATION_SHA,
+            "objective",
+        ];
+        if position < fields.len() {
+            fields[position] = "";
+        }
+        assert_eq!(
+            capsule(
+                fields[0],
+                fields[1],
+                fields[2],
+                fields[3],
+                fields[4],
+                fields[5],
+                if position == 6 {
+                    vec![]
+                } else {
+                    vec![criterion()]
+                },
+                if position == 7 {
+                    vec![]
+                } else {
+                    vec!["x".into()]
+                },
+                severity(),
+                -1,
+            ),
+            Err(expected)
+        );
+    }
+}
+
+#[test]
 fn required_core_constructs_and_optional_fields_are_absent() {
     let value = capsule(
         "review",
@@ -99,7 +192,7 @@ fn required_core_constructs_and_optional_fields_are_absent() {
     assert_eq!(value.review_scope(), ReviewCapsuleReviewScope::Full);
     assert_eq!(value.severity_policy(), &severity());
     assert!(!value.reproduction_required());
-    assert_eq!(value.context_epoch(), 0);
+    assert_eq!(value.context_epoch().decimal_digits(), "0");
     assert_eq!(value.non_goals(), None);
     assert_eq!(value.architecture_refs(), None);
     assert_eq!(value.contract_refs(), None);
@@ -111,6 +204,8 @@ fn required_core_constructs_and_optional_fields_are_absent() {
         ReviewCapsuleNonTemporalCore::baseline_sha;
     let _: fn(&ReviewCapsuleNonTemporalCore) -> &CommitSha =
         ReviewCapsuleNonTemporalCore::implementation_sha;
+    let _: fn(&ReviewCapsuleNonTemporalCore) -> &ReviewRequestNonNegativeInteger =
+        ReviewCapsuleNonTemporalCore::context_epoch;
 }
 
 #[test]
@@ -641,7 +736,7 @@ fn review_scope_vocabulary_is_closed_and_passive() {
         )
         .unwrap();
         // Reconstruct because fields are private and immutable; scope changes no other data.
-        capsule = ReviewCapsuleNonTemporalCore::new(
+        capsule = ReviewCapsuleNonTemporalCore::new_with_context_epoch(
             capsule.review_id().into(),
             capsule.task_id().into(),
             capsule.attempt_id().into(),
@@ -660,7 +755,7 @@ fn review_scope_vocabulary_is_closed_and_passive() {
             capsule.severity_policy().clone(),
             capsule.reproduction_required(),
             None,
-            capsule.context_epoch(),
+            capsule.context_epoch().clone(),
         )
         .unwrap();
         assert_eq!(capsule.review_scope(), value);
@@ -721,7 +816,7 @@ fn reproduction_structured_schema_and_context_epoch_are_stored_without_inference
                 .unwrap();
                 assert_eq!(value.reproduction_required(), reproduction_required);
                 assert_eq!(value.structured_output_schema(), schema.as_ref());
-                assert_eq!(value.context_epoch(), epoch);
+                assert_eq!(value.context_epoch().decimal_digits(), epoch.to_string());
             }
         }
     }
