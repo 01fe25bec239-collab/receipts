@@ -2,14 +2,13 @@ use std::fmt;
 
 use crate::{
     CommitSha, WorkspaceCheckpointCheckSource, WorkspaceCheckpointExecutedCheckResult,
-    WorkspaceCheckpointRef,
+    WorkspaceCheckpointRef, WorkspaceDateTimeV1,
 };
 
 /// Bounded core of one `WorkspaceCheckpoint.executed_checks[]` entry.
 ///
 /// Records evidence of an explicitly-invoked argv command and its observed
-/// outcome. This is the deliberately bounded `Core` slice: `started_at`,
-/// `finished_at` remain out of scope. Result is optional and caller supplied only.
+/// outcome. Result and timestamps are optional and caller supplied only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceCheckpointExecutedCheckCore {
     source: WorkspaceCheckpointCheckSource,
@@ -19,6 +18,8 @@ pub struct WorkspaceCheckpointExecutedCheckCore {
     timed_out: Option<bool>,
     output_ref: Option<WorkspaceCheckpointRef>,
     result: Option<WorkspaceCheckpointExecutedCheckResult>,
+    started_at: Option<WorkspaceDateTimeV1>,
+    finished_at: Option<WorkspaceDateTimeV1>,
 }
 
 impl WorkspaceCheckpointExecutedCheckCore {
@@ -46,6 +47,8 @@ impl WorkspaceCheckpointExecutedCheckCore {
             timed_out,
             output_ref,
             result: None,
+            started_at: None,
+            finished_at: None,
         })
     }
 
@@ -54,6 +57,26 @@ impl WorkspaceCheckpointExecutedCheckCore {
     pub fn with_result(mut self, result: Option<WorkspaceCheckpointExecutedCheckResult>) -> Self {
         self.result = result;
         self
+    }
+
+    /// Stores exactly the caller-supplied start timestamp, including absence.
+    pub fn with_started_at(mut self, started_at: Option<WorkspaceDateTimeV1>) -> Self {
+        self.started_at = started_at;
+        self
+    }
+
+    /// Stores exactly the caller-supplied finish timestamp, including absence.
+    pub fn with_finished_at(mut self, finished_at: Option<WorkspaceDateTimeV1>) -> Self {
+        self.finished_at = finished_at;
+        self
+    }
+
+    pub fn started_at(&self) -> Option<&WorkspaceDateTimeV1> {
+        self.started_at.as_ref()
+    }
+
+    pub fn finished_at(&self) -> Option<&WorkspaceDateTimeV1> {
+        self.finished_at.as_ref()
     }
 
     pub const fn result(&self) -> Option<WorkspaceCheckpointExecutedCheckResult> {

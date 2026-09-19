@@ -1,7 +1,7 @@
 use crate::{
     CommitSha, WorkspaceCheckpointCheckSource, WorkspaceCheckpointExecutedCheckCore,
     WorkspaceCheckpointExecutedCheckCoreError, WorkspaceCheckpointExecutedCheckResult,
-    WorkspaceCheckpointRef, WorkspaceCheckpointRefType,
+    WorkspaceCheckpointRef, WorkspaceCheckpointRefType, WorkspaceDateTimeV1,
 };
 
 const CODE_SHA_FIXTURE: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -51,6 +51,8 @@ fn constructs_normal_core_value_and_exposes_each_accessor() {
     assert_eq!(core.timed_out(), None);
     assert_eq!(core.output_ref(), None);
     assert_eq!(core.result(), None);
+    assert_eq!(core.started_at(), None);
+    assert_eq!(core.finished_at(), None);
 }
 
 #[test]
@@ -334,6 +336,34 @@ fn caller_supplied_results_are_independent_of_every_evidence_field() {
                         assert_eq!(absent.result(), None);
                         let core = absent.clone().with_result(result);
                         assert_eq!(core.result(), result);
+                        assert_eq!(core.started_at(), None);
+                        assert_eq!(core.finished_at(), None);
+                        let temporal = core
+                            .clone()
+                            .with_started_at(Some(
+                                WorkspaceDateTimeV1::try_new("2026-09-18T12:00:00Z").unwrap(),
+                            ))
+                            .with_finished_at(Some(
+                                WorkspaceDateTimeV1::try_new("2026-09-18T11:00:00Z").unwrap(),
+                            ));
+                        assert_eq!(temporal.result(), result);
+                        assert_eq!(
+                            temporal.started_at().unwrap().as_str(),
+                            "2026-09-18T12:00:00Z"
+                        );
+                        assert_eq!(
+                            temporal.finished_at().unwrap().as_str(),
+                            "2026-09-18T11:00:00Z"
+                        );
+                        assert_eq!(
+                            temporal.clone().with_result(None).started_at(),
+                            temporal.started_at()
+                        );
+                        assert_eq!(
+                            temporal.clone().with_result(None).finished_at(),
+                            temporal.finished_at()
+                        );
+                        assert_eq!(temporal.with_started_at(None).with_finished_at(None), core);
                         assert_eq!(core.source(), source);
                         assert_eq!(core.command(), absent.command());
                         assert_eq!(core.exit_code(), exit_code);
@@ -370,4 +400,70 @@ fn unknown_is_present_and_result_can_be_replaced_or_cleared() {
     let replaced = unknown.with_result(Some(Pass));
     assert_eq!(replaced.result(), Some(Pass));
     assert_eq!(replaced.with_result(None), absent);
+}
+
+#[test]
+fn temporal_fields_are_independent_replaceable_clearable_and_lexically_exact() {
+    for sha in [CODE_SHA_FIXTURE, "abcdef0123456789abcdef0123456789abcdef01"] {
+        for command in [
+            vec!["cargo".into(), "test".into()],
+            vec!["2026-09-18T12:00:00Z".into()],
+        ] {
+            let absent = core_fixture(
+                WorkspaceCheckpointCheckSource::WorkerExecution,
+                command,
+                0,
+                fixture_sha_value(sha),
+                None,
+                None,
+            )
+            .with_result(Some(WorkspaceCheckpointExecutedCheckResult::Pass));
+            assert_eq!(absent.started_at(), None);
+            assert_eq!(absent.finished_at(), None);
+            assert_eq!(
+                absent.clone().with_started_at(None).with_finished_at(None),
+                absent
+            );
+            for spelling in [
+                "2026-09-08T00:00:00Z",
+                "2026-09-08t00:00:00Z",
+                "2026-09-08T00:00:00z",
+                "2026-09-08t00:00:00.100z",
+                "2026-09-08T00:00:00.1+05:30",
+                "2026-09-08T00:00:00.100-00:00",
+            ] {
+                let value = WorkspaceDateTimeV1::try_new(spelling).unwrap();
+                let start_only = absent.clone().with_started_at(Some(value.clone()));
+                let finish_only = absent.clone().with_finished_at(Some(value.clone()));
+                assert_eq!(start_only.started_at().unwrap().as_str(), spelling);
+                assert_eq!(start_only.finished_at(), None);
+                assert_eq!(finish_only.started_at(), None);
+                assert_eq!(finish_only.finished_at().unwrap().as_str(), spelling);
+                assert_ne!(start_only, absent);
+                assert_ne!(finish_only, absent);
+                assert_ne!(start_only, finish_only);
+                let both = start_only.clone().with_finished_at(Some(value));
+                assert_eq!(both.clone(), both);
+                assert_ne!(both, start_only);
+                assert_ne!(both, finish_only);
+                assert_eq!(both.started_at().unwrap().as_str(), spelling);
+                assert_eq!(both.finished_at().unwrap().as_str(), spelling);
+                let replacement = WorkspaceDateTimeV1::try_new("1985-04-12T23:20:50.52Z").unwrap();
+                let replaced = both
+                    .clone()
+                    .with_started_at(Some(replacement.clone()))
+                    .with_finished_at(Some(replacement.clone()));
+                assert_ne!(replaced, both);
+                assert_eq!(replaced.started_at(), Some(&replacement));
+                assert_eq!(replaced.finished_at(), Some(&replacement));
+                assert_eq!(replaced.result(), absent.result());
+                assert_eq!(
+                    replaced.with_started_at(None).with_finished_at(None),
+                    absent
+                );
+                assert_eq!(both.clone().with_finished_at(None), start_only);
+                assert_eq!(both.with_started_at(None), finish_only);
+            }
+        }
+    }
 }
