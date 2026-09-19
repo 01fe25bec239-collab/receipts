@@ -330,11 +330,101 @@ pub struct ReviewCapsuleNonTemporalCore {
 }
 
 impl ReviewCapsuleNonTemporalCore {
-    /// Accepts the shared arbitrary-magnitude integer carrier or legacy `i64`
-    /// input. Failed conversion reports `NegativeContextEpoch`; all stored
-    /// epochs use the shared carrier, without a native-width maximum.
+    /// Constructs from a legacy `i64` epoch; negative values report `NegativeContextEpoch`.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        review_id: String,
+        task_id: String,
+        attempt_id: String,
+        baseline_sha: String,
+        implementation_sha: String,
+        objective: String,
+        acceptance_criteria: Vec<ReviewCapsuleCriterion>,
+        non_goals: Option<Vec<String>>,
+        architecture_refs: Option<Vec<WorkspaceCheckpointRef>>,
+        contract_refs: Option<Vec<WorkspaceCheckpointRef>>,
+        diff: WorkspaceCheckpointRef,
+        allowed_write_paths: Vec<String>,
+        checks: Option<Vec<ReviewCapsuleCheck>>,
+        security_requirements: Option<Vec<String>>,
+        review_scope: ReviewCapsuleReviewScope,
+        severity_policy: ReviewCapsuleSeverityPolicy,
+        reproduction_required: bool,
+        structured_output_schema: Option<WorkspaceCheckpointRef>,
+        context_epoch: i64,
+    ) -> Result<Self, ReviewCapsuleConstructionError> {
+        Self::build(
+            review_id,
+            task_id,
+            attempt_id,
+            baseline_sha,
+            implementation_sha,
+            objective,
+            acceptance_criteria,
+            non_goals,
+            architecture_refs,
+            contract_refs,
+            diff,
+            allowed_write_paths,
+            checks,
+            security_requirements,
+            review_scope,
+            severity_policy,
+            reproduction_required,
+            structured_output_schema,
+            context_epoch,
+        )
+    }
+
+    /// Constructs from the shared integer carrier without a native-width maximum.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_context_epoch(
+        review_id: String,
+        task_id: String,
+        attempt_id: String,
+        baseline_sha: String,
+        implementation_sha: String,
+        objective: String,
+        acceptance_criteria: Vec<ReviewCapsuleCriterion>,
+        non_goals: Option<Vec<String>>,
+        architecture_refs: Option<Vec<WorkspaceCheckpointRef>>,
+        contract_refs: Option<Vec<WorkspaceCheckpointRef>>,
+        diff: WorkspaceCheckpointRef,
+        allowed_write_paths: Vec<String>,
+        checks: Option<Vec<ReviewCapsuleCheck>>,
+        security_requirements: Option<Vec<String>>,
+        review_scope: ReviewCapsuleReviewScope,
+        severity_policy: ReviewCapsuleSeverityPolicy,
+        reproduction_required: bool,
+        structured_output_schema: Option<WorkspaceCheckpointRef>,
+        context_epoch: ReviewRequestNonNegativeInteger,
+    ) -> Result<Self, ReviewCapsuleConstructionError> {
+        Self::build(
+            review_id,
+            task_id,
+            attempt_id,
+            baseline_sha,
+            implementation_sha,
+            objective,
+            acceptance_criteria,
+            non_goals,
+            architecture_refs,
+            contract_refs,
+            diff,
+            allowed_write_paths,
+            checks,
+            security_requirements,
+            review_scope,
+            severity_policy,
+            reproduction_required,
+            structured_output_schema,
+            context_epoch,
+        )
+    }
+
+    // Both public paths share validation, including the legacy error ordering.
+    #[allow(clippy::too_many_arguments)]
+    fn build(
         review_id: String,
         task_id: String,
         attempt_id: String,

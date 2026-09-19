@@ -627,7 +627,7 @@ fn request_and_capsule_share_the_complete_context_epoch_value_domain() {
         assert_eq!(v.context_epoch(), &value);
         assert_eq!(v.context_epoch().decimal_digits(), digits);
         // Only the epoch is reused: this is not request-to-capsule composition.
-        let capsule = ReviewCapsuleNonTemporalCore::new(
+        let capsule = ReviewCapsuleNonTemporalCore::new_with_context_epoch(
             "review".into(),
             "task".into(),
             "attempt".into(),
