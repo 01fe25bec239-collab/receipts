@@ -1,5 +1,6 @@
 //! In-process, non-temporal ReviewCapsule data. Constructors validate schema shape only.
 
+use crate::ReviewRequestNonNegativeInteger;
 use receipts_workspace_execution::{
     CommitSha, WorkspaceCheckpointCheckSource, WorkspaceCheckpointExecutedCheckCore,
     WorkspaceCheckpointRef,
@@ -292,6 +293,19 @@ impl std::error::Error for ReviewCapsuleConstructionError {}
 /// let _ = value.finished_at();
 /// # }
 /// ```
+///
+/// The shared integer carrier cannot be replaced or mutated through this API:
+///
+/// ```compile_fail
+/// # fn forbidden(value: &mut receipts_review_integration::ReviewCapsuleNonTemporalCore) {
+/// value.context_epoch = receipts_review_integration::ReviewRequestNonNegativeInteger::from_decimal("0").unwrap();
+/// # }
+/// ```
+/// ```compile_fail
+/// # fn forbidden(value: &mut receipts_review_integration::ReviewCapsuleNonTemporalCore) {
+/// let _: &mut receipts_review_integration::ReviewRequestNonNegativeInteger = value.context_epoch();
+/// # }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewCapsuleNonTemporalCore {
     review_id: String,
@@ -312,10 +326,13 @@ pub struct ReviewCapsuleNonTemporalCore {
     severity_policy: ReviewCapsuleSeverityPolicy,
     reproduction_required: bool,
     structured_output_schema: Option<WorkspaceCheckpointRef>,
-    context_epoch: i64,
+    context_epoch: ReviewRequestNonNegativeInteger,
 }
 
 impl ReviewCapsuleNonTemporalCore {
+    /// Accepts the shared arbitrary-magnitude integer carrier or legacy `i64`
+    /// input. Failed conversion reports `NegativeContextEpoch`; all stored
+    /// epochs use the shared carrier, without a native-width maximum.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         review_id: String,
@@ -336,7 +353,7 @@ impl ReviewCapsuleNonTemporalCore {
         severity_policy: ReviewCapsuleSeverityPolicy,
         reproduction_required: bool,
         structured_output_schema: Option<WorkspaceCheckpointRef>,
-        context_epoch: i64,
+        context_epoch: impl TryInto<ReviewRequestNonNegativeInteger>,
     ) -> Result<Self, ReviewCapsuleConstructionError> {
         validate_id(
             &review_id,
@@ -366,9 +383,9 @@ impl ReviewCapsuleNonTemporalCore {
         if allowed_write_paths.is_empty() {
             return Err(ReviewCapsuleConstructionError::EmptyAllowedWritePaths);
         }
-        if context_epoch < 0 {
-            return Err(ReviewCapsuleConstructionError::NegativeContextEpoch);
-        }
+        let context_epoch = context_epoch
+            .try_into()
+            .map_err(|_| ReviewCapsuleConstructionError::NegativeContextEpoch)?;
         Ok(Self {
             review_id,
             task_id,
@@ -446,8 +463,8 @@ impl ReviewCapsuleNonTemporalCore {
     pub fn structured_output_schema(&self) -> Option<&WorkspaceCheckpointRef> {
         self.structured_output_schema.as_ref()
     }
-    pub const fn context_epoch(&self) -> i64 {
-        self.context_epoch
+    pub const fn context_epoch(&self) -> &ReviewRequestNonNegativeInteger {
+        &self.context_epoch
     }
 }
 

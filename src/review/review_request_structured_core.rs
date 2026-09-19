@@ -57,8 +57,8 @@ impl std::error::Error for ReviewRequestConstructionError {}
 /// signed/zero-padded decimal inputs compare equal. No wire lexical rule is
 /// implied: a future wire adapter must map integer values to this carrier.
 ///
-/// Used as REVIEWREQUEST_CONTEXT_EPOCH_FIELD_REPRESENTATION, without ownership
-/// of State's ContextEpoch aggregate, epoch advancement, or State lookup.
+/// Shared by ReviewRequest and ReviewCapsule for `context_epoch`, without
+/// ownership of State's ContextEpoch aggregate, epoch advancement, or State lookup.
 ///
 /// ```compile_fail
 /// # fn forbidden(value: &mut receipts_review_integration::ReviewRequestNonNegativeInteger) {
@@ -97,6 +97,15 @@ impl ReviewRequestNonNegativeInteger {
     /// Canonical decimal magnitude for in-process inspection, not serialization.
     pub fn decimal_digits(&self) -> &str {
         &self.digits
+    }
+}
+
+impl TryFrom<i64> for ReviewRequestNonNegativeInteger {
+    type Error = ReviewRequestConstructionError;
+
+    /// Compatibility input for native-width callers; storage remains unbounded.
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        Self::from_decimal(&value.to_string())
     }
 }
 
