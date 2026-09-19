@@ -1117,3 +1117,150 @@ fn git_evidence_preserves_caller_supplied_check_results_without_inference() {
         assert!(!marker.exists());
     }
 }
+
+#[test]
+fn temporal_capture_preserves_real_git_evidence_and_exact_timestamp_spellings() {
+    let repo = TestRepo::new("checkpoint-temporal-evidence");
+    let base = repo.head_sha();
+    let head = repo.commit_file("tracked", "original");
+    fs::write(repo.path().join("tracked"), "staged").unwrap();
+    git(repo.path(), &["add", "tracked"]);
+    fs::write(repo.path().join("tracked"), "also unstaged").unwrap();
+    fs::write(repo.path().join("untracked"), "new").unwrap();
+    let make_request = || {
+        let mut input = request(repo.path());
+        input.base_sha = Some(&base);
+        input
+    };
+    let before = snapshot(repo.path());
+    let non_temporal = capture_workspace_checkpoint_evidence(make_request()).unwrap();
+    for spelling in [
+        "2026-09-19t12:34:56z",
+        "2026-09-19T12:34:56.0012300Z",
+        "2026-09-19T12:34:56+05:30",
+        "2026-09-19T12:34:56-00:00",
+    ] {
+        let captured_at = WorkspaceDateTimeV1::try_new(spelling).unwrap();
+        // Exercise the public crate-root export as a production caller would.
+        let temporal = crate::capture_workspace_checkpoint_temporal_evidence(
+            make_request(),
+            captured_at.clone(),
+        )
+        .unwrap();
+        assert_eq!(temporal.captured_at(), &captured_at);
+        assert_eq!(
+            temporal.captured_at().as_str().as_bytes(),
+            spelling.as_bytes()
+        );
+        assert_eq!(temporal.core(), &non_temporal);
+        assert_eq!(temporal.core().head_sha().as_str(), head);
+        assert_eq!(temporal.core().base_sha().unwrap().as_str(), base);
+        assert_eq!(temporal.core().modified_files(), &["tracked"]);
+        assert_eq!(temporal.core().untracked_files(), &["untracked"]);
+        assert_eq!(temporal.core().crash_classification(), None);
+        assert_eq!(snapshot(repo.path()), before);
+    }
+}
+
+#[test]
+fn temporal_capture_preserves_nested_checks_and_reverse_chronology() {
+    use crate::WorkspaceCheckpointExecutedCheckResult as R;
+
+    let repo = TestRepo::new("checkpoint-temporal-checks");
+    let marker = repo.path().join("must-not-execute");
+    let started_at = WorkspaceDateTimeV1::try_new("2026-09-19T13:00:00Z").unwrap();
+    let finished_at = WorkspaceDateTimeV1::try_new("2026-09-19T12:00:00Z").unwrap();
+    let captured_at = WorkspaceDateTimeV1::try_new("2026-09-19T11:00:00Z").unwrap();
+    let mut checks = Vec::new();
+    for start in [None, Some(started_at.clone())] {
+        for finish in [None, Some(finished_at.clone())] {
+            checks.push(
+                WorkspaceCheckpointExecutedCheckCore::new(
+                    WorkspaceCheckpointCheckSource::WorkerExecution,
+                    vec!["/usr/bin/touch".into(), marker.to_str().unwrap().into()],
+                    0,
+                    CommitSha::parse(&repo.head_sha()).unwrap(),
+                    Some(true),
+                    None,
+                )
+                .unwrap()
+                .with_result(Some(R::Fail))
+                .with_started_at(start.clone())
+                .with_finished_at(finish),
+            );
+        }
+    }
+    let mut input = request(repo.path());
+    input.executed_checks = checks.clone();
+    let temporal =
+        capture_workspace_checkpoint_temporal_evidence(input, captured_at.clone()).unwrap();
+    assert_eq!(temporal.captured_at(), &captured_at);
+    assert_eq!(temporal.core().executed_checks(), checks);
+    for (observed, supplied) in temporal.core().executed_checks().iter().zip(&checks) {
+        assert_eq!(observed.started_at(), supplied.started_at());
+        assert_eq!(observed.finished_at(), supplied.finished_at());
+        assert_eq!(observed.result(), Some(R::Fail));
+        assert_eq!(observed.exit_code(), 0);
+    }
+    assert!(!marker.exists());
+}
+
+#[test]
+fn temporal_composition_preserves_existing_classified_capture_path_and_absence() {
+    use crate::WorkspaceCheckpointCrashClassification as C;
+
+    let repo = TestRepo::new("checkpoint-temporal-classification");
+    let captured_at = WorkspaceDateTimeV1::try_new("2026-09-19t12:34:56z").unwrap();
+    let absent =
+        capture_workspace_checkpoint_temporal_evidence(request(repo.path()), captured_at.clone())
+            .unwrap();
+    assert_eq!(absent.core().crash_classification(), None);
+    // Classification enters through the existing separate capture method;
+    // the temporal helper's unchanged request has no classification field.
+    for classification in std::iter::once(None).chain(C::ALL.map(Some)) {
+        let core = request(repo.path())
+            .capture_with_crash_classification(classification)
+            .unwrap();
+        let temporal =
+            WorkspaceCheckpointTemporalCaptureCore::new(core.clone(), captured_at.clone());
+        assert_eq!(temporal.core(), &core);
+        assert_eq!(temporal.core().crash_classification(), classification);
+        assert_eq!(temporal.captured_at(), &captured_at);
+        assert_eq!(&core.with_crash_classification(None), absent.core());
+    }
+}
+
+#[test]
+fn temporal_capture_propagates_the_existing_git_error_and_diagnostics() {
+    let temp = TempDir::new("checkpoint-temporal-no-repo");
+    let captured_at = WorkspaceDateTimeV1::try_new("2026-09-19T12:34:56-00:00").unwrap();
+    let non_temporal = capture_workspace_checkpoint_evidence(request(temp.path())).unwrap_err();
+    let temporal =
+        capture_workspace_checkpoint_temporal_evidence(request(temp.path()), captured_at)
+            .unwrap_err();
+    let E::GitCommandFailed {
+        observation,
+        status,
+        stderr,
+        stderr_total_bytes,
+        stderr_truncated,
+    } = non_temporal
+    else {
+        panic!("expected existing Git command failure")
+    };
+    assert_eq!(observation, Observation::WorktreeRoot);
+    assert!(matches!(
+        temporal,
+        E::GitCommandFailed {
+            observation: actual_observation,
+            status: actual_status,
+            stderr: actual_stderr,
+            stderr_total_bytes: actual_total,
+            stderr_truncated: actual_truncated,
+        } if actual_observation == observation
+            && actual_status == status
+            && actual_stderr == stderr
+            && actual_total == stderr_total_bytes
+            && actual_truncated == stderr_truncated
+    ));
+}
