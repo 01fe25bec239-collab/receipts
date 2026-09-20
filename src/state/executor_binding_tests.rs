@@ -1231,3 +1231,185 @@ fn create_bypass_public_create_cannot_manufacture_lease_expired_state() {
 //
 // No scanner, timer, startup sweep, failover, rebind, or alternate public
 // helper exists that could write the terminal pair.
+
+// B01–B10, B14–B16: every terminal/rehydration shape and exact full fields.
+#[test]
+fn blocking_inspection_returns_only_incomplete_terminal_evidence() {
+    let tmp = TempDir::new("eb-inspection-shapes");
+    let mut repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
+    assert_eq!(
+        repo.find_role_blocking_executor_binding("unknown").unwrap(),
+        None
+    );
+    for invalid in [String::new(), "é".repeat(201)] {
+        assert!(matches!(
+            repo.find_role_blocking_executor_binding(&invalid),
+            Err(StateError::ExecutorBindingValidation { .. })
+        ));
+    }
+    for valid in [" ".to_string(), "é".repeat(200)] {
+        assert_eq!(
+            repo.find_role_blocking_executor_binding(&valid).unwrap(),
+            None
+        );
+    }
+    for (index, (released_at, reason)) in [
+        (None, None),
+        (Some("old release"), None),
+        (None, Some(ReleaseReason::Completed)),
+        (Some("old release"), Some(ReleaseReason::Completed)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (rh_index, rehydrated) in [None, Some(false), Some(true)].into_iter().enumerate() {
+            let role_id = format!("role-{index}-{rh_index}");
+            let role = minimal_role(&role_id, LogicalRoleType::RuntimeA2);
+            repo.create_logical_role(role.clone()).unwrap();
+            assert_eq!(
+                repo.find_role_blocking_executor_binding(&role_id).unwrap(),
+                None
+            );
+            let mut binding = minimal_binding(&format!("binding-{index}-{rh_index}"), &role_id);
+            binding.session_ref = Some("session reference".into());
+            binding.routing_decision_id = Some("routing-decision".into());
+            binding.lease_expires_at = "1900-01-01T00:00:00.000Z".into();
+            binding.released_at = released_at.map(str::to_string);
+            binding.release_reason = reason;
+            binding.rehydration_completed = rehydrated;
+            repo.create_executor_binding(binding.clone()).unwrap();
+            let expected = if released_at.is_some() && reason.is_some() {
+                None
+            } else {
+                Some(binding.clone())
+            };
+            assert_eq!(
+                repo.find_role_blocking_executor_binding(&role_id).unwrap(),
+                expected
+            );
+            assert_eq!(
+                repo.find_executor_binding(&binding.binding_id).unwrap(),
+                Some(binding)
+            );
+            assert_eq!(repo.find_logical_role(&role_id).unwrap(), Some(role));
+        }
+    }
+    // Fully released history must not obscure the current blocker.
+    let successor = minimal_binding("successor", "role-3-0");
+    repo.create_executor_binding(successor.clone()).unwrap();
+    assert_eq!(
+        repo.find_role_blocking_executor_binding("role-3-0")
+            .unwrap(),
+        Some(successor)
+    );
+    assert_eq!(
+        repo.find_role_blocking_executor_binding("ROLE-3-0")
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        repo.find_role_blocking_executor_binding("role-%").unwrap(),
+        None
+    );
+}
+
+// B11–B13: selected corruption and multiple blockers fail closed, without repair.
+#[test]
+fn blocking_inspection_rejects_corrupt_evidence_and_multiple_blockers() {
+    let tmp = TempDir::new("eb-inspection-corrupt");
+    let mut repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
+    repo.create_logical_role(minimal_role("role", LogicalRoleType::RuntimeA1))
+        .unwrap();
+    repo.create_executor_binding(minimal_binding("binding-z", "role"))
+        .unwrap();
+    repo.connection()
+        .execute_batch(
+            "PRAGMA ignore_check_constraints = ON;
+        UPDATE executor_binding SET release_reason = 'UNKNOWN';
+        PRAGMA ignore_check_constraints = OFF;",
+        )
+        .unwrap();
+    assert!(matches!(
+        repo.find_role_blocking_executor_binding("role"),
+        Err(StateError::ExecutorBindingDecodeFailed { .. })
+    ));
+    repo.connection()
+        .execute_batch(
+            "UPDATE executor_binding SET release_reason = NULL, rehydration_completed = 2",
+        )
+        .unwrap();
+    assert!(matches!(
+        repo.find_role_blocking_executor_binding("role"),
+        Err(StateError::ExecutorBindingDecodeFailed { .. })
+    ));
+    repo.connection().execute_batch("UPDATE executor_binding SET rehydration_completed = NULL;
+        DROP INDEX idx_executor_binding_role_unreleased;
+        INSERT INTO executor_binding (binding_id, role_id, provider_id, model_id, runtime_id, bound_at, lease_expires_at)
+        VALUES ('binding-a', 'role', 'p', 'm', 'r', 'bound', 'deadline');").unwrap();
+    for _ in 0..2 {
+        let error = repo
+            .find_role_blocking_executor_binding("role")
+            .unwrap_err();
+        assert!(
+            matches!(error, StateError::InternalQueryFailed { detail } if detail == "multiple blocking executor bindings for role_id \"role\"")
+        );
+    }
+    assert_eq!(repo.count_table_rows("executor_binding").unwrap(), 2);
+}
+
+// S01–S05 / B16: both public inspections work with SQLite writes forbidden.
+#[test]
+fn inspection_apis_preserve_schema_and_durable_data() {
+    let tmp = TempDir::new("eb-inspection-read-only");
+    let mut repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
+    let mut role = minimal_role("role", LogicalRoleType::RuntimeA1);
+    role.ownership_paths = vec!["b".into(), "a".into(), "b".into()];
+    let binding = minimal_binding("binding", "role");
+    repo.create_logical_role(role.clone()).unwrap();
+    repo.create_executor_binding(binding.clone()).unwrap();
+    let schema = || {
+        repo.connection()
+            .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let before_schema = schema();
+    let before_changes = repo.connection().total_changes();
+    repo.connection()
+        .execute_batch("PRAGMA query_only = ON")
+        .unwrap();
+    assert_eq!(
+        repo.list_logical_roles_for_project("project-1").unwrap(),
+        vec![role.clone()]
+    );
+    assert_eq!(
+        repo.find_role_blocking_executor_binding("role").unwrap(),
+        Some(binding.clone())
+    );
+    assert_eq!(schema(), before_schema);
+    assert_eq!(repo.connection().total_changes(), before_changes);
+    assert_eq!(repo.schema_version().unwrap(), 12);
+    assert_eq!(repo.count_table_rows("event").unwrap(), 0);
+    assert_eq!(repo.count_table_rows("trusted_time_watermark").unwrap(), 0);
+    assert_eq!(repo.find_logical_role("role").unwrap(), Some(role.clone()));
+    assert_eq!(
+        repo.find_executor_binding("binding").unwrap(),
+        Some(binding.clone())
+    );
+    drop(repo);
+    let repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
+    assert_eq!(repo.find_logical_role("role").unwrap(), Some(role));
+    assert_eq!(
+        repo.find_executor_binding("binding").unwrap(),
+        Some(binding)
+    );
+}

@@ -137,6 +137,37 @@ pub struct LogicalRole {
 }
 
 impl SqliteStateRepository {
+    /// Lists every durable role for an exact project identity, including
+    /// suspended and retired roles, in binary ascending role-ID order.
+    /// Roles and their ordered ownership paths share one read snapshot;
+    /// any read or decode failure rejects the entire result.
+    pub fn list_logical_roles_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<LogicalRole>, StateError> {
+        ensure_identifier("project_id", project_id)?;
+        let tx = self
+            .connection()
+            .unchecked_transaction()
+            .map_err(internal_query_failure)?;
+        let roles = {
+            let mut statement = tx
+                .prepare(SELECT_PROJECT_ROLES_SQL)
+                .map_err(internal_query_failure)?;
+            let rows = statement
+                .query_map([project_id], extract_role_row)
+                .map_err(internal_query_failure)?;
+            rows.map(|row| {
+                let row = row.map_err(internal_query_failure)?;
+                let paths = read_ownership_paths(&tx, &row.role_id)?;
+                row.into_logical_role(paths)
+            })
+            .collect::<Result<Vec<_>, StateError>>()?
+        };
+        tx.commit().map_err(internal_query_failure)?;
+        Ok(roles)
+    }
+
     /// Durably creates a new LogicalRole.
     ///
     /// Creation is atomic: the role row and its ownership-path rows commit
@@ -218,6 +249,14 @@ WHERE role_id = ?1";
 
 const SELECT_OWNERSHIP_PATHS_SQL: &str =
     "SELECT path FROM logical_role_ownership_path WHERE role_id = ?1 ORDER BY position";
+
+const SELECT_PROJECT_ROLES_SQL: &str = "SELECT
+    role_id, project_id, role_type, status, current_context_epoch,
+    name, workstream_id, integration_branch, context_manifest_id,
+    active_binding_id, created_at
+FROM logical_role
+WHERE project_id = ?1
+ORDER BY role_id COLLATE BINARY ASC";
 
 /// Inserts the role row and its ownership-path rows using bound parameters.
 ///

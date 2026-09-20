@@ -518,3 +518,131 @@ fn t18_identity_survives_reopen_without_executor_or_session_identity() {
         );
     }
 }
+
+// R01–R06: exact scope, all statuses, binary order and complete durable fields.
+#[test]
+fn project_role_list_round_trips_all_statuses_in_binary_order() {
+    let tmp = TempDir::new("lr-project-list");
+    let mut repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
+    assert_eq!(
+        repo.list_logical_roles_for_project("project-1").unwrap(),
+        vec![]
+    );
+    let mut expected = Vec::new();
+    for (id, status) in [
+        ("a", LogicalRoleStatus::Retired),
+        ("Z", LogicalRoleStatus::Suspended),
+        ("A", LogicalRoleStatus::Active),
+    ] {
+        let mut role = minimal_role(id, LogicalRoleType::RuntimeA2);
+        role.status = status;
+        role.current_context_epoch =
+            crate::StateEpochValueV1::try_from("18446744073709551616").unwrap();
+        role.name = Some(" name ".into());
+        role.workstream_id = Some("workstream".into());
+        role.integration_branch = Some("branch".into());
+        role.context_manifest_id = Some("manifest".into());
+        role.active_binding_id = Some("binding".into());
+        role.created_at = Some("opaque timestamp".into());
+        role.ownership_paths = vec!["b".into(), "a".into(), "b".into()];
+        repo.create_logical_role(role.clone()).unwrap();
+        expected.push(role);
+    }
+    for (index, project) in [
+        "project-10",
+        "Project-1",
+        " project-1",
+        "project-1 ",
+        "project-%",
+        "project-'",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut role = minimal_role(&format!("other-{index}"), LogicalRoleType::RuntimeA1);
+        role.project_id = project.into();
+        repo.create_logical_role(role.clone()).unwrap();
+        assert_eq!(
+            repo.list_logical_roles_for_project(project).unwrap(),
+            vec![role]
+        );
+    }
+    expected.reverse();
+    assert_eq!(
+        repo.list_logical_roles_for_project("project-1").unwrap(),
+        expected
+    );
+}
+
+// R07–R10: validation precedes storage, corruption is scoped and never skipped.
+#[test]
+fn project_role_list_validation_and_scoped_decode_failures() {
+    let tmp = TempDir::new("lr-list-corrupt");
+    let mut repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
+    let healthy = minimal_role("a-healthy", LogicalRoleType::RuntimeA1);
+    repo.create_logical_role(healthy.clone()).unwrap();
+    repo.create_logical_role(minimal_role("z-corrupt", LogicalRoleType::RuntimeA2))
+        .unwrap();
+    for (column, value) in [
+        ("role_type", "RUNTIME_A3"),
+        ("status", "UNKNOWN"),
+        ("current_context_epoch", "01"),
+    ] {
+        repo.connection()
+            .execute_batch("PRAGMA ignore_check_constraints = ON")
+            .unwrap();
+        repo.connection()
+            .execute(
+                &format!("UPDATE logical_role SET {column} = ?1 WHERE role_id = 'z-corrupt'"),
+                [value],
+            )
+            .unwrap();
+        repo.connection()
+            .execute_batch("PRAGMA ignore_check_constraints = OFF")
+            .unwrap();
+        assert!(matches!(
+            repo.list_logical_roles_for_project("project-1"),
+            Err(StateError::LogicalRoleDecodeFailed { .. })
+        ));
+        assert!(
+            repo.list_logical_roles_for_project("absent")
+                .unwrap()
+                .is_empty()
+        );
+        repo.connection()
+            .execute(
+                "UPDATE logical_role SET project_id = 'other' WHERE role_id = 'z-corrupt'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            repo.list_logical_roles_for_project("project-1").unwrap(),
+            vec![healthy.clone()]
+        );
+        repo.connection().execute("UPDATE logical_role SET role_type = 'RUNTIME_A2', status = 'ACTIVE', current_context_epoch = '0', project_id = 'project-1' WHERE role_id = 'z-corrupt'", []).unwrap();
+    }
+    for invalid in [String::new(), "é".repeat(201)] {
+        assert!(matches!(
+            repo.list_logical_roles_for_project(&invalid),
+            Err(StateError::LogicalRoleValidation { .. })
+        ));
+    }
+    for valid in [" ".to_string(), "é".repeat(200)] {
+        assert!(
+            repo.list_logical_roles_for_project(&valid)
+                .unwrap()
+                .is_empty()
+        );
+    }
+    // A required ownership-path read failure also rejects the entire list.
+    repo.connection()
+        .execute(
+            "INSERT INTO logical_role_ownership_path VALUES ('z-corrupt', 0, x'FF')",
+            [],
+        )
+        .unwrap();
+    assert!(matches!(
+        repo.list_logical_roles_for_project("project-1"),
+        Err(StateError::InternalQueryFailed { .. })
+    ));
+}
