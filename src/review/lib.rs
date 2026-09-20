@@ -132,3 +132,9 @@ pub use integration_decision::IntegrationDecision;
 
 #[cfg(test)]
 mod integration_decision_tests;
+
+pub mod a4_review;
+pub use a4_review::A4Review;
+
+#[cfg(test)]
+mod a4_review_tests;
