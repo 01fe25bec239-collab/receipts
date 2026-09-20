@@ -13,6 +13,7 @@ use crate::startup_recovery::{
     DurableBindingState, StartupDurableInconsistency, StartupReconciliationRequirement,
     StartupRecoverySnapshot, classify_startup_recovery,
 };
+use crate::tests::{state_epoch, state_epoch_text};
 
 fn role(status: LogicalRoleStatus) -> LogicalRole {
     LogicalRole {
@@ -20,7 +21,7 @@ fn role(status: LogicalRoleStatus) -> LogicalRole {
         project_id: "project-1".into(),
         role_type: LogicalRoleType::RuntimeA2,
         status,
-        current_context_epoch: 3,
+        current_context_epoch: state_epoch(3),
         name: None,
         workstream_id: None,
         ownership_paths: vec!["src/state".into()],
@@ -53,7 +54,7 @@ fn manifest() -> ContextManifest {
         manifest_id: "manifest-1".into(),
         role_id: "role-1".into(),
         project_id: "project-1".into(),
-        epoch: 3,
+        epoch: state_epoch(3),
         sources: vec![ContextManifestSource {
             r#ref: ContextSourceRef {
                 ref_type: ContextSourceRefType::RepoPath,
@@ -72,7 +73,7 @@ fn manifest() -> ContextManifest {
 fn epoch() -> ContextEpoch {
     ContextEpoch {
         project_id: "project-1".into(),
-        epoch: 3,
+        epoch: state_epoch(3),
         advanced_at: "2026-09-01T00:00:00Z".into(),
         trigger: ContextEpochTrigger::A2Init,
     }
@@ -98,6 +99,47 @@ fn requires(
     requirement: StartupReconciliationRequirement,
 ) -> bool {
     result.requirements.contains(&requirement)
+}
+
+#[test]
+fn huge_epochs_compare_exactly_without_native_integer_conversion() {
+    let huge = state_epoch_text("18446744073709551616000000000000000000");
+    let mut durable_role = role(LogicalRoleStatus::Active);
+    durable_role.current_context_epoch = huge.clone();
+    let mut durable_manifest = manifest();
+    durable_manifest.epoch = huge.clone();
+    let durable_epoch = epoch();
+    let mut durable_attempt = attempt();
+    durable_attempt.context_epoch_id = huge;
+
+    let consistent = classify_startup_recovery(StartupRecoverySnapshot {
+        role: &durable_role,
+        binding: None,
+        context_manifest: Some(&durable_manifest),
+        latest_context_epoch: Some(&durable_epoch),
+        rehydration_attempt: Some(&durable_attempt),
+    });
+    assert!(
+        !consistent
+            .inconsistencies
+            .iter()
+            .any(|item| matches!(item, StartupDurableInconsistency::RehydrationEpochMismatch))
+    );
+
+    durable_attempt.context_epoch_id = state_epoch_text("18446744073709551616000000000000000001");
+    let inconsistent = classify_startup_recovery(StartupRecoverySnapshot {
+        role: &durable_role,
+        binding: None,
+        context_manifest: Some(&durable_manifest),
+        latest_context_epoch: Some(&durable_epoch),
+        rehydration_attempt: Some(&durable_attempt),
+    });
+    assert!(
+        inconsistent
+            .inconsistencies
+            .iter()
+            .any(|item| matches!(item, StartupDurableInconsistency::RehydrationEpochMismatch))
+    );
 }
 
 #[test]
@@ -320,7 +362,7 @@ fn attempt() -> ContextRehydrationAttempt {
         project_id: "project-1".into(),
         durable_role_id: "role-1".into(),
         context_manifest_id: "manifest-1".into(),
-        context_epoch_id: 3,
+        context_epoch_id: state_epoch(3),
         repository_snapshot_references: Vec::new(),
         requested_by_actor: EventActor {
             kind: ActorKind::System,
@@ -773,7 +815,9 @@ fn supplied_identity_contradictions_remain_individually_fail_closed() {
             StartupDurableInconsistency::RehydrationProjectMismatch => {
                 attempt.project_id = "other".into()
             }
-            StartupDurableInconsistency::RehydrationEpochMismatch => attempt.context_epoch_id += 1,
+            StartupDurableInconsistency::RehydrationEpochMismatch => {
+                attempt.context_epoch_id = attempt.context_epoch_id.successor().unwrap()
+            }
             _ => unreachable!(),
         }
         let result = classify_startup_recovery(StartupRecoverySnapshot {

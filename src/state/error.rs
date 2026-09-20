@@ -10,6 +10,12 @@ use std::fmt;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum StateError {
+    /// A value was not canonical non-negative decimal State epoch text.
+    InvalidStateEpochValue { value: String },
+    /// A canonical State epoch cannot be represented by the compatibility i64 surface.
+    StateEpochValueOutOfI64Range { value: String },
+    /// Allocation for an unbounded State epoch failed.
+    StateEpochValueAllocationFailed { detail: String },
     /// The SQLite database file could not be opened or created.
     OpenFailed {
         /// Underlying driver detail.
@@ -62,6 +68,12 @@ pub enum StateError {
         /// Underlying driver detail.
         detail: String,
     },
+    /// Explicit maintenance migration was refused for this stored version.
+    ExplicitMigrationRefused { found: u32 },
+    /// The persisted migration ledger is not the exact registered prefix.
+    MigrationLedgerCorrupt { detail: String },
+    /// The specialized v12 physical rebuild failed closed.
+    V12PhysicalMigrationFailed { detail: String },
     /// A transaction could not be begun.
     TransactionBeginFailed {
         /// Underlying driver detail.
@@ -357,16 +369,10 @@ pub enum StateError {
         /// The `project_id` of the duplicate record.
         project_id: String,
         /// The `epoch` number of the duplicate record.
-        epoch: i64,
+        epoch: crate::epoch_value::StateEpochValueV1,
     },
-    /// Advancing a project's context epoch cannot derive a representable
-    /// successor.
-    ///
-    /// The persisted maximum epoch for the project is `i64::MAX`, so
-    /// `max + 1` overflows the stored integer type: advancement fails
-    /// closed rather than wrapping, saturating, resetting, reusing the
-    /// current maximum, or deleting history. The failure is decided before
-    /// any insert is attempted, so no row is written.
+    /// Deprecated compatibility surface from the former finite epoch
+    /// representation. Unbounded decimal advancement does not return it.
     ContextEpochAdvanceOverflow {
         /// The `project_id` whose history is at the representable maximum.
         project_id: String,
@@ -421,7 +427,10 @@ pub enum StateError {
         detail: String,
     },
     /// Historical changed_sources was not captured; no valid value can be returned.
-    ContextEpochChangedSourcesNotCaptured { project_id: String, epoch: i64 },
+    ContextEpochChangedSourcesNotCaptured {
+        project_id: String,
+        epoch: crate::epoch_value::StateEpochValueV1,
+    },
     /// Persisted changed-source composition violates the frozen contract.
     ContextEpochChangedSourcesDecodeFailed { detail: String },
     /// A context-rehydration request violated the closed typed boundary.
@@ -440,6 +449,18 @@ pub enum StateError {
 impl fmt::Display for StateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            StateError::InvalidStateEpochValue { value } => {
+                write!(f, "invalid StateEpochValueV1 {value:?}")
+            }
+            StateError::StateEpochValueOutOfI64Range { value } => {
+                write!(
+                    f,
+                    "StateEpochValueV1 {value} is outside the i64 compatibility range"
+                )
+            }
+            StateError::StateEpochValueAllocationFailed { detail } => {
+                write!(f, "failed to allocate StateEpochValueV1: {detail}")
+            }
             StateError::OpenFailed { detail } => {
                 write!(f, "failed to open the state database: {detail}")
             }
@@ -481,6 +502,15 @@ impl fmt::Display for StateError {
                 detail,
             } => {
                 write!(f, "migration {version} ({name}) failed: {detail}")
+            }
+            StateError::ExplicitMigrationRefused { found } => {
+                write!(f, "explicit State migration refuses schema version {found}")
+            }
+            StateError::MigrationLedgerCorrupt { detail } => {
+                write!(f, "persisted migration ledger is corrupt: {detail}")
+            }
+            StateError::V12PhysicalMigrationFailed { detail } => {
+                write!(f, "v12 context epoch physical migration failed: {detail}")
             }
             StateError::TransactionBeginFailed { detail } => {
                 write!(f, "failed to begin a transaction: {detail}")
@@ -658,7 +688,7 @@ impl fmt::Display for StateError {
             StateError::ContextEpochAdvanceOverflow { project_id } => {
                 write!(
                     f,
-                    "the next context epoch for project_id {project_id:?} cannot be derived: the persisted maximum epoch is i64::MAX and has no representable successor; advancement fails closed and writes nothing"
+                    "the next context epoch for project_id {project_id:?} could not be represented by a legacy finite compatibility path"
                 )
             }
             StateError::ContextEpochInvalidatedRoleDuplicate { role_id } => {

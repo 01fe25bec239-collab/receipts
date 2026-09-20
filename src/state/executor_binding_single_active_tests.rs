@@ -27,7 +27,7 @@ use crate::executor_binding_lease_expiry_tests::{BINDING, DEADLINE, clock, reque
 use crate::logical_role::{LogicalRole, LogicalRoleStatus, LogicalRoleType};
 use crate::migrations;
 use crate::repository::SqliteStateRepository;
-use crate::tests::{TempDir, trusted_clock};
+use crate::tests::{TempDir, state_epoch, trusted_clock};
 
 /// The stable identifier of the migration-0005 partial unique index.
 const GUARD_INDEX_NAME: &str = "idx_executor_binding_role_unreleased";
@@ -55,7 +55,7 @@ fn minimal_role(role_id: &str, role_type: LogicalRoleType) -> LogicalRole {
         project_id: "project-1".to_string(),
         role_type,
         status: LogicalRoleStatus::Active,
-        current_context_epoch: 0,
+        current_context_epoch: state_epoch(0),
         name: None,
         workstream_id: None,
         ownership_paths: Vec::new(),
@@ -142,10 +142,10 @@ fn named_binding_indexes(repo: &SqliteStateRepository) -> Vec<(String, String)> 
 fn t01_fresh_database_bootstraps_through_schema_7() {
     let tmp = TempDir::new("sab-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 11);
+    assert_eq!(repo.schema_version().expect("version read"), 12);
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        11,
+        12,
         "one metadata row per applied migration"
     );
     // The guard index is part of the fresh bootstrap.
@@ -165,10 +165,10 @@ fn t02_schema_version_7_reopens() {
     let tmp = TempDir::new("sab-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 11);
+        assert_eq!(repo.schema_version().expect("version read"), 12);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            11,
+            12,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -187,7 +187,7 @@ fn t03_ordinary_open_of_version_4_fails_closed() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 4,
-                supported: 11
+                supported: 12
             }
         ),
         "unexpected error: {error}"
@@ -233,7 +233,7 @@ fn t04_migration_v5_adds_exactly_one_partial_unique_index() {
     }
 
     // The database now records version 5, so it opens with the version-5
-    // prefix of the registered chain (the ordinary chain ends at version 11
+    // prefix of the registered chain (the ordinary chain ends at version 12
     // and refuses a version-5 database).
     let version_5_chain = &migrations::registered()[..5];
     let repo = SqliteStateRepository::open_with_migrations(tmp.db_path(), version_5_chain)
@@ -1177,7 +1177,7 @@ fn t38_conflict_does_not_mutate_logical_role() {
     let tmp = TempDir::new("sab-t38");
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
     let mut role = minimal_role("role-ae-001", LogicalRoleType::RuntimeA2);
-    role.current_context_epoch = 7;
+    role.current_context_epoch = state_epoch(7);
     role.name = Some("Guarded role".to_string());
     role.ownership_paths = vec!["receipts/one".to_string(), "receipts/two".to_string()];
     repo.create_logical_role(role.clone()).expect("role create");
@@ -1262,7 +1262,7 @@ fn t50_migration_preserves_binding_history() {
             .expect("apply migration 5 over conforming version-4 history");
     }
     // The database now records version 5, so it opens with the version-5
-    // prefix of the registered chain (the ordinary chain ends at version 11
+    // prefix of the registered chain (the ordinary chain ends at version 12
     // and refuses a version-5 database).
     let repo =
         SqliteStateRepository::open_with_migrations(tmp.db_path(), &migrations::registered()[..5])

@@ -10,7 +10,7 @@ use crate::error::StateError;
 use crate::logical_role::{LogicalRole, LogicalRoleStatus, LogicalRoleType};
 use crate::migrations;
 use crate::repository::SqliteStateRepository;
-use crate::tests::TempDir;
+use crate::tests::{TempDir, state_epoch};
 
 /// A minimal contract-valid role: only required fields set, epoch 0.
 fn minimal_role(role_id: &str, role_type: LogicalRoleType) -> LogicalRole {
@@ -19,7 +19,7 @@ fn minimal_role(role_id: &str, role_type: LogicalRoleType) -> LogicalRole {
         project_id: "project-1".to_string(),
         role_type,
         status: LogicalRoleStatus::Active,
-        current_context_epoch: 0,
+        current_context_epoch: state_epoch(0),
         name: None,
         workstream_id: None,
         ownership_paths: Vec::new(),
@@ -36,7 +36,7 @@ fn minimal_role(role_id: &str, role_type: LogicalRoleType) -> LogicalRole {
 fn t01_fresh_database_reaches_schema_version_7() {
     let tmp = TempDir::new("lr-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 11);
+    assert_eq!(repo.schema_version().expect("version read"), 12);
     assert!(
         repo.table_exists("logical_role").expect("table check"),
         "logical_role must exist after migration 2"
@@ -71,10 +71,10 @@ fn t02_version_7_reopen_idempotent() {
     let tmp = TempDir::new("lr-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 11);
+        assert_eq!(repo.schema_version().expect("version read"), 12);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            11,
+            12,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -97,7 +97,7 @@ fn t03_ordinary_open_of_version_1_database_fails() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 1,
-                supported: 11
+                supported: 12
             }
         ),
         "unexpected error: {error}"
@@ -146,7 +146,7 @@ fn t06_full_field_round_trip() {
         project_id: "project-42".to_string(),
         role_type: LogicalRoleType::RuntimeA2,
         status: LogicalRoleStatus::Suspended,
-        current_context_epoch: 7,
+        current_context_epoch: state_epoch(7),
         name: Some("Receipts builder role".to_string()),
         workstream_id: Some("workstream-alpha".to_string()),
         ownership_paths: vec!["receipts/core".to_string(), "receipts/edge".to_string()],
@@ -243,12 +243,12 @@ fn t10_duplicate_role_id_fails_without_overwrite() {
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
     let mut original = minimal_role("role-dup-001", LogicalRoleType::RuntimeA1);
     original.status = LogicalRoleStatus::Retired;
-    original.current_context_epoch = 3;
+    original.current_context_epoch = state_epoch(3);
     original.name = Some("original".to_string());
     repo.create_logical_role(original.clone()).expect("create");
 
     let mut duplicate = minimal_role("role-dup-001", LogicalRoleType::RuntimeA2);
-    duplicate.current_context_epoch = 99;
+    duplicate.current_context_epoch = state_epoch(99);
     duplicate.name = Some("impostor".to_string());
     duplicate.ownership_paths = vec!["should/not/persist".to_string()];
     let error = repo
@@ -344,16 +344,8 @@ fn t13_epoch_zero_accepted() {
 #[test]
 fn t14_negative_epoch_rejected() {
     let tmp = TempDir::new("lr-t14");
-    let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
-    let mut role = minimal_role("role-epoch-neg-001", LogicalRoleType::RuntimeA1);
-    role.current_context_epoch = -1;
-    let error = repo
-        .create_logical_role(role)
-        .expect_err("negative context epoch must be rejected");
-    assert!(
-        matches!(error, StateError::LogicalRoleValidation { .. }),
-        "unexpected error: {error}"
-    );
+    let repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
+    assert!(crate::StateEpochValueV1::try_from(-1_i64).is_err());
     // Nothing from the rejected create persisted.
     assert_eq!(
         repo.find_logical_role("role-epoch-neg-001").expect("find"),

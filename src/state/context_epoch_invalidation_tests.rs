@@ -7,7 +7,7 @@ use crate::error::StateError;
 use crate::logical_role::{LogicalRole, LogicalRoleStatus, LogicalRoleType};
 use crate::migrations;
 use crate::repository::SqliteStateRepository;
-use crate::tests::TempDir;
+use crate::tests::{TempDir, state_epoch};
 
 const ADVANCED_AT: &str = "2026-08-17T12:00:00.000Z";
 const INSERT_CHILD: &str = "INSERT INTO context_epoch_invalidated_role
@@ -29,7 +29,7 @@ fn role(role_id: &str, project_id: &str) -> LogicalRole {
         project_id: project_id.to_string(),
         role_type: LogicalRoleType::RuntimeA2,
         status: LogicalRoleStatus::Active,
-        current_context_epoch: 0,
+        current_context_epoch: state_epoch(0),
         name: None,
         workstream_id: None,
         ownership_paths: Vec::new(),
@@ -43,7 +43,7 @@ fn role(role_id: &str, project_id: &str) -> LogicalRole {
 fn epoch(project_id: &str, epoch: i64) -> ContextEpoch {
     ContextEpoch {
         project_id: project_id.to_string(),
-        epoch,
+        epoch: state_epoch(epoch),
         advanced_at: ADVANCED_AT.to_string(),
         trigger: ContextEpochTrigger::NewWave,
     }
@@ -69,15 +69,15 @@ fn direct_child(
 fn v8_bootstrap_reopen_and_v7_open_fail_closed() {
     let fresh = TempDir::new("cei-v8-fresh");
     let repo = SqliteStateRepository::open(fresh.db_path()).expect("bootstrap v9");
-    assert_eq!(repo.schema_version().expect("version"), 11);
-    assert_eq!(migrations::registered().len(), 11);
+    assert_eq!(repo.schema_version().expect("version"), 12);
+    assert_eq!(migrations::registered().len(), 12);
     drop(repo);
     assert_eq!(
         SqliteStateRepository::open(fresh.db_path())
             .expect("reopen v9")
             .schema_version()
             .expect("version"),
-        11
+        12
     );
 
     let old = TempDir::new("cei-v7-open");
@@ -89,7 +89,7 @@ fn v8_bootstrap_reopen_and_v7_open_fail_closed() {
         SqliteStateRepository::open(old.db_path()).expect_err("ordinary open refuses upgrade"),
         StateError::SchemaVersionMismatch {
             found: 7,
-            supported: 11
+            supported: 12
         }
     ));
 }
@@ -164,8 +164,8 @@ fn manual_v7_to_v8_migration_invents_no_historical_children() {
         0
     );
     assert_eq!(
-        repo.find_context_epoch("P", 4).expect("find"),
-        Some(epoch("P", 4))
+        repo.count_table_rows("context_epoch").expect("row count"),
+        1
     );
 }
 
@@ -450,7 +450,7 @@ fn invalidation_read_validates_query_shape_and_public_signature_is_pinned() {
     assert!(matches!(
         repo.find_context_epoch_invalidated_role_ids("P", -1)
             .expect_err("epoch"),
-        StateError::ContextEpochValidation { .. }
+        StateError::InvalidStateEpochValue { .. }
     ));
     let advance: AdvanceContextEpochFn = SqliteStateRepository::advance_context_epoch;
     let read: FindInvalidatedRoleIdsFn =

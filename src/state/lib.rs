@@ -20,6 +20,7 @@ pub mod context_epoch;
 pub mod context_manifest;
 pub mod context_rehydration;
 pub mod entitlement;
+pub mod epoch_value;
 pub mod error;
 pub mod event;
 pub mod executor_binding;
@@ -51,6 +52,9 @@ mod context_rehydration_tests;
 
 #[cfg(test)]
 mod event_tests;
+
+#[cfg(test)]
+mod epoch_value_tests;
 
 #[cfg(test)]
 mod executor_binding_lease_tests;
@@ -99,6 +103,7 @@ pub use context_rehydration::{
     SourceDigestComparison, SourceDisposition, SourceMaterializationFailure, StateQueryRefV1,
     context_rehydration_event_payload, context_source_digest_v1,
 };
+pub use epoch_value::StateEpochValueV1;
 pub use error::StateError;
 pub use event::{
     ActorKind, EventActor, EventEnvelope, EventPayloadReference, EventSubject, EventType,

@@ -7,7 +7,7 @@ use crate::executor_binding_lease_expiry::{
 };
 use crate::logical_role::{LogicalRole, LogicalRoleStatus, LogicalRoleType};
 use crate::repository::SqliteStateRepository;
-use crate::tests::{FakeTrustedClock, TempDir, trusted_clock_at};
+use crate::tests::{FakeTrustedClock, TempDir, state_epoch, trusted_clock_at};
 
 const PROJECT: &str = "project-lease";
 const ROLE: &str = "role-lease";
@@ -56,7 +56,7 @@ pub(crate) fn request(
             occurred_at: at.to_string(),
             payload: expected_provenance(binding, PROJECT, at).expect("provenance"),
             correlation_id: "corr-lease".to_string(),
-            epoch: 0,
+            epoch: state_epoch(0),
         },
     }
 }
@@ -71,7 +71,7 @@ fn role(role_id: &str) -> LogicalRole {
         project_id: PROJECT.to_string(),
         role_type: LogicalRoleType::RuntimeA2,
         status: LogicalRoleStatus::Active,
-        current_context_epoch: 0,
+        current_context_epoch: state_epoch(0),
         name: None,
         workstream_id: None,
         ownership_paths: vec![],

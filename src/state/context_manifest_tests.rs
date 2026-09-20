@@ -41,7 +41,7 @@ use crate::error::StateError;
 use crate::logical_role::{LogicalRole, LogicalRoleStatus, LogicalRoleType};
 use crate::migrations;
 use crate::repository::SqliteStateRepository;
-use crate::tests::TempDir;
+use crate::tests::{TempDir, state_epoch};
 
 /// A minimal contract-valid LogicalRole for manifest ownership.
 fn minimal_role(role_id: &str) -> LogicalRole {
@@ -50,7 +50,7 @@ fn minimal_role(role_id: &str) -> LogicalRole {
         project_id: "project-1".to_string(),
         role_type: LogicalRoleType::RuntimeA1,
         status: LogicalRoleStatus::Active,
-        current_context_epoch: 0,
+        current_context_epoch: state_epoch(0),
         name: None,
         workstream_id: None,
         ownership_paths: Vec::new(),
@@ -83,7 +83,7 @@ fn minimal_manifest(manifest_id: &str, role_id: &str) -> ContextManifest {
         manifest_id: manifest_id.to_string(),
         role_id: role_id.to_string(),
         project_id: "project-1".to_string(),
-        epoch: 0,
+        epoch: state_epoch(0),
         sources: vec![minimal_source()],
         created_at: "2026-08-17T10:00:00.000Z".to_string(),
         last_rehydrated_at: None,
@@ -114,20 +114,20 @@ fn t01_fresh_database_bootstraps_to_schema_version_7() {
     let registered = migrations::registered();
     assert_eq!(
         registered.len(),
-        11,
-        "exactly eleven registered migrations (v0001–v0011) may exist"
+        12,
+        "exactly twelve registered migrations may exist"
     );
     assert_eq!(
         registered.last().expect("chain is non-empty").version,
-        11,
-        "the registered chain must end at version 11"
+        12,
+        "the registered chain must end at version 12"
     );
     let tmp = TempDir::new("cm-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 11);
+    assert_eq!(repo.schema_version().expect("version read"), 12);
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        11,
+        12,
         "one metadata row per applied migration"
     );
 }
@@ -138,10 +138,10 @@ fn t02_version_7_database_reopens_idempotently() {
     let tmp = TempDir::new("cm-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 11);
+        assert_eq!(repo.schema_version().expect("version read"), 12);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            11,
+            12,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -164,7 +164,7 @@ fn t03_ordinary_open_of_version_5_fails_closed() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 5,
-                supported: 11
+                supported: 12
             }
         ),
         "unexpected error: {error}"
@@ -368,7 +368,7 @@ fn t08_multiple_ordered_sources_round_trip() {
         manifest_id: "manifest-001".to_string(),
         role_id: "role-1".to_string(),
         project_id: "project-1".to_string(),
-        epoch: 2,
+        epoch: state_epoch(2),
         sources: vec![
             ContextManifestSource {
                 r#ref: ContextSourceRef {
@@ -489,7 +489,7 @@ fn t12_duplicate_leaves_original_unchanged() {
         .expect("original persists");
     let mut duplicate = minimal_manifest("manifest-001", "role-1");
     duplicate.project_id = "other-project".to_string();
-    duplicate.epoch = 99;
+    duplicate.epoch = state_epoch(99);
     duplicate.sources[0].digest = "replaced-digest".to_string();
     let error = repo
         .create_context_manifest(duplicate)
@@ -537,7 +537,7 @@ fn t14_role_conflict_leaves_original_unchanged() {
     repo.create_context_manifest(original.clone())
         .expect("original persists");
     let mut challenger = minimal_manifest("manifest-002", "role-1");
-    challenger.epoch = 42;
+    challenger.epoch = state_epoch(42);
     let error = repo
         .create_context_manifest(challenger)
         .expect_err("role conflict must fail");
@@ -762,7 +762,7 @@ fn t22_epoch_rules() {
     );
 
     let mut positive = minimal_manifest("manifest-pos", "role-2");
-    positive.epoch = 4;
+    positive.epoch = state_epoch(4);
     repo.create_context_manifest(positive.clone())
         .expect("epoch 4");
     assert_eq!(
@@ -773,17 +773,7 @@ fn t22_epoch_rules() {
         4
     );
 
-    let mut negative = minimal_manifest("manifest-neg", "role-1");
-    negative.epoch = -1;
-    let error = repo
-        .create_context_manifest(negative)
-        .expect_err("negative epoch must fail");
-    assert!(matches!(
-        error,
-        StateError::ContextManifestValidation {
-            ref detail
-        } if detail.contains("epoch")
-    ));
+    assert!(crate::StateEpochValueV1::try_from(-1_i64).is_err());
 }
 
 // T23 — an empty source list is rejected; a supplied source list is never
@@ -809,7 +799,7 @@ fn t23_source_list_not_sorted_or_emptied() {
         manifest_id: "manifest-002".to_string(),
         role_id: "role-1".to_string(),
         project_id: "project-1".to_string(),
-        epoch: 0,
+        epoch: state_epoch(0),
         sources: ["z-source", "a-source", "m-source"]
             .into_iter()
             .map(|target| ContextManifestSource {
@@ -1409,7 +1399,7 @@ fn t41_corrupt_source_ordinal_gap_fails_closed() {
         manifest_id: "manifest-001".to_string(),
         role_id: "role-1".to_string(),
         project_id: "project-1".to_string(),
-        epoch: 0,
+        epoch: state_epoch(0),
         sources: vec![
             minimal_source(),
             {

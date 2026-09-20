@@ -22,7 +22,7 @@ use crate::event::{ActorKind, EventActor, EventEnvelope, EventSubject, EventType
 use crate::executor_binding::ExecutorBinding;
 use crate::logical_role::{LogicalRole, LogicalRoleStatus, LogicalRoleType};
 use crate::repository::SqliteStateRepository;
-use crate::tests::TempDir;
+use crate::tests::{TempDir, state_epoch, state_epoch_text};
 
 const PRIOR_DIGEST: &str =
     "sha256:v1:0000000000000000000000000000000000000000000000000000000000000000";
@@ -239,7 +239,7 @@ impl ContextRehydratedEventSupplier for EventSupplier {
                 .correlation_reference
                 .clone()
                 .expect("test correlation"),
-            epoch: attempt.context_epoch_id,
+            epoch: attempt.context_epoch_id.clone(),
         }
     }
 }
@@ -256,7 +256,7 @@ fn seed(repo: &mut SqliteStateRepository, sources: Vec<ContextManifestSource>) {
         project_id: "project-1".to_string(),
         role_type: LogicalRoleType::RuntimeA2,
         status: LogicalRoleStatus::Active,
-        current_context_epoch: 0,
+        current_context_epoch: state_epoch(0),
         name: None,
         workstream_id: None,
         ownership_paths: Vec::new(),
@@ -268,7 +268,7 @@ fn seed(repo: &mut SqliteStateRepository, sources: Vec<ContextManifestSource>) {
     .expect("role");
     repo.append_context_epoch(ContextEpoch {
         project_id: "project-1".to_string(),
-        epoch: 0,
+        epoch: state_epoch(0),
         advanced_at: "2026-08-17T09:00:00Z".to_string(),
         trigger: ContextEpochTrigger::A1Init,
     })
@@ -277,7 +277,7 @@ fn seed(repo: &mut SqliteStateRepository, sources: Vec<ContextManifestSource>) {
         manifest_id: "manifest-1".to_string(),
         role_id: "role-1".to_string(),
         project_id: "project-1".to_string(),
-        epoch: 0,
+        epoch: state_epoch(0),
         sources,
         created_at: "2026-08-17T09:00:00Z".to_string(),
         last_rehydrated_at: None,
@@ -308,7 +308,7 @@ fn request(bindings: Vec<ContextSourceBindingV1>) -> ContextRehydrationRequest {
         project_id: "project-1".to_string(),
         durable_role_id: "role-1".to_string(),
         context_manifest_id: "manifest-1".to_string(),
-        context_epoch_id: 0,
+        context_epoch_id: state_epoch(0),
         requested_by_actor: EventActor {
             kind: ActorKind::System,
             id: Some("orchestrator".to_string()),
@@ -444,6 +444,10 @@ fn success_rereads_required_sources_defers_reference_and_commits_event_atomicall
     assert_eq!(
         payload.reference,
         r#"{"attempt_id":"attempt-1","entity":"ContextRehydrationAttempt","project_id":"project-1","v":1}"#
+    );
+    assert_eq!(
+        payload.digest,
+        "sha256:context-rehydration-attempt:v1:0616deb242fde47de57d844f87c2fc145f543fa97c50ebdb57684f25f63a2fb1"
     );
 }
 
@@ -587,6 +591,108 @@ fn closed_state_query_is_canonical_materialized_context() {
 }
 
 #[test]
+fn finite_context_epoch_query_preserves_exact_v1_identity_and_result_bytes() {
+    let (_tmp, mut repo) = opened("rehydration-query-v1-vector");
+    seed(
+        &mut repo,
+        vec![source(
+            ContextSourceRefType::StateQuery,
+            "context-epoch-by-id",
+            SourceClass::Mandatory,
+        )],
+    );
+    let outcome = repo
+        .rehydrate_context(
+            request(vec![ContextSourceBindingV1 {
+                source_ordinal: 0,
+                source_id: "source-query".into(),
+                source_ref: BoundContextSourceRefV1::StateQuery(StateQueryRefV1::ContextEpoch {
+                    project_id: "project-1".into(),
+                    epoch: state_epoch(0),
+                }),
+            }]),
+            &mut RepoMaterializer {
+                values: HashMap::new(),
+                calls: 0,
+            },
+            &mut ArtifactFake {
+                values: HashMap::new(),
+                calls: 0,
+            },
+            &mut EventSupplier {
+                calls: 0,
+                corrupt_digest: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        outcome.attempt.source_evidence[0].canonical_source_identity,
+        r#"{"parameters":{"epoch":0,"project_id":"project-1"},"project_id":"project-1","query_id":"context-epoch-by-id","query_version":1}"#
+    );
+    assert_eq!(
+        outcome.sources[0].bytes,
+        br#"{"found":true,"query_id":"context-epoch-by-id","query_version":1,"values":[{"name":"project_id","value":{"type":"String","value":"project-1"}},{"name":"epoch","value":{"type":"Integer","value":0}},{"name":"advanced_at","value":{"type":"String","value":"2026-08-17T09:00:00Z"}},{"name":"trigger","value":{"type":"String","value":"A1_INIT"}}]}"#
+    );
+}
+
+#[test]
+fn huge_context_epoch_uses_v2_query_attempt_and_event_evidence() {
+    let (_tmp, mut repo) = opened("rehydration-query-v2");
+    seed(
+        &mut repo,
+        vec![source(
+            ContextSourceRefType::StateQuery,
+            "context-epoch-by-id",
+            SourceClass::Mandatory,
+        )],
+    );
+    let huge = state_epoch_text("9223372036854775808");
+    repo.append_context_epoch(ContextEpoch {
+        project_id: "project-1".into(),
+        epoch: huge.clone(),
+        advanced_at: "huge".into(),
+        trigger: ContextEpochTrigger::NewWave,
+    })
+    .unwrap();
+    let mut request = request(vec![ContextSourceBindingV1 {
+        source_ordinal: 0,
+        source_id: "source-query".into(),
+        source_ref: BoundContextSourceRefV1::StateQuery(StateQueryRefV1::ContextEpoch {
+            project_id: "project-1".into(),
+            epoch: huge.clone(),
+        }),
+    }]);
+    request.context_epoch_id = huge.clone();
+    let outcome = repo
+        .rehydrate_context(
+            request,
+            &mut RepoMaterializer {
+                values: HashMap::new(),
+                calls: 0,
+            },
+            &mut ArtifactFake {
+                values: HashMap::new(),
+                calls: 0,
+            },
+            &mut EventSupplier {
+                calls: 0,
+                corrupt_digest: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(outcome.attempt.context_epoch_id, huge);
+    let body = std::str::from_utf8(&outcome.sources[0].bytes).unwrap();
+    assert!(body.contains(r#""query_version":2"#));
+    assert!(body.contains(r#""value":"9223372036854775808""#));
+    let payload = context_rehydration_event_payload(&outcome.attempt).unwrap();
+    assert!(payload.reference.ends_with(r#""v":2}"#));
+    assert_eq!(
+        payload.digest,
+        "sha256:context-rehydration-attempt:v2:25aa7ac9e191c2062b5c824f5f974d5b9cdf04d65356e84c4e366f8b2aaff7cf"
+    );
+}
+
+#[test]
 fn consumed_unchanged_is_not_reread_without_trusted_touch_evidence() {
     for touched in [false, true] {
         let (_tmp, mut repo) = opened(if touched {
@@ -612,7 +718,7 @@ fn consumed_unchanged_is_not_reread_without_trusted_touch_evidence() {
                 project_id: "project-1".to_string(),
                 durable_role_id: "role-1".to_string(),
                 context_manifest_id: "manifest-1".to_string(),
-                context_epoch_id: 0,
+                context_epoch_id: state_epoch(0),
                 task_id: "task-1".to_string(),
                 correlation_reference: "correlation-1".to_string(),
             });
@@ -662,7 +768,7 @@ fn reference_is_materialized_only_with_scoped_demand() {
         project_id: "project-1".to_string(),
         durable_role_id: "role-1".to_string(),
         context_manifest_id: "manifest-1".to_string(),
-        context_epoch_id: 0,
+        context_epoch_id: state_epoch(0),
         task_id: Some("task-1".to_string()),
         correlation_reference: "correlation-1".to_string(),
     });
@@ -692,7 +798,7 @@ fn reference_is_materialized_only_with_scoped_demand() {
 #[test]
 fn migration_v9_is_registered_with_immutable_attempt_tables() {
     let (_tmp, repo) = opened("rehydration-schema");
-    assert_eq!(repo.schema_version().expect("version"), 11);
+    assert_eq!(repo.schema_version().expect("version"), 12);
     for table in [
         "context_rehydration_attempt",
         "context_rehydration_repository_snapshot",
@@ -828,46 +934,7 @@ fn malformed_state_query_parameters_fail_before_registry_execution() {
 
 #[test]
 fn negative_state_query_epoch_fails_before_execution_or_materialization() {
-    let (_tmp, mut repo) = opened("negative-state-query-epoch");
-    seed(
-        &mut repo,
-        vec![source(
-            ContextSourceRefType::StateQuery,
-            "context-epoch-by-id",
-            SourceClass::Mandatory,
-        )],
-    );
-    let binding = ContextSourceBindingV1 {
-        source_ordinal: 0,
-        source_id: "query-1".to_string(),
-        source_ref: BoundContextSourceRefV1::StateQuery(StateQueryRefV1::ContextEpoch {
-            project_id: "project-1".to_string(),
-            epoch: -1,
-        }),
-    };
-    let mut repository = RepoMaterializer {
-        values: HashMap::new(),
-        calls: 0,
-    };
-    let mut artifacts = ArtifactFake {
-        values: HashMap::new(),
-        calls: 0,
-    };
-    let outcome = repo
-        .rehydrate_context(
-            request(vec![binding]),
-            &mut repository,
-            &mut artifacts,
-            &mut EventSupplier {
-                calls: 0,
-                corrupt_digest: false,
-            },
-        )
-        .expect("bounded failure");
-    assert_eq!(outcome.attempt.status, ContextRehydrationStatus::Failed);
-    assert!(outcome.attempt.source_evidence.is_empty());
-    assert_eq!(repository.calls, 0);
-    assert_eq!(artifacts.calls, 0);
+    assert!(crate::StateEpochValueV1::try_from(-1_i64).is_err());
 }
 
 #[test]
@@ -1057,7 +1124,7 @@ impl RepositorySnapshotMaterializer for EpochAdvancingMaterializer {
             other
                 .append_context_epoch(ContextEpoch {
                     project_id: "project-1".to_string(),
-                    epoch: 1,
+                    epoch: state_epoch(1),
                     advanced_at: "later".to_string(),
                     trigger: ContextEpochTrigger::ContractChange,
                 })
@@ -1126,13 +1193,13 @@ fn historical_role_and_manifest_epoch_snapshots_do_not_block_current_epoch() {
     );
     repo.append_context_epoch(ContextEpoch {
         project_id: "project-1".to_string(),
-        epoch: 1,
+        epoch: state_epoch(1),
         advanced_at: "later".to_string(),
         trigger: ContextEpochTrigger::ArchitectureChange,
     })
     .expect("epoch 1");
     let mut candidate = request(vec![repo_binding(0, "source-1", "safe/path")]);
-    candidate.context_epoch_id = 1;
+    candidate.context_epoch_id = state_epoch(1);
     let outcome = repo
         .rehydrate_context(
             candidate,
@@ -1526,7 +1593,7 @@ fn mandatory_unchanged_and_trusted_consumed_touch_both_genuinely_reread() {
                 project_id: "project-1".to_string(),
                 durable_role_id: "role-1".to_string(),
                 context_manifest_id: "manifest-1".to_string(),
-                context_epoch_id: 0,
+                context_epoch_id: state_epoch(0),
                 task_id: "task-1".to_string(),
                 correlation_reference: "correlation-1".to_string(),
             });
@@ -1588,7 +1655,7 @@ fn event_insert_failure_rolls_back_candidate_success_before_failed_receipt() {
             digest: "existing-digest".to_string(),
         },
         correlation_id: "existing-correlation".to_string(),
-        epoch: 0,
+        epoch: state_epoch(0),
     })
     .expect("existing event");
     let outcome = repo

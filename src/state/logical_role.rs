@@ -17,6 +17,7 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::epoch_value::StateEpochValueV1;
 use crate::error::StateError;
 use crate::repository::{SqliteStateRepository, UnitOfWork};
 
@@ -114,7 +115,7 @@ pub struct LogicalRole {
     /// Lifecycle status.
     pub status: LogicalRoleStatus,
     /// Current context epoch. Must be >= 0.
-    pub current_context_epoch: i64,
+    pub current_context_epoch: StateEpochValueV1,
     /// Optional human-readable name. Stored as provided.
     pub name: Option<String>,
     /// Optional workstream. When present: non-empty, at most
@@ -242,7 +243,7 @@ fn insert_logical_role(conn: &Connection, role: &LogicalRole) -> Result<(), Stat
             role.project_id,
             role.role_type.as_str(),
             role.status.as_str(),
-            role.current_context_epoch,
+            role.current_context_epoch.as_str(),
             role.name,
             role.workstream_id,
             role.integration_branch,
@@ -309,7 +310,7 @@ struct RoleRow {
     project_id: String,
     role_type: String,
     status: String,
-    current_context_epoch: i64,
+    current_context_epoch: String,
     name: Option<String>,
     workstream_id: Option<String>,
     integration_branch: Option<String>,
@@ -322,20 +323,16 @@ impl RoleRow {
     /// Applies contract decoding (enum values, non-negative epoch) and
     /// fails closed on any violation.
     fn into_logical_role(self, ownership_paths: Vec<String>) -> Result<LogicalRole, StateError> {
-        if self.current_context_epoch < 0 {
-            return Err(StateError::LogicalRoleDecodeFailed {
-                detail: format!(
-                    "persisted current_context_epoch {} is negative",
-                    self.current_context_epoch
-                ),
-            });
-        }
+        let current_context_epoch = StateEpochValueV1::try_from(self.current_context_epoch)
+            .map_err(|error| StateError::LogicalRoleDecodeFailed {
+                detail: error.to_string(),
+            })?;
         Ok(LogicalRole {
             role_id: self.role_id,
             project_id: self.project_id,
             role_type: LogicalRoleType::from_storage(&self.role_type)?,
             status: LogicalRoleStatus::from_storage(&self.status)?,
-            current_context_epoch: self.current_context_epoch,
+            current_context_epoch,
             name: self.name,
             workstream_id: self.workstream_id,
             ownership_paths,
@@ -378,14 +375,6 @@ fn validate_for_create(role: &LogicalRole) -> Result<(), StateError> {
     }
     if let Some(context_manifest_id) = &role.context_manifest_id {
         ensure_identifier("context_manifest_id", context_manifest_id)?;
-    }
-    if role.current_context_epoch < 0 {
-        return Err(StateError::LogicalRoleValidation {
-            detail: format!(
-                "current_context_epoch must be >= 0, found {}",
-                role.current_context_epoch
-            ),
-        });
     }
     Ok(())
 }

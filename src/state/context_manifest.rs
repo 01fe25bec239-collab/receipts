@@ -31,6 +31,7 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::epoch_value::StateEpochValueV1;
 use crate::error::StateError;
 use crate::repository::{SqliteStateRepository, UnitOfWork};
 
@@ -244,7 +245,7 @@ pub struct ContextManifest {
     /// metadata only (no project table or cross-component validation).
     pub project_id: String,
     /// Manifest epoch snapshot. Must be >= 0.
-    pub epoch: i64,
+    pub epoch: StateEpochValueV1,
     /// The authoritative ordered context-source list. Non-empty; order
     /// round-trips exactly.
     pub sources: Vec<ContextManifestSource>,
@@ -453,7 +454,7 @@ fn insert_context_manifest(
             manifest.manifest_id,
             manifest.role_id,
             manifest.project_id,
-            manifest.epoch,
+            manifest.epoch.as_str(),
             manifest.created_at,
             manifest.last_rehydrated_at
         ],
@@ -606,7 +607,7 @@ struct ManifestRow {
     manifest_id: String,
     role_id: String,
     project_id: String,
-    epoch: i64,
+    epoch: String,
     created_at: String,
     last_rehydrated_at: Option<String>,
 }
@@ -628,11 +629,11 @@ impl ManifestRow {
         ensure_decoded_identifier("manifest_id", &self.manifest_id)?;
         ensure_decoded_identifier("role_id", &self.role_id)?;
         ensure_decoded_identifier("project_id", &self.project_id)?;
-        if self.epoch < 0 {
-            return Err(StateError::ContextManifestDecodeFailed {
-                detail: format!("persisted epoch {} is negative", self.epoch),
-            });
-        }
+        let epoch = StateEpochValueV1::try_from(self.epoch).map_err(|error| {
+            StateError::ContextManifestDecodeFailed {
+                detail: error.to_string(),
+            }
+        })?;
         if self.created_at.is_empty() {
             return Err(StateError::ContextManifestDecodeFailed {
                 detail: "persisted created_at is empty".to_string(),
@@ -672,7 +673,7 @@ impl ManifestRow {
             manifest_id: self.manifest_id,
             role_id: self.role_id,
             project_id: self.project_id,
-            epoch: self.epoch,
+            epoch,
             sources,
             created_at: self.created_at,
             last_rehydrated_at: self.last_rehydrated_at,
@@ -799,11 +800,6 @@ fn validate_for_create(manifest: &ContextManifest) -> Result<(), StateError> {
     ensure_identifier("manifest_id", &manifest.manifest_id)?;
     ensure_identifier("role_id", &manifest.role_id)?;
     ensure_identifier("project_id", &manifest.project_id)?;
-    if manifest.epoch < 0 {
-        return Err(StateError::ContextManifestValidation {
-            detail: format!("epoch must be >= 0, found {}", manifest.epoch),
-        });
-    }
     if manifest.sources.is_empty() {
         return Err(StateError::ContextManifestValidation {
             detail: "sources must contain at least one source".to_string(),
