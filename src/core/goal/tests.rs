@@ -237,10 +237,15 @@ fn integrated_sha_is_exact_lowercase_forty_hex_without_lookup() {
 }
 
 #[test]
-fn context_epoch_is_optional_nonnegative_i64_data_only() {
+fn legacy_context_epoch_is_optional_nonnegative_i64_data_only() {
     for epoch in [None, Some(0), Some(1), Some(i64::MAX)] {
         let actual = metadata(None, epoch).unwrap();
-        assert_eq!(actual.context_epoch(), epoch);
+        assert_eq!(
+            actual
+                .context_epoch()
+                .map(GoalEvaluationContextEpoch::decimal_digits),
+            epoch.as_ref().map(ToString::to_string).as_deref()
+        );
         assert_eq!(actual.state(), GoalEvaluationState::HumanRequired);
     }
     for value in [-1, i64::MIN] {
@@ -249,6 +254,119 @@ fn context_epoch_is_optional_nonnegative_i64_data_only() {
             Err(GoalEvaluationCoreError::NegativeContextEpoch { value })
         );
     }
+}
+
+#[test]
+fn context_epoch_carrier_covers_the_complete_nonnegative_domain() {
+    let ten_thousand_digits = format!("1{}", "0".repeat(9_999));
+    for digits in [
+        "0",
+        "1",
+        "9223372036854775807",
+        "9223372036854775808",
+        "18446744073709551615",
+        "18446744073709551616",
+        ten_thousand_digits.as_str(),
+    ] {
+        let value = GoalEvaluationContextEpoch::from_decimal(digits).unwrap();
+        assert_eq!(value.decimal_digits(), digits);
+    }
+
+    let one = GoalEvaluationContextEpoch::from_decimal("1").unwrap();
+    assert_eq!(
+        GoalEvaluationContextEpoch::from_decimal("0001"),
+        Ok(one.clone())
+    );
+    assert_eq!(GoalEvaluationContextEpoch::from_decimal("+1"), Ok(one));
+    assert_eq!(
+        GoalEvaluationContextEpoch::from_decimal("-0")
+            .unwrap()
+            .decimal_digits(),
+        "0"
+    );
+}
+
+#[test]
+fn context_epoch_carrier_rejects_non_domain_decimal_spellings() {
+    assert_eq!(
+        GoalEvaluationContextEpoch::from_decimal("-1"),
+        Err(GoalEvaluationContextEpochError::NegativeInteger)
+    );
+    for value in ["", " 1", "1 ", "1.0", "1e3", "0x10", "+", "-", "١"] {
+        assert_eq!(
+            GoalEvaluationContextEpoch::from_decimal(value),
+            Err(GoalEvaluationContextEpochError::InvalidDecimalInteger)
+        );
+    }
+}
+
+fn full_domain_metadata(
+    state: GoalEvaluationState,
+    layer: DeterministicLayer,
+    sha: Option<String>,
+    epoch: Option<GoalEvaluationContextEpoch>,
+    evaluated_at: OrchestrationDateTimeV1,
+) -> Result<DeterministicGoalEvaluationCore, GoalEvaluationCoreError> {
+    DeterministicGoalEvaluationCore::try_new_with_context_epoch(
+        "e".into(),
+        "g".into(),
+        None,
+        state,
+        layer,
+        sha,
+        epoch,
+        evaluated_at,
+    )
+}
+
+#[test]
+fn full_domain_context_epoch_is_exact_metadata_only() {
+    let evaluated_at = OrchestrationDateTimeV1::try_new("2026-09-08t00:00:00.100z").unwrap();
+    for digits in ["9223372036854775808", "18446744073709551616"] {
+        let actual = full_domain_metadata(
+            GoalEvaluationState::Blocked,
+            DeterministicLayer::try_new(true, None).unwrap(),
+            Some("a".repeat(40)),
+            Some(GoalEvaluationContextEpoch::from_decimal(digits).unwrap()),
+            evaluated_at.clone(),
+        )
+        .unwrap();
+        assert_eq!(actual.context_epoch().unwrap().decimal_digits(), digits);
+        assert_eq!(actual.state(), GoalEvaluationState::Blocked);
+        assert!(actual.deterministic_layer().passed());
+        assert_eq!(
+            actual.integrated_sha(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(actual.evaluated_at(), &evaluated_at);
+    }
+}
+
+#[test]
+fn full_domain_context_epoch_does_not_change_existing_validation() {
+    let epoch = || GoalEvaluationContextEpoch::from_decimal("18446744073709551616").unwrap();
+    let evaluated_at = || OrchestrationDateTimeV1::try_new("2026-09-08T00:00:00Z").unwrap();
+
+    assert_eq!(
+        full_domain_metadata(
+            GoalEvaluationState::Complete,
+            DeterministicLayer::try_new(false, None).unwrap(),
+            None,
+            Some(epoch()),
+            evaluated_at(),
+        ),
+        Err(GoalEvaluationCoreError::CompleteWithFailedLayer)
+    );
+    assert_eq!(
+        full_domain_metadata(
+            GoalEvaluationState::Incomplete,
+            DeterministicLayer::try_new(true, None).unwrap(),
+            Some("A".repeat(40)),
+            Some(epoch()),
+            evaluated_at(),
+        ),
+        Err(GoalEvaluationCoreError::InvalidIntegratedSha)
+    );
 }
 
 #[test]
@@ -372,7 +490,12 @@ fn evaluated_at_does_not_change_sha_or_epoch_validation() {
             for epoch in [None, Some(0), Some(1), Some(i64::MAX)] {
                 let actual = construct(sha.clone(), epoch).unwrap();
                 assert_eq!(actual.integrated_sha(), sha.as_deref());
-                assert_eq!(actual.context_epoch(), epoch);
+                assert_eq!(
+                    actual
+                        .context_epoch()
+                        .map(GoalEvaluationContextEpoch::decimal_digits),
+                    epoch.as_ref().map(ToString::to_string).as_deref()
+                );
                 assert_eq!(actual.evaluated_at(), &evaluated_at);
             }
         }
