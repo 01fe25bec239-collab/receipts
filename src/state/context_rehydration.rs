@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::context_epoch::ContextEpochTrigger;
 use crate::context_manifest::{ContextManifest, ContextSourceRefType, SourceClass};
+use crate::epoch_value::StateEpochValueV1;
 use crate::error::StateError;
 use crate::event::{
     ActorKind, EventActor, EventEnvelope, EventPayloadReference, EventType, SubjectKind,
@@ -21,6 +22,8 @@ use crate::repository::{SqliteStateRepository, UnitOfWork};
 const SOURCE_DIGEST_DOMAIN: &[u8] = b"multiagent-context-source-digest\0v1\0";
 const ATTEMPT_DIGEST_DOMAIN: &[u8] =
     b"multiagent:event-payload-reference:ContextRehydrationAttempt:v1";
+const ATTEMPT_DIGEST_DOMAIN_V2: &[u8] =
+    b"multiagent:event-payload-reference:ContextRehydrationAttempt:v2";
 const MAX_IDENTIFIER_LENGTH: usize = 200;
 pub const MAX_SOURCE_EVIDENCE_RECORDS_PER_ATTEMPT: usize = 256;
 pub const MAX_REPOSITORY_SNAPSHOT_REFERENCES_PER_ATTEMPT: usize = 64;
@@ -70,11 +73,22 @@ pub struct ArtifactRefV1 {
 /// Closed typed parameter sets for the State query registry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StateQueryRefV1 {
-    LogicalRole { role_id: String },
-    ContextManifest { manifest_id: String },
-    ContextEpoch { project_id: String, epoch: i64 },
-    ExecutorBinding { binding_id: String },
-    Event { event_id: String },
+    LogicalRole {
+        role_id: String,
+    },
+    ContextManifest {
+        manifest_id: String,
+    },
+    ContextEpoch {
+        project_id: String,
+        epoch: StateEpochValueV1,
+    },
+    ExecutorBinding {
+        binding_id: String,
+    },
+    Event {
+        event_id: String,
+    },
 }
 
 impl StateQueryRefV1 {
@@ -108,13 +122,10 @@ impl StateQueryRefV1 {
             Self::ContextManifest { manifest_id } => {
                 ensure_identifier("STATE_QUERY manifest_id", manifest_id)
             }
-            Self::ContextEpoch { project_id, epoch } => {
+            Self::ContextEpoch { project_id, .. } => {
                 ensure_identifier("STATE_QUERY project_id", project_id)?;
                 if project_id != attempt_project_id {
                     return validation_failure("STATE_QUERY project scope mismatch");
-                }
-                if *epoch < 0 {
-                    return validation_failure("STATE_QUERY epoch must be non-negative");
                 }
                 Ok(())
             }
@@ -138,8 +149,13 @@ impl StateQueryRefV1 {
             id: &'a str,
         }
         #[derive(Serialize)]
-        struct Epoch<'a> {
+        struct EpochV1<'a> {
             epoch: i64,
+            project_id: &'a str,
+        }
+        #[derive(Serialize)]
+        struct EpochV2<'a> {
+            epoch: &'a str,
             project_id: &'a str,
         }
 
@@ -156,17 +172,26 @@ impl StateQueryRefV1 {
                 query_version: Self::VERSION,
                 parameters: Id { id: manifest_id },
             }),
-            Self::ContextEpoch { project_id, epoch } => {
-                serde_json_canonicalizer::to_vec(&Identity {
+            Self::ContextEpoch { project_id, epoch } => match epoch.try_to_i64() {
+                Ok(epoch) => serde_json_canonicalizer::to_vec(&Identity {
                     project_id,
                     query_id: self.query_id(),
-                    query_version: Self::VERSION,
-                    parameters: Epoch {
-                        epoch: *epoch,
+                    query_version: 1,
+                    parameters: EpochV1 { epoch, project_id },
+                }),
+                Err(StateError::StateEpochValueOutOfI64Range { .. }) => {
+                    serde_json_canonicalizer::to_vec(&Identity {
                         project_id,
-                    },
-                })
-            }
+                        query_id: self.query_id(),
+                        query_version: 2,
+                        parameters: EpochV2 {
+                            epoch: epoch.as_str(),
+                            project_id,
+                        },
+                    })
+                }
+                Err(error) => return Err(error),
+            },
             Self::ExecutorBinding { binding_id } => serde_json_canonicalizer::to_vec(&Identity {
                 project_id,
                 query_id: self.query_id(),
@@ -210,7 +235,7 @@ pub struct ContextSourceTouchEvidence {
     pub project_id: String,
     pub durable_role_id: String,
     pub context_manifest_id: String,
-    pub context_epoch_id: i64,
+    pub context_epoch_id: StateEpochValueV1,
     pub task_id: String,
     pub correlation_reference: String,
 }
@@ -222,7 +247,7 @@ pub struct ContextSourceDemand {
     pub project_id: String,
     pub durable_role_id: String,
     pub context_manifest_id: String,
-    pub context_epoch_id: i64,
+    pub context_epoch_id: StateEpochValueV1,
     pub task_id: Option<String>,
     pub correlation_reference: String,
 }
@@ -397,7 +422,7 @@ pub struct ContextRehydrationAttempt {
     pub project_id: String,
     pub durable_role_id: String,
     pub context_manifest_id: String,
-    pub context_epoch_id: i64,
+    pub context_epoch_id: StateEpochValueV1,
     pub repository_snapshot_references: Vec<RepositorySnapshotRefV1>,
     pub requested_by_actor: EventActor,
     pub executor_binding_id: Option<String>,
@@ -420,7 +445,7 @@ pub struct ContextRehydrationRequest {
     pub project_id: String,
     pub durable_role_id: String,
     pub context_manifest_id: String,
-    pub context_epoch_id: i64,
+    pub context_epoch_id: StateEpochValueV1,
     pub requested_by_actor: EventActor,
     pub executor_binding_id: Option<String>,
     pub session_reference: Option<String>,
@@ -791,9 +816,6 @@ impl SqliteStateRepository {
         ensure_identifier("context_manifest_id", &request.context_manifest_id)?;
         ensure_non_empty("started_at", &request.started_at)?;
         ensure_non_empty("completed_at", &request.completed_at)?;
-        if request.context_epoch_id < 0 {
-            return validation_failure("context_epoch_id must be non-negative");
-        }
         validate_actor(&request.requested_by_actor)?;
         validate_optional("executor_binding_id", &request.executor_binding_id)?;
         validate_optional("session_reference", &request.session_reference)?;
@@ -832,7 +854,7 @@ impl SqliteStateRepository {
             return validation_failure("context manifest scope mismatch");
         }
         let epoch = self
-            .find_context_epoch(&request.project_id, request.context_epoch_id)?
+            .find_context_epoch_value(&request.project_id, &request.context_epoch_id)?
             .ok_or_else(|| StateError::ContextRehydrationValidation {
                 detail: "context epoch does not exist".to_string(),
             })?;
@@ -873,6 +895,15 @@ impl SqliteStateRepository {
             Null,
             Strings(Vec<String>),
         }
+        fn epoch_value(value: &StateEpochValueV1, query_version: &mut u32) -> Value {
+            match value.try_to_i64() {
+                Ok(value) => Value::Integer(value),
+                Err(_) => {
+                    *query_version = 2;
+                    Value::String(value.as_str().to_string())
+                }
+            }
+        }
         fn string(name: &'static str, value: impl Into<String>) -> Field {
             Field {
                 name,
@@ -890,6 +921,7 @@ impl SqliteStateRepository {
         if query.project_id(&request.project_id) != request.project_id {
             return validation_failure("STATE_QUERY project scope mismatch");
         }
+        let mut query_version = 1;
         let values = match query {
             StateQueryRefV1::LogicalRole { role_id } => {
                 let value = self.find_logical_role(role_id)?;
@@ -907,7 +939,7 @@ impl SqliteStateRepository {
                         string("status", value.status.as_str()),
                         Field {
                             name: "current_context_epoch",
-                            value: Value::Integer(value.current_context_epoch),
+                            value: epoch_value(&value.current_context_epoch, &mut query_version),
                         },
                         optional("name", value.name),
                         optional("workstream_id", value.workstream_id),
@@ -937,26 +969,26 @@ impl SqliteStateRepository {
                         string("project_id", value.project_id),
                         Field {
                             name: "epoch",
-                            value: Value::Integer(value.epoch),
+                            value: epoch_value(&value.epoch, &mut query_version),
                         },
                         string("created_at", value.created_at),
                         optional("last_rehydrated_at", value.last_rehydrated_at),
                     ]
                 })
             }
-            StateQueryRefV1::ContextEpoch { project_id, epoch } => {
-                self.find_context_epoch(project_id, *epoch)?.map(|value| {
+            StateQueryRefV1::ContextEpoch { project_id, epoch } => self
+                .find_context_epoch_value(project_id, epoch)?
+                .map(|value| {
                     vec![
                         string("project_id", value.project_id),
                         Field {
                             name: "epoch",
-                            value: Value::Integer(value.epoch),
+                            value: epoch_value(&value.epoch, &mut query_version),
                         },
                         string("advanced_at", value.advanced_at),
                         string("trigger", value.trigger.as_str()),
                     ]
-                })
-            }
+                }),
             StateQueryRefV1::ExecutorBinding { binding_id } => {
                 let value = self.find_executor_binding(binding_id)?;
                 if let Some(binding) = &value {
@@ -1019,7 +1051,7 @@ impl SqliteStateRepository {
                         string("correlation_id", value.correlation_id),
                         Field {
                             name: "epoch",
-                            value: Value::Integer(value.epoch),
+                            value: epoch_value(&value.epoch, &mut query_version),
                         },
                     ]
                 })
@@ -1036,7 +1068,7 @@ impl SqliteStateRepository {
         let result = serde_json_canonicalizer::to_vec(&ResultV1 {
             found: values.is_some(),
             query_id: query.query_id(),
-            query_version: StateQueryRefV1::VERSION,
+            query_version,
             values: values.unwrap_or_default(),
         })
         .map_err(canonicalization_failure)?;
@@ -1072,22 +1104,31 @@ pub fn context_rehydration_event_payload(
         project_id: &'a str,
         v: u8,
     }
+    let version = if attempt.context_epoch_id.try_to_i64().is_ok() {
+        1
+    } else {
+        2
+    };
     let reference = serde_json_canonicalizer::to_string(&Identity {
         attempt_id: &attempt.rehydration_attempt_id,
         entity: "ContextRehydrationAttempt",
         project_id: &attempt.project_id,
-        v: 1,
+        v: version,
     })
     .map_err(canonicalization_failure)?;
     let projection = attempt_digest_projection(attempt)?;
     let mut hasher = Sha256::new();
-    hasher.update(ATTEMPT_DIGEST_DOMAIN);
+    hasher.update(if version == 1 {
+        ATTEMPT_DIGEST_DOMAIN
+    } else {
+        ATTEMPT_DIGEST_DOMAIN_V2
+    });
     hasher.update([0]);
     hasher.update(projection);
     Ok(EventPayloadReference {
         reference,
         digest: format!(
-            "sha256:context-rehydration-attempt:v1:{}",
+            "sha256:context-rehydration-attempt:v{version}:{}",
             lowercase_hex(hasher.finalize().as_slice())
         ),
     })
@@ -1180,6 +1221,12 @@ fn validate_success_event(
 
 fn attempt_digest_projection(attempt: &ContextRehydrationAttempt) -> Result<Vec<u8>, StateError> {
     #[derive(Serialize)]
+    #[serde(untagged)]
+    enum Epoch<'a> {
+        Integer(i64),
+        String(&'a str),
+    }
+    #[derive(Serialize)]
     struct Actor<'a> {
         id: &'a Option<String>,
         kind: &'static str,
@@ -1187,7 +1234,7 @@ fn attempt_digest_projection(attempt: &ContextRehydrationAttempt) -> Result<Vec<
     #[derive(Serialize)]
     struct Projection<'a> {
         completed_at: &'a str,
-        context_epoch_id: i64,
+        context_epoch_id: Epoch<'a>,
         context_manifest_id: &'a str,
         correlation_reference: &'a Option<String>,
         durable_role_id: &'a str,
@@ -1227,9 +1274,16 @@ fn attempt_digest_projection(attempt: &ContextRehydrationAttempt) -> Result<Vec<
                 &right.logical_relative_path,
             ))
     });
+    let (context_epoch_id, version) = match attempt.context_epoch_id.try_to_i64() {
+        Ok(value) => (Epoch::Integer(value), 1),
+        Err(StateError::StateEpochValueOutOfI64Range { .. }) => {
+            (Epoch::String(attempt.context_epoch_id.as_str()), 2)
+        }
+        Err(error) => return Err(error),
+    };
     serde_json_canonicalizer::to_vec(&Projection {
         completed_at: &attempt.completed_at,
-        context_epoch_id: attempt.context_epoch_id,
+        context_epoch_id,
         context_manifest_id: &attempt.context_manifest_id,
         correlation_reference: &attempt.correlation_reference,
         durable_role_id: &attempt.durable_role_id,
@@ -1249,7 +1303,7 @@ fn attempt_digest_projection(attempt: &ContextRehydrationAttempt) -> Result<Vec<
         task_id: &attempt.task_id,
         trigger_kind: attempt.trigger_kind.as_str(),
         trigger_reference: &attempt.trigger_reference,
-        v: 1,
+        v: version,
     })
     .map_err(canonicalization_failure)
 }
@@ -1675,7 +1729,7 @@ fn attempt_from_request(
         project_id: request.project_id.clone(),
         durable_role_id: request.durable_role_id.clone(),
         context_manifest_id: request.context_manifest_id.clone(),
-        context_epoch_id: request.context_epoch_id,
+        context_epoch_id: request.context_epoch_id.clone(),
         repository_snapshot_references: snapshots,
         requested_by_actor: request.requested_by_actor.clone(),
         executor_binding_id: request.executor_binding_id.clone(),
@@ -2012,8 +2066,14 @@ fn failed_evidence(
 
 fn canonical_touch_evidence(item: &ContextSourceTouchEvidence) -> Result<String, StateError> {
     #[derive(Serialize)]
+    #[serde(untagged)]
+    enum Epoch<'a> {
+        Integer(i64),
+        String(&'a str),
+    }
+    #[derive(Serialize)]
     struct Evidence<'a> {
-        context_epoch_id: i64,
+        context_epoch_id: Epoch<'a>,
         context_manifest_id: &'a str,
         correlation_reference: &'a str,
         durable_role_id: &'a str,
@@ -2023,8 +2083,15 @@ fn canonical_touch_evidence(item: &ContextSourceTouchEvidence) -> Result<String,
         task_id: &'a str,
         v: u8,
     }
+    let (context_epoch_id, version) = match item.context_epoch_id.try_to_i64() {
+        Ok(value) => (Epoch::Integer(value), 1),
+        Err(StateError::StateEpochValueOutOfI64Range { .. }) => {
+            (Epoch::String(item.context_epoch_id.as_str()), 2)
+        }
+        Err(error) => return Err(error),
+    };
     serde_json_canonicalizer::to_string(&Evidence {
-        context_epoch_id: item.context_epoch_id,
+        context_epoch_id,
         context_manifest_id: &item.context_manifest_id,
         correlation_reference: &item.correlation_reference,
         durable_role_id: &item.durable_role_id,
@@ -2032,7 +2099,7 @@ fn canonical_touch_evidence(item: &ContextSourceTouchEvidence) -> Result<String,
         relation: "CONSUMES",
         source_id: &item.source_id,
         task_id: &item.task_id,
-        v: 1,
+        v: version,
     })
     .map_err(canonicalization_failure)
 }
@@ -2116,6 +2183,7 @@ fn valid_source_digest(value: &str) -> bool {
 fn valid_attempt_digest(value: &str) -> bool {
     value
         .strip_prefix("sha256:context-rehydration-attempt:v1:")
+        .or_else(|| value.strip_prefix("sha256:context-rehydration-attempt:v2:"))
         .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(is_lower_hex))
 }
 
@@ -2286,7 +2354,7 @@ fn insert_attempt(
             attempt.rehydration_attempt_id,
             attempt.durable_role_id,
             attempt.context_manifest_id,
-            attempt.context_epoch_id,
+            attempt.context_epoch_id.as_str(),
             attempt.trigger_kind.as_str(),
             attempt.trigger_reference,
             attempt.task_id,
@@ -2380,7 +2448,7 @@ fn read_attempt(
         String,
         String,
         String,
-        i64,
+        String,
         String,
         Option<String>,
         Option<String>,
@@ -2434,7 +2502,8 @@ fn read_attempt(
         durable_role_id: row.0,
         context_manifest_id: row.1,
         project_id: row.2,
-        context_epoch_id: row.3,
+        context_epoch_id: StateEpochValueV1::try_from(row.3)
+            .map_err(|error| decode_failure(error.to_string()))?,
         trigger_kind: ContextEpochTrigger::from_storage(&row.4)?,
         trigger_reference: row.5,
         task_id: row.6,

@@ -48,6 +48,7 @@ use std::collections::HashSet;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::epoch_value::StateEpochValueV1;
 use crate::error::StateError;
 use crate::repository::{SqliteStateRepository, UnitOfWork};
 
@@ -194,7 +195,7 @@ pub struct ContextEpoch {
     /// [`MAX_IDENTIFIER_LENGTH`] scalar values; persisted byte-for-byte.
     pub project_id: String,
     /// The epoch number reached. Must be >= 0.
-    pub epoch: i64,
+    pub epoch: StateEpochValueV1,
     /// The opaque timestamp supplied for the transition. Non-empty;
     /// stored exactly as provided and never parsed.
     pub advanced_at: String,
@@ -301,12 +302,16 @@ impl SqliteStateRepository {
         project_id: &str,
         epoch: i64,
     ) -> Result<Option<ChangedSources>, StateError> {
+        let epoch = StateEpochValueV1::try_from(epoch)?;
+        self.find_context_epoch_changed_sources_value(project_id, &epoch)
+    }
+
+    pub fn find_context_epoch_changed_sources_value(
+        &self,
+        project_id: &str,
+        epoch: &StateEpochValueV1,
+    ) -> Result<Option<ChangedSources>, StateError> {
         validate_project_id(project_id)?;
-        if epoch < 0 {
-            return Err(StateError::ContextEpochValidation {
-                detail: format!("epoch must be >= 0, found {epoch}"),
-            });
-        }
         let tx = self
             .connection()
             .unchecked_transaction()
@@ -316,7 +321,7 @@ impl SqliteStateRepository {
         let found = if parent.is_some() {
             let marker: Option<i64> = tx.query_row(
                 "SELECT changed_sources_present FROM context_epoch WHERE project_id = ?1 AND epoch = ?2",
-                params![project_id, epoch], |row| row.get(0),
+                params![project_id, epoch.as_str()], |row| row.get(0),
             ).map_err(|e| changed_sources_decode(e.to_string()))?;
             Some(match marker {
                 Some(1) => ChangedSources::Present(sources),
@@ -324,7 +329,7 @@ impl SqliteStateRepository {
                 None if sources.is_empty() => {
                     return Err(StateError::ContextEpochChangedSourcesNotCaptured {
                         project_id: project_id.to_string(),
-                        epoch,
+                        epoch: epoch.clone(),
                     });
                 }
                 _ => return Err(changed_sources_decode("invalid presence/child composition")),
@@ -370,11 +375,6 @@ impl SqliteStateRepository {
     ///   [`StateError::ContextEpochValidation`] before any storage
     ///   access — inputs are accepted unchanged or rejected, never
     ///   normalized, trimmed, parsed, or regenerated;
-    /// * a persisted maximum epoch of `i64::MAX` fails with
-    ///   [`StateError::ContextEpochAdvanceOverflow`]: `max + 1` is not
-    ///   representable, so the successor is derived with checked
-    ///   arithmetic that never wraps, saturates, resets, or reuses the
-    ///   current maximum, and no row is written;
     /// * a `(project_id, derived epoch)` pair that already exists fails
     ///   with [`StateError::ContextEpochAlreadyExists`] (explicit
     ///   in-transaction pre-check, with the composite primary key as the
@@ -422,16 +422,16 @@ impl SqliteStateRepository {
         validate_invalidated_role_ids(invalidated_role_ids)?;
         self.run_transaction(|uow| {
             let latest = uow.read_latest_context_epoch(project_id)?;
-            let epoch = derive_next_epoch(project_id, latest.map(|record| record.epoch))?;
+            let epoch = derive_next_epoch(latest.as_ref().map(|record| &record.epoch))?;
             validate_invalidated_roles(uow.tx(), project_id, invalidated_role_ids)?;
             let created = ContextEpoch {
                 project_id: project_id.to_string(),
-                epoch,
+                epoch: epoch.clone(),
                 advanced_at: advanced_at.to_string(),
                 trigger,
             };
             insert_context_epoch(uow.tx(), &created, &changed_sources)?;
-            insert_invalidated_roles(uow.tx(), project_id, epoch, invalidated_role_ids)?;
+            insert_invalidated_roles(uow.tx(), project_id, &epoch, invalidated_role_ids)?;
             Ok(created)
         })
     }
@@ -445,12 +445,16 @@ impl SqliteStateRepository {
         project_id: &str,
         epoch: i64,
     ) -> Result<Option<Vec<String>>, StateError> {
+        let epoch = StateEpochValueV1::try_from(epoch)?;
+        self.find_context_epoch_invalidated_role_ids_value(project_id, &epoch)
+    }
+
+    pub fn find_context_epoch_invalidated_role_ids_value(
+        &self,
+        project_id: &str,
+        epoch: &StateEpochValueV1,
+    ) -> Result<Option<Vec<String>>, StateError> {
         validate_project_id(project_id)?;
-        if epoch < 0 {
-            return Err(StateError::ContextEpochValidation {
-                detail: format!("epoch must be >= 0, found {epoch}"),
-            });
-        }
         let conn = self.connection();
         let tx = conn
             .unchecked_transaction()
@@ -481,12 +485,16 @@ impl SqliteStateRepository {
         project_id: &str,
         epoch: i64,
     ) -> Result<Option<ContextEpoch>, StateError> {
+        let epoch = StateEpochValueV1::try_from(epoch)?;
+        self.find_context_epoch_value(project_id, &epoch)
+    }
+
+    pub fn find_context_epoch_value(
+        &self,
+        project_id: &str,
+        epoch: &StateEpochValueV1,
+    ) -> Result<Option<ContextEpoch>, StateError> {
         validate_project_id(project_id)?;
-        if epoch < 0 {
-            return Err(StateError::ContextEpochValidation {
-                detail: format!("epoch must be >= 0, found {epoch}"),
-            });
-        }
         let conn = self.connection();
         let tx = conn
             .unchecked_transaction()
@@ -581,7 +589,7 @@ const SELECT_LATEST_SQL: &str = "SELECT
     trigger
 FROM context_epoch
 WHERE project_id = ?1
-ORDER BY epoch DESC
+ORDER BY length(epoch) DESC, epoch COLLATE BINARY DESC
 LIMIT 1";
 
 const SELECT_ROLE_PROJECT_SQL: &str = "SELECT project_id FROM logical_role WHERE role_id = ?1";
@@ -659,7 +667,7 @@ fn validate_invalidated_roles(
 fn insert_invalidated_roles(
     conn: &Connection,
     project_id: &str,
-    epoch: i64,
+    epoch: &StateEpochValueV1,
     role_ids: &[String],
 ) -> Result<(), StateError> {
     let mut statement = conn
@@ -667,7 +675,7 @@ fn insert_invalidated_roles(
         .map_err(invalidation_write_failure)?;
     for role_id in role_ids {
         statement
-            .execute(params![project_id, epoch, role_id])
+            .execute(params![project_id, epoch.as_str(), role_id])
             .map_err(invalidation_write_failure)?;
     }
     Ok(())
@@ -676,13 +684,15 @@ fn insert_invalidated_roles(
 fn read_invalidated_role_ids(
     conn: &Connection,
     project_id: &str,
-    epoch: i64,
+    epoch: &StateEpochValueV1,
 ) -> Result<Vec<String>, StateError> {
     let mut statement = conn
         .prepare(SELECT_INVALIDATED_ROLE_IDS_SQL)
         .map_err(internal_query_failure)?;
     let rows = statement
-        .query_map(params![project_id, epoch], |row| row.get::<_, String>(0))
+        .query_map(params![project_id, epoch.as_str()], |row| {
+            row.get::<_, String>(0)
+        })
         .map_err(internal_query_failure)?;
     let role_ids = rows
         .collect::<Result<Vec<_>, _>>()
@@ -715,19 +725,15 @@ fn query_latest_context_epoch(
 
 /// Derives the next epoch from the transaction-snapshot latest-epoch
 /// lookup, per the frozen advancement rule: no persisted history for the
-/// project → `0`; otherwise `max + 1` with checked arithmetic. The only
-/// non-negative `max` without a representable successor is `i64::MAX`:
-/// the result fails closed with
-/// [`StateError::ContextEpochAdvanceOverflow`] — never wrapping,
-/// saturating, resetting to zero, or reusing the current maximum.
-fn derive_next_epoch(project_id: &str, latest_epoch: Option<i64>) -> Result<i64, StateError> {
+/// project → `0`; otherwise the exact decimal successor of `max`. Every
+/// canonical finite decimal epoch has a successor; native integer bounds
+/// are not part of this domain.
+fn derive_next_epoch(
+    latest_epoch: Option<&StateEpochValueV1>,
+) -> Result<StateEpochValueV1, StateError> {
     match latest_epoch {
-        None => Ok(0),
-        Some(max) => max
-            .checked_add(1)
-            .ok_or_else(|| StateError::ContextEpochAdvanceOverflow {
-                project_id: project_id.to_string(),
-            }),
+        None => StateEpochValueV1::try_from(0),
+        Some(max) => max.successor(),
     }
 }
 
@@ -749,7 +755,7 @@ fn insert_context_epoch(
     let duplicate: Option<i64> = conn
         .query_row(
             EPOCH_EXISTS_SQL,
-            params![epoch.project_id, epoch.epoch],
+            params![epoch.project_id, epoch.epoch.as_str()],
             |row| row.get(0),
         )
         .optional()
@@ -757,7 +763,7 @@ fn insert_context_epoch(
     if duplicate.is_some() {
         return Err(StateError::ContextEpochAlreadyExists {
             project_id: epoch.project_id.clone(),
-            epoch: epoch.epoch,
+            epoch: epoch.epoch.clone(),
         });
     }
     conn.execute(
@@ -771,7 +777,7 @@ fn insert_context_epoch(
         },
         params![
             epoch.project_id,
-            epoch.epoch,
+            epoch.epoch.as_str(),
             epoch.advanced_at,
             epoch.trigger.as_str()
         ],
@@ -780,7 +786,7 @@ fn insert_context_epoch(
         if is_primary_key_violation(&error) {
             StateError::ContextEpochAlreadyExists {
                 project_id: epoch.project_id.clone(),
-                epoch: epoch.epoch,
+                epoch: epoch.epoch.clone(),
             }
         } else {
             write_failure(error)
@@ -802,7 +808,7 @@ fn insert_context_epoch(
             statement
                 .execute(params![
                     epoch.project_id,
-                    epoch.epoch,
+                    epoch.epoch.as_str(),
                     ordinal,
                     item.ref_type.as_str(),
                     item.target,
@@ -833,13 +839,13 @@ fn changed_sources_decode(detail: impl Into<String>) -> StateError {
 fn read_changed_source_items(
     conn: &Connection,
     project_id: &str,
-    epoch: i64,
+    epoch: &StateEpochValueV1,
 ) -> Result<Vec<ChangedSource>, StateError> {
     let mut statement = conn.prepare("SELECT source_ordinal, ref_type, target, digest, section
         FROM context_epoch_changed_source WHERE project_id = ?1 AND epoch = ?2 ORDER BY source_ordinal")
         .map_err(|e| changed_sources_decode(e.to_string()))?;
     let mut rows = statement
-        .query(params![project_id, epoch])
+        .query(params![project_id, epoch.as_str()])
         .map_err(|e| changed_sources_decode(e.to_string()))?;
     let mut items = Vec::new();
     while let Some(row) = rows
@@ -876,11 +882,11 @@ fn read_changed_source_items(
 fn read_context_epoch(
     conn: &Connection,
     project_id: &str,
-    epoch: i64,
+    epoch: &StateEpochValueV1,
 ) -> Result<Option<ContextEpoch>, StateError> {
     conn.query_row(
         SELECT_EPOCH_SQL,
-        params![project_id, epoch],
+        params![project_id, epoch.as_str()],
         extract_epoch_row,
     )
     .optional()
@@ -893,7 +899,7 @@ fn read_context_epoch(
 /// interpretation is applied.
 struct EpochRow {
     project_id: String,
-    epoch: i64,
+    epoch: String,
     advanced_at: String,
     trigger: String,
 }
@@ -904,11 +910,11 @@ impl EpochRow {
     /// clamped epoch, no defaulted `advanced_at`.
     fn into_context_epoch(self) -> Result<ContextEpoch, StateError> {
         ensure_decoded_identifier("project_id", &self.project_id)?;
-        if self.epoch < 0 {
-            return Err(StateError::ContextEpochDecodeFailed {
-                detail: format!("persisted epoch {} is negative", self.epoch),
-            });
-        }
+        let epoch = StateEpochValueV1::try_from(self.epoch).map_err(|error| {
+            StateError::ContextEpochDecodeFailed {
+                detail: error.to_string(),
+            }
+        })?;
         if self.advanced_at.is_empty() {
             return Err(StateError::ContextEpochDecodeFailed {
                 detail: "persisted advanced_at is empty".to_string(),
@@ -916,7 +922,7 @@ impl EpochRow {
         }
         Ok(ContextEpoch {
             project_id: self.project_id,
-            epoch: self.epoch,
+            epoch,
             advanced_at: self.advanced_at,
             trigger: ContextEpochTrigger::from_storage(&self.trigger)?,
         })
@@ -943,11 +949,6 @@ fn extract_epoch_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EpochRow> {
 /// trimmed, parsed, or regenerated.
 fn validate_for_append(epoch: &ContextEpoch) -> Result<(), StateError> {
     validate_project_id(&epoch.project_id)?;
-    if epoch.epoch < 0 {
-        return Err(StateError::ContextEpochValidation {
-            detail: format!("epoch must be >= 0, found {}", epoch.epoch),
-        });
-    }
     ensure_non_empty("advanced_at", &epoch.advanced_at)?;
     Ok(())
 }

@@ -51,7 +51,9 @@
 
 use rusqlite::ToSql;
 
-use crate::context_epoch::{ContextEpoch, ContextEpochTrigger};
+use crate::context_epoch::{
+    ChangedSource, ChangedSourceRefType, ChangedSources, ContextEpoch, ContextEpochTrigger,
+};
 use crate::context_manifest::{
     ContextManifest, ContextManifestSource, ContextSourceRef, ContextSourceRefType, RequiredFor,
     SourceClass,
@@ -65,13 +67,13 @@ use crate::executor_binding::{ExecutorBinding, ReleaseReason};
 use crate::logical_role::{LogicalRole, LogicalRoleStatus, LogicalRoleType};
 use crate::migrations;
 use crate::repository::SqliteStateRepository;
-use crate::tests::{TempDir, trusted_clock};
+use crate::tests::{TempDir, state_epoch, state_epoch_text, trusted_clock};
 
 /// A minimal contract-valid ContextEpoch: only the four core fields.
 fn minimal_epoch(project_id: &str, epoch: i64, trigger: ContextEpochTrigger) -> ContextEpoch {
     ContextEpoch {
         project_id: project_id.to_string(),
-        epoch,
+        epoch: state_epoch(epoch),
         advanced_at: "2026-08-17T10:00:00.000Z".to_string(),
         trigger,
     }
@@ -84,7 +86,7 @@ fn minimal_role(role_id: &str) -> LogicalRole {
         project_id: "project-1".to_string(),
         role_type: LogicalRoleType::RuntimeA1,
         status: LogicalRoleStatus::Active,
-        current_context_epoch: 0,
+        current_context_epoch: state_epoch(0),
         name: None,
         workstream_id: None,
         ownership_paths: Vec::new(),
@@ -101,7 +103,7 @@ fn minimal_manifest(manifest_id: &str, role_id: &str) -> ContextManifest {
         manifest_id: manifest_id.to_string(),
         role_id: role_id.to_string(),
         project_id: "project-1".to_string(),
-        epoch: 3,
+        epoch: state_epoch(3),
         sources: vec![ContextManifestSource {
             r#ref: ContextSourceRef {
                 ref_type: ContextSourceRefType::RepoPath,
@@ -162,7 +164,7 @@ fn minimal_event() -> EventEnvelope {
                 .to_string(),
         },
         correlation_id: "corr-0001".to_string(),
-        epoch: 0,
+        epoch: state_epoch(0),
     }
 }
 
@@ -189,20 +191,20 @@ fn t01_fresh_database_bootstraps_to_schema_version_7() {
     let registered = migrations::registered();
     assert_eq!(
         registered.len(),
-        11,
-        "exactly eleven registered migrations (v0001–v0011) may exist"
+        12,
+        "exactly twelve registered migrations may exist"
     );
     assert_eq!(
         registered.last().expect("chain is non-empty").version,
-        11,
-        "the registered chain must end at version 11"
+        12,
+        "the registered chain must end at version 12"
     );
     let tmp = TempDir::new("ce-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 11);
+    assert_eq!(repo.schema_version().expect("version read"), 12);
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        11,
+        12,
         "one metadata row per applied migration"
     );
 }
@@ -213,10 +215,10 @@ fn t02_version_7_database_reopens_idempotently() {
     let tmp = TempDir::new("ce-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 11);
+        assert_eq!(repo.schema_version().expect("version read"), 12);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            11,
+            12,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -239,7 +241,7 @@ fn t03_ordinary_open_of_version_6_fails_closed() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 6,
-                supported: 11
+                supported: 12
             }
         ),
         "unexpected error: {error}"
@@ -445,7 +447,7 @@ fn t09_exact_round_trip() {
     let (_tmp, mut repo) = opened_repo("ce-t09");
     let record = ContextEpoch {
         project_id: "project-1".to_string(),
-        epoch: 12,
+        epoch: state_epoch(12),
         advanced_at: "2026-08-17T12:34:56.789Z".to_string(),
         trigger: ContextEpochTrigger::SecurityEscalation,
     };
@@ -631,8 +633,8 @@ fn t18_duplicate_fails_explicitly() {
             &error,
             StateError::ContextEpochAlreadyExists {
                 project_id,
-                epoch: 3
-            } if project_id == "project-1"
+                epoch
+            } if project_id == "project-1" && epoch == &state_epoch(3)
         ),
         "unexpected error: {error}"
     );
@@ -644,7 +646,7 @@ fn t19_duplicate_leaves_original_unchanged() {
     let (_tmp, mut repo) = opened_repo("ce-t19");
     let original = ContextEpoch {
         project_id: "project-1".to_string(),
-        epoch: 3,
+        epoch: state_epoch(3),
         advanced_at: "2026-08-16T10:00:00.000Z".to_string(),
         trigger: ContextEpochTrigger::TaskThreshold,
     };
@@ -768,14 +770,8 @@ fn t25_positive_epoch_accepted() {
 // T26 — a negative epoch is rejected by validation.
 #[test]
 fn t26_negative_epoch_rejected() {
-    let (_tmp, mut repo) = opened_repo("ce-t26");
-    let error = repo
-        .append_context_epoch(minimal_epoch("project-1", -1, ContextEpochTrigger::A1Init))
-        .expect_err("negative epoch must fail validation");
-    assert!(
-        matches!(error, StateError::ContextEpochValidation { .. }),
-        "unexpected error: {error}"
-    );
+    let (_tmp, repo) = opened_repo("ce-t26");
+    assert!(crate::StateEpochValueV1::try_from(-1_i64).is_err());
     assert_eq!(
         repo.count_table_rows("context_epoch").expect("rows"),
         0,
@@ -787,7 +783,7 @@ fn t26_negative_epoch_rejected() {
         .find_context_epoch("project-1", -5)
         .expect_err("negative query epoch must fail validation");
     assert!(
-        matches!(error, StateError::ContextEpochValidation { .. }),
+        matches!(error, StateError::InvalidStateEpochValue { .. }),
         "unexpected error: {error}"
     );
     // Invalid read inputs fail the same way.
@@ -822,7 +818,7 @@ fn t28_advanced_at_round_trips_byte_for_byte() {
     let advanced_at = "  not-a-parsed-timestamp ☃ ";
     let record = ContextEpoch {
         project_id: "project-1".to_string(),
-        epoch: 2,
+        epoch: state_epoch(2),
         advanced_at: advanced_at.to_string(),
         trigger: ContextEpochTrigger::ContextCompaction,
     };
@@ -842,7 +838,7 @@ fn t29_no_timestamp_parsing_or_normalization() {
     let advanced_at = "sometime-yesterday-ish";
     repo.append_context_epoch(ContextEpoch {
         project_id: "project-1".to_string(),
-        epoch: 2,
+        epoch: state_epoch(2),
         advanced_at: advanced_at.to_string(),
         trigger: ContextEpochTrigger::HostSwitch,
     })
@@ -1627,7 +1623,7 @@ fn probe_d_duplicate_with_changed_fields() {
     let (_tmp, mut repo) = opened_repo("ce-pd");
     let original = ContextEpoch {
         project_id: "project-1".to_string(),
-        epoch: 6,
+        epoch: state_epoch(6),
         advanced_at: "2026-08-16T10:00:00.000Z".to_string(),
         trigger: ContextEpochTrigger::ContextCompaction,
     };
@@ -1643,8 +1639,8 @@ fn probe_d_duplicate_with_changed_fields() {
             &error,
             StateError::ContextEpochAlreadyExists {
                 project_id,
-                epoch: 6
-            } if project_id == "project-1"
+                epoch
+            } if project_id == "project-1" && epoch == &state_epoch(6)
         ),
         "unexpected error: {error}"
     );
@@ -1991,8 +1987,12 @@ fn changed_sources_v10_to_v11_legacy_is_uncaptured_and_four_field_reads_survive(
     repo.run_transaction(|uow| uow.execute_batch(migration.sql))
         .expect("v10 -> v11");
     drop(repo);
-    let repo = SqliteStateRepository::open(tmp.db_path()).expect("v11 reopen");
-    assert_eq!(repo.schema_version().expect("version"), 11);
+    assert_eq!(
+        SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).expect("v11 -> v12"),
+        12
+    );
+    let repo = SqliteStateRepository::open(tmp.db_path()).expect("v12 reopen");
+    assert_eq!(repo.schema_version().expect("version"), 12);
     assert_eq!(
         repo.count_table_rows("context_epoch_changed_source")
             .expect("children"),
@@ -2017,7 +2017,7 @@ fn changed_sources_v10_to_v11_legacy_is_uncaptured_and_four_field_reads_survive(
     );
     assert!(matches!(
         repo.find_context_epoch_changed_sources("project-1", 7),
-        Err(StateError::ContextEpochChangedSourcesNotCaptured { epoch: 7, .. })
+        Err(StateError::ContextEpochChangedSourcesNotCaptured { epoch, .. }) if epoch == state_epoch(7)
     ));
 }
 
@@ -2105,7 +2105,7 @@ fn changed_sources_corrupt_compositions_fail_closed() {
         "UPDATE context_epoch_changed_source SET source_ordinal = 0.5",
         "UPDATE context_epoch_changed_source SET source_ordinal = 'bad'",
         "INSERT INTO context_epoch_changed_source SELECT * FROM context_epoch_changed_source",
-        "INSERT INTO context_epoch_changed_source VALUES ('project-1', 0, 2, 'URL', 'x', NULL, NULL)",
+        "INSERT INTO context_epoch_changed_source VALUES ('project-1', '0', 2, 'URL', 'x', NULL, NULL)",
         "UPDATE context_epoch_changed_source SET digest = x'FF'",
         "UPDATE context_epoch_changed_source SET section = x'FF'",
         "DELETE FROM context_epoch",
@@ -2119,7 +2119,7 @@ fn changed_sources_corrupt_compositions_fail_closed() {
         repo.connection().execute_batch("PRAGMA ignore_check_constraints = ON;
             DROP TABLE context_epoch_changed_source;
             CREATE TABLE context_epoch_changed_source (project_id, epoch, source_ordinal, ref_type, target, digest, section);
-            INSERT INTO context_epoch_changed_source VALUES ('project-1', 0, 0, 'URL', 'x', NULL, NULL);").expect("corruptible child");
+            INSERT INTO context_epoch_changed_source VALUES ('project-1', '0', 0, 'URL', 'x', NULL, NULL);").expect("corruptible child");
         direct_exec(&mut repo, corruption, &[]);
         assert!(
             matches!(
@@ -2216,4 +2216,100 @@ fn changed_sources_append_and_advancement_rollback_all_children_and_parent() {
             columns_before
         );
     }
+}
+
+#[test]
+fn unbounded_epoch_round_trips_across_state_carriers_and_orders_numerically() {
+    let (_tmp, mut repo) = opened_repo("unbounded-carriers");
+    let huge = state_epoch_text("18446744073709551616");
+    let mut role = minimal_role("role-huge");
+    role.current_context_epoch = huge.clone();
+    repo.create_logical_role(role.clone()).unwrap();
+
+    let mut manifest = minimal_manifest("manifest-huge", "role-huge");
+    manifest.epoch = huge.clone();
+    repo.create_context_manifest(manifest.clone()).unwrap();
+
+    let mut event = minimal_event();
+    event.epoch = huge.clone();
+    repo.append_event(event.clone()).unwrap();
+
+    let record = ContextEpoch {
+        project_id: "project-1".into(),
+        epoch: huge.clone(),
+        advanced_at: "huge".into(),
+        trigger: ContextEpochTrigger::NewWave,
+    };
+    repo.append_context_epoch_with_changed_sources(
+        record.clone(),
+        ChangedSources::Present(vec![ChangedSource {
+            ref_type: ChangedSourceRefType::Url,
+            target: "https://example.invalid".into(),
+            digest: Some("digest".into()),
+            section: Some("section".into()),
+        }]),
+    )
+    .unwrap();
+    repo.append_context_epoch(ContextEpoch {
+        project_id: "project-2".into(),
+        ..record.clone()
+    })
+    .unwrap();
+    assert!(matches!(
+        repo.append_context_epoch(record.clone()),
+        Err(StateError::ContextEpochAlreadyExists { .. })
+    ));
+    assert_eq!(
+        repo.find_context_epoch_value("project-1", &huge).unwrap(),
+        Some(record)
+    );
+    assert!(matches!(
+        repo.find_context_epoch_changed_sources_value("project-1", &huge)
+            .unwrap(),
+        Some(ChangedSources::Present(items)) if items.len() == 1
+    ));
+    assert_eq!(repo.find_logical_role("role-huge").unwrap(), Some(role));
+    assert_eq!(
+        repo.find_context_manifest("manifest-huge").unwrap(),
+        Some(manifest)
+    );
+    assert_eq!(repo.find_event(EVENT_ULID).unwrap(), Some(event));
+
+    let next = repo
+        .advance_context_epoch(
+            "project-1",
+            "next",
+            ContextEpochTrigger::NewWave,
+            &["role-huge".into()],
+        )
+        .unwrap();
+    assert_eq!(next.epoch, state_epoch_text("18446744073709551617"));
+    assert_eq!(
+        repo.find_context_epoch_invalidated_role_ids_value("project-1", &next.epoch)
+            .unwrap(),
+        Some(vec!["role-huge".into()])
+    );
+
+    for value in ["2", "9", "10", "99", "100", "18446744073709551617"] {
+        repo.append_context_epoch(ContextEpoch {
+            project_id: "numeric".into(),
+            epoch: state_epoch_text(value),
+            advanced_at: value.into(),
+            trigger: ContextEpochTrigger::TaskThreshold,
+        })
+        .unwrap();
+    }
+    assert_eq!(
+        repo.find_latest_context_epoch("numeric")
+            .unwrap()
+            .unwrap()
+            .epoch,
+        state_epoch_text("18446744073709551617")
+    );
+    assert_eq!(
+        repo.advance_context_epoch("numeric", "next", ContextEpochTrigger::NewWave, &[])
+            .unwrap()
+            .epoch,
+        state_epoch_text("18446744073709551618")
+    );
 }

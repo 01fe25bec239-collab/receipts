@@ -22,7 +22,7 @@ use crate::executor_binding::{ExecutorBinding, ReleaseReason, apply_lease_renewa
 use crate::logical_role::{LogicalRole, LogicalRoleStatus, LogicalRoleType};
 use crate::migrations;
 use crate::repository::SqliteStateRepository;
-use crate::tests::{TempDir, trusted_clock};
+use crate::tests::{TempDir, state_epoch, trusted_clock};
 
 /// A minimal contract-valid LogicalRole for binding targets.
 fn minimal_role(role_id: &str, role_type: LogicalRoleType) -> LogicalRole {
@@ -31,7 +31,7 @@ fn minimal_role(role_id: &str, role_type: LogicalRoleType) -> LogicalRole {
         project_id: "project-1".to_string(),
         role_type,
         status: LogicalRoleStatus::Active,
-        current_context_epoch: 0,
+        current_context_epoch: state_epoch(0),
         name: None,
         workstream_id: None,
         ownership_paths: Vec::new(),
@@ -132,7 +132,7 @@ fn minimal_event(event_id: &str) -> EventEnvelope {
                 .to_string(),
         },
         correlation_id: "corr-0001".to_string(),
-        epoch: 0,
+        epoch: state_epoch(0),
     }
 }
 
@@ -177,8 +177,8 @@ fn t01_schema_version_remains_11() {
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
     assert_eq!(
         repo.schema_version().expect("version read"),
-        11,
-        "the supported schema version must be 11 before any renewal"
+        12,
+        "the supported schema version must be 12 before any renewal"
     );
     repo.create_logical_role(minimal_role("role-ver-001", LogicalRoleType::RuntimeA1))
         .expect("role create");
@@ -188,16 +188,16 @@ fn t01_schema_version_remains_11() {
         .expect("renew");
     assert_eq!(
         repo.schema_version().expect("version read"),
-        11,
+        12,
         "a lease renewal must not change the schema version"
     );
     drop(repo);
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("reopen");
-    assert_eq!(repo.schema_version().expect("version read"), 11);
+    assert_eq!(repo.schema_version().expect("version read"), 12);
 }
 
 // T02 — lease renewal itself introduces no migration beyond the authorized
-// watermark migration: the registered chain ends at version 11, and the
+// watermark migration: the registered chain ends at version 12, and the
 // durable metadata carries exactly one row per applied migration after
 // renewals.
 #[test]
@@ -205,13 +205,13 @@ fn t02_no_migration_introduced_by_lease_renewal() {
     let registered = migrations::registered();
     assert_eq!(
         registered.len(),
-        11,
-        "exactly eleven registered migrations (v0001–v0011) may exist"
+        12,
+        "exactly twelve registered migrations may exist"
     );
     assert_eq!(
         registered.last().expect("chain is non-empty").version,
-        11,
-        "the registered chain must end at version 11"
+        12,
+        "the registered chain must end at version 12"
     );
     let tmp = TempDir::new("ebl-t02");
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
@@ -223,7 +223,7 @@ fn t02_no_migration_introduced_by_lease_renewal() {
         .expect("renew");
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        11,
+        12,
         "no extra migration metadata row may appear"
     );
 }
@@ -972,7 +972,7 @@ fn t32_renewal_does_not_mutate_logical_role() {
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
     let mut role = minimal_role("role-mut-001", LogicalRoleType::RuntimeA2);
     role.status = LogicalRoleStatus::Suspended;
-    role.current_context_epoch = 7;
+    role.current_context_epoch = state_epoch(7);
     role.name = Some("Role under renewal".to_string());
     role.workstream_id = Some("workstream-42".to_string());
     role.ownership_paths = vec!["receipts/one".to_string(), "receipts/two".to_string()];

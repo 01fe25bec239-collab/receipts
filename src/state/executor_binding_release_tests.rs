@@ -21,7 +21,7 @@ use crate::executor_binding::{ExecutorBinding, ReleaseReason, apply_release};
 use crate::logical_role::{LogicalRole, LogicalRoleStatus, LogicalRoleType};
 use crate::migrations;
 use crate::repository::SqliteStateRepository;
-use crate::tests::TempDir;
+use crate::tests::{TempDir, state_epoch};
 
 /// A minimal contract-valid LogicalRole for binding targets.
 fn minimal_role(role_id: &str, role_type: LogicalRoleType) -> LogicalRole {
@@ -30,7 +30,7 @@ fn minimal_role(role_id: &str, role_type: LogicalRoleType) -> LogicalRole {
         project_id: "project-1".to_string(),
         role_type,
         status: LogicalRoleStatus::Active,
-        current_context_epoch: 0,
+        current_context_epoch: state_epoch(0),
         name: None,
         workstream_id: None,
         ownership_paths: Vec::new(),
@@ -579,7 +579,7 @@ fn t22_release_does_not_modify_referenced_logical_role() {
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
     let mut role = minimal_role("role-mut-001", LogicalRoleType::RuntimeA2);
     role.status = LogicalRoleStatus::Suspended;
-    role.current_context_epoch = 7;
+    role.current_context_epoch = state_epoch(7);
     role.name = Some("Role under release".to_string());
     role.workstream_id = Some("workstream-42".to_string());
     role.ownership_paths = vec!["receipts/one".to_string(), "receipts/two".to_string()];
@@ -730,10 +730,10 @@ fn t29_schema_version_remains_exactly_7() {
             .last()
             .expect("registered chain is non-empty")
             .version,
-        11,
-        "the registered chain itself must end at version 11"
+        12,
+        "the registered chain itself must end at version 12"
     );
-    assert_eq!(repo.schema_version().expect("version read"), 11);
+    assert_eq!(repo.schema_version().expect("version read"), 12);
     repo.create_logical_role(minimal_role("role-ver-001", LogicalRoleType::RuntimeA1))
         .expect("role create");
     repo.create_executor_binding(minimal_binding("binding-ver-001", "role-ver-001"))
@@ -742,17 +742,17 @@ fn t29_schema_version_remains_exactly_7() {
         .expect("release");
     assert_eq!(
         repo.schema_version().expect("version read"),
-        11,
+        12,
         "a release must not change the schema version"
     );
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        11,
+        12,
         "no extra migration metadata row may appear"
     );
     drop(repo);
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("reopen");
-    assert_eq!(repo.schema_version().expect("version read"), 11);
+    assert_eq!(repo.schema_version().expect("version read"), 12);
 }
 
 // T30 — a release introduces no new schema objects: after releases the

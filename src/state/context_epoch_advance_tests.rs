@@ -70,7 +70,7 @@ use crate::executor_binding::{ExecutorBinding, ReleaseReason};
 use crate::logical_role::{LogicalRole, LogicalRoleStatus, LogicalRoleType};
 use crate::migrations;
 use crate::repository::SqliteStateRepository;
-use crate::tests::{TempDir, trusted_clock};
+use crate::tests::{TempDir, state_epoch, state_epoch_text, trusted_clock};
 
 /// The opaque timestamp used by the advancement helper.
 const ADVANCED_AT: &str = "2026-08-17T10:00:00.000Z";
@@ -96,7 +96,7 @@ fn advance(
 fn explicit_epoch(project_id: &str, epoch: i64, trigger: ContextEpochTrigger) -> ContextEpoch {
     ContextEpoch {
         project_id: project_id.to_string(),
-        epoch,
+        epoch: state_epoch(epoch),
         advanced_at: ADVANCED_AT.to_string(),
         trigger,
     }
@@ -109,7 +109,7 @@ fn minimal_role(role_id: &str) -> LogicalRole {
         project_id: "project-1".to_string(),
         role_type: LogicalRoleType::RuntimeA1,
         status: LogicalRoleStatus::Active,
-        current_context_epoch: 0,
+        current_context_epoch: state_epoch(0),
         name: None,
         workstream_id: None,
         ownership_paths: Vec::new(),
@@ -126,7 +126,7 @@ fn minimal_manifest(manifest_id: &str, role_id: &str) -> ContextManifest {
         manifest_id: manifest_id.to_string(),
         role_id: role_id.to_string(),
         project_id: "project-1".to_string(),
-        epoch: 3,
+        epoch: state_epoch(3),
         sources: vec![ContextManifestSource {
             r#ref: ContextSourceRef {
                 ref_type: ContextSourceRefType::RepoPath,
@@ -187,7 +187,7 @@ fn minimal_event() -> EventEnvelope {
                 .to_string(),
         },
         correlation_id: "corr-0001".to_string(),
-        epoch: 0,
+        epoch: state_epoch(0),
     }
 }
 
@@ -210,16 +210,16 @@ fn direct_exec(repo: &mut SqliteStateRepository, sql: &str, params: &[&dyn ToSql
 #[test]
 fn t01_schema_remains_version_8() {
     let (tmp, mut repo) = opened_repo("cea-t01");
-    assert_eq!(repo.schema_version().expect("version read"), 11);
+    assert_eq!(repo.schema_version().expect("version read"), 12);
     advance(&mut repo, "project-1", ContextEpochTrigger::A1Init).expect("advance");
     assert_eq!(
         repo.schema_version().expect("version read"),
-        11,
+        12,
         "advancement must not change the schema version"
     );
     drop(repo);
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("reopen");
-    assert_eq!(repo.schema_version().expect("version read"), 11);
+    assert_eq!(repo.schema_version().expect("version read"), 12);
 }
 
 // T02 — migration v11 is the exact registered chain head.
@@ -228,11 +228,11 @@ fn t02_migration_v8_registered() {
     let registered = migrations::registered();
     assert_eq!(
         registered.len(),
-        11,
-        "exactly eleven registered migrations may exist"
+        12,
+        "exactly twelve registered migrations may exist"
     );
     let versions: Vec<u32> = registered.iter().map(|m| m.version).collect();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
 }
 
 // T03 — the first advancement for a project with no history returns and
@@ -627,10 +627,8 @@ fn t21_multi_project_max_plus_one() {
     );
 }
 
-// T22 — existing history at i64::MAX → advancement fails closed with
-// ContextEpochAdvanceOverflow.
 #[test]
-fn t22_overflow_fails_closed() {
+fn t22_i64_max_has_an_exact_successor() {
     let (_tmp, mut repo) = opened_repo("cea-t22");
     repo.append_context_epoch(explicit_epoch(
         "project-1",
@@ -638,20 +636,14 @@ fn t22_overflow_fails_closed() {
         ContextEpochTrigger::TaskThreshold,
     ))
     .expect("seed i64::MAX history");
-    let error = advance(&mut repo, "project-1", ContextEpochTrigger::NewWave)
-        .expect_err("i64::MAX history must fail advancement");
-    assert!(
-        matches!(
-            &error,
-            StateError::ContextEpochAdvanceOverflow { project_id } if project_id == "project-1"
-        ),
-        "unexpected error: {error}"
-    );
+    let created = advance(&mut repo, "project-1", ContextEpochTrigger::NewWave)
+        .expect("i64::MAX has an exact successor");
+    assert_eq!(created.epoch, state_epoch_text("9223372036854775808"));
 }
 
 // T23 — an overflow failure inserts no row.
 #[test]
-fn t23_overflow_failure_inserts_no_row() {
+fn t23_i64_max_successor_is_durable() {
     let (_tmp, mut repo) = opened_repo("cea-t23");
     repo.append_context_epoch(explicit_epoch(
         "project-1",
@@ -664,25 +656,23 @@ fn t23_overflow_failure_inserts_no_row() {
         1,
         "pre-overflow history"
     );
-    advance(&mut repo, "project-1", ContextEpochTrigger::NewWave)
-        .expect_err("overflow fails closed");
+    advance(&mut repo, "project-1", ContextEpochTrigger::NewWave).expect("advance");
     assert_eq!(
         repo.count_table_rows("context_epoch").expect("rows"),
-        1,
-        "the overflow failure must not insert a row"
+        2,
+        "the successor is inserted"
     );
 }
 
 // T24 — an overflow failure leaves the prior history unchanged.
 #[test]
-fn t24_overflow_failure_leaves_history_unchanged() {
+fn t24_i64_max_successor_leaves_history_unchanged() {
     let (_tmp, mut repo) = opened_repo("cea-t24");
     let first = explicit_epoch("project-1", 4, ContextEpochTrigger::NewWave);
     let max = explicit_epoch("project-1", i64::MAX, ContextEpochTrigger::TaskThreshold);
     repo.append_context_epoch(first.clone()).expect("seed 4");
     repo.append_context_epoch(max.clone()).expect("seed max");
-    advance(&mut repo, "project-1", ContextEpochTrigger::NewWave)
-        .expect_err("overflow fails closed");
+    let successor = advance(&mut repo, "project-1", ContextEpochTrigger::NewWave).expect("advance");
     assert_eq!(
         repo.find_context_epoch("project-1", 4).expect("find"),
         Some(first),
@@ -690,8 +680,8 @@ fn t24_overflow_failure_leaves_history_unchanged() {
     );
     assert_eq!(
         repo.find_latest_context_epoch("project-1").expect("latest"),
-        Some(max),
-        "the maximum record is untouched by the overflow failure"
+        Some(successor),
+        "the successor is now latest"
     );
 }
 
@@ -707,25 +697,20 @@ fn t25_no_wrap_panic_or_saturation() {
     ))
     .expect("seed i64::MAX history");
     for _ in 0..3 {
-        let error = advance(&mut repo, "project-1", ContextEpochTrigger::NewWave)
-            .expect_err("every attempt at i64::MAX fails identically");
-        assert!(
-            matches!(error, StateError::ContextEpochAdvanceOverflow { .. }),
-            "no wrap/saturation success, no panic: {error}"
-        );
+        advance(&mut repo, "project-1", ContextEpochTrigger::NewWave).expect("exact successor");
     }
     // No wrapped negative or saturated record ever appeared.
     assert_eq!(
         repo.count_table_rows("context_epoch").expect("rows"),
-        1,
-        "only the seeded history row exists"
+        4,
+        "three exact successors were appended"
     );
     assert_eq!(
         repo.find_latest_context_epoch("project-1")
             .expect("latest")
             .expect("present")
             .epoch,
-        i64::MAX
+        state_epoch_text("9223372036854775810")
     );
     // Overflow is project-scoped: another project still advances to 0.
     let other = advance(&mut repo, "project-2", ContextEpochTrigger::A1Init)
@@ -924,8 +909,8 @@ fn t33_append_duplicate_behavior_unchanged() {
             &error,
             StateError::ContextEpochAlreadyExists {
                 project_id,
-                epoch: 2
-            } if project_id == "project-1"
+                epoch
+            } if project_id == "project-1" && epoch == &state_epoch(2)
         ),
         "unexpected error: {error}"
     );
@@ -1275,17 +1260,14 @@ fn t64_no_new_schema_object() {
         tables_before,
         "advancement adds no table"
     );
-    // The only index entries are SQLite's implicit `sqlite_autoindex_*`
-    // for the composite primary key; no explicitly created index exists.
     let indexes = repo
         .sqlite_master_entries("index", "context_epoch")
         .expect("indexes");
-    assert!(
-        indexes
-            .iter()
-            .all(|(name, sql)| name.starts_with("sqlite_autoindex") && sql.is_empty()),
-        "no explicit index on context_epoch; found: {indexes:?}"
-    );
+    assert!(indexes.iter().any(|(name, sql)| {
+        name == "idx_context_epoch_project_numeric_epoch"
+            && sql.contains("length(epoch) DESC")
+            && sql.contains("epoch COLLATE BINARY DESC")
+    }));
     assert!(
         !indexes.is_empty(),
         "the implicit primary-key autoindex remains the durable backstop"
@@ -1442,10 +1424,8 @@ fn probe_c_timestamp_disagreement_ignored() {
     );
 }
 
-// PROBE D — overflow: history contains i64::MAX → advance → explicit
-// failure, no new row.
 #[test]
-fn probe_d_overflow_fails_with_no_new_row() {
+fn probe_d_i64_max_advances_without_overflow() {
     let (_tmp, mut repo) = opened_repo("cea-pd");
     repo.append_context_epoch(explicit_epoch(
         "project-1",
@@ -1453,18 +1433,9 @@ fn probe_d_overflow_fails_with_no_new_row() {
         ContextEpochTrigger::TaskThreshold,
     ))
     .expect("seed i64::MAX");
-    let rows_before = repo.count_table_rows("context_epoch").expect("rows");
-    let error = advance(&mut repo, "project-1", ContextEpochTrigger::NewWave)
-        .expect_err("PROBE D: i64::MAX must fail");
-    assert!(
-        matches!(error, StateError::ContextEpochAdvanceOverflow { .. }),
-        "unexpected error: {error}"
-    );
-    assert_eq!(
-        repo.count_table_rows("context_epoch").expect("rows"),
-        rows_before,
-        "PROBE D: no new row"
-    );
+    let created = advance(&mut repo, "project-1", ContextEpochTrigger::NewWave)
+        .expect("PROBE D: i64::MAX advances");
+    assert_eq!(created.epoch, state_epoch_text("9223372036854775808"));
 }
 
 // PROBE E — rollback: derive next, insert inside the transaction, force

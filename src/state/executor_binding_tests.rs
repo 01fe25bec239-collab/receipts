@@ -19,7 +19,7 @@ use crate::executor_binding::{ExecutorBinding, ReleaseReason};
 use crate::logical_role::{LogicalRole, LogicalRoleStatus, LogicalRoleType};
 use crate::migrations;
 use crate::repository::SqliteStateRepository;
-use crate::tests::TempDir;
+use crate::tests::{TempDir, state_epoch};
 
 /// A minimal contract-valid LogicalRole for binding targets.
 fn minimal_role(role_id: &str, role_type: LogicalRoleType) -> LogicalRole {
@@ -28,7 +28,7 @@ fn minimal_role(role_id: &str, role_type: LogicalRoleType) -> LogicalRole {
         project_id: "project-1".to_string(),
         role_type,
         status: LogicalRoleStatus::Active,
-        current_context_epoch: 0,
+        current_context_epoch: state_epoch(0),
         name: None,
         workstream_id: None,
         ownership_paths: Vec::new(),
@@ -91,7 +91,7 @@ const ALL_NINE_STRINGS: [&str; 9] = [
 fn t01_fresh_database_reaches_schema_version_7() {
     let tmp = TempDir::new("eb-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 11);
+    assert_eq!(repo.schema_version().expect("version read"), 12);
     assert!(
         repo.table_exists("executor_binding").expect("table check"),
         "executor_binding must exist after migration 3"
@@ -131,10 +131,10 @@ fn t02_version_7_reopen_idempotent() {
     let tmp = TempDir::new("eb-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 11);
+        assert_eq!(repo.schema_version().expect("version read"), 12);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            11,
+            12,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -157,7 +157,7 @@ fn t03_ordinary_open_of_version_2_database_fails() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 2,
-                supported: 11
+                supported: 12
             }
         ),
         "unexpected error: {error}"
@@ -999,7 +999,7 @@ fn t32_binding_creation_does_not_mutate_role() {
     let tmp = TempDir::new("eb-t32");
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
     let mut role = minimal_role("role-mut-001", LogicalRoleType::RuntimeA2);
-    role.current_context_epoch = 5;
+    role.current_context_epoch = state_epoch(5);
     role.name = Some("Role under binding".to_string());
     role.ownership_paths = vec!["receipts/one".to_string(), "receipts/two".to_string()];
     repo.create_logical_role(role.clone()).expect("role create");

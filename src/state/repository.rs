@@ -65,6 +65,28 @@ impl SqliteStateRepository {
         Self::open_with_migrations(path, migrations::registered())
     }
 
+    /// Explicitly upgrades an exact v11 State database to v12.
+    pub fn migrate_existing_to_current(path: impl AsRef<Path>) -> Result<u32, StateError> {
+        let mut conn = Connection::open(path.as_ref()).map_err(|e| StateError::OpenFailed {
+            detail: e.to_string(),
+        })?;
+        configure_connection(&conn)?;
+        let found = read_schema_version(&conn)?;
+        match found {
+            11 => {
+                verify_exact_ledger(&conn, &migrations::registered()[..11])?;
+                migrations::v0012_context_epoch_unbounded::apply(&mut conn)?;
+                verify_exact_ledger(&conn, migrations::registered())?;
+                Ok(12)
+            }
+            12 => {
+                verify_exact_ledger(&conn, migrations::registered())?;
+                Ok(12)
+            }
+            found => Err(StateError::ExplicitMigrationRefused { found }),
+        }
+    }
+
     /// Version-reconciliation core of [`Self::open`], parameterized by the
     /// migration chain so tests can construct supported/unsupported version
     /// combinations. Not part of the public surface.
@@ -80,7 +102,12 @@ impl SqliteStateRepository {
         configure_connection(&conn)?;
         let repo = Self { conn };
         match repo.read_schema_version()? {
-            found if found == supported => Ok(repo),
+            found if found == supported => {
+                if supported == 12 {
+                    verify_exact_ledger(repo.connection(), chain)?;
+                }
+                Ok(repo)
+            }
             0 => {
                 let mut repo = repo;
                 bootstrap(&mut repo.conn, chain)?;
@@ -203,6 +230,7 @@ impl SqliteStateRepository {
     /// Reports whether an internal table exists. Crate-private
     /// test/inspection support; `table` is always a repository-internal or
     /// test-literal identifier.
+    #[cfg(test)]
     pub(crate) fn table_exists(&self, table: &str) -> Result<bool, StateError> {
         let count: i64 = self
             .conn
@@ -318,23 +346,72 @@ impl SqliteStateRepository {
     }
 
     fn read_schema_version(&self) -> Result<u32, StateError> {
-        if !self.table_exists(SCHEMA_VERSION_TABLE)? {
-            return Ok(0);
-        }
-        let version: i64 = self
-            .conn
-            .query_row(
-                &format!("SELECT COALESCE(MAX(version), 0) FROM {SCHEMA_VERSION_TABLE}"),
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| StateError::SchemaVersionReadFailed {
-                detail: e.to_string(),
-            })?;
-        u32::try_from(version).map_err(|_| StateError::SchemaVersionReadFailed {
-            detail: format!("recorded schema version {version} is negative"),
-        })
+        read_schema_version(&self.conn)
     }
+}
+
+fn read_schema_version(conn: &Connection) -> Result<u32, StateError> {
+    let exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [SCHEMA_VERSION_TABLE],
+            |row| row.get(0),
+        )
+        .map_err(|e| StateError::SchemaVersionReadFailed {
+            detail: e.to_string(),
+        })?;
+    if exists == 0 {
+        return Ok(0);
+    }
+    let version: i64 = conn
+        .query_row(
+            &format!("SELECT COALESCE(MAX(version), 0) FROM {SCHEMA_VERSION_TABLE}"),
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| StateError::SchemaVersionReadFailed {
+            detail: e.to_string(),
+        })?;
+    u32::try_from(version).map_err(|_| StateError::SchemaVersionReadFailed {
+        detail: format!("recorded schema version {version} is negative"),
+    })
+}
+
+fn verify_exact_ledger(conn: &Connection, chain: &[Migration]) -> Result<(), StateError> {
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT version, migration_name FROM {SCHEMA_VERSION_TABLE} ORDER BY version"
+        ))
+        .map_err(|error| StateError::MigrationLedgerCorrupt {
+            detail: error.to_string(),
+        })?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| StateError::MigrationLedgerCorrupt {
+            detail: error.to_string(),
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| StateError::MigrationLedgerCorrupt {
+            detail: error.to_string(),
+        })?;
+    if rows.len() != chain.len() {
+        return Err(StateError::MigrationLedgerCorrupt {
+            detail: format!("expected {} rows, found {}", chain.len(), rows.len()),
+        });
+    }
+    for ((version, name), expected) in rows.iter().zip(chain) {
+        if *version != i64::from(expected.version) || name != expected.name {
+            return Err(StateError::MigrationLedgerCorrupt {
+                detail: format!(
+                    "expected ({}, {:?}), found ({version}, {name:?})",
+                    expected.version, expected.name
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Applies the mandatory connection configuration required by the BUILD-A1
@@ -419,6 +496,10 @@ fn read_pragma_integer(conn: &Connection, name: &str) -> Result<i64, StateError>
 /// never committed.
 fn bootstrap(conn: &mut Connection, chain: &[Migration]) -> Result<(), StateError> {
     for migration in chain {
+        if migration.version == 12 && migration.name == "context_epoch_unbounded" {
+            migrations::v0012_context_epoch_unbounded::apply(conn)?;
+            continue;
+        }
         let tx = conn
             .transaction()
             .map_err(|e| StateError::TransactionBeginFailed {

@@ -39,6 +39,7 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::epoch_value::StateEpochValueV1;
 use crate::error::StateError;
 use crate::repository::{SqliteStateRepository, UnitOfWork};
 
@@ -481,7 +482,7 @@ pub struct EventEnvelope {
     /// structural identifier.
     pub correlation_id: String,
     /// Non-negative event epoch.
-    pub epoch: i64,
+    pub epoch: StateEpochValueV1,
 }
 
 impl SqliteStateRepository {
@@ -610,7 +611,7 @@ fn insert_event(conn: &Connection, event: &EventEnvelope) -> Result<(), StateErr
             event.payload.reference,
             event.payload.digest,
             event.correlation_id,
-            event.epoch,
+            event.epoch.as_str(),
         ],
     )
     .map_err(|error| {
@@ -650,7 +651,7 @@ struct EventRow {
     payload_reference: String,
     payload_digest: String,
     correlation_id: String,
-    epoch: i64,
+    epoch: String,
 }
 
 impl EventRow {
@@ -658,11 +659,11 @@ impl EventRow {
     /// and fails closed on any violation. Persisted structural strings are
     /// surfaced exactly as stored; they are never repaired or rewritten.
     fn into_event_envelope(self) -> Result<EventEnvelope, StateError> {
-        if self.epoch < 0 {
-            return Err(StateError::EventDecodeFailed {
-                detail: format!("persisted epoch {} is negative", self.epoch),
-            });
-        }
+        let epoch = StateEpochValueV1::try_from(self.epoch).map_err(|error| {
+            StateError::EventDecodeFailed {
+                detail: error.to_string(),
+            }
+        })?;
         Ok(EventEnvelope {
             event_id: self.event_id,
             project_id: self.project_id,
@@ -682,7 +683,7 @@ impl EventRow {
                 digest: self.payload_digest,
             },
             correlation_id: self.correlation_id,
-            epoch: self.epoch,
+            epoch,
         })
     }
 }
@@ -732,11 +733,6 @@ pub(crate) fn validate_for_append(event: &EventEnvelope) -> Result<(), StateErro
     ensure_non_empty("payload.reference", &event.payload.reference)?;
     ensure_non_empty("payload.digest", &event.payload.digest)?;
     ensure_non_empty("correlation_id", &event.correlation_id)?;
-    if event.epoch < 0 {
-        return Err(StateError::EventValidation {
-            detail: format!("epoch must be >= 0, found {}", event.epoch),
-        });
-    }
     Ok(())
 }
 
