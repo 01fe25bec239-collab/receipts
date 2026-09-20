@@ -116,6 +116,72 @@ impl std::fmt::Display for GoalEvaluationCoreError {
 
 impl std::error::Error for GoalEvaluationCoreError {}
 
+/// Construction failures for [`GoalEvaluationContextEpoch`] decimal input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalEvaluationContextEpochError {
+    InvalidDecimalInteger,
+    NegativeInteger,
+}
+
+impl std::fmt::Display for GoalEvaluationContextEpochError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidDecimalInteger => {
+                f.write_str("expected decimal integer digits with an optional sign")
+            }
+            Self::NegativeInteger => f.write_str("context_epoch must be non-negative"),
+        }
+    }
+}
+
+impl std::error::Error for GoalEvaluationContextEpochError {}
+
+/// Immutable, arbitrary-magnitude non-negative integer VALUE carrier.
+///
+/// Decimal digits are an in-process representation, not a wire-format claim.
+/// There is no finite semantic maximum. This type provides no State lookup,
+/// epoch advancement or lifecycle, ordering, or arithmetic authority.
+///
+/// ```compile_fail
+/// # fn forbidden(value: &mut receipts_orchestration::goal::GoalEvaluationContextEpoch) {
+/// value.digits.clear();
+/// # }
+/// ```
+/// ```compile_fail
+/// # fn forbidden(value: &mut receipts_orchestration::goal::GoalEvaluationContextEpoch) {
+/// let _: &mut str = value.decimal_digits();
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalEvaluationContextEpoch {
+    digits: String,
+}
+
+impl GoalEvaluationContextEpoch {
+    /// Constructs an integer VALUE from a decimal convenience spelling.
+    ///
+    /// This parses no JSON syntax and establishes no serialization contract.
+    /// Optional signs and leading zeroes are accepted; negative zero is zero.
+    pub fn from_decimal(value: &str) -> Result<Self, GoalEvaluationContextEpochError> {
+        let digits = value.strip_prefix(['+', '-']).unwrap_or(value);
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(GoalEvaluationContextEpochError::InvalidDecimalInteger);
+        }
+        let magnitude = digits.trim_start_matches('0');
+        if value.starts_with('-') && !magnitude.is_empty() {
+            return Err(GoalEvaluationContextEpochError::NegativeInteger);
+        }
+        Ok(Self {
+            digits: if magnitude.is_empty() { "0" } else { magnitude }.into(),
+        })
+    }
+
+    /// Canonical decimal magnitude for read-only in-process inspection.
+    pub fn decimal_digits(&self) -> &str {
+        &self.digits
+    }
+}
+
 /// Immutable supplied deterministic layer. Conditions retain order and duplicates.
 /// Missing conditions and an explicitly empty list remain distinct.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,8 +254,13 @@ pub struct DeterministicGoalEvaluationCore {
     state: GoalEvaluationState,
     deterministic_layer: DeterministicLayer,
     integrated_sha: Option<String>,
-    context_epoch: Option<i64>,
+    context_epoch: Option<GoalEvaluationContextEpoch>,
     evaluated_at: OrchestrationDateTimeV1,
+}
+
+enum ContextEpochInput {
+    Legacy(Option<i64>),
+    FullDomain(Option<GoalEvaluationContextEpoch>),
 }
 
 impl DeterministicGoalEvaluationCore {
@@ -204,6 +275,53 @@ impl DeterministicGoalEvaluationCore {
         deterministic_layer: DeterministicLayer,
         integrated_sha: Option<String>,
         context_epoch: Option<i64>,
+        evaluated_at: OrchestrationDateTimeV1,
+    ) -> Result<Self, GoalEvaluationCoreError> {
+        Self::build(
+            evaluation_id,
+            goal_id,
+            project_id,
+            state,
+            deterministic_layer,
+            integrated_sha,
+            ContextEpochInput::Legacy(context_epoch),
+            evaluated_at,
+        )
+    }
+
+    /// Constructs with the complete non-negative integer context-epoch domain.
+    #[allow(clippy::too_many_arguments)] // Explicit schema fields; no hidden defaults.
+    pub fn try_new_with_context_epoch(
+        evaluation_id: String,
+        goal_id: String,
+        project_id: Option<String>,
+        state: GoalEvaluationState,
+        deterministic_layer: DeterministicLayer,
+        integrated_sha: Option<String>,
+        context_epoch: Option<GoalEvaluationContextEpoch>,
+        evaluated_at: OrchestrationDateTimeV1,
+    ) -> Result<Self, GoalEvaluationCoreError> {
+        Self::build(
+            evaluation_id,
+            goal_id,
+            project_id,
+            state,
+            deterministic_layer,
+            integrated_sha,
+            ContextEpochInput::FullDomain(context_epoch),
+            evaluated_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Shared validation for both public constructors.
+    fn build(
+        evaluation_id: String,
+        goal_id: String,
+        project_id: Option<String>,
+        state: GoalEvaluationState,
+        deterministic_layer: DeterministicLayer,
+        integrated_sha: Option<String>,
+        context_epoch: ContextEpochInput,
         evaluated_at: OrchestrationDateTimeV1,
     ) -> Result<Self, GoalEvaluationCoreError> {
         for (field, value) in [
@@ -226,11 +344,16 @@ impl DeterministicGoalEvaluationCore {
         {
             return Err(GoalEvaluationCoreError::InvalidIntegratedSha);
         }
-        if let Some(value) = context_epoch
-            && value < 0
-        {
-            return Err(GoalEvaluationCoreError::NegativeContextEpoch { value });
-        }
+        let context_epoch = match context_epoch {
+            ContextEpochInput::Legacy(Some(value)) if value < 0 => {
+                return Err(GoalEvaluationCoreError::NegativeContextEpoch { value });
+            }
+            ContextEpochInput::Legacy(Some(value)) => Some(GoalEvaluationContextEpoch {
+                digits: value.to_string(),
+            }),
+            ContextEpochInput::Legacy(None) | ContextEpochInput::FullDomain(None) => None,
+            ContextEpochInput::FullDomain(value) => value,
+        };
         if state == GoalEvaluationState::Complete && !deterministic_layer.passed() {
             return Err(GoalEvaluationCoreError::CompleteWithFailedLayer);
         }
@@ -277,8 +400,9 @@ impl DeterministicGoalEvaluationCore {
         &self.evaluated_at
     }
 
-    pub fn context_epoch(&self) -> Option<i64> {
-        self.context_epoch
+    /// Full-domain integer VALUE only; no lifecycle, lookup, or wire authority.
+    pub fn context_epoch(&self) -> Option<&GoalEvaluationContextEpoch> {
+        self.context_epoch.as_ref()
     }
 }
 
