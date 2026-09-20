@@ -44,6 +44,7 @@ impl Fixture {
             checkpoint: &self.checkpoint,
             decision,
             pre_recovery_checkpoint_id: "fresh".into(),
+            pre_recovery_captured_at: WorkspaceDateTimeV1::try_new("2026-09-20T00:00:00Z").unwrap(),
             attempt_id: Some("replacement-attempt".into()),
             last_accepted_sha: None,
         }
@@ -142,6 +143,14 @@ fn recovery_preparation_all_decisions_preserve_dirty_index_refs_and_untracked_by
             decision == WorkspaceRecoveryDecision::ResetToLastAccepted
         );
         let fresh = result.pre_recovery_capture();
+        assert_eq!(result.pre_recovery_temporal_capture().core(), fresh);
+        assert_eq!(
+            result
+                .pre_recovery_temporal_capture()
+                .captured_at()
+                .as_str(),
+            "2026-09-20T00:00:00Z"
+        );
         assert_eq!(fresh.kind(), WorkspaceCheckpointKind::RecoveryCapture);
         assert_eq!(fresh.checkpoint_id(), "fresh");
         assert_eq!(fresh.workspace_id(), "workspace");
@@ -164,6 +173,34 @@ fn recovery_preparation_all_decisions_preserve_dirty_index_refs_and_untracked_by
             git(f.root(), &["show", ":tracked"]).stdout,
             b"staged\0bytes"
         );
+    }
+}
+
+#[test]
+fn recovery_preparation_preserves_caller_timestamp_spelling_without_temporal_policy() {
+    let f = Fixture::new(None);
+    for spelling in [
+        "2026-09-20t00:00:00z",
+        "2026-09-20T00:00:00.0012300Z",
+        "2026-09-20T00:00:00+05:30",
+        "0000-01-01T00:00:00-00:00",
+    ] {
+        for decision in WorkspaceRecoveryDecision::ALL {
+            let mut request = f.request(decision);
+            request.pre_recovery_captured_at = WorkspaceDateTimeV1::try_new(spelling).unwrap();
+            if decision == WorkspaceRecoveryDecision::ResetToLastAccepted {
+                request.last_accepted_sha = Some(f.handle.base_sha().as_str());
+            }
+            let result = prepare_workspace_checkpoint_recovery(request).unwrap();
+            let temporal = result.pre_recovery_temporal_capture();
+            assert_eq!(temporal.captured_at().as_str(), spelling);
+            assert_eq!(temporal.core().head_sha(), result.current_head());
+            assert_eq!(result.pre_recovery_capture(), temporal.core());
+            assert_eq!(
+                temporal.core().kind(),
+                WorkspaceCheckpointKind::RecoveryCapture
+            );
+        }
     }
 }
 

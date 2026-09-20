@@ -6,8 +6,8 @@ use crate::checkpoint_evidence_capture::{observe, parse_head, parse_root};
 use crate::{
     CommitSha, WorkspaceCheckpointCaptureCore, WorkspaceCheckpointEvidenceCaptureError,
     WorkspaceCheckpointEvidenceCaptureRequest, WorkspaceCheckpointGitObservation as Observation,
-    WorkspaceCheckpointKind, WorkspaceHandle, WorkspaceRecoveryDecision,
-    capture_workspace_checkpoint_evidence,
+    WorkspaceCheckpointKind, WorkspaceCheckpointTemporalCaptureCore, WorkspaceDateTimeV1,
+    WorkspaceHandle, WorkspaceRecoveryDecision, capture_workspace_checkpoint_temporal_evidence,
 };
 
 /// Caller-selected recovery context. The handle is the only source of a target
@@ -19,6 +19,7 @@ pub struct WorkspaceRecoveryPreparationRequest<'a> {
     pub checkpoint: &'a WorkspaceCheckpointCaptureCore,
     pub decision: WorkspaceRecoveryDecision,
     pub pre_recovery_checkpoint_id: String,
+    pub pre_recovery_captured_at: WorkspaceDateTimeV1,
     pub attempt_id: Option<String>,
     pub last_accepted_sha: Option<&'a str>,
 }
@@ -45,7 +46,7 @@ pub struct WorkspaceRecoveryPreparation<'a> {
     canonical_target: PathBuf,
     decision: WorkspaceRecoveryDecision,
     current_head: CommitSha,
-    pre_recovery_capture: WorkspaceCheckpointCaptureCore,
+    pre_recovery_temporal_capture: WorkspaceCheckpointTemporalCaptureCore,
     last_accepted_sha: Option<CommitSha>,
 }
 
@@ -66,7 +67,10 @@ impl<'a> WorkspaceRecoveryPreparation<'a> {
         &self.current_head
     }
     pub fn pre_recovery_capture(&self) -> &WorkspaceCheckpointCaptureCore {
-        &self.pre_recovery_capture
+        self.pre_recovery_temporal_capture.core()
+    }
+    pub fn pre_recovery_temporal_capture(&self) -> &WorkspaceCheckpointTemporalCaptureCore {
+        &self.pre_recovery_temporal_capture
     }
     pub fn last_accepted_sha(&self) -> Option<&CommitSha> {
         self.last_accepted_sha.as_ref()
@@ -120,6 +124,7 @@ pub fn prepare_workspace_checkpoint_recovery(
         checkpoint,
         decision,
         pre_recovery_checkpoint_id,
+        pre_recovery_captured_at,
         attempt_id,
         last_accepted_sha,
     } = request;
@@ -148,8 +153,8 @@ pub fn prepare_workspace_checkpoint_recovery(
     if let Some(target) = &last_accepted_sha {
         verify_commit(&root, target)?;
     }
-    let pre_recovery_capture =
-        capture_workspace_checkpoint_evidence(WorkspaceCheckpointEvidenceCaptureRequest {
+    let pre_recovery_temporal_capture = capture_workspace_checkpoint_temporal_evidence(
+        WorkspaceCheckpointEvidenceCaptureRequest {
             directory: &root,
             checkpoint_id: pre_recovery_checkpoint_id,
             workspace_id: handle.workspace_id().into(),
@@ -159,13 +164,15 @@ pub fn prepare_workspace_checkpoint_recovery(
             base_sha: None,
             dirty_diff_ref: None,
             executed_checks: Vec::new(),
-        })?;
+        },
+        pre_recovery_captured_at,
+    )?;
     // Detect observable target/branch/HEAD changes across capture, without
     // pretending to exclude arbitrary concurrent writers or prove continuity.
     if validate_target(handle)? != root {
         return Err(E::WorktreeRootMismatch);
     }
-    if pre_recovery_capture.head_sha() != &current_head
+    if pre_recovery_temporal_capture.core().head_sha() != &current_head
         || self::current_head(&root)? != current_head
     {
         return Err(E::HeadChanged);
@@ -176,7 +183,7 @@ pub fn prepare_workspace_checkpoint_recovery(
         canonical_target: root,
         decision,
         current_head,
-        pre_recovery_capture,
+        pre_recovery_temporal_capture,
         last_accepted_sha,
     })
 }
