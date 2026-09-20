@@ -302,6 +302,7 @@ version = "0.1.0"
 name = "receipts-orchestration"
 version = "0.1.0"
 dependencies = [
+ "receipts-state",
  "receipts-workspace-execution",
 ]
 
