@@ -126,3 +126,9 @@ pub use review_request::ReviewRequest;
 
 #[cfg(test)]
 mod review_request_tests;
+
+pub mod integration_decision;
+pub use integration_decision::IntegrationDecision;
+
+#[cfg(test)]
+mod integration_decision_tests;
