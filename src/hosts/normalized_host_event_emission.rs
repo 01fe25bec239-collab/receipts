@@ -1,7 +1,8 @@
-//! Pure whole-event semantic source compatibility; no physical emission.
+//! Whole-event semantic source compatibility and validated adapter emission.
+//! This composition provides no live host event producer or delivery guarantee.
 
 use crate::{
-    NormalizedHostEvent, NormalizedHostEventSourceClass, NormalizedHostEventType,
+    HostAdapter, NormalizedHostEvent, NormalizedHostEventSourceClass, NormalizedHostEventType,
     source_class_allowed,
 };
 
@@ -25,6 +26,22 @@ impl std::fmt::Display for NormalizedHostEventEmissionSourceError {
 }
 
 impl std::error::Error for NormalizedHostEventEmissionSourceError {}
+
+/// Validates the explicit source class, then calls [`HostAdapter::emit`] exactly once.
+///
+/// Rejection returns the existing validation error without calling the adapter.
+/// Acceptance passes the original event reference and returns the adapter's
+/// opaque outcome unchanged. Compatibility establishes no authenticity, trust,
+/// confidence correctness, payload correctness, persistence, or delivery.
+/// This bridge does not produce or normalize live host events.
+pub fn emit_validated_normalized_host_event<A: HostAdapter>(
+    adapter: &A,
+    source_class: NormalizedHostEventSourceClass,
+    event: &NormalizedHostEvent,
+) -> Result<A::EmitOutcome, NormalizedHostEventEmissionSourceError> {
+    validate_normalized_host_event_source(source_class, event)?;
+    Ok(adapter.emit(event))
+}
 
 /// Validates only semantic source-class compatibility through [`source_class_allowed`].
 ///
