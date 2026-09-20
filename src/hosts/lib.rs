@@ -21,7 +21,9 @@
 //! * read-only Host capability observation through fixed configuration paths
 //!   and an enumerated non-worker CLI probe; no shell or filesystem writes;
 //! * no installation, hook mutation, trust approval, credential authority,
-//!   networking, rendering, event normalization, or runtime worker execution;
+//!   networking, event normalization, or runtime worker execution;
+//! * [`render_graph_snapshot`] formats supplied snapshot evidence only; summary
+//!   and graph topology are omitted, and no live Host presentation is bound;
 //! * adjacent frozen contracts (`InstallPlan`, `CoreHandle`,
 //!   `CoreView`, `UserPrompt`, `UserResponse`,
 //!   shutdown reason) remain externally owned and
@@ -38,6 +40,7 @@
 //! * no authoritative state read or write path exists here.
 
 pub mod adapter;
+pub mod graph_snapshot_renderer;
 pub mod host_capability_consistency;
 pub mod host_capability_freshness_policy;
 pub mod host_capability_freshness_vocabulary;
@@ -65,6 +68,9 @@ mod adapter_tests;
 
 #[cfg(test)]
 mod conformance_tests;
+
+#[cfg(test)]
+mod graph_snapshot_renderer_tests;
 
 #[cfg(test)]
 mod host_capability_consistency_tests;
@@ -121,6 +127,7 @@ mod normalized_host_event_source_class_tests;
 mod normalized_host_event_source_policy_tests;
 
 pub use adapter::HostAdapter;
+pub use graph_snapshot_renderer::render_graph_snapshot;
 pub use host_capability_consistency::{
     HostCapabilityConsistencyError, HostCapabilityConsistencyInputs,
     validate_complete_probe_consistency,
