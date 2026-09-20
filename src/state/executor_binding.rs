@@ -164,6 +164,42 @@ pub struct ExecutorBinding {
 }
 
 impl SqliteStateRepository {
+    /// Reads the binding whose incomplete terminal pair blocks a successor.
+    /// Partial terminal shapes remain blocking; lease age and rehydration
+    /// evidence do not affect selection. Discovery and complete decoding
+    /// share one read snapshot. Multiple blockers fail closed as corruption.
+    pub fn find_role_blocking_executor_binding(
+        &self,
+        role_id: &str,
+    ) -> Result<Option<ExecutorBinding>, StateError> {
+        ensure_identifier("role_id", role_id)?;
+        let tx = self
+            .connection()
+            .unchecked_transaction()
+            .map_err(internal_query_failure)?;
+        let ids = {
+            let mut statement = tx
+                .prepare(INSPECT_ROLE_BLOCKERS_SQL)
+                .map_err(internal_query_failure)?;
+            statement
+                .query_map([role_id], |row| row.get::<_, String>(0))
+                .map_err(internal_query_failure)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(internal_query_failure)?
+        };
+        let found = match ids.as_slice() {
+            [] => None,
+            [id] => read_executor_binding(&tx, id)?,
+            _ => {
+                return Err(StateError::InternalQueryFailed {
+                    detail: format!("multiple blocking executor bindings for role_id {role_id:?}"),
+                });
+            }
+        };
+        tx.commit().map_err(internal_query_failure)?;
+        Ok(found)
+    }
+
     /// Durably creates a new immutable ExecutorBinding.
     ///
     /// Creation is atomic: the row commits or not at all. A `binding_id`
@@ -326,6 +362,11 @@ const ROLE_BLOCKING_BINDING_SQL: &str = "SELECT binding_id FROM executor_binding
 WHERE role_id = ?1 AND (released_at IS NULL OR release_reason IS NULL)
 ORDER BY binding_id
 LIMIT 1";
+
+const INSPECT_ROLE_BLOCKERS_SQL: &str = "SELECT binding_id FROM executor_binding
+WHERE role_id = ?1 AND (released_at IS NULL OR release_reason IS NULL)
+ORDER BY binding_id COLLATE BINARY ASC
+LIMIT 2";
 
 const INSERT_BINDING_SQL: &str = "INSERT INTO executor_binding (
     binding_id,
