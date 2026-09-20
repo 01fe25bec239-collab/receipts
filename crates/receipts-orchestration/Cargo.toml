@@ -9,4 +9,5 @@ publish = false
 path = "../../src/core/lib.rs"
 
 [dependencies]
+receipts-state = { path = "../.." }
 receipts-workspace-execution = { path = "../receipts-workspace-execution" }
