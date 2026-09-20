@@ -12,9 +12,10 @@ use receipts_workspace_execution::execution::{
 };
 
 use crate::{
-    CodexLiveProtocolError, CodexLiveStartError, CodexProbeChannel, CodexProbeError,
-    CodexProbeExecutionError, CodexProbeKind, CodexTaskExecutionError, CodexTaskOutputChannel,
-    FailureClass, classify_codex_probe_execution_error, classify_codex_task_execution_error,
+    CodexAuthStatusError, CodexLiveProtocolError, CodexLiveStartError, CodexProbeChannel,
+    CodexProbeError, CodexProbeExecutionError, CodexProbeKind, CodexTaskExecutionError,
+    CodexTaskOutputChannel, FailureClass, classify_codex_auth_status_error,
+    classify_codex_probe_execution_error, classify_codex_task_execution_error,
 };
 
 /// Runtime origin of one error observation, not a lifecycle cause or policy decision.
@@ -25,6 +26,7 @@ pub enum RawFailureSource {
     ClaudeLiveStart,
     ClaudeProtocol,
     ClaudeAuthStatus,
+    CodexAuthStatus,
     /// One-shot task execution.
     CodexTask,
     /// Capability probing, with the original probe kind where available.
@@ -296,5 +298,22 @@ impl From<&crate::ClaudeAuthStatusError> for RawFailure {
         };
         failure.source = RawFailureSource::ClaudeAuthStatus;
         failure
+    }
+}
+
+impl From<&CodexAuthStatusError> for RawFailure {
+    fn from(error: &CodexAuthStatusError) -> Self {
+        let evidence = match error {
+            CodexAuthStatusError::Workspace(error) => {
+                RawFailureEvidence::WorkspaceExecution(discriminant(error))
+            }
+            CodexAuthStatusError::TimedOut(termination) => {
+                RawFailureEvidence::TimedOut(*termination)
+            }
+        };
+        Self {
+            class: classify_codex_auth_status_error(error),
+            ..Self::unknown(RawFailureSource::CodexAuthStatus, evidence)
+        }
     }
 }

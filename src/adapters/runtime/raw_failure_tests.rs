@@ -5,11 +5,12 @@ use receipts_workspace_execution::execution::{
 };
 
 use crate::{
-    CodexCapability, CodexJsonlError, CodexJsonlErrorKind, CodexLiveProtocolError,
-    CodexLiveStartError, CodexProbeChannel, CodexProbeError, CodexProbeExecutionError,
-    CodexProbeKind, CodexTaskExecutionError, CodexTaskOutputChannel, FailureClass, RawFailure,
-    RawFailureEvidence as Evidence, RawFailureSource as Source,
-    classify_codex_probe_execution_error, classify_codex_task_execution_error,
+    CodexAuthStatusError, CodexCapability, CodexJsonlError, CodexJsonlErrorKind,
+    CodexLiveProtocolError, CodexLiveStartError, CodexProbeChannel, CodexProbeError,
+    CodexProbeExecutionError, CodexProbeKind, CodexTaskExecutionError, CodexTaskOutputChannel,
+    FailureClass, RawFailure, RawFailureEvidence as Evidence, RawFailureSource as Source,
+    classify_codex_auth_status_error, classify_codex_probe_execution_error,
+    classify_codex_task_execution_error,
 };
 
 const SECRET: &str = "sk-test-NOT-A-REAL-CREDENTIAL-A3-012";
@@ -25,6 +26,46 @@ fn safe(failure: RawFailure) {
 fn workspace_error() -> ExecutionError {
     ExecutionError::ProcessSpawnFailed {
         detail: SECRET.repeat(100_000),
+    }
+}
+
+#[test]
+fn raw_codex_auth_status_preserves_only_typed_evidence_and_existing_classifier() {
+    let workspace = workspace_error();
+    let workspace_kind = discriminant(&workspace);
+    let cases = [
+        (
+            CodexAuthStatusError::Workspace(workspace),
+            Evidence::WorkspaceExecution(workspace_kind),
+            FailureClass::Unknown,
+        ),
+        (
+            CodexAuthStatusError::TimedOut(ProcessTermination::TimedOutGracefullyTerminated),
+            Evidence::TimedOut(ProcessTermination::TimedOutGracefullyTerminated),
+            FailureClass::Timeout,
+        ),
+        (
+            CodexAuthStatusError::TimedOut(ProcessTermination::TimedOutForceKilled),
+            Evidence::TimedOut(ProcessTermination::TimedOutForceKilled),
+            FailureClass::Timeout,
+        ),
+        (
+            CodexAuthStatusError::TimedOut(ProcessTermination::Completed),
+            Evidence::TimedOut(ProcessTermination::Completed),
+            FailureClass::Unknown,
+        ),
+    ];
+    for (error, evidence, class) in cases {
+        let failure = RawFailure::from(&error);
+        assert_eq!(failure.origin(), Source::CodexAuthStatus);
+        assert_eq!(failure.evidence(), evidence);
+        assert_eq!(failure.classify_failure(), class);
+        assert_eq!(
+            failure.classify_failure(),
+            classify_codex_auth_status_error(&error)
+        );
+        drop(error);
+        safe(failure);
     }
 }
 
