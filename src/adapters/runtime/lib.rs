@@ -2,6 +2,12 @@ mod adapter;
 mod attempt;
 mod auth_status;
 mod claude_execution;
+mod claude_probe;
+mod claude_probe_execution;
+#[cfg(all(test, unix))]
+mod claude_probe_execution_tests;
+#[cfg(test)]
+mod claude_probe_tests;
 mod claude_stream_json;
 mod codex_auth_status;
 mod codex_failure_classification;
@@ -89,3 +95,12 @@ pub use codex_task_execution::{
     CodexTaskOutputChannel, CodexTaskSandboxMode, execute_codex_task_once,
 };
 pub use failure::FailureClass;
+
+pub use claude_probe::{
+    ClaudeCapability, ClaudeCapabilityEvidence, ClaudeCapabilityProbeReport, ClaudeProbeChannel,
+    ClaudeProbeError, ClaudeProbeKind, ClaudeProbeObservation, parse_claude_probe,
+};
+pub use claude_probe_execution::{
+    ClaudeProbeExecutionError, classify_claude_probe_execution_error,
+    execute_claude_capability_probe,
+};
