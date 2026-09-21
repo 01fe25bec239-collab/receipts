@@ -67,7 +67,7 @@ pub use routing_decision::{
 };
 
 pub use routing_request::{
-    RoutingPriority, RoutingQualityFloor, RoutingRequestConstraints,
+    RoutingPriority, RoutingQualityFloor, RoutingRequest, RoutingRequestConstraints,
     RoutingRequestConstraintsError, RoutingRequestCoreError, RoutingRequestNonTemporalCore,
     RoutingRequestRole, RoutingTaskClass,
 };

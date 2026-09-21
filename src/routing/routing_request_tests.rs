@@ -1,5 +1,6 @@
+use crate::policy_eligibility::{ModelRoutingDateTimeV1, ModelRoutingDateTimeV1Error};
 use crate::{
-    RoutingPriority, RoutingQualityFloor, RoutingRequestConstraints,
+    RoutingPriority, RoutingQualityFloor, RoutingRequest, RoutingRequestConstraints,
     RoutingRequestConstraintsError, RoutingRequestCoreError, RoutingRequestNonTemporalCore,
     RoutingRequestRole, RoutingTaskClass,
 };
@@ -79,6 +80,102 @@ fn closed_vocabularies_have_exact_order_and_canonical_strings() {
         RoutingPriority::ALL.map(|v| v.as_str()),
         ["HIGHEST", "HIGH", "SECONDARY", "LOW"]
     );
+}
+
+#[test]
+fn deadline_states_are_distinct_and_preserve_the_complete_core() {
+    let capabilities = vec![" \t\n".into(), "CoDiNg/界/e\u{301}".into(), " \t\n".into()];
+    let core = RoutingRequestNonTemporalCore::try_new(
+        " request/界 ".into(),
+        Some(" task/Ω ".into()),
+        RoutingRequestRole::Reviewer,
+        RoutingTaskClass::SecurityCriticalCode,
+        RoutingQualityFloor::Economy,
+        capabilities.clone(),
+        Some(capabilities),
+        Some(RoutingPriority::Low),
+        Some(RoutingPriority::Highest),
+        Some(
+            RoutingRequestConstraints::try_new(
+                Some("provider".into()),
+                Some(vec!["provider".into()]),
+                Some("model".into()),
+                Some("provider".into()),
+                Some(-0.0),
+            )
+            .unwrap(),
+        ),
+        Some(u64::MAX),
+    )
+    .unwrap();
+    let timestamp = ModelRoutingDateTimeV1::try_new("2026-09-21T12:34:56Z".into()).unwrap();
+    let absent = RoutingRequest::new(core.clone(), None);
+    let null = RoutingRequest::new(core.clone(), Some(None));
+    let value = RoutingRequest::new(core.clone(), Some(Some(timestamp.clone())));
+    assert_eq!(absent.deadline(), None);
+    assert_eq!(null.deadline(), Some(None));
+    assert_eq!(value.deadline(), Some(Some(&timestamp)));
+    assert_ne!(absent, null);
+    assert_ne!(absent, value);
+    assert_ne!(null, value);
+    for request in [absent, null, value] {
+        assert_eq!(request.core(), &core);
+        assert_eq!(request, request.clone());
+        assert_eq!(
+            request
+                .core()
+                .constraints()
+                .unwrap()
+                .max_cost()
+                .unwrap()
+                .to_bits(),
+            (-0.0_f64).to_bits()
+        );
+    }
+}
+
+#[test]
+fn deadline_preserves_exact_accepted_lexical_values() {
+    let core = request("r".into(), None, vec!["coding".into()], Some(vec![])).unwrap();
+    let long = format!("2026-09-21T12:34:56.{}Z", "0123456789".repeat(1_000));
+    for text in [
+        "2026-09-21T12:34:56Z",
+        "2026-09-21t12:34:56z",
+        "2026-09-21T12:34:56-00:00",
+        "2026-09-21T12:34:56+05:30",
+        "2026-09-21T12:34:56.1200Z",
+        "0000-02-29t00:00:00z",
+        "9999-12-31T23:59:60+23:59",
+        long.as_str(),
+    ] {
+        let timestamp = ModelRoutingDateTimeV1::try_new(text.into()).unwrap();
+        let request = RoutingRequest::new(core.clone(), Some(Some(timestamp.clone())));
+        assert_eq!(request.deadline(), Some(Some(&timestamp)));
+        assert_eq!(request.deadline().unwrap().unwrap().as_str(), text);
+        assert_eq!(request.core(), &core);
+    }
+}
+
+#[test]
+fn invalid_deadlines_fail_at_the_canonical_validation_boundary() {
+    let core = request("r".into(), None, vec!["coding".into()], None).unwrap();
+    for text in [
+        "",
+        "2026-02-29T12:34:56Z",
+        "2026-09-21T24:34:56Z",
+        "2026-09-21T12:34:61Z",
+        "2026-09-21T12:34:56",
+        "2026-09-21T12:34:56.Z",
+        "2026-09-21T12:34:56+24:00",
+        " 2026-09-21T12:34:56Z",
+    ] {
+        assert_eq!(
+            ModelRoutingDateTimeV1::try_new(text.into())
+                .map(|value| RoutingRequest::new(core.clone(), Some(Some(value)))),
+            Err(ModelRoutingDateTimeV1Error),
+            "{text:?}"
+        );
+    }
 }
 
 fn request(
