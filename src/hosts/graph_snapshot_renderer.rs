@@ -53,7 +53,13 @@ fn display_text(value: Option<&str>) -> String {
             '\n' => output.push_str("\\n"),
             '\r' => output.push_str("\\r"),
             '\t' => output.push_str("\\t"),
-            control if control.is_control() || matches!(control, '\u{2028}' | '\u{2029}') => {
+            control
+                if control.is_control()
+                    || matches!(
+                        control,
+                        '\u{061c}' | '\u{200e}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+                    ) =>
+            {
                 write!(output, "\\u{{{:x}}}", u32::from(control))
                     .expect("writing to a String cannot fail");
             }

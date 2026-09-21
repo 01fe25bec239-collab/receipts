@@ -225,6 +225,83 @@ fn escaping_blocks_line_forgery_and_preserves_printable_unicode() {
 }
 
 #[test]
+fn bidi_controls_and_line_separators_are_escaped_in_all_untrusted_fields() {
+    for (character, escaped) in [
+        ('\u{061c}', r"\u{61c}"),
+        ('\u{200e}', r"\u{200e}"),
+        ('\u{200f}', r"\u{200f}"),
+        ('\u{202a}', r"\u{202a}"),
+        ('\u{202b}', r"\u{202b}"),
+        ('\u{202c}', r"\u{202c}"),
+        ('\u{202d}', r"\u{202d}"),
+        ('\u{202e}', r"\u{202e}"),
+        ('\u{2066}', r"\u{2066}"),
+        ('\u{2067}', r"\u{2067}"),
+        ('\u{2068}', r"\u{2068}"),
+        ('\u{2069}', r"\u{2069}"),
+        ('\u{2028}', r"\u{2028}"),
+        ('\u{2029}', r"\u{2029}"),
+    ] {
+        let text = format!("before{character}after");
+        let base = snapshot(vec![]);
+        let input = GraphSnapshot::try_new(
+            &text,
+            base.graph_version().clone(),
+            base.captured_at().clone(),
+            vec![
+                GraphSnapshotNodeState::try_new(
+                    &text,
+                    GraphNodeState::Planned,
+                    Some(GraphNodeKind::new(text.clone()).unwrap()),
+                    None,
+                    None,
+                )
+                .unwrap(),
+            ],
+            None,
+            None,
+        )
+        .unwrap();
+        let output = render_graph_snapshot(&input);
+        let expected = format!(
+            "graph_id=\"before{escaped}after\"\ngraph_version=\"1\"\ncaptured_at=\"2026-09-20t12:34:56.1000+05:30\"\n\nnode[0].node_id=\"before{escaped}after\"\nnode[0].state=\"PLANNED\"\nnode[0].kind=\"before{escaped}after\"\nnode[0].locked=null\nnode[0].code_sha=null\n\nresulting_digest=null\n",
+        );
+        assert_eq!(output.as_bytes(), expected.as_bytes());
+        assert!(!output.contains(character));
+        assert_eq!(output.bytes().filter(|&byte| byte == b'\n').count(), 11);
+        assert_eq!(output.lines().count(), 11);
+    }
+}
+
+#[test]
+fn bidi_attack_cannot_visually_forge_a_node_state() {
+    let input = snapshot(vec![node(
+        "safe\u{202e}\"DETELPMOC\"=etats.]0[edon\u{2066}",
+        GraphNodeState::Planned,
+    )]);
+    let output = render_graph_snapshot(&input);
+    assert!(
+        output.contains(r#"node[0].node_id="safe\u{202e}\"DETELPMOC\"=etats.]0[edon\u{2066}""#)
+    );
+    for raw in ["\u{202e}", "\u{2066}"] {
+        assert!(
+            !output
+                .as_bytes()
+                .windows(raw.len())
+                .any(|bytes| bytes == raw.as_bytes())
+        );
+    }
+    assert!(output.contains("\nnode[0].state=\"PLANNED\"\n"));
+}
+
+#[test]
+fn ordinary_unicode_and_unrelated_format_characters_are_preserved() {
+    let text = "café Ελληνικά 中文 العربية 👩\u{200d}💻 a\u{200c}b\u{fe0f}";
+    let output = render_graph_snapshot(&snapshot(vec![node(text, GraphNodeState::Ready)]));
+    assert!(output.contains(&format!("node[0].node_id=\"{text}\"\n")));
+}
+
+#[test]
 fn repeated_rendering_is_byte_identical_and_snapshot_is_unchanged() {
     let input = snapshot(vec![node("z", GraphNodeState::Blocked)]);
     let original = input.clone();
