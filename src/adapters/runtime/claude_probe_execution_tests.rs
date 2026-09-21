@@ -25,11 +25,11 @@ fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
     assert!(args == ["--version"] || args == ["--help"]);
     let kind = if args[0] == "--version" { "version" } else { "help" };
-    fs::write(format!("{kind}-observed"), b"empty environment; closed stdin; exact argv").unwrap();
     if Path::new("force").exists() {
         unsafe extern "C" { fn signal(sig: i32, handler: usize) -> usize; }
         unsafe { signal(15, 1); }
     }
+    fs::write(format!("{kind}-observed"), b"empty environment; closed stdin; exact argv; signal ready").unwrap();
     if Path::new("timeout").exists() { std::thread::sleep(Duration::from_secs(30)); }
     std::io::stdout().write_all(&fs::read(format!("{kind}-stdout")).unwrap()).unwrap();
     std::io::stderr().write_all(&fs::read(format!("{kind}-stderr")).unwrap()).unwrap();
@@ -207,8 +207,9 @@ fn real_graceful_and_forced_timeouts_preserve_workspace_termination() {
         if force {
             fixture.write("force", b"");
         }
+        // Allow finite cold-start scheduling time before exercising termination.
         let policy =
-            ProcessTimeoutPolicy::new(Duration::from_secs(1), Duration::from_millis(100)).unwrap();
+            ProcessTimeoutPolicy::new(Duration::from_secs(3), Duration::from_millis(100)).unwrap();
         let error = execute_claude_capability_probe(helper(), &fixture.root, &fixture.cwd, &policy)
             .unwrap_err();
         assert_eq!(
@@ -222,7 +223,10 @@ fn real_graceful_and_forced_timeouts_preserve_workspace_termination() {
             classify_claude_probe_execution_error(&error),
             FailureClass::Timeout
         );
-        assert!(fixture.cwd.join("version-observed").exists());
+        assert_eq!(
+            fs::read(fixture.cwd.join("version-observed")).unwrap(),
+            b"empty environment; closed stdin; exact argv; signal ready"
+        );
         assert!(!fixture.cwd.join("help-observed").exists());
     }
 }

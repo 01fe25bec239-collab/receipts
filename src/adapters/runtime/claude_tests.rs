@@ -600,7 +600,7 @@ fn drop_before_collect_and_orphan_cleanup_remain_workspace_owned() {
         let attempt = start_claude_live_attempt(&ws.request(
             "fixture",
             ClaudePermissionMode::Plan,
-            Duration::from_millis(700),
+            Duration::from_secs(1),
         ))
         .unwrap();
         ws.ready();
@@ -740,9 +740,8 @@ fn auth_execution_and_timeout_errors_are_typed_conservative_and_secret_safe() {
     safe(&RawFailure::from(&error));
     ws.write("stdout", MARKER);
     ws.write("stderr", MARKER);
-    let error =
-        observe_claude_auth_status(helper(), &ws.0, &ws.0, &policy(Duration::from_millis(700)))
-            .unwrap_err();
+    let error = observe_claude_auth_status(helper(), &ws.0, &ws.0, &policy(Duration::from_secs(1)))
+        .unwrap_err();
     assert!(matches!(error, ClaudeAuthStatusError::TimedOut(_)));
     assert_eq!(
         RawFailure::from(&error).classify_failure(),
