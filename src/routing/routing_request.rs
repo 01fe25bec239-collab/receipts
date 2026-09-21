@@ -1,6 +1,50 @@
 //! Frozen RoutingRequest vocabulary and validated in-process storage only.
 //! No parsing, policy evaluation, or executor selection.
 
+use crate::policy_eligibility::ModelRoutingDateTimeV1;
+
+/// Complete in-process request storage; no wire codec or temporal evaluation.
+/// The caller supplies `deadline`: `None` is absent, `Some(None)` is explicit
+/// null, and `Some(Some(value))` preserves a canonical timestamp unchanged.
+/// `execution_context` remains deferred; the non-temporal core is unchanged.
+///
+/// Raw text cannot bypass canonical timestamp validation.
+/// ```compile_fail
+/// # use receipts_model_routing::{RoutingRequest, RoutingRequestNonTemporalCore};
+/// # fn forbidden(core: RoutingRequestNonTemporalCore) {
+/// RoutingRequest::new(core, Some(Some(String::from("invalid"))));
+/// # }
+/// ```
+/// Fields are private and accessors expose only shared references.
+/// ```compile_fail
+/// # use receipts_model_routing::{RoutingRequest, RoutingRequestNonTemporalCore};
+/// # fn forbidden(core: RoutingRequestNonTemporalCore) {
+/// let _ = RoutingRequest { core, deadline: None };
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoutingRequest {
+    core: RoutingRequestNonTemporalCore,
+    deadline: Option<Option<ModelRoutingDateTimeV1>>,
+}
+
+impl RoutingRequest {
+    pub fn new(
+        core: RoutingRequestNonTemporalCore,
+        deadline: Option<Option<ModelRoutingDateTimeV1>>,
+    ) -> Self {
+        Self { core, deadline }
+    }
+
+    pub fn core(&self) -> &RoutingRequestNonTemporalCore {
+        &self.core
+    }
+
+    pub fn deadline(&self) -> Option<Option<&ModelRoutingDateTimeV1>> {
+        self.deadline.as_ref().map(Option::as_ref)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoutingRequestRole {
     Implementer,
@@ -189,7 +233,7 @@ impl RoutingRequestConstraints {
 }
 
 /// In-process non-temporal core, NOT the complete wire RoutingRequest.
-/// `deadline` is deferred without an authoritative timestamp binding.
+/// `deadline` is stored separately by the complete in-process [`RoutingRequest`].
 /// `execution_context` is deferred because frozen prose and schema disagree.
 /// `context_size_hint` uses a bounded non-negative u64 carrier, not an
 /// arbitrary-precision JSON integer codec; no units are implied.
