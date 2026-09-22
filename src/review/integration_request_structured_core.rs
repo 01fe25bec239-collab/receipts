@@ -1,13 +1,11 @@
-//! Review-owned, in-process, structured, non-temporal IntegrationRequest data only.
+//! Review-owned, in-process IntegrationRequest data with optional check timestamps.
 //! Authority: build-control/orchestrator-architecture/schemas/IntegrationRequest.schema.json
 //! at f49d621ee510705939394f7df4996223a73fdcb7.
 //! Evidence submitted to an acceptance/integration gate establishes no acceptance,
 //! integration, gate PASS, merge authorization, CI success, or BUILD-A1 approval.
-//! STARTED_AT_STATUS: DEFERRED_NO_AUTHORIZED_REVIEW_TEMPORAL_TYPE
-//! FINISHED_AT_STATUS: DEFERRED_NO_AUTHORIZED_REVIEW_TEMPORAL_TYPE
-//! FULL_TEMPORAL_INTEGRATIONREQUEST_CLAIMED: NO
 //! Pure shape validation and data access only; no wire serialization or persistence.
 
+use crate::ReviewDateTimeV1;
 use crate::{
     A4ReviewFindingCategory, A4ReviewFindingConfidence, A4ReviewFindingSeverity,
     A4ReviewFindingSource, AssuranceProfile, IntegrationDecisionNullableString,
@@ -214,17 +212,81 @@ impl IntegrationRequestTask {
     }
 }
 
-/// Supplied argv and result evidence; never executes checks.
-/// started_at and finished_at are deferred; this is not the temporal contract.
+/// Supplied check evidence; timestamps are independently optional, immutable, and never ordered.
+/// Existing `new` omits both timestamps; `new_with_timestamps` preserves supplied values.
+///
+/// ```
+/// use receipts_review_integration::{IntegrationRequestPostMergeCheck, ReviewDateTimeV1};
+/// fn timestamps(value: &IntegrationRequestPostMergeCheck) -> (Option<&ReviewDateTimeV1>, Option<&ReviewDateTimeV1>) {
+///     (value.started_at(), value.finished_at())
+/// }
+/// ```
 ///
 /// ```compile_fail
-/// # fn forbidden(value: &receipts_review_integration::IntegrationRequestPostMergeCheck) {
-/// value.started_at();
+/// # fn forbidden(value: &mut receipts_review_integration::IntegrationRequestPostMergeCheck) {
+/// let _: Option<&mut receipts_review_integration::ReviewDateTimeV1> = value.started_at();
 /// # }
 /// ```
+///
 /// ```compile_fail
-/// # fn forbidden(value: &receipts_review_integration::IntegrationRequestPostMergeCheck) {
-/// value.finished_at();
+/// # fn forbidden(value: receipts_review_integration::IntegrationRequestPostMergeCheck) {
+/// let _ = receipts_review_integration::IntegrationRequestPostMergeCheck { started_at: None, ..value };
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden(value: &mut receipts_review_integration::IntegrationRequestPostMergeCheck) {
+/// value.set_started_at(None);
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden() {
+/// let _ = receipts_review_integration::IntegrationRequestPostMergeCheck::new_with_timestamps(
+///     receipts_workspace_execution::WorkspaceCheckpointCheckSource::ReviewExecution, vec!["tool".into()], receipts_review_integration::IntegrationRequestSignedInteger::from_decimal("0").unwrap(), "a".repeat(40), None, None, None, Some(None), None,
+/// );
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden() {
+/// let _ = receipts_review_integration::IntegrationRequestPostMergeCheck::new_with_timestamps(
+///     receipts_workspace_execution::WorkspaceCheckpointCheckSource::ReviewExecution, vec!["tool".into()], receipts_review_integration::IntegrationRequestSignedInteger::from_decimal("0").unwrap(), "a".repeat(40), None, None, None, Some(String::from("2026-09-08T00:00:00Z")), None,
+/// );
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden(value: &mut receipts_review_integration::IntegrationRequestPostMergeCheck) {
+/// let _: Option<&mut receipts_review_integration::ReviewDateTimeV1> = value.finished_at();
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden(value: receipts_review_integration::IntegrationRequestPostMergeCheck) {
+/// let _ = receipts_review_integration::IntegrationRequestPostMergeCheck { finished_at: None, ..value };
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden(value: &mut receipts_review_integration::IntegrationRequestPostMergeCheck) {
+/// value.set_finished_at(None);
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden() {
+/// let _ = receipts_review_integration::IntegrationRequestPostMergeCheck::new_with_timestamps(
+///     receipts_workspace_execution::WorkspaceCheckpointCheckSource::ReviewExecution, vec!["tool".into()], receipts_review_integration::IntegrationRequestSignedInteger::from_decimal("0").unwrap(), "a".repeat(40), None, None, None, None, Some(None),
+/// );
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden() {
+/// let _ = receipts_review_integration::IntegrationRequestPostMergeCheck::new_with_timestamps(
+///     receipts_workspace_execution::WorkspaceCheckpointCheckSource::ReviewExecution, vec!["tool".into()], receipts_review_integration::IntegrationRequestSignedInteger::from_decimal("0").unwrap(), "a".repeat(40), None, None, None, None, Some(String::from("2026-09-08T00:00:00Z")),
+/// );
 /// # }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,6 +298,8 @@ pub struct IntegrationRequestPostMergeCheck {
     timed_out: Option<bool>,
     output_ref: Option<WorkspaceCheckpointRef>,
     result: Option<ReviewCapsuleCheckResult>,
+    started_at: Option<ReviewDateTimeV1>,
+    finished_at: Option<ReviewDateTimeV1>,
 }
 
 impl IntegrationRequestPostMergeCheck {
@@ -247,6 +311,24 @@ impl IntegrationRequestPostMergeCheck {
         timed_out: Option<bool>,
         output_ref: Option<WorkspaceCheckpointRef>,
         result: Option<ReviewCapsuleCheckResult>,
+    ) -> Result<Self, IntegrationRequestConstructionError> {
+        Self::new_with_timestamps(
+            source, command, exit_code, code_sha, timed_out, output_ref, result, None, None,
+        )
+    }
+
+    /// Stores independently optional caller timestamps without chronology policy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_timestamps(
+        source: WorkspaceCheckpointCheckSource,
+        command: Vec<String>,
+        exit_code: IntegrationRequestSignedInteger,
+        code_sha: String,
+        timed_out: Option<bool>,
+        output_ref: Option<WorkspaceCheckpointRef>,
+        result: Option<ReviewCapsuleCheckResult>,
+        started_at: Option<ReviewDateTimeV1>,
+        finished_at: Option<ReviewDateTimeV1>,
     ) -> Result<Self, IntegrationRequestConstructionError> {
         if command.is_empty() {
             return Err(IntegrationRequestConstructionError::EmptyCommand);
@@ -261,8 +343,18 @@ impl IntegrationRequestPostMergeCheck {
             timed_out,
             output_ref,
             result,
+            started_at,
+            finished_at,
         })
     }
+    pub fn started_at(&self) -> Option<&ReviewDateTimeV1> {
+        self.started_at.as_ref()
+    }
+
+    pub fn finished_at(&self) -> Option<&ReviewDateTimeV1> {
+        self.finished_at.as_ref()
+    }
+
     pub fn source(&self) -> WorkspaceCheckpointCheckSource {
         self.source
     }

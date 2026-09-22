@@ -1,6 +1,6 @@
-//! In-process, non-temporal ReviewCapsule data. Constructors validate schema shape only.
+//! In-process ReviewCapsule data with optional check timestamps. Constructors validate schema shape only.
 
-use crate::ReviewRequestNonNegativeInteger;
+use crate::{ReviewDateTimeV1, ReviewRequestNonNegativeInteger};
 use receipts_workspace_execution::{
     CommitSha, WorkspaceCheckpointCheckSource, WorkspaceCheckpointExecutedCheckCore,
     WorkspaceCheckpointRef,
@@ -111,12 +111,89 @@ impl ReviewCapsuleCheckResult {
     }
 }
 
-/// A ReviewCapsule check delegates its compatible physical fields to Workspace.
-/// `started_at` and `finished_at` are deferred because no temporal type is authorized.
+/// Supplied check evidence; timestamps are independently optional, immutable, and never ordered.
+/// Existing `new` omits both timestamps; `new_with_timestamps` preserves supplied values.
+///
+/// ```
+/// use receipts_review_integration::{ReviewCapsuleCheck, ReviewDateTimeV1};
+/// fn timestamps(value: &ReviewCapsuleCheck) -> (Option<&ReviewDateTimeV1>, Option<&ReviewDateTimeV1>) {
+///     (value.started_at(), value.finished_at())
+/// }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden(value: &mut receipts_review_integration::ReviewCapsuleCheck) {
+/// let _: Option<&mut receipts_review_integration::ReviewDateTimeV1> = value.started_at();
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden(value: receipts_review_integration::ReviewCapsuleCheck) {
+/// let _ = receipts_review_integration::ReviewCapsuleCheck { started_at: None, ..value };
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden(value: &mut receipts_review_integration::ReviewCapsuleCheck) {
+/// value.set_started_at(None);
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden(core: receipts_workspace_execution::WorkspaceCheckpointExecutedCheckCore) {
+/// let _ = receipts_review_integration::ReviewCapsuleCheck::new_with_timestamps(
+///     core, None, Some(None), None,
+/// );
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden(core: receipts_workspace_execution::WorkspaceCheckpointExecutedCheckCore) {
+/// let _ = receipts_review_integration::ReviewCapsuleCheck::new_with_timestamps(
+///     core, None, Some(String::from("2026-09-08T00:00:00Z")), None,
+/// );
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden(value: &mut receipts_review_integration::ReviewCapsuleCheck) {
+/// let _: Option<&mut receipts_review_integration::ReviewDateTimeV1> = value.finished_at();
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden(value: receipts_review_integration::ReviewCapsuleCheck) {
+/// let _ = receipts_review_integration::ReviewCapsuleCheck { finished_at: None, ..value };
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden(value: &mut receipts_review_integration::ReviewCapsuleCheck) {
+/// value.set_finished_at(None);
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden(core: receipts_workspace_execution::WorkspaceCheckpointExecutedCheckCore) {
+/// let _ = receipts_review_integration::ReviewCapsuleCheck::new_with_timestamps(
+///     core, None, None, Some(None),
+/// );
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden(core: receipts_workspace_execution::WorkspaceCheckpointExecutedCheckCore) {
+/// let _ = receipts_review_integration::ReviewCapsuleCheck::new_with_timestamps(
+///     core, None, None, Some(String::from("2026-09-08T00:00:00Z")),
+/// );
+/// # }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewCapsuleCheck {
     core: WorkspaceCheckpointExecutedCheckCore,
     result: Option<ReviewCapsuleCheckResult>,
+    started_at: Option<ReviewDateTimeV1>,
+    finished_at: Option<ReviewDateTimeV1>,
 }
 
 impl ReviewCapsuleCheck {
@@ -124,7 +201,30 @@ impl ReviewCapsuleCheck {
         core: WorkspaceCheckpointExecutedCheckCore,
         result: Option<ReviewCapsuleCheckResult>,
     ) -> Self {
-        Self { core, result }
+        Self::new_with_timestamps(core, result, None, None)
+    }
+
+    /// Stores independently optional caller timestamps without chronology policy.
+    pub const fn new_with_timestamps(
+        core: WorkspaceCheckpointExecutedCheckCore,
+        result: Option<ReviewCapsuleCheckResult>,
+        started_at: Option<ReviewDateTimeV1>,
+        finished_at: Option<ReviewDateTimeV1>,
+    ) -> Self {
+        Self {
+            core,
+            result,
+            started_at,
+            finished_at,
+        }
+    }
+
+    pub fn started_at(&self) -> Option<&ReviewDateTimeV1> {
+        self.started_at.as_ref()
+    }
+
+    pub fn finished_at(&self) -> Option<&ReviewDateTimeV1> {
+        self.finished_at.as_ref()
     }
 
     pub const fn source(&self) -> WorkspaceCheckpointCheckSource {
@@ -269,9 +369,8 @@ impl std::error::Error for ReviewCapsuleConstructionError {}
 
 /// Immutable, exact-SHA-bound, in-process structured ReviewCapsule core.
 ///
-/// This bounded type does not claim complete wire-format closure. Check
-/// `started_at` and `finished_at` are deferred because no temporal type is
-/// authorized. `test_results` is intentionally omitted under the BUILD-A1
+/// This bounded type does not claim complete wire-format closure. Nested checks
+/// preserve optional Review timestamps. `test_results` is omitted under the BUILD-A1
 /// machine-schema reconciliation. `context_epoch` is the embedded
 /// `REVIEWCAPSULE_CONTEXT_EPOCH_FIELD_REPRESENTATION`, not ownership of the
 /// State `ContextEpoch` aggregate.
@@ -284,7 +383,7 @@ impl std::error::Error for ReviewCapsuleConstructionError {}
 /// let _ = ReviewCapsuleNonTemporalCore::new();
 /// ```
 ///
-/// No reconciled-away or deferred APIs exist:
+/// No reconciled-away or aggregate-level check APIs exist:
 ///
 /// ```compile_fail
 /// # fn inspect(value: &receipts_review_integration::ReviewCapsuleNonTemporalCore) {
