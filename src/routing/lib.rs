@@ -5,6 +5,7 @@ mod candidate_eligibility;
 mod candidate_identity_constraint_composition;
 mod candidate_identity_constraints;
 mod candidate_pre_score_composition;
+mod candidate_pre_score_set_composition;
 mod candidate_set;
 mod quota_state;
 
@@ -22,6 +23,8 @@ mod candidate_identity_constraints_tests;
 #[cfg(test)]
 mod candidate_pre_score_composition_tests;
 #[cfg(test)]
+mod candidate_pre_score_set_composition_tests;
+#[cfg(test)]
 mod candidate_set_tests;
 
 pub use candidate_eligibility::{
@@ -36,6 +39,10 @@ pub use candidate_identity_constraints::{
 };
 pub use candidate_pre_score_composition::{
     BoundedPreScoreCandidateAssessment, evaluate_bounded_pre_score_candidate,
+};
+pub use candidate_pre_score_set_composition::{
+    BoundedPreScoreCandidateEvidence, BoundedPreScoreEvidenceBindingError,
+    evaluate_bounded_pre_score_candidate_set,
 };
 pub use candidate_set::{RegistryCandidateIdentity, enumerate_registry_candidates};
 
