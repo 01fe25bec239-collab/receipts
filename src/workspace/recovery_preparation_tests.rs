@@ -13,11 +13,14 @@ struct Fixture {
 }
 impl Fixture {
     fn new(task: Option<&str>) -> Self {
+        Self::with_created_at(task, None)
+    }
+    fn with_created_at(task: Option<&str>, created_at: Option<WorkspaceDateTimeV1>) -> Self {
         let repo = TestRepo::new_nested("recovery-preparation", "repo");
         repo.commit_file("tracked", "original");
         repo.commit_file("unstaged-only", "original");
         let root = fs::canonicalize(repo.root.path()).unwrap();
-        let handle = WorkspaceProvisionRequest::new(
+        let mut request = WorkspaceProvisionRequest::new(
             repo.path(),
             "workspace",
             task,
@@ -25,9 +28,11 @@ impl Fixture {
             root.join("target"),
             &repo.head_sha(),
         )
-        .unwrap()
-        .provision()
         .unwrap();
+        if let Some(created_at) = created_at {
+            request = request.with_created_at(created_at);
+        }
+        let handle = request.provision().unwrap();
         let checkpoint = checkpoint(&handle, "workspace", task, handle.base_sha().clone(), None);
         Self {
             repo,
@@ -200,6 +205,34 @@ fn recovery_preparation_preserves_caller_timestamp_spelling_without_temporal_pol
                 temporal.core().kind(),
                 WorkspaceCheckpointKind::RecoveryCapture
             );
+        }
+    }
+}
+
+#[test]
+fn recovery_preparation_retains_created_at_absence_and_exact_presence() {
+    let spelling = "2026-09-21t00:00:00.0012300z";
+    for created_at in [None, Some(WorkspaceDateTimeV1::try_new(spelling).unwrap())] {
+        let f = Fixture::with_created_at(None, created_at.clone());
+        let original = f.handle.clone();
+        for decision in WorkspaceRecoveryDecision::ALL {
+            for _ in 0..2 {
+                let mut request = f.request(decision);
+                if decision == WorkspaceRecoveryDecision::ResetToLastAccepted {
+                    request.last_accepted_sha = Some(f.handle.base_sha().as_str());
+                }
+                let result = prepare_workspace_checkpoint_recovery(request).unwrap();
+                assert!(std::ptr::eq(result.handle(), &f.handle));
+                assert_eq!(result.handle(), &original);
+                assert_eq!(result.handle().created_at(), created_at.as_ref());
+                assert_eq!(
+                    result
+                        .handle()
+                        .created_at()
+                        .map(WorkspaceDateTimeV1::as_str),
+                    created_at.as_ref().map(|_| spelling)
+                );
+            }
         }
     }
 }
@@ -503,6 +536,7 @@ fn recovery_preparation_lexical_parent_and_symlink_alias_handles_fail_closed() {
             "task-branch".into(),
             path.into_boxed_path(),
             f.handle.base_sha().clone(),
+            None,
             None,
         );
         let mut request = f.request(WorkspaceRecoveryDecision::InspectAndSalvage);

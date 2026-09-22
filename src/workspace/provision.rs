@@ -17,6 +17,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+use crate::date_time::WorkspaceDateTimeV1;
 use crate::error::WorkspaceError;
 use crate::git;
 use crate::handle::{CommitSha, WorkspaceHandle};
@@ -43,6 +44,7 @@ pub struct WorkspaceProvisionRequest {
     worktree_path: PathBuf,
     base_sha: CommitSha,
     remote_publish_policy: Option<WorkspaceRemotePublishPolicy>,
+    created_at: Option<WorkspaceDateTimeV1>,
 }
 
 impl WorkspaceProvisionRequest {
@@ -88,12 +90,35 @@ impl WorkspaceProvisionRequest {
             worktree_path,
             base_sha,
             remote_publish_policy: None,
+            created_at: None,
         })
     }
 
     /// Stores an explicit policy without executing or authorizing remote operations.
     pub fn with_remote_publish_policy(mut self, policy: WorkspaceRemotePublishPolicy) -> Self {
         self.remote_publish_policy = Some(policy);
+        self
+    }
+
+    /// Stores an already validated creation timestamp without changing its spelling.
+    /// Omission means absent; explicit null is not represented.
+    ///
+    /// Raw strings cannot bypass canonical validation:
+    /// ```compile_fail
+    /// use receipts_workspace_execution::WorkspaceProvisionRequest;
+    /// fn invalid(request: WorkspaceProvisionRequest) {
+    ///     request.with_created_at(String::from("invalid"));
+    /// }
+    /// ```
+    /// Explicit null is not an admitted value:
+    /// ```compile_fail
+    /// use receipts_workspace_execution::WorkspaceProvisionRequest;
+    /// fn invalid(request: WorkspaceProvisionRequest) {
+    ///     request.with_created_at(None);
+    /// }
+    /// ```
+    pub fn with_created_at(mut self, created_at: WorkspaceDateTimeV1) -> Self {
+        self.created_at = Some(created_at);
         self
     }
 
@@ -269,6 +294,7 @@ impl WorkspaceProvisionRequest {
             self.worktree_path.clone().into_boxed_path(),
             self.base_sha.clone(),
             self.remote_publish_policy,
+            self.created_at.clone(),
         ))
     }
 }

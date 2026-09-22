@@ -2,6 +2,7 @@
 
 use std::path::Path;
 
+use crate::date_time::WorkspaceDateTimeV1;
 use crate::error::WorkspaceError;
 use crate::remote_publish_policy::WorkspaceRemotePublishPolicy;
 
@@ -120,6 +121,7 @@ pub struct WorkspaceHandle {
     head_sha: Option<CommitSha>,
     isolation: WorkspaceIsolation,
     remote_publish_policy: Option<WorkspaceRemotePublishPolicy>,
+    created_at: Option<WorkspaceDateTimeV1>,
 }
 
 impl WorkspaceHandle {
@@ -132,6 +134,7 @@ impl WorkspaceHandle {
         worktree_path: Box<Path>,
         base_sha: CommitSha,
         remote_publish_policy: Option<WorkspaceRemotePublishPolicy>,
+        created_at: Option<WorkspaceDateTimeV1>,
     ) -> Self {
         Self {
             workspace_id,
@@ -143,6 +146,7 @@ impl WorkspaceHandle {
             isolation: WorkspaceIsolation::WorkspaceIsolation,
             task_id,
             remote_publish_policy,
+            created_at,
         }
     }
 
@@ -165,6 +169,7 @@ impl WorkspaceHandle {
             isolation: prior.isolation,
             task_id: prior.task_id.clone(),
             remote_publish_policy: prior.remote_publish_policy,
+            created_at: prior.created_at.clone(),
         }
     }
 
@@ -214,5 +219,10 @@ impl WorkspaceHandle {
     /// The explicitly supplied policy, stored without granting remote authority.
     pub fn remote_publish_policy(&self) -> Option<WorkspaceRemotePublishPolicy> {
         self.remote_publish_policy
+    }
+
+    /// The caller-supplied creation timestamp, preserved exactly; `None` means absent.
+    pub fn created_at(&self) -> Option<&WorkspaceDateTimeV1> {
+        self.created_at.as_ref()
     }
 }
