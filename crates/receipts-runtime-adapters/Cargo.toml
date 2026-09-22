@@ -9,5 +9,6 @@ publish = false
 path = "../../src/adapters/runtime/lib.rs"
 
 [dependencies]
+receipts-runtime-bindings = { path = "../receipts-runtime-bindings" }
 receipts-workspace-execution = { path = "../receipts-workspace-execution" }
 serde_json = "=1.0.151"

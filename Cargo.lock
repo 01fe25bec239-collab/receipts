@@ -317,6 +317,7 @@ dependencies = [
 name = "receipts-runtime-adapters"
 version = "0.1.0"
 dependencies = [
+ "receipts-runtime-bindings",
  "receipts-workspace-execution",
  "serde_json",
 ]

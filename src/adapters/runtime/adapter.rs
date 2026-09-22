@@ -3,6 +3,7 @@
 //! This module declares vocabulary only. It implements no runtime behavior,
 //! grants no execution authority, and defines no externally owned contracts.
 
+use receipts_runtime_bindings::RuntimeCapsuleFamily;
 use receipts_workspace_execution::WorkspaceHandle;
 
 use crate::{AttemptId, FailureClass, RawFailure, RuntimeAuthStatus};
@@ -19,14 +20,6 @@ pub trait RuntimeAdapter {
     ///
     /// This declaration defines neither `ModelRef` nor model-registry behavior.
     type Models;
-
-    /// Physical binding placeholder for the frozen capsule family.
-    ///
-    /// `Capsule` is not a new Receipts contract. Its eventual binding must
-    /// preserve the authority of `TaskCapsule`, `RepairCapsule`, and
-    /// `ReviewCapsule`; this crate defines none of those contracts' shapes.
-    /// The one frozen `start` semantic remains one operation.
-    type Capsule;
 
     /// Unbound placeholder for the frozen execution policy.
     ///
@@ -74,7 +67,7 @@ pub trait RuntimeAdapter {
     /// dispatch gate must authorize dispatch before this boundary is reached.
     fn start(
         &self,
-        task: &Self::Capsule,
+        task: &RuntimeCapsuleFamily,
         workspace: &WorkspaceHandle,
         policy: &Self::ExecutionPolicy,
     ) -> Self::AttemptHandle;
