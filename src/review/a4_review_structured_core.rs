@@ -1,4 +1,5 @@
-//! Non-temporal, in-process A4 review records. Constructors validate shape only.
+//! In-process A4 review records with optional reproduction check timestamps. Constructors validate shape only.
+use crate::ReviewDateTimeV1;
 use crate::{
     A4ReviewDimension, A4ReviewDimensionAssessment, A4ReviewFindingCategory,
     A4ReviewFindingConfidence, A4ReviewFindingSeverity, A4ReviewFindingSource,
@@ -244,7 +245,83 @@ impl A4ReviewDimensionReview {
     }
 }
 
-/// Stored reproduction evidence only. Temporal started_at and finished_at are deferred.
+/// Supplied check evidence; timestamps are independently optional, immutable, and never ordered.
+/// Existing `new` omits both timestamps; `new_with_timestamps` preserves supplied values.
+///
+/// ```
+/// use receipts_review_integration::{A4ReviewReproductionCheck, ReviewDateTimeV1};
+/// fn timestamps(value: &A4ReviewReproductionCheck) -> (Option<&ReviewDateTimeV1>, Option<&ReviewDateTimeV1>) {
+///     (value.started_at(), value.finished_at())
+/// }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden(value: &mut receipts_review_integration::A4ReviewReproductionCheck) {
+/// let _: Option<&mut receipts_review_integration::ReviewDateTimeV1> = value.started_at();
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden(value: receipts_review_integration::A4ReviewReproductionCheck) {
+/// let _ = receipts_review_integration::A4ReviewReproductionCheck { started_at: None, ..value };
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden(value: &mut receipts_review_integration::A4ReviewReproductionCheck) {
+/// value.set_started_at(None);
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden() {
+/// let _ = receipts_review_integration::A4ReviewReproductionCheck::new_with_timestamps(
+///     receipts_workspace_execution::WorkspaceCheckpointCheckSource::ReviewExecution, vec!["tool".into()], 0, "a".repeat(40), None, None, None, Some(None), None,
+/// );
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden() {
+/// let _ = receipts_review_integration::A4ReviewReproductionCheck::new_with_timestamps(
+///     receipts_workspace_execution::WorkspaceCheckpointCheckSource::ReviewExecution, vec!["tool".into()], 0, "a".repeat(40), None, None, None, Some(String::from("2026-09-08T00:00:00Z")), None,
+/// );
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden(value: &mut receipts_review_integration::A4ReviewReproductionCheck) {
+/// let _: Option<&mut receipts_review_integration::ReviewDateTimeV1> = value.finished_at();
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden(value: receipts_review_integration::A4ReviewReproductionCheck) {
+/// let _ = receipts_review_integration::A4ReviewReproductionCheck { finished_at: None, ..value };
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden(value: &mut receipts_review_integration::A4ReviewReproductionCheck) {
+/// value.set_finished_at(None);
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden() {
+/// let _ = receipts_review_integration::A4ReviewReproductionCheck::new_with_timestamps(
+///     receipts_workspace_execution::WorkspaceCheckpointCheckSource::ReviewExecution, vec!["tool".into()], 0, "a".repeat(40), None, None, None, None, Some(None),
+/// );
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden() {
+/// let _ = receipts_review_integration::A4ReviewReproductionCheck::new_with_timestamps(
+///     receipts_workspace_execution::WorkspaceCheckpointCheckSource::ReviewExecution, vec!["tool".into()], 0, "a".repeat(40), None, None, None, None, Some(String::from("2026-09-08T00:00:00Z")),
+/// );
+/// # }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct A4ReviewReproductionCheck {
     source: WorkspaceCheckpointCheckSource,
@@ -254,6 +331,8 @@ pub struct A4ReviewReproductionCheck {
     timed_out: Option<bool>,
     output_ref: Option<WorkspaceCheckpointRef>,
     result: Option<A4ReviewReproductionCheckResult>,
+    started_at: Option<ReviewDateTimeV1>,
+    finished_at: Option<ReviewDateTimeV1>,
 }
 impl A4ReviewReproductionCheck {
     pub fn new(
@@ -264,6 +343,24 @@ impl A4ReviewReproductionCheck {
         timed_out: Option<bool>,
         output_ref: Option<WorkspaceCheckpointRef>,
         result: Option<A4ReviewReproductionCheckResult>,
+    ) -> Result<Self, A4ReviewConstructionError> {
+        Self::new_with_timestamps(
+            source, command, exit_code, code_sha, timed_out, output_ref, result, None, None,
+        )
+    }
+
+    /// Stores independently optional caller timestamps without chronology policy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_timestamps(
+        source: WorkspaceCheckpointCheckSource,
+        command: Vec<String>,
+        exit_code: i64,
+        code_sha: String,
+        timed_out: Option<bool>,
+        output_ref: Option<WorkspaceCheckpointRef>,
+        result: Option<A4ReviewReproductionCheckResult>,
+        started_at: Option<ReviewDateTimeV1>,
+        finished_at: Option<ReviewDateTimeV1>,
     ) -> Result<Self, A4ReviewConstructionError> {
         if command.is_empty() {
             return Err(A4ReviewConstructionError::EmptyReproductionCommand);
@@ -280,8 +377,18 @@ impl A4ReviewReproductionCheck {
             timed_out,
             output_ref,
             result,
+            started_at,
+            finished_at,
         })
     }
+    pub fn started_at(&self) -> Option<&ReviewDateTimeV1> {
+        self.started_at.as_ref()
+    }
+
+    pub fn finished_at(&self) -> Option<&ReviewDateTimeV1> {
+        self.finished_at.as_ref()
+    }
+
     pub fn source(&self) -> WorkspaceCheckpointCheckSource {
         self.source
     }
@@ -337,9 +444,8 @@ impl A4ReviewReproduction {
 
 /// Structured in-process core, exact SHA-bound for its lifetime.
 ///
-/// reviewed_at, reproduction.checks[].started_at, and
-/// reproduction.checks[].finished_at are deferred. This is not a complete
-/// wire contract and makes no wire/serde completeness claim. No acceptance
+/// `reviewed_at` belongs to the A4Review wrapper; nested checks preserve optional
+/// Review timestamps. This makes no wire/serde completeness claim. No acceptance
 /// policy is applied: all caller-supplied evidence is preserved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct A4ReviewNonTemporalCore {

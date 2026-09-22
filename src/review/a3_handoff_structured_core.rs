@@ -1,4 +1,5 @@
-//! Machine-authoritative A3Handoff data only; temporal check fields are deferred.
+//! Machine-authoritative A3Handoff data with optional caller-supplied check timestamps.
+use crate::ReviewDateTimeV1;
 use receipts_workspace_execution::{
     CommitSha, WorkspaceCheckpointCheckSource, WorkspaceCheckpointExecutedCheckCore,
     WorkspaceCheckpointRef,
@@ -208,36 +209,89 @@ impl A3HandoffLabeledEvidence {
     }
 }
 
-/// An A3Handoff check delegates its compatible physical fields to Workspace.
-/// `started_at` and `finished_at` are deferred because no temporal type is authorized.
+/// Supplied check evidence; timestamps are independently optional, immutable, and never ordered.
+/// Existing `new` omits both timestamps; `new_with_timestamps` preserves supplied values.
+///
+/// ```
+/// use receipts_review_integration::{A3HandoffCheck, ReviewDateTimeV1};
+/// fn timestamps(value: &A3HandoffCheck) -> (Option<&ReviewDateTimeV1>, Option<&ReviewDateTimeV1>) {
+///     (value.started_at(), value.finished_at())
+/// }
+/// ```
 ///
 /// ```compile_fail
 /// # fn forbidden(value: &mut receipts_review_integration::A3HandoffCheck) {
-/// value.started_at();
+/// let _: Option<&mut receipts_review_integration::ReviewDateTimeV1> = value.started_at();
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden(value: receipts_review_integration::A3HandoffCheck) {
+/// let _ = receipts_review_integration::A3HandoffCheck { started_at: None, ..value };
 /// # }
 /// ```
 ///
 /// ```compile_fail
 /// # fn forbidden(value: &mut receipts_review_integration::A3HandoffCheck) {
-/// value.finished_at();
+/// value.set_started_at(None);
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden(core: receipts_workspace_execution::WorkspaceCheckpointExecutedCheckCore) {
+/// let _ = receipts_review_integration::A3HandoffCheck::new_with_timestamps(
+///     core, None, Some(None), None,
+/// );
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden(core: receipts_workspace_execution::WorkspaceCheckpointExecutedCheckCore) {
+/// let _ = receipts_review_integration::A3HandoffCheck::new_with_timestamps(
+///     core, None, Some(String::from("2026-09-08T00:00:00Z")), None,
+/// );
 /// # }
 /// ```
 ///
 /// ```compile_fail
 /// # fn forbidden(value: &mut receipts_review_integration::A3HandoffCheck) {
-/// value.set_started_at(String::new());
+/// let _: Option<&mut receipts_review_integration::ReviewDateTimeV1> = value.finished_at();
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden(value: receipts_review_integration::A3HandoffCheck) {
+/// let _ = receipts_review_integration::A3HandoffCheck { finished_at: None, ..value };
 /// # }
 /// ```
 ///
 /// ```compile_fail
 /// # fn forbidden(value: &mut receipts_review_integration::A3HandoffCheck) {
-/// value.set_finished_at(String::new());
+/// value.set_finished_at(None);
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden(core: receipts_workspace_execution::WorkspaceCheckpointExecutedCheckCore) {
+/// let _ = receipts_review_integration::A3HandoffCheck::new_with_timestamps(
+///     core, None, None, Some(None),
+/// );
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn forbidden(core: receipts_workspace_execution::WorkspaceCheckpointExecutedCheckCore) {
+/// let _ = receipts_review_integration::A3HandoffCheck::new_with_timestamps(
+///     core, None, None, Some(String::from("2026-09-08T00:00:00Z")),
+/// );
 /// # }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct A3HandoffCheck {
     core: WorkspaceCheckpointExecutedCheckCore,
     result: Option<A3HandoffCheckResult>,
+    started_at: Option<ReviewDateTimeV1>,
+    finished_at: Option<ReviewDateTimeV1>,
 }
 
 impl A3HandoffCheck {
@@ -245,7 +299,30 @@ impl A3HandoffCheck {
         core: WorkspaceCheckpointExecutedCheckCore,
         result: Option<A3HandoffCheckResult>,
     ) -> Self {
-        Self { core, result }
+        Self::new_with_timestamps(core, result, None, None)
+    }
+
+    /// Stores independently optional caller timestamps without chronology policy.
+    pub const fn new_with_timestamps(
+        core: WorkspaceCheckpointExecutedCheckCore,
+        result: Option<A3HandoffCheckResult>,
+        started_at: Option<ReviewDateTimeV1>,
+        finished_at: Option<ReviewDateTimeV1>,
+    ) -> Self {
+        Self {
+            core,
+            result,
+            started_at,
+            finished_at,
+        }
+    }
+
+    pub fn started_at(&self) -> Option<&ReviewDateTimeV1> {
+        self.started_at.as_ref()
+    }
+
+    pub fn finished_at(&self) -> Option<&ReviewDateTimeV1> {
+        self.finished_at.as_ref()
     }
 
     pub const fn source(&self) -> WorkspaceCheckpointCheckSource {
@@ -283,8 +360,7 @@ impl A3HandoffCheck {
 
 /// Immutable non-temporal A3Handoff evidence. No readiness or verification policy.
 ///
-/// Check `started_at` and `finished_at` are deferred because no generic datetime
-/// physical type is authorized. This is not complete temporal or wire support.
+/// Nested checks preserve optional Review timestamps. This is not wire support.
 /// Required fields cannot be omitted, and accepted evidence cannot be rebound.
 ///
 /// ```compile_fail

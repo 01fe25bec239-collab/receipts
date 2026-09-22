@@ -705,3 +705,108 @@ fn optional_arrays_and_attestation_object_distinguish_absent_empty_nonempty() {
         }
     }
 }
+
+#[test]
+fn check_timestamps_are_independent_exact_evidence_and_preserve_legacy_fields() {
+    let source = WorkspaceCheckpointCheckSource::ReviewExecution;
+    let command = vec!["not-executed".into(), "".into(), " 界 ".into()];
+    let output = WorkspaceCheckpointRef::new(
+        WorkspaceCheckpointRefType::ArtifactId,
+        " supplied output ",
+        Some("".into()),
+        None,
+    )
+    .unwrap();
+    let exit_code =
+        IntegrationRequestSignedInteger::from_decimal("-1234567890123456789012345678901234567890")
+            .unwrap();
+    // Include a backwards-looking pair: the carrier must not impose chronology.
+    for (start, finish) in [
+        ("2026-09-08T00:00:00Z", "2026-09-08t00:00:00z"),
+        ("2026-09-08T00:00:00+05:30", "2026-09-08T00:00:00-08:00"),
+        (
+            "2026-09-08T00:00:00-00:00",
+            "2026-09-08T00:00:00.123456789123456789Z",
+        ),
+        ("2026-09-08T10:00:00Z", "2026-09-08T09:00:00Z"),
+    ] {
+        for timed_out in [None, Some(false), Some(true)] {
+            for result in std::iter::once(None).chain(ReviewCapsuleCheckResult::ALL.map(Some)) {
+                let legacy = IntegrationRequestPostMergeCheck::new(
+                    source,
+                    command.clone(),
+                    exit_code.clone(),
+                    SHA.into(),
+                    timed_out,
+                    Some(output.clone()),
+                    result,
+                )
+                .unwrap();
+                assert_eq!(legacy.started_at(), None);
+                assert_eq!(legacy.finished_at(), None);
+                for started in [None, Some(start)] {
+                    for finished in [None, Some(finish)] {
+                        let value = IntegrationRequestPostMergeCheck::new_with_timestamps(
+                            source,
+                            command.clone(),
+                            exit_code.clone(),
+                            SHA.into(),
+                            timed_out,
+                            Some(output.clone()),
+                            result,
+                            started.map(|raw| ReviewDateTimeV1::try_new(raw).unwrap()),
+                            finished.map(|raw| ReviewDateTimeV1::try_new(raw).unwrap()),
+                        )
+                        .unwrap();
+                        let started_at: Option<&ReviewDateTimeV1> = value.started_at();
+                        let finished_at: Option<&ReviewDateTimeV1> = value.finished_at();
+                        assert_eq!(started_at.map(ReviewDateTimeV1::as_str), started);
+                        assert_eq!(finished_at.map(ReviewDateTimeV1::as_str), finished);
+                        assert_eq!(value.source(), source);
+                        assert_eq!(value.command(), command);
+                        assert_eq!(value.exit_code(), &exit_code);
+                        assert_eq!(value.code_sha().as_str(), SHA);
+                        assert_eq!(value.timed_out(), timed_out);
+                        assert_eq!(value.output_ref(), Some(&output));
+                        assert_eq!(value.result(), result);
+                        if started.is_none() && finished.is_none() {
+                            assert_eq!(value, legacy);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn timestamps_do_not_bypass_command_or_sha_validation() {
+    let timestamp = ReviewDateTimeV1::try_new("2026-09-08t00:00:00z").unwrap();
+    for (command, sha, expected) in [
+        (
+            vec![],
+            SHA,
+            IntegrationRequestConstructionError::EmptyCommand,
+        ),
+        (
+            vec!["tool".into()],
+            "HEAD",
+            IntegrationRequestConstructionError::MalformedSha("code_sha"),
+        ),
+    ] {
+        assert_eq!(
+            IntegrationRequestPostMergeCheck::new_with_timestamps(
+                WorkspaceCheckpointCheckSource::ReviewExecution,
+                command,
+                Signed::from_decimal("0").unwrap(),
+                sha.into(),
+                None,
+                None,
+                None,
+                Some(timestamp.clone()),
+                Some(timestamp.clone()),
+            ),
+            Err(expected)
+        );
+    }
+}

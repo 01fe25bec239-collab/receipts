@@ -838,15 +838,15 @@ fn reproduction_structured_schema_and_context_epoch_are_stored_without_inference
 }
 
 #[test]
-fn reconciled_and_deferred_fields_are_absent_from_the_api_boundary() {
+fn reconciled_fields_remain_absent_and_nested_timestamps_use_the_canonical_type() {
     let source = include_str!("review_capsule_structured_core.rs");
+    for field in ["started_at", "finished_at"] {
+        assert!(source.contains(&format!("{field}: Option<ReviewDateTimeV1>")));
+        assert!(source.contains(&format!("fn {field}(&self) -> Option<&ReviewDateTimeV1>")));
+    }
     for forbidden_field_or_api in [
         "test_results:",
         "fn test_results",
-        "started_at:",
-        "fn started_at",
-        "finished_at:",
-        "fn finished_at",
         "history:",
         "messages:",
         "reasoning:",
@@ -858,5 +858,71 @@ fn reconciled_and_deferred_fields_are_absent_from_the_api_boundary() {
             !source.contains(forbidden_field_or_api),
             "unexpected API: {forbidden_field_or_api}"
         );
+    }
+}
+
+#[test]
+fn check_timestamps_are_independent_exact_evidence_and_preserve_legacy_fields() {
+    let source = WorkspaceCheckpointCheckSource::ReviewExecution;
+    let command = vec!["not-executed".into(), "".into(), " 界 ".into()];
+    let output = WorkspaceCheckpointRef::new(
+        WorkspaceCheckpointRefType::ArtifactId,
+        " supplied output ",
+        Some("".into()),
+        None,
+    )
+    .unwrap();
+    let exit_code = -137;
+    // Include a backwards-looking pair: the carrier must not impose chronology.
+    for (start, finish) in [
+        ("2026-09-08T00:00:00Z", "2026-09-08t00:00:00z"),
+        ("2026-09-08T00:00:00+05:30", "2026-09-08T00:00:00-08:00"),
+        (
+            "2026-09-08T00:00:00-00:00",
+            "2026-09-08T00:00:00.123456789123456789Z",
+        ),
+        ("2026-09-08T10:00:00Z", "2026-09-08T09:00:00Z"),
+    ] {
+        for timed_out in [None, Some(false), Some(true)] {
+            for result in std::iter::once(None).chain(ReviewCapsuleCheckResult::ALL.map(Some)) {
+                let core = WorkspaceCheckpointExecutedCheckCore::new(
+                    source,
+                    command.clone(),
+                    exit_code,
+                    CommitSha::parse(BASE_SHA).unwrap(),
+                    timed_out,
+                    Some(output.clone()),
+                )
+                .unwrap();
+                let legacy = ReviewCapsuleCheck::new(core.clone(), result);
+                assert_eq!(legacy.started_at(), None);
+                assert_eq!(legacy.finished_at(), None);
+                for started in [None, Some(start)] {
+                    for finished in [None, Some(finish)] {
+                        let value = ReviewCapsuleCheck::new_with_timestamps(
+                            core.clone(),
+                            result,
+                            started.map(|raw| ReviewDateTimeV1::try_new(raw).unwrap()),
+                            finished.map(|raw| ReviewDateTimeV1::try_new(raw).unwrap()),
+                        );
+                        let started_at: Option<&ReviewDateTimeV1> = value.started_at();
+                        let finished_at: Option<&ReviewDateTimeV1> = value.finished_at();
+                        assert_eq!(started_at.map(ReviewDateTimeV1::as_str), started);
+                        assert_eq!(finished_at.map(ReviewDateTimeV1::as_str), finished);
+                        assert_eq!(value.source(), source);
+                        assert_eq!(value.command(), command);
+                        assert_eq!(value.exit_code(), exit_code);
+                        assert_eq!(value.code_sha().as_str(), BASE_SHA);
+                        assert_eq!(value.timed_out(), timed_out);
+                        assert_eq!(value.output_ref(), Some(&output));
+                        assert_eq!(value.result(), result);
+                        assert_eq!(value.core(), &core);
+                        if started.is_none() && finished.is_none() {
+                            assert_eq!(value, legacy);
+                        }
+                    }
+                }
+            }
+        }
     }
 }

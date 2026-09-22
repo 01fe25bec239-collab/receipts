@@ -605,3 +605,146 @@ fn all_four_blocker_states_are_distinct_and_readiness_is_never_inferred() {
         }
     }
 }
+
+#[test]
+fn check_timestamps_are_independent_exact_evidence_and_preserve_legacy_fields() {
+    let source = WorkspaceCheckpointCheckSource::ReviewExecution;
+    let command = vec!["not-executed".into(), "".into(), " 界 ".into()];
+    let output = WorkspaceCheckpointRef::new(
+        WorkspaceCheckpointRefType::ArtifactId,
+        " supplied output ",
+        Some("".into()),
+        None,
+    )
+    .unwrap();
+    let exit_code = -137;
+    // Include a backwards-looking pair: the carrier must not impose chronology.
+    for (start, finish) in [
+        ("2026-09-08T00:00:00Z", "2026-09-08t00:00:00z"),
+        ("2026-09-08T00:00:00+05:30", "2026-09-08T00:00:00-08:00"),
+        (
+            "2026-09-08T00:00:00-00:00",
+            "2026-09-08T00:00:00.123456789123456789Z",
+        ),
+        ("2026-09-08T10:00:00Z", "2026-09-08T09:00:00Z"),
+    ] {
+        for timed_out in [None, Some(false), Some(true)] {
+            for result in std::iter::once(None).chain(A3HandoffCheckResult::ALL.map(Some)) {
+                let core = WorkspaceCheckpointExecutedCheckCore::new(
+                    source,
+                    command.clone(),
+                    exit_code,
+                    CommitSha::parse(START).unwrap(),
+                    timed_out,
+                    Some(output.clone()),
+                )
+                .unwrap();
+                let legacy = A3HandoffCheck::new(core.clone(), result);
+                assert_eq!(legacy.started_at(), None);
+                assert_eq!(legacy.finished_at(), None);
+                for started in [None, Some(start)] {
+                    for finished in [None, Some(finish)] {
+                        let value = A3HandoffCheck::new_with_timestamps(
+                            core.clone(),
+                            result,
+                            started.map(|raw| ReviewDateTimeV1::try_new(raw).unwrap()),
+                            finished.map(|raw| ReviewDateTimeV1::try_new(raw).unwrap()),
+                        );
+                        let started_at: Option<&ReviewDateTimeV1> = value.started_at();
+                        let finished_at: Option<&ReviewDateTimeV1> = value.finished_at();
+                        assert_eq!(started_at.map(ReviewDateTimeV1::as_str), started);
+                        assert_eq!(finished_at.map(ReviewDateTimeV1::as_str), finished);
+                        assert_eq!(value.source(), source);
+                        assert_eq!(value.command(), command);
+                        assert_eq!(value.exit_code(), exit_code);
+                        assert_eq!(value.code_sha().as_str(), START);
+                        assert_eq!(value.timed_out(), timed_out);
+                        assert_eq!(value.output_ref(), Some(&output));
+                        assert_eq!(value.result(), result);
+                        assert_eq!(value.core(), &core);
+                        if started.is_none() && finished.is_none() {
+                            assert_eq!(value, legacy);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_checks_preserve_a_large_fraction_and_reject_invalid_input_before_composition() {
+    let raw = format!("2026-09-08T00:00:00.{}Z", "1234567890".repeat(10_000));
+    let timestamp = ReviewDateTimeV1::try_new(raw.clone()).unwrap();
+    let core = check(None).core().clone();
+    let a3 = A3HandoffCheck::new_with_timestamps(
+        core.clone(),
+        None,
+        Some(timestamp.clone()),
+        Some(timestamp.clone()),
+    );
+    let capsule = ReviewCapsuleCheck::new_with_timestamps(
+        core,
+        None,
+        Some(timestamp.clone()),
+        Some(timestamp.clone()),
+    );
+    let a4 = A4ReviewReproductionCheck::new_with_timestamps(
+        a3.source(),
+        a3.command().to_vec(),
+        a3.exit_code(),
+        START.into(),
+        a3.timed_out(),
+        None,
+        None,
+        Some(timestamp.clone()),
+        Some(timestamp.clone()),
+    )
+    .unwrap();
+    let integration = IntegrationRequestPostMergeCheck::new_with_timestamps(
+        a3.source(),
+        a3.command().to_vec(),
+        IntegrationRequestSignedInteger::from_decimal("137").unwrap(),
+        START.into(),
+        a3.timed_out(),
+        None,
+        None,
+        Some(timestamp.clone()),
+        Some(timestamp),
+    )
+    .unwrap();
+    for stored in [
+        a3.started_at(),
+        a3.finished_at(),
+        capsule.started_at(),
+        capsule.finished_at(),
+        a4.started_at(),
+        a4.finished_at(),
+        integration.started_at(),
+        integration.finished_at(),
+    ] {
+        assert_eq!(stored.unwrap().as_str(), raw);
+    }
+    let aggregate = required(
+        "t",
+        "a",
+        START,
+        FINAL,
+        "",
+        vec![],
+        vec![check(None), a3.clone()],
+        false,
+    )
+    .unwrap();
+    assert_eq!(aggregate.checks(), &[check(None), a3]);
+    for invalid in [
+        "",
+        "2026-09-08 00:00:00Z",
+        "2026-09-08T24:00:00Z",
+        "2026-09-08T00:00:00",
+        " 2026-09-08T00:00:00Z",
+        "2026-09-08T00:00:00Z ",
+    ] {
+        assert!(ReviewDateTimeV1::try_new(invalid).is_err(), "{invalid:?}");
+    }
+}

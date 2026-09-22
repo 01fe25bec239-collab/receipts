@@ -1,5 +1,5 @@
 //! Review-owned, in-process A4Review with optional reviewed_at evidence.
-//! Reproduction check timestamps remain deferred; no wire completeness is claimed.
+//! Reproduction checks carry independently optional timestamps; no wire completeness is claimed.
 //! Physical authority: BUILD-A1-ADR-A4REVIEW-OPTIONAL-REVIEWED-AT-PHYSICAL-V1-001.
 //! Composes the unchanged non-temporal core with an optional validated timestamp.
 //! No execution, clock, defaults, temporal policy, or wire serialization.
@@ -73,16 +73,15 @@ use crate::{A4ReviewNonTemporalCore, ReviewDateTimeV1};
 /// let _: &mut str = value.reviewed_at().unwrap().as_str();
 /// # }
 /// ```
-/// Reproduction check timestamps remain deferred.
+/// Reproduction check `started_at` and `finished_at` are caller-supplied,
+/// independently optional `Option<ReviewDateTimeV1>` values. They are immutable,
+/// with no clock, default, normalization, or chronology policy.
 ///
-/// ```compile_fail
-/// # fn forbidden(check: &receipts_review_integration::A4ReviewReproductionCheck) {
-/// check.started_at();
-/// # }
 /// ```
-/// ```compile_fail
-/// # fn forbidden(check: &receipts_review_integration::A4ReviewReproductionCheck) {
-/// check.finished_at();
+/// # use receipts_review_integration::{A4ReviewReproductionCheck, ReviewDateTimeV1};
+/// # fn timestamps(check: &A4ReviewReproductionCheck) {
+/// let _: Option<&ReviewDateTimeV1> = check.started_at();
+/// let _: Option<&ReviewDateTimeV1> = check.finished_at();
 /// # }
 /// ```
 /// No comparison, ordering, arithmetic, or default timestamp is provided.
