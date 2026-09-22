@@ -1,7 +1,9 @@
 use super::*;
 use crate::execution::{ProcessRunRequest, ProcessTimeoutPolicy, start_live_process_attempt};
 use crate::test_support::{TestRepo, git, stdout_trimmed};
-use crate::{WorkspaceCheckpointKind, WorkspaceProvisionRequest, WriteScopeGitOperation};
+use crate::{
+    WorkspaceCheckpointKind, WorkspaceDateTimeV1, WorkspaceProvisionRequest, WriteScopeGitOperation,
+};
 use std::{fs, time::Duration};
 
 struct Fixture {
@@ -15,10 +17,13 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_created_at(None)
+    }
+    fn with_created_at(created_at: Option<WorkspaceDateTimeV1>) -> Self {
         let repo = TestRepo::new_nested("attempt-finalization", "repo");
         repo.commit_file("src/file", "start");
         repo.commit_file("outside", "start");
-        let handle = WorkspaceProvisionRequest::new(
+        let mut request = WorkspaceProvisionRequest::new(
             repo.path(),
             "workspace",
             Some("task"),
@@ -26,9 +31,11 @@ impl Fixture {
             fs::canonicalize(repo.root.path()).unwrap().join("target"),
             &repo.head_sha(),
         )
-        .unwrap()
-        .provision()
         .unwrap();
+        if let Some(created_at) = created_at {
+            request = request.with_created_at(created_at);
+        }
+        let handle = request.provision().unwrap();
         let checkpoint = checkpoint(&handle, "workspace", Some("task"), Some("attempt"));
         let terminal = terminal(
             handle.worktree_path(),
@@ -189,6 +196,29 @@ fn attempt_finalization_clean_exact_anchor_preserves_older_checkpoint_and_all_ev
 }
 
 #[test]
+fn attempt_finalization_clones_created_at_absence_and_exact_presence() {
+    let spelling = "2026-09-20t00:00:00.0012300z";
+    for created_at in [None, Some(WorkspaceDateTimeV1::try_new(spelling).unwrap())] {
+        let f = Fixture::with_created_at(created_at.clone());
+        let original = f.handle.clone();
+        for _ in 0..2 {
+            let result = finalize_workspace_attempt(f.request()).unwrap();
+            assert_eq!(result.handle(), &original);
+            assert!(!std::ptr::eq(result.handle(), &f.handle));
+            assert_eq!(result.handle().created_at(), created_at.as_ref());
+            assert_eq!(
+                result
+                    .handle()
+                    .created_at()
+                    .map(WorkspaceDateTimeV1::as_str),
+                created_at.as_ref().map(|_| spelling)
+            );
+            assert_eq!(f.handle, original);
+        }
+    }
+}
+
+#[test]
 fn attempt_finalization_committed_scope_matrix() {
     for case in ["modification", "deletion", "nested-forbidden", "mixed"] {
         let mut f = Fixture::new();
@@ -285,6 +315,7 @@ fn attempt_finalization_missing_and_tag_objects_fail_locally() {
             f.root().into(),
             CommitSha::parse(sha).unwrap(),
             None,
+            None,
         );
         let mut r = f.request();
         r.handle = &handle;
@@ -316,6 +347,7 @@ fn attempt_finalization_request_and_checkpoint_identity_matrix() {
         "task-branch".into(),
         f.root().into(),
         f.handle.base_sha().clone(),
+        None,
         None,
     );
     let mut r = f.request();

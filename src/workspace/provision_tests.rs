@@ -14,6 +14,7 @@
 use std::ffi::{OsStr, OsString};
 use std::sync::{Mutex, MutexGuard};
 
+use crate::WorkspaceDateTimeV1;
 use crate::error::WorkspaceError;
 use crate::handle::{CommitSha, WorkspaceHandle, WorkspaceIsolation, WorkspaceState};
 use crate::provision::WorkspaceProvisionRequest;
@@ -184,6 +185,36 @@ fn t06_handle_is_provisioned_with_expected_fields() {
     assert_eq!(handle.isolation(), WorkspaceIsolation::WorkspaceIsolation);
     assert_eq!(handle.isolation().as_str(), "WORKSPACE_ISOLATION");
     assert_eq!(handle.remote_publish_policy(), None);
+    assert_eq!(handle.created_at(), None);
+}
+
+#[test]
+fn created_at_opt_in_preserves_canonical_value_and_identity() {
+    let repo = TestRepo::new("wt-created-at");
+    let base_sha = repo.head_sha();
+    let request = valid_request(&repo, "ws-created", "task/created", "worktree", &base_sha);
+    let spelling = "2026-09-20t00:00:00.0012300z";
+    let created_at = WorkspaceDateTimeV1::try_new(spelling).unwrap();
+    let supplied = request.clone().with_created_at(created_at.clone());
+    assert_ne!(supplied, request, "absence and presence are distinct");
+    let handle = supplied.clone().provision().unwrap();
+    assert_eq!(handle.created_at(), Some(&created_at));
+    assert_eq!(
+        handle.clone().created_at().unwrap().as_str().as_bytes(),
+        spelling.as_bytes()
+    );
+    assert_eq!(handle.workspace_id(), request.workspace_id());
+    assert_eq!(handle.task_id(), request.task_id());
+    assert_eq!(handle.branch(), request.branch());
+    assert_eq!(handle.worktree_path(), request.worktree_path());
+    assert_eq!(handle.base_sha(), request.base_sha());
+    assert_eq!(handle.head_sha(), Some(request.base_sha()));
+    assert_eq!(handle.isolation(), WorkspaceIsolation::WorkspaceIsolation);
+    assert_eq!(handle.remote_publish_policy(), None);
+    assert_eq!(handle.state(), WorkspaceState::Provisioned);
+    for invalid in ["invalid", "null", "", "2026-02-30t00:00:00z"] {
+        assert!(WorkspaceDateTimeV1::try_new(invalid).is_err());
+    }
 }
 
 // T7 — a Git command failure (duplicate branch creation refused by Git) is

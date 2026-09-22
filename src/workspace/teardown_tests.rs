@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::WorkspaceDateTimeV1;
 use crate::error::WorkspaceError;
 use crate::handle::{CommitSha, WorkspaceHandle, WorkspaceIsolation, WorkspaceState};
 use crate::provision::WorkspaceProvisionRequest;
@@ -105,6 +106,8 @@ fn td01_successful_teardown_returns_torn_down_and_verifies_externally() {
     assert_eq!(torn.isolation(), WorkspaceIsolation::WorkspaceIsolation);
     assert_eq!(handle.remote_publish_policy(), None);
     assert_eq!(torn.remote_publish_policy(), None);
+    assert_eq!(handle.created_at(), None);
+    assert_eq!(torn.created_at(), None);
 
     // External verification: registration gone, checkout removed, branch
     // retained at the exact original commit.
@@ -445,6 +448,7 @@ fn td11_missing_worktree_checkout_fails_closed() {
         phantom.clone().into_boxed_path(),
         CommitSha::parse(&base_sha).expect("fixture SHA shape"),
         None,
+        None,
     );
 
     let error = teardown_request(&repo)
@@ -484,6 +488,8 @@ fn td12_unresolvable_repository_root_fails_closed() {
 
 #[test]
 fn explicit_remote_policies_are_preserved_without_remote_behavior() {
+    let spelling = "2026-09-20t00:00:00.0012300z";
+    let created_at = WorkspaceDateTimeV1::try_new(spelling).unwrap();
     for policy in [
         WorkspaceRemotePublishPolicy::LocalOnly,
         WorkspaceRemotePublishPolicy::PushOnAccept,
@@ -511,7 +517,8 @@ fn explicit_remote_policies_are_preserved_without_remote_behavior() {
             &base_sha,
         )
         .expect("valid request")
-        .with_remote_publish_policy(policy);
+        .with_remote_publish_policy(policy)
+        .with_created_at(created_at.clone());
         let handle = request.provision().expect("policy must remain data only");
         assert_eq!(handle.remote_publish_policy(), Some(policy));
         assert_eq!(handle.state(), WorkspaceState::Provisioned);
@@ -538,6 +545,18 @@ fn explicit_remote_policies_are_preserved_without_remote_behavior() {
         assert_eq!(torn.base_sha(), handle.base_sha());
         assert_eq!(torn.head_sha(), handle.head_sha());
         assert_eq!(torn.isolation(), handle.isolation());
+        assert_eq!(handle.state(), WorkspaceState::Provisioned);
+        for retained in [&handle, &handle.clone(), &torn, &torn.clone()] {
+            assert_eq!(retained.created_at(), Some(&created_at));
+            assert_eq!(
+                retained.created_at().unwrap().as_str().as_bytes(),
+                spelling.as_bytes()
+            );
+        }
+        assert!(matches!(
+            teardown_request(&repo).teardown(&torn),
+            Err(WorkspaceError::TeardownUnsupportedState { state }) if state == "TORN_DOWN"
+        ));
         assert!(!worktree_registered(&repo, &worktree_path));
         assert!(!worktree_path.exists());
         assert_eq!(retained_branch_target(&repo, "task/policy"), base_sha);
@@ -580,7 +599,8 @@ fn finalized_fixture(
         path,
         &repo.head_sha(),
     )
-    .unwrap();
+    .unwrap()
+    .with_created_at(WorkspaceDateTimeV1::try_new("2026-09-20t00:00:00.0012300z").unwrap());
     if let Some(policy) = policy {
         request = request.with_remote_publish_policy(policy);
     }
@@ -702,6 +722,11 @@ fn finalized_teardown_preserves_identity_base_and_policy_at_exact_final_commit()
         assert_eq!(torn.worktree_path(), handle.worktree_path());
         assert_eq!(torn.isolation(), handle.isolation());
         assert_eq!(torn.remote_publish_policy(), policy);
+        assert_eq!(torn.created_at(), handle.created_at());
+        assert_eq!(
+            torn.created_at().unwrap().as_str(),
+            "2026-09-20t00:00:00.0012300z"
+        );
         assert_eq!(handle.head_sha(), Some(handle.base_sha()));
         assert!(!handle.worktree_path().exists());
         assert!(!worktree_registered(&repo, handle.worktree_path()));
