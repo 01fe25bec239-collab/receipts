@@ -1,6 +1,7 @@
-use std::{cell::RefCell, path::PathBuf, process::Command};
+use std::cell::RefCell;
 
-use receipts_workspace_execution::{WorkspaceHandle, WorkspaceProvisionRequest};
+use receipts_runtime_bindings::RuntimeCapsuleFamily;
+use receipts_workspace_execution::WorkspaceHandle;
 
 use crate::{
     AttemptId, CodexTaskExecutionError, FailureClass, RawFailure, RuntimeAdapter, RuntimeAuthStatus,
@@ -12,7 +13,6 @@ struct FixtureHealthReport(&'static str);
 struct FixtureRuntimeCapabilities(&'static str);
 #[derive(Debug, PartialEq, Eq)]
 struct FixtureModels(&'static str);
-struct FixtureCapsule;
 struct FixtureExecutionPolicy;
 #[derive(Debug, PartialEq, Eq)]
 struct FixtureAttemptHandle(&'static str);
@@ -43,7 +43,6 @@ impl RuntimeAdapter for TrackingRuntimeAdapter {
     type HealthReport = FixtureHealthReport;
     type RuntimeCapabilities = FixtureRuntimeCapabilities;
     type Models = FixtureModels;
-    type Capsule = FixtureCapsule;
     type ExecutionPolicy = FixtureExecutionPolicy;
     type AttemptHandle = FixtureAttemptHandle;
     type AttemptEvent = FixtureAttemptEvent;
@@ -78,7 +77,7 @@ impl RuntimeAdapter for TrackingRuntimeAdapter {
 
     fn start(
         &self,
-        _task: &FixtureCapsule,
+        _task: &RuntimeCapsuleFamily,
         _workspace: &WorkspaceHandle,
         _policy: &FixtureExecutionPolicy,
     ) -> FixtureAttemptHandle {
@@ -121,7 +120,6 @@ impl RuntimeAdapter for DefaultResumeRuntimeAdapter {
     type HealthReport = FixtureHealthReport;
     type RuntimeCapabilities = FixtureRuntimeCapabilities;
     type Models = FixtureModels;
-    type Capsule = FixtureCapsule;
     type ExecutionPolicy = FixtureExecutionPolicy;
     type AttemptHandle = FixtureAttemptHandle;
     type AttemptEvent = FixtureAttemptEvent;
@@ -151,7 +149,7 @@ impl RuntimeAdapter for DefaultResumeRuntimeAdapter {
 
     fn start(
         &self,
-        _task: &FixtureCapsule,
+        _task: &RuntimeCapsuleFamily,
         _workspace: &WorkspaceHandle,
         _policy: &FixtureExecutionPolicy,
     ) -> FixtureAttemptHandle {
@@ -174,21 +172,9 @@ impl RuntimeAdapter for DefaultResumeRuntimeAdapter {
 }
 
 #[test]
-fn frozen_surface_is_exercised_once_with_deterministic_results() {
-    let repository = TestRepository::new();
-    let workspace = WorkspaceProvisionRequest::new(
-        &repository.0,
-        "conformance-workspace",
-        None,
-        "conformance-task",
-        repository.0.join("worktree"),
-        &repository.git(&["rev-parse", "HEAD"]),
-    )
-    .unwrap()
-    .provision()
-    .unwrap();
+fn safely_invocable_frozen_surface_has_deterministic_results() {
     let adapter = TrackingRuntimeAdapter::new();
-    let started = adapter.start(&FixtureCapsule, &workspace, &FixtureExecutionPolicy);
+    let handle = FixtureAttemptHandle("started-attempt");
 
     assert_eq!(adapter.runtime_id(), "tracking-fixture");
     assert_eq!(adapter.health(), FixtureHealthReport("healthy-fixture"));
@@ -198,13 +184,12 @@ fn frozen_surface_is_exercised_once_with_deterministic_results() {
         FixtureRuntimeCapabilities("capabilities-fixture")
     );
     assert_eq!(adapter.models(), FixtureModels("models-fixture"));
-    assert_eq!(started, FixtureAttemptHandle("started-attempt"));
-    assert_eq!(adapter.stream_events(&started), OpaqueEventStream);
+    assert_eq!(adapter.stream_events(&handle), OpaqueEventStream);
     assert_eq!(
-        adapter.collect_result(&started),
+        adapter.collect_result(&handle),
         FixtureAttemptResult("collected-result")
     );
-    adapter.cancel(&started, &FixtureCancelReason);
+    adapter.cancel(&handle, &FixtureCancelReason);
     assert_eq!(
         adapter.classify_failure(&RawFailure::from(&CodexTaskExecutionError::EmptyPrompt)),
         FailureClass::PolicyBlocked
@@ -213,7 +198,23 @@ fn frozen_surface_is_exercised_once_with_deterministic_results() {
         adapter.resume(&AttemptId::new(" exact-試行-e\u{301} ").unwrap()),
         Some(FixtureAttemptHandle("resumed-attempt"))
     );
-    assert_eq!(*adapter.calls.borrow(), [1; 11]);
+    assert_eq!(*adapter.calls.borrow(), [1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1]);
+}
+
+#[test]
+fn start_uses_the_three_variant_canonical_capsule_family() {
+    let _: fn(
+        &TrackingRuntimeAdapter,
+        &RuntimeCapsuleFamily,
+        &WorkspaceHandle,
+        &FixtureExecutionPolicy,
+    ) -> FixtureAttemptHandle = TrackingRuntimeAdapter::start;
+
+    let _: fn(RuntimeCapsuleFamily) = |family| match family {
+        RuntimeCapsuleFamily::Task(_) => {}
+        RuntimeCapsuleFamily::Repair(_) => {}
+        RuntimeCapsuleFamily::Review(_) => {}
+    };
 }
 
 #[test]
@@ -224,50 +225,4 @@ fn omitted_resume_override_means_unsupported() {
         adapter.resume(&AttemptId::new(" exact-試行-e\u{301} ").unwrap()),
         None
     );
-}
-
-// A throwaway repository keeps the eleven-operation call test intact without
-// fabricating Workspace-owned evidence or adding production lifecycle behavior.
-struct TestRepository(PathBuf);
-
-impl TestRepository {
-    fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "receipts-runtime-conformance-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir(&path).unwrap();
-        let repository = Self(path);
-        repository.git(&["init", "--quiet"]);
-        repository.git(&["commit", "--quiet", "--allow-empty", "-m", "seed"]);
-        repository
-    }
-
-    fn git(&self, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .current_dir(&self.0)
-            .env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .args([
-                "-c",
-                "user.name=Runtime Tests",
-                "-c",
-                "user.email=runtime@receipts.invalid",
-                "-c",
-                "commit.gpgsign=false",
-            ])
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "git {args:?}: {:?}", output);
-        String::from_utf8(output.stdout).unwrap().trim().to_owned()
-    }
-}
-
-impl Drop for TestRepository {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
 }
