@@ -1,6 +1,9 @@
 use std::{any::TypeId, error::Error};
 
-use crate::{AttemptId, CodexCapabilityEvidence, CodexCapabilityProbeReport, RuntimeCapabilities};
+use crate::{
+    AttemptId, ClaudeCapabilityEvidence, ClaudeCapabilityProbeReport, CodexCapabilityEvidence,
+    CodexCapabilityProbeReport, RuntimeCapabilities,
+};
 
 const SECRET: &str = "sk-test-NOT-A-REAL-CREDENTIAL-A3-012";
 
@@ -44,21 +47,50 @@ fn identity_and_validation_errors_do_not_format_caller_values() {
 }
 
 #[test]
-fn capabilities_binding_is_the_original_report_with_no_second_inference() {
-    assert_eq!(
+fn capabilities_carrier_preserves_both_reports_and_whole_report_unknown() {
+    assert_ne!(
         TypeId::of::<RuntimeCapabilities>(),
         TypeId::of::<CodexCapabilityProbeReport>()
     );
-    let report = CodexCapabilityProbeReport {
-        version: "synthetic".into(),
+    let codex = CodexCapabilityProbeReport {
+        version: "codex synthetic".into(),
         json: CodexCapabilityEvidence::Supported,
         output_schema: CodexCapabilityEvidence::Unknown,
-        sandbox: CodexCapabilityEvidence::Unknown,
+        sandbox: CodexCapabilityEvidence::Supported,
     };
-    let binding: &RuntimeCapabilities = &report;
-    assert!(std::ptr::eq(binding, &report));
-    assert_eq!(binding.output_schema, CodexCapabilityEvidence::Unknown);
-    assert_eq!(binding.sandbox, CodexCapabilityEvidence::Unknown);
+    let claude = ClaudeCapabilityProbeReport {
+        version: "claude synthetic".into(),
+        print: ClaudeCapabilityEvidence::Supported,
+        input_format: ClaudeCapabilityEvidence::Unknown,
+        output_format: ClaudeCapabilityEvidence::Supported,
+        no_session_persistence: ClaudeCapabilityEvidence::Unknown,
+        permission_mode: ClaudeCapabilityEvidence::Supported,
+        verbose: ClaudeCapabilityEvidence::Unknown,
+    };
+
+    match RuntimeCapabilities::Codex(codex.clone()) {
+        RuntimeCapabilities::Codex(report) => assert_eq!(report, codex),
+        _ => panic!("Codex report changed variant"),
+    }
+    match RuntimeCapabilities::Claude(claude.clone()) {
+        RuntimeCapabilities::Claude(report) => assert_eq!(report, claude),
+        _ => panic!("Claude report changed variant"),
+    }
+    assert_ne!(
+        RuntimeCapabilities::Unknown,
+        RuntimeCapabilities::Codex(codex)
+    );
+    assert_ne!(
+        RuntimeCapabilities::Unknown,
+        RuntimeCapabilities::Claude(claude)
+    );
+
+    // Exhaustive matching keeps Unknown a separate no-evidence state.
+    let _: fn(RuntimeCapabilities) = |capabilities| match capabilities {
+        RuntimeCapabilities::Codex(_) => {}
+        RuntimeCapabilities::Claude(_) => {}
+        RuntimeCapabilities::Unknown => {}
+    };
 }
 
 #[test]
