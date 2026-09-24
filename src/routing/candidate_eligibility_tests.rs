@@ -586,7 +586,7 @@ fn availability_requires_exact_complete_scope_before_trusting_state() {
 }
 
 #[test]
-fn policy_status_is_generic_and_technical_status_is_independent_including_q_v13_04() {
+fn recorded_technical_and_policy_statuses_reject_independently_including_q_v13_04() {
     for provider in ["provider-a", "another-synthetic-provider"] {
         let service = service(provider, LifecycleState::Routable);
         for status in PolicyStatus::ALL {
@@ -616,11 +616,13 @@ fn policy_status_is_generic_and_technical_status_is_independent_including_q_v13_
                     Some("worker"),
                     Some(false),
                 );
-                let expected = if status == PolicyStatus::VerifiedAllowed {
-                    vec![]
-                } else {
-                    vec![ProviderPolicyStatusIneligible(status)]
-                };
+                let mut expected = Vec::new();
+                if technical != TechnicalStatus::Connected {
+                    expected.push(RecordedTechnicalStatusIneligible(technical));
+                }
+                if status != PolicyStatus::VerifiedAllowed {
+                    expected.push(ProviderPolicyStatusIneligible(status));
+                }
                 assert_eq!(
                     result.rejections(),
                     expected,
@@ -739,31 +741,33 @@ fn policy_identity_mismatch_suppresses_unrelated_policy_conclusions() {
         ("other", "other"),
     ] {
         for status in PolicyStatus::ALL {
-            let policy = policy(
-                provider,
-                runtime,
-                status,
-                TechnicalStatus::Connected,
-                None,
-                Some(Some("2026-09-09T00:00:00Z")),
-            );
-            assert_eq!(
-                evaluate(
-                    service.registry(),
-                    &request(&["coding"]),
-                    &availability(
-                        "provider-a",
-                        Some("model-a"),
-                        Some("runtime-a"),
-                        AvailabilityStateKind::Available
-                    ),
-                    &policy,
+            for technical in TechnicalStatus::ALL {
+                let policy = policy(
+                    provider,
+                    runtime,
+                    status,
+                    technical,
                     None,
-                    None
-                )
-                .rejections(),
-                [ProviderPolicyIdentityMismatch]
-            );
+                    Some(Some("2026-09-09T00:00:00Z")),
+                );
+                assert_eq!(
+                    evaluate(
+                        service.registry(),
+                        &request(&["coding"]),
+                        &availability(
+                            "provider-a",
+                            Some("model-a"),
+                            Some("runtime-a"),
+                            AvailabilityStateKind::Available
+                        ),
+                        &policy,
+                        None,
+                        None
+                    )
+                    .rejections(),
+                    [ProviderPolicyIdentityMismatch]
+                );
+            }
         }
     }
 }
@@ -783,7 +787,7 @@ fn simultaneous_rejections_have_stable_gate_and_request_order() {
         "provider-a",
         "runtime-a",
         PolicyStatus::NeedsReview,
-        TechnicalStatus::Connected,
+        TechnicalStatus::Expired,
         None,
         Some(Some("2026-09-09T00:00:00Z")),
     );
@@ -808,6 +812,7 @@ fn simultaneous_rejections_have_stable_gate_and_request_order() {
             RequiredCapabilityUnsupported(c("unsupported")),
             RequiredCapabilityUnknown(c("a-unknown")),
             AvailabilityIneligible(AvailabilityStateKind::RateLimited),
+            RecordedTechnicalStatusIneligible(TechnicalStatus::Expired),
             ProviderPolicyStatusIneligible(PolicyStatus::NeedsReview),
         ]
     );
@@ -815,29 +820,75 @@ fn simultaneous_rejections_have_stable_gate_and_request_order() {
 }
 
 #[test]
+fn recorded_unknown_is_distinct_from_availability_policy_blocked() {
+    let service = service("provider-a", LifecycleState::Routable);
+    assert_eq!(
+        evaluate(
+            service.registry(),
+            &request(&["coding"]),
+            &availability(
+                "provider-a",
+                Some("model-a"),
+                Some("runtime-a"),
+                AvailabilityStateKind::PolicyBlocked,
+            ),
+            &policy(
+                "provider-a",
+                "runtime-a",
+                PolicyStatus::VerifiedAllowed,
+                TechnicalStatus::Unknown,
+                Some(&["worker"]),
+                None,
+            ),
+            Some("worker"),
+            None,
+        )
+        .rejections(),
+        [
+            AvailabilityIneligible(AvailabilityStateKind::PolicyBlocked),
+            RecordedTechnicalStatusIneligible(TechnicalStatus::Unknown),
+        ]
+    );
+}
+
+#[test]
 fn context_and_deadline_failures_accumulate_after_allowed_status() {
     let service = service("provider-a", LifecycleState::Routable);
-    for (passed, expected) in [
-        (None, ReverificationEvidenceMissing),
-        (Some(true), ReverificationDeadlinePassed),
-    ] {
-        assert_eq!(
-            evaluate(
-                service.registry(),
-                &request(&["coding"]),
-                &availability(
-                    "provider-a",
-                    Some("model-a"),
-                    Some("runtime-a"),
-                    AvailabilityStateKind::Available
-                ),
-                &allowed("provider-a"),
-                None,
-                passed
-            )
-            .rejections(),
-            [ExecutionContextNotProvenAllowed, expected]
-        );
+    for technical in [TechnicalStatus::Connected, TechnicalStatus::AuthRequired] {
+        for (passed, deadline_rejection) in [
+            (None, ReverificationEvidenceMissing),
+            (Some(true), ReverificationDeadlinePassed),
+        ] {
+            let mut expected = Vec::new();
+            if technical != TechnicalStatus::Connected {
+                expected.push(RecordedTechnicalStatusIneligible(technical));
+            }
+            expected.extend([ExecutionContextNotProvenAllowed, deadline_rejection]);
+            assert_eq!(
+                evaluate(
+                    service.registry(),
+                    &request(&["coding"]),
+                    &availability(
+                        "provider-a",
+                        Some("model-a"),
+                        Some("runtime-a"),
+                        AvailabilityStateKind::Available
+                    ),
+                    &policy(
+                        "provider-a",
+                        "runtime-a",
+                        PolicyStatus::VerifiedAllowed,
+                        technical,
+                        Some(&["worker"]),
+                        Some(Some("2026-09-09T00:00:00Z")),
+                    ),
+                    None,
+                    passed
+                )
+                .rejections(),
+                expected
+            );
+        }
     }
 }
 

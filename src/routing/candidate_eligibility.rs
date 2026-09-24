@@ -4,7 +4,7 @@
 
 use crate::intelligence::LifecycleState;
 use crate::policy_eligibility::{
-    PolicyEligibilityEvaluator, PolicyStatus, ProviderPolicyEligibility,
+    PolicyEligibilityEvaluator, PolicyStatus, ProviderPolicyEligibility, TechnicalStatus,
 };
 use crate::registry::{CapabilityId, Compatibility, ModelId, ProviderId, Registry, RuntimeId};
 use crate::{
@@ -22,6 +22,7 @@ pub enum CandidateEligibilityRejection {
     AvailabilityScopeInsufficient,
     AvailabilityIneligible(AvailabilityStateKind),
     ProviderPolicyIdentityMismatch,
+    RecordedTechnicalStatusIneligible(TechnicalStatus),
     ProviderPolicyStatusIneligible(PolicyStatus),
     ExecutionContextNotProvenAllowed,
     ReverificationEvidenceMissing,
@@ -46,16 +47,17 @@ impl CandidateEligibilityOutcome {
     }
 }
 
-/// Evaluates only required capabilities and the five documented bounded gates.
+/// Evaluates only required capabilities and the documented bounded gates.
 /// Other request fields are not enforced. All identities and contexts are exact.
+/// Technical status is recorded policy evidence, not current Runtime auth proof.
 ///
 /// No frozen/current contract establishes availability scope inheritance, so
 /// both optional scope identifiers must be present and match this candidate.
 /// A mismatched or insufficient record cannot establish its candidate's state.
 /// Missing models suppress lifecycle and capability checks; missing associations
 /// suppress capability checks. Independent availability/policy checks continue.
-/// Mismatched policy identity suppresses policy evaluation; ineligible status
-/// suppresses dependent context/deadline diagnostics, as in the policy evaluator.
+/// Mismatched policy identity suppresses technical-status and policy evaluation;
+/// ineligible policy status suppresses dependent context/deadline diagnostics.
 #[allow(clippy::too_many_arguments)] // Explicit existing inputs; no new service or request contract.
 pub fn evaluate_candidate_eligibility(
     request: &RoutingRequestNonTemporalCore,
@@ -117,28 +119,33 @@ pub fn evaluate_candidate_eligibility(
 
     if policy.provider_id() != provider || policy.runtime_id() != runtime {
         rejections.push(ProviderPolicyIdentityMismatch);
-    } else if !PolicyEligibilityEvaluator::evaluate(
-        policy,
-        requested_execution_context,
-        reverification_deadline_passed,
-    ) {
-        if !policy.policy_status().passes_policy_gate_by_default() {
-            rejections.push(ProviderPolicyStatusIneligible(policy.policy_status()));
-        } else {
-            // Explain the existing evaluator's rejection; these diagnostics
-            // never grant eligibility or substitute deadline evidence.
-            if !requested_execution_context.is_some_and(|requested| {
-                policy
-                    .allowed_execution_contexts()
-                    .is_some_and(|allowed| allowed.iter().any(|context| context == requested))
-            }) {
-                rejections.push(ExecutionContextNotProvenAllowed);
-            }
-            if policy.reverification_deadline().flatten().is_some() {
-                match reverification_deadline_passed {
-                    None => rejections.push(ReverificationEvidenceMissing),
-                    Some(true) => rejections.push(ReverificationDeadlinePassed),
-                    Some(false) => {}
+    } else {
+        if policy.technical_status() != TechnicalStatus::Connected {
+            rejections.push(RecordedTechnicalStatusIneligible(policy.technical_status()));
+        }
+        if !PolicyEligibilityEvaluator::evaluate(
+            policy,
+            requested_execution_context,
+            reverification_deadline_passed,
+        ) {
+            if !policy.policy_status().passes_policy_gate_by_default() {
+                rejections.push(ProviderPolicyStatusIneligible(policy.policy_status()));
+            } else {
+                // Explain the existing evaluator's rejection; these diagnostics
+                // never grant eligibility or substitute deadline evidence.
+                if !requested_execution_context.is_some_and(|requested| {
+                    policy
+                        .allowed_execution_contexts()
+                        .is_some_and(|allowed| allowed.iter().any(|context| context == requested))
+                }) {
+                    rejections.push(ExecutionContextNotProvenAllowed);
+                }
+                if policy.reverification_deadline().flatten().is_some() {
+                    match reverification_deadline_passed {
+                        None => rejections.push(ReverificationEvidenceMissing),
+                        Some(true) => rejections.push(ReverificationDeadlinePassed),
+                        Some(false) => {}
+                    }
                 }
             }
         }
