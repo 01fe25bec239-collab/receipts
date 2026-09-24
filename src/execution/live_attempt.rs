@@ -198,7 +198,7 @@ impl LiveProcessAttempt {
     /// Bounded copies (at most the existing per-stream capture limit each).
     /// Valid while running, terminating, terminal, and after collection.
     pub fn snapshot_output(&self) -> Result<LiveProcessOutput, ExecutionError> {
-        snapshot(&self.stdout, &self.stderr)
+        snapshot(&self.stdout, &self.stderr, false)
     }
     /// Claim cancellation; cleanup runs exactly once on the owning controller.
     pub fn cancel(&self) -> LiveProcessCancelAcceptance {
@@ -234,11 +234,19 @@ impl Drop for LiveProcessAttempt {
     }
 }
 
-fn snapshot(stdout: &Retention, stderr: &Retention) -> Result<LiveProcessOutput, ExecutionError> {
+fn snapshot(
+    stdout: &Retention,
+    stderr: &Retention,
+    complete: bool,
+) -> Result<LiveProcessOutput, ExecutionError> {
     let copy = |retention: &Retention, stream| {
-        lock(retention)
-            .snapshot()
-            .map_err(|error| super::runner::retention_allocation_failed(stream, error))
+        let retention = lock(retention);
+        (if complete {
+            retention.complete_snapshot()
+        } else {
+            retention.snapshot()
+        })
+        .map_err(|error| super::runner::retention_allocation_failed(stream, error))
     };
     Ok(LiveProcessOutput {
         stdout: copy(stdout, "stdout")?,
@@ -555,7 +563,7 @@ mod platform {
                 Ok(LiveProcessOutcome {
                     termination,
                     exit_code,
-                    output: snapshot(&out, &err)?,
+                    output: snapshot(&out, &err, true)?,
                 })
             })
             .map_err(|error| ExecutionError::ProcessSpawnFailed {

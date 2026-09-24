@@ -7,3 +7,6 @@ publish = false
 
 [lib]
 path = "../../src/workspace/lib.rs"
+
+[dependencies]
+sha2 = "=0.11.0"

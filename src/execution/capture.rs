@@ -24,10 +24,11 @@
 //! * **Overflow fails closed.** Total-byte accounting is checked `u64`
 //!   arithmetic; it never wraps and never saturates.
 //!
-//! Output digests are deliberately not implemented here: this slice
-//! captures bytes only.
+//! Complete-stream digests are available only after successful EOF.
 
+use sha2::{Digest, Sha256};
 use std::collections::TryReserveError;
+use std::fmt::Write;
 use std::io::{ErrorKind, Read};
 
 use crate::execution::outcome::ProcessRunOutcome;
@@ -48,6 +49,14 @@ pub const STREAM_TAIL_RETENTION_BYTES: usize = 524_288;
 /// the child actually produces.
 const READ_BUFFER_BYTES: usize = 32 * 1024;
 
+fn digest_hex(bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(64);
+    for byte in bytes {
+        write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    hex
+}
+
 /// One stream's captured bytes plus the metadata describing what the
 /// complete stream looked like.
 ///
@@ -64,6 +73,7 @@ pub struct CapturedStream {
     total_bytes: u64,
     captured_bytes: u64,
     truncated: bool,
+    digest: Option<String>,
 }
 
 impl CapturedStream {
@@ -95,6 +105,12 @@ impl CapturedStream {
     /// and therefore lost its middle from retention.
     pub fn truncated(&self) -> bool {
         self.truncated
+    }
+
+    /// SHA-256 of every raw byte drained through EOF, as 64 lowercase hex
+    /// characters. Running snapshots and failed drains have no digest.
+    pub fn digest(&self) -> Option<&str> {
+        self.digest.as_deref()
     }
 }
 
@@ -170,6 +186,7 @@ pub(crate) struct BoundedStreamRetention {
     tail_start: usize,
     tail_len: usize,
     total_bytes: u64,
+    hasher: Sha256,
 }
 
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -195,6 +212,7 @@ impl BoundedStreamRetention {
             tail_start: 0,
             tail_len: 0,
             total_bytes: 0,
+            hasher: Sha256::new(),
         })
     }
 
@@ -213,6 +231,7 @@ impl BoundedStreamRetention {
                 chunk: chunk.len(),
             },
         )?;
+        self.hasher.update(chunk);
 
         let head_room = self.head_cap - self.head.len();
         let take = head_room.min(chunk.len());
@@ -281,7 +300,16 @@ impl BoundedStreamRetention {
             tail,
             total_bytes: self.total_bytes,
             truncated: self.total_bytes > (self.head_cap + self.tail_cap) as u64,
+            digest: None,
         })
+    }
+
+    /// Only the caller that has successfully joined this stream's reader may
+    /// turn its final snapshot into complete-stream evidence.
+    pub(crate) fn complete_snapshot(&self) -> Result<CapturedStream, TryReserveError> {
+        let mut captured = self.snapshot()?;
+        captured.digest = Some(digest_hex(&self.hasher.clone().finalize()));
+        Ok(captured)
     }
 
     /// Freezes retention into the immutable captured representation.
@@ -303,6 +331,7 @@ impl BoundedStreamRetention {
             total_bytes: self.total_bytes,
             captured_bytes,
             truncated: self.total_bytes > (self.head_cap + self.tail_cap) as u64,
+            digest: Some(digest_hex(&self.hasher.finalize())),
         }
     }
 }
