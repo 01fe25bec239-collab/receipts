@@ -4,13 +4,12 @@ use receipts_runtime_bindings::RuntimeCapsuleFamily;
 use receipts_workspace_execution::WorkspaceHandle;
 
 use crate::{
-    AttemptId, CodexTaskExecutionError, FailureClass, RawFailure, RuntimeAdapter, RuntimeAuthStatus,
+    AttemptId, CodexTaskExecutionError, FailureClass, RawFailure, RuntimeAdapter,
+    RuntimeAuthStatus, RuntimeCapabilities,
 };
 
 #[derive(Debug, PartialEq, Eq)]
 struct FixtureHealthReport(&'static str);
-#[derive(Debug, PartialEq, Eq)]
-struct FixtureRuntimeCapabilities(&'static str);
 #[derive(Debug, PartialEq, Eq)]
 struct FixtureModels(&'static str);
 struct FixtureExecutionPolicy;
@@ -41,7 +40,6 @@ impl TrackingRuntimeAdapter {
 
 impl RuntimeAdapter for TrackingRuntimeAdapter {
     type HealthReport = FixtureHealthReport;
-    type RuntimeCapabilities = FixtureRuntimeCapabilities;
     type Models = FixtureModels;
     type ExecutionPolicy = FixtureExecutionPolicy;
     type AttemptHandle = FixtureAttemptHandle;
@@ -65,9 +63,9 @@ impl RuntimeAdapter for TrackingRuntimeAdapter {
         RuntimeAuthStatus::Unknown
     }
 
-    fn capabilities(&self) -> FixtureRuntimeCapabilities {
+    fn capabilities(&self) -> RuntimeCapabilities {
         self.record(3);
-        FixtureRuntimeCapabilities("capabilities-fixture")
+        RuntimeCapabilities::Unknown
     }
 
     fn models(&self) -> FixtureModels {
@@ -118,7 +116,6 @@ struct DefaultResumeRuntimeAdapter;
 
 impl RuntimeAdapter for DefaultResumeRuntimeAdapter {
     type HealthReport = FixtureHealthReport;
-    type RuntimeCapabilities = FixtureRuntimeCapabilities;
     type Models = FixtureModels;
     type ExecutionPolicy = FixtureExecutionPolicy;
     type AttemptHandle = FixtureAttemptHandle;
@@ -139,8 +136,8 @@ impl RuntimeAdapter for DefaultResumeRuntimeAdapter {
         RuntimeAuthStatus::Unknown
     }
 
-    fn capabilities(&self) -> FixtureRuntimeCapabilities {
-        FixtureRuntimeCapabilities("unused")
+    fn capabilities(&self) -> RuntimeCapabilities {
+        RuntimeCapabilities::Unknown
     }
 
     fn models(&self) -> FixtureModels {
@@ -179,10 +176,7 @@ fn safely_invocable_frozen_surface_has_deterministic_results() {
     assert_eq!(adapter.runtime_id(), "tracking-fixture");
     assert_eq!(adapter.health(), FixtureHealthReport("healthy-fixture"));
     assert_eq!(adapter.authenticate_status(), RuntimeAuthStatus::Unknown);
-    assert_eq!(
-        adapter.capabilities(),
-        FixtureRuntimeCapabilities("capabilities-fixture")
-    );
+    assert_eq!(adapter.capabilities(), RuntimeCapabilities::Unknown);
     assert_eq!(adapter.models(), FixtureModels("models-fixture"));
     assert_eq!(adapter.stream_events(&handle), OpaqueEventStream);
     assert_eq!(

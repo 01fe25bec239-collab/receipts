@@ -2,7 +2,8 @@ use receipts_runtime_bindings::RuntimeCapsuleFamily;
 use receipts_workspace_execution::WorkspaceHandle;
 
 use crate::{
-    AttemptId, CodexTaskExecutionError, FailureClass, RawFailure, RuntimeAdapter, RuntimeAuthStatus,
+    AttemptId, CodexTaskExecutionError, FailureClass, RawFailure, RuntimeAdapter,
+    RuntimeAuthStatus, RuntimeCapabilities,
 };
 
 struct SurfaceWitness;
@@ -10,7 +11,6 @@ struct OpaqueEventStream;
 
 impl RuntimeAdapter for SurfaceWitness {
     type HealthReport = ();
-    type RuntimeCapabilities = ();
     type Models = ();
     type ExecutionPolicy = ();
     type AttemptHandle = ();
@@ -29,7 +29,9 @@ impl RuntimeAdapter for SurfaceWitness {
         RuntimeAuthStatus::Unknown
     }
 
-    fn capabilities(&self) {}
+    fn capabilities(&self) -> RuntimeCapabilities {
+        RuntimeCapabilities::Unknown
+    }
 
     fn models(&self) {}
 
@@ -101,6 +103,7 @@ fn canonical_parameters_leave_only_the_other_associated_placeholders() {
     // These witnesses compile for every implementer without associated-type
     // equality constraints: no canonical parameter can be substituted by an adapter.
     fn parameters<A: RuntimeAdapter>() {
+        let _: fn(&A) -> RuntimeCapabilities = A::capabilities;
         let _: fn(
             &A,
             &RuntimeCapsuleFamily,
@@ -121,7 +124,6 @@ fn canonical_parameters_leave_only_the_other_associated_placeholders() {
         observed,
         [
             "HealthReport;",
-            "RuntimeCapabilities;",
             "Models;",
             "ExecutionPolicy;",
             "AttemptHandle;",

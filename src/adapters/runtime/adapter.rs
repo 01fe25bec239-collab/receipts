@@ -6,15 +6,12 @@
 use receipts_runtime_bindings::RuntimeCapsuleFamily;
 use receipts_workspace_execution::WorkspaceHandle;
 
-use crate::{AttemptId, FailureClass, RawFailure, RuntimeAuthStatus};
+use crate::{AttemptId, FailureClass, RawFailure, RuntimeAuthStatus, RuntimeCapabilities};
 
 /// Interface shared by every agent runtime.
 pub trait RuntimeAdapter {
     /// Unbound placeholder for the frozen health report.
     type HealthReport;
-
-    /// Unbound placeholder for the frozen runtime capabilities.
-    type RuntimeCapabilities;
 
     /// Unbound placeholder for the frozen `ModelRef[] | UNKNOWN` result.
     ///
@@ -57,7 +54,7 @@ pub trait RuntimeAdapter {
 
     fn authenticate_status(&self) -> RuntimeAuthStatus;
 
-    fn capabilities(&self) -> Self::RuntimeCapabilities;
+    fn capabilities(&self) -> RuntimeCapabilities;
 
     fn models(&self) -> Self::Models;
 
