@@ -103,11 +103,18 @@ fn availability(
 }
 
 fn policy(candidate: &RegistryCandidateIdentity) -> ProviderPolicyEligibility {
+    policy_with_technical(candidate, TechnicalStatus::Connected)
+}
+
+fn policy_with_technical(
+    candidate: &RegistryCandidateIdentity,
+    technical: TechnicalStatus,
+) -> ProviderPolicyEligibility {
     ProviderPolicyEligibility::try_new(
         candidate.provider_id().as_str().into(),
         candidate.runtime_id().as_str().into(),
         "synthetic-credential".into(),
-        TechnicalStatus::Connected,
+        technical,
         PolicyStatus::VerifiedAllowed,
         Some(vec!["worker".into(), " Worker ".into(), "é".into()]),
         timestamp(),
@@ -119,6 +126,54 @@ fn policy(candidate: &RegistryCandidateIdentity) -> ProviderPolicyEligibility {
         None,
     )
     .unwrap()
+}
+
+#[test]
+fn recorded_technical_status_propagates_in_canonical_candidate_order() {
+    let service = registry(&[
+        ("C", "M", "R"),
+        ("A", "M", "R2"),
+        ("B", "M", "R"),
+        ("A", "M", "R1"),
+        ("D", "M", "R"),
+    ]);
+    let candidates = enumerate_registry_candidates(service.registry());
+    let available: Vec<_> = candidates
+        .iter()
+        .map(|candidate| availability(candidate, AvailabilityStateKind::Available))
+        .collect();
+    let policies: Vec<_> = candidates
+        .iter()
+        .zip(TechnicalStatus::ALL)
+        .map(|(candidate, status)| policy_with_technical(candidate, status))
+        .collect();
+    let evidence = bundles(&candidates, &available, &policies, &[Some(false); 5]);
+    let result = assert_direct_delegation(
+        &service,
+        &request(&["coding"], None, None),
+        &evidence,
+        Some("worker"),
+    );
+    assert_eq!(
+        result
+            .iter()
+            .map(|item| item.candidate())
+            .collect::<Vec<_>>(),
+        candidates.iter().collect::<Vec<_>>()
+    );
+    for (assessment, status) in result.iter().zip(TechnicalStatus::ALL) {
+        let mut expected = vec![
+            LifecycleNotNormallyRoutable(LifecycleState::Discovered),
+            RequiredCapabilityUnknown(CapabilityId::try_new("coding".into()).unwrap()),
+        ];
+        if status != TechnicalStatus::Connected {
+            expected.push(RecordedTechnicalStatusIneligible(status));
+        }
+        assert_eq!(
+            assessment.bounded_eligibility_outcome().rejections(),
+            expected
+        );
+    }
 }
 
 fn bundles<'a>(
