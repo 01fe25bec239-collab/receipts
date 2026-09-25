@@ -15,6 +15,7 @@
 //! stderr receives no banner, so stderr expectations are the raw pattern
 //! alone. Both channels stay byte-exact either way.
 
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
@@ -77,11 +78,30 @@ fn expected_stream(banner: &[u8], total: usize) -> Vec<u8> {
     expected
 }
 
+fn expected_digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 // --- Capture assertions --------------------------------------------------
 
 /// Asserts every frozen capture invariant against the complete expected
 /// stream, including that retention contains process bytes only.
 fn assert_captured(actual: &CapturedStream, expected: &[u8], what: &str) {
+    let expected_digest = expected_digest(expected);
+    assert_eq!(
+        actual.digest(),
+        Some(expected_digest.as_str()),
+        "{what}: full-stream SHA-256"
+    );
+    assert_eq!(expected_digest.len(), 64, "{what}: digest length");
+    assert!(
+        expected_digest
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    );
     let total = expected.len() as u64;
     assert_eq!(actual.total_bytes(), total, "{what}: total_bytes");
     assert_eq!(
@@ -150,6 +170,11 @@ fn assert_pattern_prefix_stream(actual: &CapturedStream, banner: &[u8], what: &s
 }
 
 fn assert_empty_stream(actual: &CapturedStream, what: &str) {
+    assert_eq!(
+        actual.digest(),
+        Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+        "{what}: empty SHA-256"
+    );
     assert_eq!(actual.total_bytes(), 0, "{what}: total_bytes");
     assert_eq!(actual.captured_bytes(), 0, "{what}: captured_bytes");
     assert!(!actual.truncated(), "{what}: truncated");
@@ -1529,6 +1554,7 @@ fn total_byte_counting_overflow_fails_closed_instead_of_wrapping() {
         .push(&[0u8])
         .expect_err("counting one more byte past u64::MAX must fail");
     assert_eq!(retention.total_bytes(), u64::MAX, "the count must not wrap");
+    assert_eq!(retention.snapshot().unwrap().digest(), None);
     let mapped = capture_fault_failed("stderr", fault);
     assert!(
         matches!(
@@ -1592,6 +1618,7 @@ fn a_read_failure_before_eof_fails_closed_with_a_stream_identified_error() {
     // before the failure were still counted — but no CapturedStream is
     // produced for a stream that never reached EOF.
     assert_eq!(retention.total_bytes(), 4);
+    assert_eq!(retention.snapshot().unwrap().digest(), None);
 }
 
 #[test]

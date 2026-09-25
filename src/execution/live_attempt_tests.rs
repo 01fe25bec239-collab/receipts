@@ -3,6 +3,7 @@
 use super::live_attempt::{AFTER_CLAIM, BEFORE_MONITOR, TestGate};
 use super::unix_signal::{caller_process_group, process_alive, recorded_group_is_empty};
 use super::*;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -11,6 +12,13 @@ use std::time::{Duration, Instant};
 
 const LIMIT: Duration = Duration::from_secs(10);
 const GRACE: Duration = Duration::from_millis(100);
+
+fn expected_digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 struct Workspace(PathBuf);
 impl Workspace {
@@ -102,8 +110,18 @@ fn outcome(
         Err(LiveProcessAttemptError::AlreadyCollectedOrCollecting)
     ));
     let snapshot = attempt.snapshot_output().unwrap();
-    assert_eq!(snapshot.stdout(), result.stdout());
-    assert_eq!(snapshot.stderr(), result.stderr());
+    for (running, terminal) in [
+        (snapshot.stdout(), result.stdout()),
+        (snapshot.stderr(), result.stderr()),
+    ] {
+        assert_eq!(running.digest(), None);
+        assert!(terminal.digest().is_some());
+        assert_eq!(running.head(), terminal.head());
+        assert_eq!(running.tail(), terminal.tail());
+        assert_eq!(running.total_bytes(), terminal.total_bytes());
+        assert_eq!(running.captured_bytes(), terminal.captured_bytes());
+        assert_eq!(running.truncated(), terminal.truncated());
+    }
     result
 }
 fn prove_empty(ws: &Workspace, caller: i32) {
@@ -348,6 +366,7 @@ fn live_stdout_heavy_stderr_heavy_and_simultaneous_bounded_retention() {
         let snapshot = attempt.snapshot_output().unwrap();
         for stream in [snapshot.stdout(), snapshot.stderr()] {
             assert!(stream.captured_bytes() <= STREAM_CAPTURE_LIMIT_BYTES);
+            assert_eq!(stream.digest(), None);
         }
         ws.write("release-child", b"1");
         let result = outcome(&attempt, LiveProcessTerminalCause::Completed, false);
@@ -355,6 +374,17 @@ fn live_stdout_heavy_stderr_heavy_and_simultaneous_bounded_retention() {
         // Libtest adds a small stdout banner before the probe's raw bytes.
         let banner = result.stdout().total_bytes() - out as u64;
         assert!(banner > 0 && banner < 512);
+        let mut expected_stdout = result.stdout().head()[..banner as usize].to_vec();
+        expected_stdout.extend(std::iter::repeat_n(b'O', out));
+        assert_eq!(
+            result.stdout().digest(),
+            Some(expected_digest(&expected_stdout).as_str())
+        );
+        let expected_stderr = vec![b'E'; err];
+        assert_eq!(
+            result.stderr().digest(),
+            Some(expected_digest(&expected_stderr).as_str())
+        );
         for (stream, count, byte) in [(result.stdout(), out, b'O'), (result.stderr(), err, b'E')] {
             assert!(stream.captured_bytes() <= STREAM_CAPTURE_LIMIT_BYTES);
             assert_eq!(
@@ -553,7 +583,12 @@ fn live_incremental_snapshot_matches_retention_across_ring_wraps() {
             let tail_start = head.min(count).max(count.saturating_sub(tail));
             assert_eq!(snapshot.tail(), &bytes[tail_start..count]);
         }
-        assert_eq!(retention.snapshot().unwrap(), retention.finish());
+        let snapshot = retention.snapshot().unwrap();
+        assert_eq!(snapshot.digest(), None);
+        let finished = retention.finish();
+        assert_eq!(finished.digest(), Some(expected_digest(&bytes).as_str()));
+        assert_eq!(snapshot.head(), finished.head());
+        assert_eq!(snapshot.tail(), finished.tail());
     }
 }
 
@@ -635,7 +670,8 @@ fn eof_boundary_case(finish_at_boundary: &[&'static str], expired: bool) {
         assert_eq!(result.terminal_cause(), LiveProcessTerminalCause::Cancelled);
         // Both the leader and its descendant emit 23 bytes.
         assert_eq!(result.stderr().total_bytes(), 46);
-        assert_eq!(attempt.snapshot_output().unwrap().stderr(), result.stderr());
+        assert_eq!(attempt.snapshot_output().unwrap().stderr().digest(), None);
+        assert!(result.stderr().digest().is_some());
     } else {
         let expected = ["stdout", "stderr"]
             .into_iter()

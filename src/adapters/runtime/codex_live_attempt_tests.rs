@@ -270,7 +270,15 @@ fn completion_before_cancel_and_snapshot_after_single_collection() {
         Err(LiveProcessAttemptError::AlreadyCollectedOrCollecting)
     ));
     let snapshot = attempt.snapshot_output().unwrap();
-    assert_eq!(snapshot.output().stdout(), result.process().stdout());
+    let running = snapshot.output().stdout();
+    let terminal = result.process().stdout();
+    assert_eq!(running.head(), terminal.head());
+    assert_eq!(running.tail(), terminal.tail());
+    assert_eq!(running.total_bytes(), terminal.total_bytes());
+    assert_eq!(running.captured_bytes(), terminal.captured_bytes());
+    assert_eq!(running.truncated(), terminal.truncated());
+    assert_eq!(running.digest(), None);
+    assert!(terminal.digest().is_some());
     assert_eq!(
         snapshot.protocol().unwrap().termination(),
         Protocol::Indeterminate
