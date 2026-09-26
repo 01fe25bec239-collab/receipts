@@ -118,14 +118,17 @@ fn capability_name_has_no_graph_identifier_length_limit() {
 
 #[test]
 fn graph_node_accepts_empty_required_capability_names() {
-    let node = GraphNode::new(
+    let absent = GraphNode::new(
         "empty",
+        "graph",
         GraphNodeKind::TASK,
         GraphNodeState::Planned,
-        vec![],
     )
     .expect("valid node");
-    assert!(node.required_capabilities().is_empty());
+    assert_eq!(absent.required_capabilities(), None);
+    let node = absent.clone().with_required_capabilities(vec![]);
+    assert_eq!(node.required_capabilities(), Some(&[][..]));
+    assert_ne!(node, absent, "present empty differs from absent");
 }
 
 #[test]
@@ -142,13 +145,15 @@ fn graph_node_preserves_capability_names_order_and_duplicates() {
         .collect();
     let node = GraphNode::new(
         "ordered",
+        "graph",
         GraphNodeKind::TASK,
         GraphNodeState::Planned,
-        capabilities,
     )
-    .expect("valid node");
+    .expect("valid node")
+    .with_required_capabilities(capabilities);
     let actual: Vec<_> = node
         .required_capabilities()
+        .expect("present capabilities")
         .iter()
         .map(CapabilityName::as_str)
         .collect();

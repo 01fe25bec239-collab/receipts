@@ -17,7 +17,9 @@
 //!   ascending node order, and whole-graph scans examine edges in ascending
 //!   edge-id order, so the identified closing edge and closing path are a
 //!   pure function of graph content;
-//! * the rejection names the candidate edge/change deterministically.
+//! * the rejection names the candidate edge/change deterministically;
+//! * every node and edge must declare this graph's exact `graph_id`; a child
+//!   naming another graph is rejected before acceptance and never rewritten.
 //!
 //! Explicitly out of this slice: scheduler semantics, durable persistence,
 //! digests, snapshots, results, budgets, admission, routing. Nothing here
@@ -61,13 +63,15 @@ impl ExecutionGraph {
 
     /// Builds a graph from complete node and edge sets in one step.
     ///
-    /// Every structural invariant is validated on the assembled graph:
-    /// duplicate node/edge ids are rejected, edges referencing nodes absent
+    /// Every structural invariant is validated on the assembled graph: nodes
+    /// and edges declaring another `graph_id` are rejected, duplicate
+    /// node/edge ids are rejected, edges referencing nodes absent
     /// from the node set are rejected, and a precedence cycle anywhere in the
     /// resulting precedence subgraph rejects the whole construction with the
     /// closing edge identified. Checks run in deterministic (ascending id)
     /// order so equivalent input yields identical outcomes regardless of the
-    /// order elements are listed in.
+    /// order elements are listed in. An empty node and edge set yields an
+    /// empty graph for incremental construction; any failure returns no graph.
     pub fn from_parts(
         graph_id: impl Into<String>,
         nodes: Vec<GraphNode>,
@@ -83,6 +87,9 @@ impl ExecutionGraph {
         // input produces byte-identical failure identification.
         let mut sorted_edges = edges;
         sorted_edges.sort_by(|a, b| a.edge_id().cmp(b.edge_id()));
+        for edge in &sorted_edges {
+            graph.validate_edge_graph_id(edge)?;
+        }
         if let Some(duplicate) = sorted_edges
             .windows(2)
             .find(|pair| pair[0].edge_id() == pair[1].edge_id())
@@ -92,14 +99,7 @@ impl ExecutionGraph {
             });
         }
         for edge in &sorted_edges {
-            for endpoint in [edge.from_node(), edge.to_node()] {
-                if !graph.nodes.contains_key(endpoint) {
-                    return Err(GraphError::UnknownNodeReference {
-                        edge_id: edge.edge_id().to_owned(),
-                        node_id: endpoint.to_owned(),
-                    });
-                }
-            }
+            graph.validate_edge_endpoints(edge)?;
         }
         for edge in sorted_edges {
             graph.edges.insert(edge.edge_id().to_owned(), edge);
@@ -114,8 +114,10 @@ impl ExecutionGraph {
         &self.graph_id
     }
 
-    /// Adds a node, failing explicitly on a duplicate node id.
+    /// Adds a node, failing explicitly without mutation on a mismatched
+    /// child `graph_id` or a duplicate node id.
     pub fn add_node(&mut self, node: GraphNode) -> Result<(), GraphError> {
+        self.validate_child_graph_id("node", node.node_id(), node.graph_id())?;
         if self.nodes.contains_key(node.node_id()) {
             return Err(GraphError::DuplicateNodeId {
                 node_id: node.node_id().to_owned(),
@@ -140,25 +142,55 @@ impl ExecutionGraph {
     /// Dry-runs [`ExecutionGraph::add_edge`] without mutating the graph.
     ///
     /// Performs the exact acceptance checks the mutating call performs:
-    /// duplicate edge id, endpoint existence, and — for precedence
-    /// candidates — deterministic cycle analysis of the resulting precedence
-    /// subgraph.
+    /// matching child `graph_id`, duplicate edge id, endpoint existence, and
+    /// — for precedence candidates — deterministic cycle analysis of the
+    /// resulting precedence subgraph.
     pub fn validate_edge_addition(&self, candidate: &GraphEdge) -> Result<(), GraphError> {
+        self.validate_edge_graph_id(candidate)?;
         if self.edges.contains_key(candidate.edge_id()) {
             return Err(GraphError::DuplicateEdgeId {
                 edge_id: candidate.edge_id().to_owned(),
             });
         }
-        for endpoint in [candidate.from_node(), candidate.to_node()] {
+        self.validate_edge_endpoints(candidate)?;
+        if candidate.class() == EdgeClass::Precedence {
+            self.reject_if_precedence_cycle(candidate)?;
+        }
+        Ok(())
+    }
+
+    /// Rejects a child whose declared graph differs, by exact comparison,
+    /// from this graph's id.
+    fn validate_child_graph_id(
+        &self,
+        child: &'static str,
+        child_id: &str,
+        child_graph_id: &str,
+    ) -> Result<(), GraphError> {
+        if child_graph_id != self.graph_id {
+            return Err(GraphError::ChildGraphIdMismatch {
+                child,
+                child_id: child_id.to_owned(),
+                graph_id: self.graph_id.clone(),
+                child_graph_id: child_graph_id.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_edge_graph_id(&self, edge: &GraphEdge) -> Result<(), GraphError> {
+        self.validate_child_graph_id("edge", edge.edge_id(), edge.graph_id())
+    }
+
+    /// Rejects an edge whose source or target node is not in the graph.
+    fn validate_edge_endpoints(&self, edge: &GraphEdge) -> Result<(), GraphError> {
+        for endpoint in [edge.from_node(), edge.to_node()] {
             if !self.nodes.contains_key(endpoint) {
                 return Err(GraphError::UnknownNodeReference {
-                    edge_id: candidate.edge_id().to_owned(),
+                    edge_id: edge.edge_id().to_owned(),
                     node_id: endpoint.to_owned(),
                 });
             }
-        }
-        if candidate.class() == EdgeClass::Precedence {
-            self.reject_if_precedence_cycle(candidate)?;
         }
         Ok(())
     }

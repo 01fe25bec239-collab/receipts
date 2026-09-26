@@ -138,10 +138,18 @@ fn repeated_validation_preserves_actor_evidence() {
 #[test]
 fn validation_leaves_execution_graph_unchanged() {
     let nodes = ["first", "second"]
-        .map(|id| GraphNode::new(id, GraphNodeKind::TASK, GraphNodeState::Planned, vec![]).unwrap())
+        .map(|id| {
+            GraphNode::new(id, "graph", GraphNodeKind::TASK, GraphNodeState::Planned).unwrap()
+        })
         .to_vec();
-    let edge =
-        GraphEdge::precedence("edge", "first", "second", PrecedenceKind::RequiresAccepted).unwrap();
+    let edge = GraphEdge::precedence(
+        "edge",
+        "graph",
+        "first",
+        "second",
+        PrecedenceKind::RequiresAccepted,
+    )
+    .unwrap();
     let graph = ExecutionGraph::from_parts("graph", nodes, vec![edge]).unwrap();
     let before = graph.clone();
     // The policy's only input is shared actor evidence, never graph authority.

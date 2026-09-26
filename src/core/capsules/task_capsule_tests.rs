@@ -398,18 +398,22 @@ fn canonical_graph_capabilities_transfer_verbatim_without_domain_weakening() {
     ];
     let node = GraphNode::new(
         "node",
+        "graph",
         GraphNodeKind::TASK,
         GraphNodeState::Planned,
-        caps.clone(),
     )
-    .unwrap();
+    .unwrap()
+    .with_required_capabilities(caps.clone());
+    let node_capabilities = node
+        .required_capabilities()
+        .expect("explicitly present capabilities");
     let mut i = Input::valid();
-    i.required_capabilities = node.required_capabilities().to_vec();
-    i.preferred_capabilities = Some(node.required_capabilities().to_vec());
+    i.required_capabilities = node_capabilities.to_vec();
+    i.preferred_capabilities = Some(node_capabilities.to_vec());
     let c = i.build().unwrap();
     let required: &[CapabilityName] = c.required_capabilities();
     let preferred: Option<&[CapabilityName]> = c.preferred_capabilities();
-    assert_eq!(required, node.required_capabilities());
+    assert_eq!(required, node_capabilities);
     assert_eq!(preferred, Some(caps.as_slice()));
     assert_eq!(
         required
