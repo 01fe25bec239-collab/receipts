@@ -6,7 +6,8 @@
 //! concrete existing precedence path it would close.
 
 /// Maximum allowed length, in Unicode scalar values, of every constrained
-/// graph identifier (graph, node, edge): the frozen contract value 200.
+/// graph identifier (graph, node, edge, parent node, workstream, workspace):
+/// the frozen contract value 200.
 pub const MAX_IDENTIFIER_LENGTH: usize = 200;
 
 /// Every way a graph-domain operation can fail.
@@ -30,6 +31,28 @@ pub enum GraphError {
         length: usize,
         /// Maximum allowed length ([`MAX_IDENTIFIER_LENGTH`]).
         max: usize,
+    },
+    /// A node `code_sha` was not exactly 40 lowercase ASCII hex digits.
+    InvalidCodeSha {
+        /// The original offending input, unchanged.
+        value: String,
+    },
+    /// A node `attempt_number` was not canonical positive ASCII decimal.
+    InvalidAttemptNumber {
+        /// The original offending input, unchanged.
+        value: String,
+    },
+    /// A node or edge declared a graph other than the containing graph. The
+    /// graph is left unchanged; child identity is never rewritten.
+    ChildGraphIdMismatch {
+        /// Which child record was rejected: `node` or `edge`.
+        child: &'static str,
+        /// The rejected child's node or edge id.
+        child_id: String,
+        /// The containing graph's id.
+        graph_id: String,
+        /// The graph id the child declared.
+        child_graph_id: String,
     },
     /// A node id was already present in the graph.
     DuplicateNodeId {
@@ -106,6 +129,26 @@ impl std::fmt::Display for GraphError {
                 write!(
                     f,
                     "identifier for {field} has {length} scalar values, exceeding the maximum {max}"
+                )
+            }
+            GraphError::InvalidCodeSha { value } => {
+                write!(f, "code_sha {value:?} is not 40 lowercase ASCII hex digits")
+            }
+            GraphError::InvalidAttemptNumber { value } => {
+                write!(
+                    f,
+                    "attempt_number {value:?} is not a canonical positive ASCII decimal"
+                )
+            }
+            GraphError::ChildGraphIdMismatch {
+                child,
+                child_id,
+                graph_id,
+                child_graph_id,
+            } => {
+                write!(
+                    f,
+                    "{child} {child_id:?} declares graph {child_graph_id:?}, not containing graph {graph_id:?}"
                 )
             }
             GraphError::DuplicateNodeId { node_id } => {

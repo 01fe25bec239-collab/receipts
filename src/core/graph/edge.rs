@@ -141,24 +141,44 @@ impl GraphEdgeRelation {
 }
 
 /// A directed relation between two nodes of one execution graph.
+///
+/// `graph_id` names the containing graph and is checked by
+/// [`ExecutionGraph`](crate::ExecutionGraph) on insertion. The optional `note`
+/// is absent until set and preserved exactly. Fields are private, so
+/// construction cannot bypass validation or class exclusivity:
+/// ```compile_fail
+/// use receipts_orchestration::{GraphEdge, GraphEdgeRelation, PrecedenceKind};
+/// let edge = GraphEdge {
+///     edge_id: String::new(),
+///     graph_id: String::new(),
+///     from_node: String::new(),
+///     to_node: String::new(),
+///     relation: GraphEdgeRelation::Precedence(PrecedenceKind::RequiresAccepted),
+///     note: None,
+/// };
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphEdge {
     edge_id: String,
+    graph_id: String,
     from_node: String,
     to_node: String,
     relation: GraphEdgeRelation,
+    note: Option<String>,
 }
 
 impl GraphEdge {
     /// Creates a `PRECEDENCE` edge carrying exactly one precedence kind.
     pub fn precedence(
         edge_id: impl Into<String>,
+        graph_id: impl Into<String>,
         from_node: impl Into<String>,
         to_node: impl Into<String>,
         kind: PrecedenceKind,
     ) -> Result<Self, GraphError> {
         Self::new(
             edge_id,
+            graph_id,
             from_node,
             to_node,
             GraphEdgeRelation::Precedence(kind),
@@ -169,12 +189,14 @@ impl GraphEdge {
     /// edges are recorded but never treated as scheduling prerequisites.
     pub fn control(
         edge_id: impl Into<String>,
+        graph_id: impl Into<String>,
         from_node: impl Into<String>,
         to_node: impl Into<String>,
         kind: ControlKind,
     ) -> Result<Self, GraphError> {
         Self::new(
             edge_id,
+            graph_id,
             from_node,
             to_node,
             GraphEdgeRelation::Control(kind),
@@ -183,27 +205,43 @@ impl GraphEdge {
 
     fn new(
         edge_id: impl Into<String>,
+        graph_id: impl Into<String>,
         from_node: impl Into<String>,
         to_node: impl Into<String>,
         relation: GraphEdgeRelation,
     ) -> Result<Self, GraphError> {
         let edge_id = edge_id.into();
+        let graph_id = graph_id.into();
         let from_node = from_node.into();
         let to_node = to_node.into();
         GraphError::validate_identifier("edge_id", &edge_id)?;
+        GraphError::validate_identifier("graph_id", &graph_id)?;
         GraphError::validate_identifier("from_node", &from_node)?;
         GraphError::validate_identifier("to_node", &to_node)?;
         Ok(Self {
             edge_id,
+            graph_id,
             from_node,
             to_node,
             relation,
+            note: None,
         })
+    }
+
+    /// Sets `note`; any string, including empty, is preserved exactly.
+    pub fn with_note(mut self, note: impl Into<String>) -> Self {
+        self.note = Some(note.into());
+        self
     }
 
     /// The stable edge identity.
     pub fn edge_id(&self) -> &str {
         &self.edge_id
+    }
+
+    /// The identity of the graph this edge declares it belongs to.
+    pub fn graph_id(&self) -> &str {
+        &self.graph_id
     }
 
     /// The source node id.
@@ -234,5 +272,10 @@ impl GraphEdge {
     /// The control kind, present only for `CONTROL` edges.
     pub fn control_kind(&self) -> Option<ControlKind> {
         self.relation.control_kind()
+    }
+
+    /// The note, or `None` when absent.
+    pub fn note(&self) -> Option<&str> {
+        self.note.as_deref()
     }
 }

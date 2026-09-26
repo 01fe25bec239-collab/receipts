@@ -197,9 +197,14 @@ fn resulting_digest_has_no_effect() {
 
 #[test]
 fn repeated_pass_and_rejection_preserve_graph_and_mutation_exactly() {
-    let node =
-        GraphNode::new("node", GraphNodeKind::TASK, GraphNodeState::Planned, vec![]).unwrap();
-    let edge = GraphEdge::control("edge", "node", "node", ControlKind::OnPass).unwrap();
+    let node = GraphNode::new(
+        "node",
+        "graph-a",
+        GraphNodeKind::TASK,
+        GraphNodeState::Planned,
+    )
+    .unwrap();
+    let edge = GraphEdge::control("edge", "graph-a", "node", "node", ControlKind::OnPass).unwrap();
     let graph = ExecutionGraph::from_parts("graph-a", vec![node], vec![edge]).unwrap();
     let graph_before = graph.clone();
     for kind in GraphMutationOperationKind::ALL {

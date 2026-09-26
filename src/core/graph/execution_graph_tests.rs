@@ -7,35 +7,34 @@ use std::borrow::Cow;
 use crate::edge::{ControlKind, EdgeClass, GraphEdge, PrecedenceKind};
 use crate::error::GraphError;
 use crate::execution_graph::ExecutionGraph;
-use crate::node::{CapabilityName, GraphNode, GraphNodeKind};
+use crate::node::{CapabilityName, GraphNode, GraphNodeAttemptNumber, GraphNodeKind};
 use crate::node_state::GraphNodeState;
+use crate::version::GraphVersionV1;
 
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
 
+/// Graph identity shared by every fixture node, edge, and containing graph.
+const G: &str = "g";
+
 /// Creates a plain node of an arbitrary kind with no required capabilities.
 fn task(node_id: &str) -> GraphNode {
-    GraphNode::new(
-        node_id,
-        GraphNodeKind::TASK,
-        GraphNodeState::Planned,
-        Vec::new(),
-    )
-    .expect("valid fixture node")
+    GraphNode::new(node_id, G, GraphNodeKind::TASK, GraphNodeState::Planned)
+        .expect("valid fixture node")
 }
 
 fn prec(edge_id: &str, from: &str, to: &str) -> GraphEdge {
-    GraphEdge::precedence(edge_id, from, to, PrecedenceKind::RequiresAccepted)
+    GraphEdge::precedence(edge_id, G, from, to, PrecedenceKind::RequiresAccepted)
         .expect("valid fixture precedence edge")
 }
 
 fn prec_kind(edge_id: &str, from: &str, to: &str, kind: PrecedenceKind) -> GraphEdge {
-    GraphEdge::precedence(edge_id, from, to, kind).expect("valid fixture precedence edge")
+    GraphEdge::precedence(edge_id, G, from, to, kind).expect("valid fixture precedence edge")
 }
 
 fn ctrl(edge_id: &str, from: &str, to: &str, kind: ControlKind) -> GraphEdge {
-    GraphEdge::control(edge_id, from, to, kind).expect("valid fixture control edge")
+    GraphEdge::control(edge_id, G, from, to, kind).expect("valid fixture control edge")
 }
 
 /// Builds a chain `ids[0] -> ids[1] -> ..` of `REQUIRES_ACCEPTED` precedence.
@@ -77,10 +76,10 @@ fn cycle_error(
 
 #[test]
 fn all_node_states_are_stored_and_read_exactly() {
-    let mut incremental = ExecutionGraph::new("states").unwrap();
+    let mut incremental = ExecutionGraph::new(G).unwrap();
     let mut nodes = Vec::new();
     for state in GraphNodeState::ALL {
-        let node = GraphNode::new(state.as_str(), GraphNodeKind::TASK, state, vec![]).unwrap();
+        let node = GraphNode::new(state.as_str(), G, GraphNodeKind::TASK, state).unwrap();
         assert_eq!(node.state(), state);
         let cloned = node.clone();
         assert_eq!(cloned, node);
@@ -89,7 +88,7 @@ fn all_node_states_are_stored_and_read_exactly() {
         assert_eq!(incremental.node_state(node.node_id()), Some(state));
         nodes.push(node);
     }
-    let batched = ExecutionGraph::from_parts("states", nodes.clone(), vec![]).unwrap();
+    let batched = ExecutionGraph::from_parts(G, nodes.clone(), vec![]).unwrap();
     assert_eq!(batched, incremental);
     let cloned = batched.clone();
     assert_eq!(cloned, batched);
@@ -103,13 +102,12 @@ fn all_node_states_are_stored_and_read_exactly() {
             assert_eq!(graph.node_state(""), None);
         }
     }
-    let planned =
-        GraphNode::new("same", GraphNodeKind::TASK, GraphNodeState::Planned, vec![]).unwrap();
-    let ready = GraphNode::new("same", GraphNodeKind::TASK, GraphNodeState::Ready, vec![]).unwrap();
+    let planned = GraphNode::new("same", G, GraphNodeKind::TASK, GraphNodeState::Planned).unwrap();
+    let ready = GraphNode::new("same", G, GraphNodeKind::TASK, GraphNodeState::Ready).unwrap();
     assert_ne!(planned, ready, "node equality includes stored state");
     assert_ne!(
-        ExecutionGraph::from_parts("same", vec![planned], vec![]).unwrap(),
-        ExecutionGraph::from_parts("same", vec![ready], vec![]).unwrap(),
+        ExecutionGraph::from_parts(G, vec![planned], vec![]).unwrap(),
+        ExecutionGraph::from_parts(G, vec![ready], vec![]).unwrap(),
         "graph equality includes stored state"
     );
 }
@@ -122,13 +120,13 @@ fn structural_operations_preserve_live_node_states() {
         ("c", GraphNodeState::Integrated),
     ]
     .into_iter()
-    .map(|(id, state)| GraphNode::new(id, GraphNodeKind::TASK, state, vec![]).unwrap())
+    .map(|(id, state)| GraphNode::new(id, G, GraphNodeKind::TASK, state).unwrap())
     .collect();
     let edges = vec![
         prec("p_a_b", "a", "b"),
         ctrl("c_b_a", "b", "a", ControlKind::OnPass),
     ];
-    let mut graph = ExecutionGraph::from_parts("structural", nodes.clone(), edges.clone()).unwrap();
+    let mut graph = ExecutionGraph::from_parts(G, nodes.clone(), edges.clone()).unwrap();
     let assert_states = |graph: &ExecutionGraph| {
         for node in &nodes {
             assert_eq!(graph.node(node.node_id()), Some(node));
@@ -173,7 +171,7 @@ fn structural_operations_preserve_live_node_states() {
         assert_states(&graph);
     }
     let replacement =
-        GraphNode::new("a", GraphNodeKind::TASK, GraphNodeState::Cancelled, vec![]).unwrap();
+        GraphNode::new("a", G, GraphNodeKind::TASK, GraphNodeState::Cancelled).unwrap();
     assert_eq!(
         graph.add_node(replacement),
         Err(GraphError::DuplicateNodeId {
@@ -204,7 +202,7 @@ fn case_01_empty_graph_is_accepted() {
 /// Case 2: a one-node graph is valid and acyclic.
 #[test]
 fn case_02_one_node_graph_is_accepted() {
-    let mut graph = ExecutionGraph::new("g-one").expect("graph constructs");
+    let mut graph = ExecutionGraph::new(G).expect("graph constructs");
     graph.add_node(task("solo")).expect("first node accepted");
     assert_eq!(graph.node_count(), 1);
     assert_eq!(graph.edge_count(), 0);
@@ -219,7 +217,7 @@ fn case_02_one_node_graph_is_accepted() {
 /// Case 3: a simple precedence chain is accepted.
 #[test]
 fn case_03_simple_precedence_chain_is_accepted() {
-    let graph = chain_graph("g-chain", &["a", "b", "c"]);
+    let graph = chain_graph(G, &["a", "b", "c"]);
     assert_eq!(graph.node_count(), 3);
     assert_eq!(graph.precedence_edges().count(), 2);
     assert!(!graph.has_precedence_cycle());
@@ -231,7 +229,7 @@ fn case_03_simple_precedence_chain_is_accepted() {
 /// between two existing parallel paths (redundant, still acyclic).
 #[test]
 fn case_04_diamond_dag_is_accepted() {
-    let mut graph = ExecutionGraph::new("g-diamond").expect("graph constructs");
+    let mut graph = ExecutionGraph::new(G).expect("graph constructs");
     for id in ["a", "b", "c", "d"] {
         graph.add_node(task(id)).expect("unique node");
     }
@@ -264,14 +262,14 @@ fn case_05_disconnected_acyclic_components_are_accepted() {
         prec("p_w2_x_y", "w2-x", "w2-y"),
         prec("p_w2_y_z", "w2-y", "w2-z"),
     ];
-    let batched = ExecutionGraph::from_parts("g-disconnected", nodes.clone(), edges.clone())
+    let batched = ExecutionGraph::from_parts(G, nodes.clone(), edges.clone())
         .expect("disconnected components accepted");
     assert_eq!(batched.node_count(), 6);
     assert_eq!(batched.precedence_edges().count(), 3);
     assert!(!batched.has_precedence_cycle());
 
     // The same topology built incrementally compares equal.
-    let mut incremental = ExecutionGraph::new("g-disconnected").expect("graph constructs");
+    let mut incremental = ExecutionGraph::new(G).expect("graph constructs");
     for node in nodes {
         incremental.add_node(node).expect("unique node");
     }
@@ -288,7 +286,7 @@ fn case_05_disconnected_acyclic_components_are_accepted() {
 /// Case 6: a precedence self-cycle is rejected atomically.
 #[test]
 fn case_06_precedence_self_cycle_is_rejected() {
-    let mut graph = chain_graph("g-self", &["b"]);
+    let mut graph = chain_graph(G, &["b"]);
     graph.add_node(task("a")).expect("second node");
     graph.add_edge(prec("p_b_a", "b", "a")).expect("setup edge");
 
@@ -319,7 +317,7 @@ fn case_06_precedence_self_cycle_is_rejected() {
 /// deterministically identified.
 #[test]
 fn case_07_two_node_precedence_cycle_is_rejected() {
-    let mut graph = chain_graph("g-two", &["a", "b"]);
+    let mut graph = chain_graph(G, &["a", "b"]);
     let before = graph.clone();
 
     let rejection = graph
@@ -337,7 +335,7 @@ fn case_07_two_node_precedence_cycle_is_rejected() {
 /// concrete closing path.
 #[test]
 fn case_08_longer_precedence_cycle_is_rejected() {
-    let mut graph = chain_graph("g-long", &["a", "b", "c", "d"]);
+    let mut graph = chain_graph(G, &["a", "b", "c", "d"]);
     let before = graph.clone();
 
     let rejection = graph
@@ -361,7 +359,7 @@ fn case_08_longer_precedence_cycle_is_rejected() {
 /// rejected and never applied; the surviving graph stays usable.
 #[test]
 fn case_09_candidate_closing_existing_path_is_rejected() {
-    let mut graph = ExecutionGraph::new("g-close").expect("graph constructs");
+    let mut graph = ExecutionGraph::new(G).expect("graph constructs");
     for id in ["a", "b", "c", "d"] {
         graph.add_node(task(id)).expect("unique node");
     }
@@ -405,7 +403,7 @@ fn case_09_candidate_closing_existing_path_is_rejected() {
 /// (`Review-1 --CONTROL ON_REJECT--> Repair-2`) and pure control loops.
 #[test]
 fn case_10_control_loops_are_stored_without_false_rejection() {
-    let mut graph = ExecutionGraph::new("g-control-loop").expect("graph constructs");
+    let mut graph = ExecutionGraph::new(G).expect("graph constructs");
     for id in [
         "n_impl_1",
         "n_review_1",
@@ -459,7 +457,7 @@ fn case_10_control_loops_are_stored_without_false_rejection() {
 /// control hops neither close cycles nor mask real ones.
 #[test]
 fn case_11_mixed_topology_examines_only_precedence() {
-    let mut graph = ExecutionGraph::new("g-mixed").expect("graph constructs");
+    let mut graph = ExecutionGraph::new(G).expect("graph constructs");
     for id in ["a", "b", "c", "d"] {
         graph.add_node(task(id)).expect("unique node");
     }
@@ -506,7 +504,7 @@ fn case_11_mixed_topology_examines_only_precedence() {
 #[test]
 fn case_12_repeated_validation_is_identical() {
     let build = || {
-        let mut graph = ExecutionGraph::new("g-repeat").expect("graph constructs");
+        let mut graph = ExecutionGraph::new(G).expect("graph constructs");
         for id in ["a", "b", "c"] {
             graph.add_node(task(id)).expect("unique node");
         }
@@ -554,10 +552,10 @@ fn case_13_closing_edge_identification_is_insertion_order_independent() {
     ];
     let edges_reverse: Vec<GraphEdge> = edges_forward.iter().rev().cloned().collect();
 
-    let forward_graph = ExecutionGraph::from_parts("g-det", nodes.clone(), edges_forward)
-        .expect("acyclic forward build");
-    let reverse_graph = ExecutionGraph::from_parts("g-det", nodes, edges_reverse)
-        .expect("acyclic reversed-order build");
+    let forward_graph =
+        ExecutionGraph::from_parts(G, nodes.clone(), edges_forward).expect("acyclic forward build");
+    let reverse_graph =
+        ExecutionGraph::from_parts(G, nodes, edges_reverse).expect("acyclic reversed-order build");
     assert_eq!(
         forward_graph, reverse_graph,
         "equivalent input yields identical graph state"
@@ -588,7 +586,7 @@ fn case_13_closing_edge_identification_is_insertion_order_independent() {
     // ascending edge-id order and identifies the same cycle through the first
     // closing edge it reaches.
     let closed = ExecutionGraph::from_parts(
-        "g-det-closed",
+        G,
         vec![task("a"), task("b"), task("c"), task("d")],
         vec![
             prec("p_d_a", "d", "a"),
@@ -638,17 +636,12 @@ fn malformed_graph_identifiers_fail_explicitly() {
 #[test]
 fn malformed_nodes_fail_explicitly() {
     assert_eq!(
-        GraphNode::new("", GraphNodeKind::TASK, GraphNodeState::Planned, Vec::new()),
+        GraphNode::new("", G, GraphNodeKind::TASK, GraphNodeState::Planned),
         Err(GraphError::EmptyIdentifier { field: "node_id" }),
     );
     let oversized: String = "n".repeat(201);
     assert!(matches!(
-        GraphNode::new(
-            oversized,
-            GraphNodeKind::TASK,
-            GraphNodeState::Planned,
-            Vec::new()
-        ),
+        GraphNode::new(oversized, G, GraphNodeKind::TASK, GraphNodeState::Planned),
         Err(GraphError::IdentifierTooLong {
             field: "node_id",
             ..
@@ -661,8 +654,7 @@ fn malformed_nodes_fail_explicitly() {
         Err(GraphError::EmptyIdentifier { field: "kind" }),
     );
     let fresh = GraphNodeKind::new(Cow::Owned("BRAND_NEW_KIND_42".to_owned())).expect("open kind");
-    let node =
-        GraphNode::new("n1", fresh, GraphNodeState::Planned, Vec::new()).expect("valid node");
+    let node = GraphNode::new("n1", G, fresh, GraphNodeState::Planned).expect("valid node");
     assert_eq!(node.kind().as_str(), "BRAND_NEW_KIND_42");
 
     assert_eq!(
@@ -676,20 +668,20 @@ fn malformed_nodes_fail_explicitly() {
 #[test]
 fn malformed_edges_fail_explicitly() {
     assert_eq!(
-        GraphEdge::precedence("", "a", "b", PrecedenceKind::RequiresAccepted),
+        GraphEdge::precedence("", G, "a", "b", PrecedenceKind::RequiresAccepted),
         Err(GraphError::EmptyIdentifier { field: "edge_id" }),
     );
     assert_eq!(
-        GraphEdge::control("e", "", "b", ControlKind::OnPass),
+        GraphEdge::control("e", G, "", "b", ControlKind::OnPass),
         Err(GraphError::EmptyIdentifier { field: "from_node" }),
     );
     assert_eq!(
-        GraphEdge::control("e", "a", "", ControlKind::OnReject),
+        GraphEdge::control("e", G, "a", "", ControlKind::OnReject),
         Err(GraphError::EmptyIdentifier { field: "to_node" }),
     );
     let oversized: String = "n".repeat(201);
     assert!(matches!(
-        GraphEdge::precedence("e", oversized, "b", PrecedenceKind::RequiresInterface),
+        GraphEdge::precedence("e", G, oversized, "b", PrecedenceKind::RequiresInterface),
         Err(GraphError::IdentifierTooLong {
             field: "from_node",
             ..
@@ -699,7 +691,7 @@ fn malformed_edges_fail_explicitly() {
 
 #[test]
 fn duplicate_node_id_fails_explicitly() {
-    let mut graph = chain_graph("g-dupe-node", &["a", "b"]);
+    let mut graph = chain_graph(G, &["a", "b"]);
     let before = graph.clone();
     assert_eq!(
         graph.add_node(task("a")),
@@ -712,7 +704,7 @@ fn duplicate_node_id_fails_explicitly() {
 
 #[test]
 fn duplicate_edge_id_fails_explicitly_even_across_classes() {
-    let mut graph = chain_graph("g-dupe-edge", &["a", "b"]);
+    let mut graph = chain_graph(G, &["a", "b"]);
     let before = graph.clone();
     assert_eq!(
         graph.add_edge(prec("p_a_b", "b", "a")),
@@ -738,7 +730,7 @@ fn duplicate_edge_id_fails_explicitly_even_across_classes() {
 
 #[test]
 fn unknown_endpoint_reference_fails_explicitly() {
-    let mut graph = chain_graph("g-dangling", &["a"]);
+    let mut graph = chain_graph(G, &["a"]);
     let dangling = prec("p_a_ghost", "a", "ghost");
     assert_eq!(
         graph.validate_edge_addition(&dangling),
@@ -772,7 +764,7 @@ fn batch_construction_rejects_every_violation_class_explicitly() {
     // ascending edge-id order identifies the first closing edge.
     assert_eq!(
         ExecutionGraph::from_parts(
-            "g-batch-cycle",
+            G,
             vec![task("a"), task("b"), task("c")],
             vec![
                 prec("p_a_b", "a", "b"),
@@ -791,21 +783,13 @@ fn batch_construction_rejects_every_violation_class_explicitly() {
 
     // Self-cycle inside a batch is rejected.
     assert_eq!(
-        ExecutionGraph::from_parts(
-            "g-batch-self",
-            vec![task("a")],
-            vec![prec("p_a_a", "a", "a")]
-        ),
+        ExecutionGraph::from_parts(G, vec![task("a")], vec![prec("p_a_a", "a", "a")]),
         Err(cycle_error("p_a_a", "a", "a", &["a"], &[])),
     );
 
     // Dangling reference rejects the entire construction.
     assert_eq!(
-        ExecutionGraph::from_parts(
-            "g-batch-dangling",
-            vec![task("a")],
-            vec![prec("p_a_z", "a", "z")]
-        ),
+        ExecutionGraph::from_parts(G, vec![task("a")], vec![prec("p_a_z", "a", "z")]),
         Err(GraphError::UnknownNodeReference {
             edge_id: "p_a_z".to_owned(),
             node_id: "z".to_owned(),
@@ -814,14 +798,14 @@ fn batch_construction_rejects_every_violation_class_explicitly() {
 
     // Duplicate ids reject the entire construction.
     assert_eq!(
-        ExecutionGraph::from_parts("g-batch-dupe", vec![task("a"), task("a")], vec![]),
+        ExecutionGraph::from_parts(G, vec![task("a"), task("a")], vec![]),
         Err(GraphError::DuplicateNodeId {
             node_id: "a".to_owned()
         }),
     );
     assert_eq!(
         ExecutionGraph::from_parts(
-            "g-batch-dupe-edge",
+            G,
             vec![task("a"), task("b")],
             vec![prec("e1", "a", "b"), prec("e1", "b", "a")],
         ),
@@ -866,7 +850,7 @@ fn edge_class_exclusivity_is_structural() {
         (ControlKind::ExpandsInto, "EXPANDS_INTO"),
     ];
     for (kind, representation) in control_kinds {
-        let edge = GraphEdge::control("id", "a", "b", kind).expect("valid control edge");
+        let edge = GraphEdge::control("id", G, "a", "b", kind).expect("valid control edge");
         assert_eq!(edge.relation().kind_as_str(), representation);
         assert_eq!(edge.class().as_str(), "CONTROL");
         assert_eq!(edge.precedence_kind(), None);
@@ -883,22 +867,21 @@ fn required_capabilities_remain_data_only() {
     ];
     let node = GraphNode::new(
         "cap-node",
+        G,
         GraphNodeKind::IMPLEMENTATION,
         GraphNodeState::Planned,
-        capabilities,
     )
-    .expect("valid node");
+    .expect("valid node")
+    .with_required_capabilities(capabilities);
 
     // Stored verbatim, order preserved, returned unchanged: nothing here
     // interprets, filters, admits, routes, or tiers on capability data.
-    assert_eq!(node.required_capabilities().len(), 3);
-    assert_eq!(node.required_capabilities()[0].as_str(), "graph.core");
-    assert_eq!(
-        node.required_capabilities()[1].as_str(),
-        "review.independent_a4"
-    );
-    assert_eq!(node.required_capabilities()[2].as_str(), "graph.core");
-    assert_eq!(task("plain").required_capabilities().len(), 0);
+    let stored = node.required_capabilities().expect("present capabilities");
+    assert_eq!(stored.len(), 3);
+    assert_eq!(stored[0].as_str(), "graph.core");
+    assert_eq!(stored[1].as_str(), "review.independent_a4");
+    assert_eq!(stored[2].as_str(), "graph.core");
+    assert_eq!(task("plain").required_capabilities(), None);
 }
 
 #[test]
@@ -924,12 +907,12 @@ fn well_known_node_kinds_are_extensible_strings_not_an_enum() {
 
     // An unseen kind requires no code or schema change to participate fully
     // in graph topology and cycle validation.
-    let mut graph = ExecutionGraph::new("g-open-kind").expect("graph constructs");
+    let mut graph = ExecutionGraph::new(G).expect("graph constructs");
     let exotic = GraphNode::new(
         "future-node",
+        G,
         GraphNodeKind::new(Cow::Owned("KIND_NOT_YET_INVENTED".to_owned())).expect("open kind"),
         GraphNodeState::Planned,
-        Vec::new(),
     )
     .expect("valid node");
     graph.add_node(exotic).expect("open-kind node accepted");
@@ -938,4 +921,488 @@ fn well_known_node_kinds_are_extensible_strings_not_an_enum() {
         .add_edge(prec("p_future_t", "future-node", "t"))
         .expect("open-kind node participates in topology");
     assert!(!graph.has_precedence_cycle());
+}
+
+// ---------------------------------------------------------------------------
+// Full-fidelity node and edge records and child graph identity
+// ---------------------------------------------------------------------------
+
+const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+const ABOVE_U64: &str = "18446744073709551616";
+
+fn attempt(value: &str) -> GraphNodeAttemptNumber {
+    GraphNodeAttemptNumber::try_new(value).expect("valid attempt number")
+}
+
+fn version(value: &str) -> GraphVersionV1 {
+    GraphVersionV1::try_new(value).expect("valid graph version")
+}
+
+fn full_node() -> GraphNode {
+    task("full")
+        .with_title("Tïtle ✓")
+        .with_parent_node_id("parent")
+        .unwrap()
+        .with_attempt_number(attempt(ABOVE_U64))
+        .with_required_capabilities(vec![
+            CapabilityName::new("graph.core").unwrap(),
+            CapabilityName::new("review.independent_a4").unwrap(),
+            CapabilityName::new("graph.core").unwrap(),
+        ])
+        .with_task_capsule_ref("capsule://ref")
+        .with_workstream_id("ws-1")
+        .unwrap()
+        .with_code_sha(SHA)
+        .unwrap()
+        .with_workspace_id("wsp-1")
+        .unwrap()
+        .with_result_ref("")
+        .with_locked_reason("requires pro")
+        .with_created_in_version(version("7"))
+}
+
+#[test]
+fn node_preserves_every_field_through_getters() {
+    let node = full_node();
+    assert_eq!(node.node_id(), "full");
+    assert_eq!(node.graph_id(), G);
+    assert_eq!(node.kind(), &GraphNodeKind::TASK);
+    assert_eq!(node.state(), GraphNodeState::Planned);
+    assert_eq!(node.title(), Some("Tïtle ✓"));
+    assert_eq!(node.parent_node_id(), Some("parent"));
+    assert_eq!(node.attempt_number().map(|a| a.as_str()), Some(ABOVE_U64));
+    let capabilities: Vec<_> = node
+        .required_capabilities()
+        .unwrap()
+        .iter()
+        .map(CapabilityName::as_str)
+        .collect();
+    assert_eq!(
+        capabilities,
+        ["graph.core", "review.independent_a4", "graph.core"]
+    );
+    assert_eq!(node.task_capsule_ref(), Some("capsule://ref"));
+    assert_eq!(node.workstream_id(), Some("ws-1"));
+    assert_eq!(node.code_sha(), Some(SHA));
+    assert_eq!(node.workspace_id(), Some("wsp-1"));
+    assert_eq!(node.result_ref(), Some(""));
+    assert_eq!(node.locked_reason(), Some(Some("requires pro")));
+    assert_eq!(node.created_in_version(), Some(&version("7")));
+
+    // A graph holding the node returns it unchanged.
+    let graph = ExecutionGraph::from_parts(G, vec![node.clone()], vec![]).unwrap();
+    assert_eq!(graph.node("full"), Some(&node));
+}
+
+#[test]
+fn node_optional_fields_start_absent_and_each_presence_is_distinct() {
+    let bare = task("n");
+    assert_eq!(bare.title(), None);
+    assert_eq!(bare.parent_node_id(), None);
+    assert_eq!(bare.attempt_number(), None);
+    assert_eq!(bare.required_capabilities(), None);
+    assert_eq!(bare.task_capsule_ref(), None);
+    assert_eq!(bare.workstream_id(), None);
+    assert_eq!(bare.code_sha(), None);
+    assert_eq!(bare.workspace_id(), None);
+    assert_eq!(bare.result_ref(), None);
+    assert_eq!(bare.locked_reason(), None);
+    assert_eq!(bare.created_in_version(), None);
+
+    let variants = [
+        bare.clone().with_title(""),
+        bare.clone().with_parent_node_id("p").unwrap(),
+        bare.clone().with_attempt_number(attempt("1")),
+        bare.clone().with_required_capabilities(vec![]),
+        bare.clone().with_task_capsule_ref(""),
+        bare.clone().with_workstream_id("w").unwrap(),
+        bare.clone().with_code_sha(SHA).unwrap(),
+        bare.clone().with_workspace_id("w").unwrap(),
+        bare.clone().with_result_ref(""),
+        bare.clone().with_locked_reason(""),
+        bare.clone().with_null_locked_reason(),
+        bare.clone().with_created_in_version(version("1")),
+    ];
+    for (i, left) in variants.iter().enumerate() {
+        assert_ne!(left, &bare, "variant {i} equals the absent node");
+        for (j, right) in variants.iter().enumerate() {
+            assert_eq!(left == right, i == j, "variants {i} and {j}");
+        }
+    }
+}
+
+#[test]
+fn locked_reason_distinguishes_absent_null_empty_and_string() {
+    let absent = task("n");
+    let null = task("n").with_null_locked_reason();
+    let empty = task("n").with_locked_reason("");
+    let text = task("n").with_locked_reason("requires pro");
+    assert_eq!(absent.locked_reason(), None);
+    assert_eq!(null.locked_reason(), Some(None));
+    assert_eq!(empty.locked_reason(), Some(Some("")));
+    assert_eq!(text.locked_reason(), Some(Some("requires pro")));
+    let all = [&absent, &null, &empty, &text];
+    for (i, left) in all.iter().enumerate() {
+        for (j, right) in all.iter().enumerate() {
+            assert_eq!(left == right, i == j);
+        }
+    }
+}
+
+#[test]
+fn required_capabilities_distinguish_absent_empty_and_ordered_duplicates() {
+    let absent = task("n");
+    let empty = task("n").with_required_capabilities(vec![]);
+    let names = ["b.x", "a.y", "b.x"];
+    let ordered = task("n").with_required_capabilities(
+        names
+            .iter()
+            .map(|name| CapabilityName::new(*name).unwrap())
+            .collect(),
+    );
+    let reordered = task("n").with_required_capabilities(
+        ["a.y", "b.x", "b.x"]
+            .iter()
+            .map(|name| CapabilityName::new(*name).unwrap())
+            .collect(),
+    );
+    assert_eq!(absent.required_capabilities(), None);
+    assert_eq!(empty.required_capabilities(), Some(&[][..]));
+    let stored: Vec<_> = ordered
+        .required_capabilities()
+        .unwrap()
+        .iter()
+        .map(CapabilityName::as_str)
+        .collect();
+    assert_eq!(stored, names);
+    assert_ne!(absent, empty);
+    assert_ne!(ordered, reordered, "order is preserved, not normalized");
+}
+
+#[test]
+fn unconstrained_strings_preserve_empty_whitespace_and_unicode_exactly() {
+    for value in ["", " ", "\t\n", "Ünïcode ✓ 🚀", "e\u{301}", "\u{202e}rtl"] {
+        let node = task("n")
+            .with_title(value)
+            .with_task_capsule_ref(value)
+            .with_result_ref(value)
+            .with_locked_reason(value);
+        assert_eq!(node.title(), Some(value));
+        assert_eq!(node.task_capsule_ref(), Some(value));
+        assert_eq!(node.result_ref(), Some(value));
+        assert_eq!(node.locked_reason(), Some(Some(value)));
+        for edge in [
+            prec("p", "a", "b").with_note(value),
+            ctrl("c", "a", "b", ControlKind::OnPass).with_note(value),
+        ] {
+            assert_eq!(edge.note(), Some(value));
+        }
+    }
+    // Canonically equivalent Unicode spellings stay distinct (no normalization).
+    assert_ne!(task("n").with_title("é"), task("n").with_title("e\u{301}"));
+}
+
+#[test]
+fn constrained_identifiers_enforce_scalar_boundaries_and_preserve_text() {
+    let at = |n: usize| "🚀".repeat(n);
+    let too_long = |field| GraphError::IdentifierTooLong {
+        field,
+        length: 201,
+        max: crate::error::MAX_IDENTIFIER_LENGTH,
+    };
+    for n in [1, 200] {
+        let id = at(n);
+        let node = GraphNode::new(
+            id.as_str(),
+            id.as_str(),
+            GraphNodeKind::TASK,
+            GraphNodeState::Planned,
+        )
+        .unwrap()
+        .with_parent_node_id(id.as_str())
+        .unwrap()
+        .with_workstream_id(id.as_str())
+        .unwrap()
+        .with_workspace_id(id.as_str())
+        .unwrap();
+        assert_eq!(node.node_id(), id);
+        assert_eq!(node.graph_id(), id);
+        assert_eq!(node.parent_node_id(), Some(id.as_str()));
+        assert_eq!(node.workstream_id(), Some(id.as_str()));
+        assert_eq!(node.workspace_id(), Some(id.as_str()));
+        for edge in [
+            GraphEdge::precedence(
+                id.as_str(),
+                id.as_str(),
+                id.as_str(),
+                id.as_str(),
+                PrecedenceKind::RequiresAccepted,
+            )
+            .unwrap(),
+            GraphEdge::control(
+                id.as_str(),
+                id.as_str(),
+                id.as_str(),
+                id.as_str(),
+                ControlKind::OnPass,
+            )
+            .unwrap(),
+        ] {
+            assert_eq!(edge.edge_id(), id);
+            assert_eq!(edge.graph_id(), id);
+            assert_eq!(edge.from_node(), id);
+            assert_eq!(edge.to_node(), id);
+        }
+    }
+    let long = at(201);
+    let kind = GraphNodeKind::TASK;
+    let state = GraphNodeState::Planned;
+    assert_eq!(
+        GraphNode::new(long.as_str(), G, kind.clone(), state),
+        Err(too_long("node_id"))
+    );
+    assert_eq!(
+        GraphNode::new("n", long.as_str(), kind.clone(), state),
+        Err(too_long("graph_id"))
+    );
+    assert_eq!(
+        GraphNode::new("n", "", kind, state),
+        Err(GraphError::EmptyIdentifier { field: "graph_id" })
+    );
+    assert_eq!(
+        task("n").with_parent_node_id(long.as_str()),
+        Err(too_long("parent_node_id"))
+    );
+    assert_eq!(
+        task("n").with_workstream_id(long.as_str()),
+        Err(too_long("workstream_id"))
+    );
+    assert_eq!(
+        task("n").with_workspace_id(long.as_str()),
+        Err(too_long("workspace_id"))
+    );
+    for field in ["parent_node_id", "workstream_id", "workspace_id"] {
+        let result = match field {
+            "parent_node_id" => task("n").with_parent_node_id(""),
+            "workstream_id" => task("n").with_workstream_id(""),
+            _ => task("n").with_workspace_id(""),
+        };
+        assert_eq!(result, Err(GraphError::EmptyIdentifier { field }));
+    }
+    let p = PrecedenceKind::RequiresAccepted;
+    let c = ControlKind::OnPass;
+    assert_eq!(
+        GraphEdge::precedence("e", long.as_str(), "a", "b", p),
+        Err(too_long("graph_id"))
+    );
+    assert_eq!(
+        GraphEdge::control("e", long.as_str(), "a", "b", c),
+        Err(too_long("graph_id"))
+    );
+    assert_eq!(
+        GraphEdge::precedence("e", "", "a", "b", p),
+        Err(GraphError::EmptyIdentifier { field: "graph_id" })
+    );
+    assert_eq!(
+        GraphEdge::control("e", "", "a", "b", c),
+        Err(GraphError::EmptyIdentifier { field: "graph_id" })
+    );
+    assert_eq!(
+        GraphEdge::control(long.as_str(), G, "a", "b", c),
+        Err(too_long("edge_id"))
+    );
+    assert_eq!(
+        GraphEdge::control("e", G, "a", long.as_str(), c),
+        Err(too_long("to_node"))
+    );
+}
+
+#[test]
+fn code_sha_requires_exactly_forty_lowercase_ascii_hex() {
+    assert_eq!(task("n").with_code_sha(SHA).unwrap().code_sha(), Some(SHA));
+    let invalid = [
+        String::new(),
+        SHA[..39].to_owned(),
+        format!("{SHA}0"),
+        SHA.to_uppercase(),
+        format!("{}g", &SHA[..39]),
+        format!("{}é", &SHA[..38]),
+        format!(" {}", &SHA[..39]),
+    ];
+    for value in invalid {
+        assert_eq!(
+            task("n").with_code_sha(value.as_str()),
+            Err(GraphError::InvalidCodeSha { value })
+        );
+    }
+}
+
+#[test]
+fn positive_integer_fields_accept_unbounded_canonical_decimals_only() {
+    let long = format!("1{}", "0".repeat(10_000));
+    for value in ["1", "42", ABOVE_U64, long.as_str()] {
+        let node = task("n")
+            .with_attempt_number(attempt(value))
+            .with_created_in_version(version(value));
+        assert_eq!(node.attempt_number().unwrap().as_str(), value);
+        assert_eq!(node.created_in_version().unwrap().as_str(), value);
+    }
+    for value in [
+        "", "0", "00", "01", "-1", "+1", "1.0", "1e3", " 1", "1 ", "١", "１",
+    ] {
+        assert_eq!(
+            GraphNodeAttemptNumber::try_new(value),
+            Err(GraphError::InvalidAttemptNumber {
+                value: value.to_owned()
+            })
+        );
+        assert!(GraphVersionV1::try_new(value).is_err(), "{value:?}");
+    }
+}
+
+#[test]
+fn edge_note_and_graph_id_are_preserved_for_both_classes() {
+    let precedence = prec("p", "a", "b");
+    let control = ctrl("c", "a", "b", ControlKind::OnReject);
+    for edge in [&precedence, &control] {
+        assert_eq!(edge.graph_id(), G);
+        assert_eq!(edge.note(), None);
+        assert_ne!(
+            edge.clone().with_note(""),
+            *edge,
+            "empty note differs from absent"
+        );
+    }
+    assert_eq!(
+        precedence.precedence_kind(),
+        Some(PrecedenceKind::RequiresAccepted)
+    );
+    assert_eq!(precedence.control_kind(), None);
+    assert_eq!(control.control_kind(), Some(ControlKind::OnReject));
+    assert_eq!(control.precedence_kind(), None);
+    // The note never alters class or kind.
+    assert_eq!(
+        precedence.clone().with_note("n").relation(),
+        precedence.relation()
+    );
+    assert_eq!(
+        control.clone().with_note("n").relation(),
+        control.relation()
+    );
+}
+
+fn mismatch(child: &'static str, child_id: &str, child_graph_id: &str) -> GraphError {
+    GraphError::ChildGraphIdMismatch {
+        child,
+        child_id: child_id.to_owned(),
+        graph_id: G.to_owned(),
+        child_graph_id: child_graph_id.to_owned(),
+    }
+}
+
+#[test]
+fn matching_child_graph_ids_are_accepted_by_every_path() {
+    let nodes = vec![task("a"), task("b")];
+    let edges = vec![
+        prec("p", "a", "b"),
+        ctrl("c", "b", "a", ControlKind::OnReject),
+    ];
+    let batched = ExecutionGraph::from_parts(G, nodes.clone(), edges.clone()).unwrap();
+    let mut incremental = ExecutionGraph::new(G).unwrap();
+    for node in nodes {
+        incremental.add_node(node).unwrap();
+    }
+    for edge in edges {
+        assert_eq!(incremental.validate_edge_addition(&edge), Ok(()));
+        incremental.add_edge(edge).unwrap();
+    }
+    assert_eq!(batched, incremental);
+}
+
+#[test]
+fn mismatched_child_graph_ids_are_rejected_atomically_by_every_path() {
+    // Exact comparison: case, whitespace and Unicode spelling all differ.
+    for other in ["other", "G", "g ", "\u{0261}"] {
+        let foreign_node =
+            GraphNode::new("x", other, GraphNodeKind::TASK, GraphNodeState::Planned).unwrap();
+        let foreign_edges = [
+            GraphEdge::precedence("fe", other, "a", "b", PrecedenceKind::RequiresAccepted).unwrap(),
+            GraphEdge::control("fe", other, "a", "b", ControlKind::OnPass).unwrap(),
+        ];
+
+        // Insertion: nodes, including a duplicate id with a foreign graph.
+        let mut graph = chain_graph(G, &["a", "b"]);
+        let before = graph.clone();
+        assert_eq!(
+            graph.add_node(foreign_node.clone()),
+            Err(mismatch("node", "x", other))
+        );
+        let foreign_duplicate =
+            GraphNode::new("a", other, GraphNodeKind::TASK, GraphNodeState::Planned).unwrap();
+        assert_eq!(
+            graph.add_node(foreign_duplicate),
+            Err(mismatch("node", "a", other))
+        );
+        assert_eq!(graph, before);
+
+        // Dry-run and insertion for both edge classes with valid endpoints.
+        for edge in &foreign_edges {
+            assert_eq!(
+                graph.validate_edge_addition(edge),
+                Err(mismatch("edge", "fe", other))
+            );
+            assert_eq!(
+                graph.add_edge(edge.clone()),
+                Err(mismatch("edge", "fe", other))
+            );
+            assert_eq!(graph, before);
+        }
+
+        // Batch construction returns no graph.
+        assert_eq!(
+            ExecutionGraph::from_parts(G, vec![task("a"), foreign_node.clone()], vec![]),
+            Err(mismatch("node", "x", other)),
+        );
+        for edge in &foreign_edges {
+            assert_eq!(
+                ExecutionGraph::from_parts(
+                    G,
+                    vec![task("a"), task("b")],
+                    vec![prec("p", "a", "b"), edge.clone()],
+                ),
+                Err(mismatch("edge", "fe", other)),
+            );
+        }
+    }
+}
+
+#[test]
+fn child_graph_identity_is_checked_before_other_edge_violations() {
+    let mut graph = chain_graph(G, &["a", "b"]);
+    let before = graph.clone();
+    // Duplicate id, dangling endpoint and precedence cycle all lose to the
+    // identity check, in both dry-run and insertion.
+    for edge in [
+        GraphEdge::precedence("p_a_b", "other", "a", "b", PrecedenceKind::RequiresAccepted)
+            .unwrap(),
+        GraphEdge::control("e", "other", "a", "ghost", ControlKind::OnPass).unwrap(),
+        GraphEdge::precedence("e", "other", "b", "a", PrecedenceKind::RequiresAccepted).unwrap(),
+    ] {
+        let expected = Err(mismatch("edge", edge.edge_id(), "other"));
+        assert_eq!(graph.validate_edge_addition(&edge), expected);
+        assert_eq!(graph.add_edge(edge), expected);
+        assert_eq!(graph, before);
+    }
+    // Batch identity check precedes duplicate-edge detection.
+    assert_eq!(
+        ExecutionGraph::from_parts(
+            G,
+            vec![task("a"), task("b")],
+            vec![
+                prec("e", "a", "b"),
+                GraphEdge::control("e", "other", "a", "b", ControlKind::OnPass).unwrap(),
+            ],
+        ),
+        Err(mismatch("edge", "e", "other")),
+    );
 }

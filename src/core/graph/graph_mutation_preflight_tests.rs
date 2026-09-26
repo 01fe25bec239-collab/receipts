@@ -61,9 +61,14 @@ impl MutationFixture {
 }
 
 fn graph() -> ExecutionGraph {
-    let node =
-        GraphNode::new("node", GraphNodeKind::TASK, GraphNodeState::Planned, vec![]).unwrap();
-    let edge = GraphEdge::control("edge", "node", "node", ControlKind::OnPass).unwrap();
+    let node = GraphNode::new(
+        "node",
+        "graph",
+        GraphNodeKind::TASK,
+        GraphNodeState::Planned,
+    )
+    .unwrap();
+    let edge = GraphEdge::control("edge", "graph", "node", "node", ControlKind::OnPass).unwrap();
     ExecutionGraph::from_parts("graph", vec![node], vec![edge]).unwrap()
 }
 

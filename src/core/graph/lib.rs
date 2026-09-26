@@ -20,6 +20,9 @@
 //! * `required_capabilities` is data only in this slice: stored verbatim,
 //!   never interpreted — no entitlement, tier, admission, provider, or
 //!   routing behavior exists here.
+//! * nodes and edges preserve every frozen field, including optional-field
+//!   absence and `locked_reason`'s explicit null, and each declares its
+//!   containing `graph_id`, which the graph checks before acceptance.
 //!
 //! Boundary rules honored by this crate:
 //!
@@ -111,7 +114,7 @@ pub use graph_mutation_target_graph_policy::{
     GraphMutationTargetGraphError, validate_graph_mutation_target_graph,
 };
 pub use graph_mutation_vocabulary::GraphMutationOperationKind;
-pub use node::{CapabilityName, GraphNode, GraphNodeKind};
+pub use node::{CapabilityName, GraphNode, GraphNodeAttemptNumber, GraphNodeKind};
 pub use node_result_vocabulary::{GraphNodeCheckResult, GraphNodeResultOutcome};
 pub use node_state::{GraphNodeState, GraphNodeStateParseError};
 pub use node_state_transition::{

@@ -155,8 +155,13 @@ fn graph_id_has_no_effect() {
 
 #[test]
 fn repeated_validation_preserves_inputs_and_does_not_execute_operations() {
-    let node =
-        GraphNode::new("node", GraphNodeKind::TASK, GraphNodeState::Planned, vec![]).unwrap();
+    let node = GraphNode::new(
+        "node",
+        "graph",
+        GraphNodeKind::TASK,
+        GraphNodeState::Planned,
+    )
+    .unwrap();
     let graph = ExecutionGraph::from_parts("graph", vec![node], vec![]).unwrap();
     let graph_before = graph.clone();
     for op in GraphMutationOperationKind::ALL {
