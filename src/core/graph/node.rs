@@ -16,6 +16,8 @@
 
 use std::borrow::Cow;
 
+use receipts_workspace_execution::CommitSha;
+
 use crate::error::GraphError;
 use crate::node_state::GraphNodeState;
 use crate::version::GraphVersionV1;
@@ -171,7 +173,7 @@ pub struct GraphNode {
     required_capabilities: Option<Vec<CapabilityName>>,
     task_capsule_ref: Option<String>,
     workstream_id: Option<String>,
-    code_sha: Option<String>,
+    code_sha: Option<CommitSha>,
     workspace_id: Option<String>,
     result_ref: Option<String>,
     /// Outer `None`: absent; `Some(None)`: explicit null.
@@ -270,17 +272,13 @@ impl GraphNode {
         Ok(self)
     }
 
-    /// Sets `code_sha`, which must be exactly 40 lowercase ASCII hex digits.
+    /// Sets `code_sha` through the canonical Workspace [`CommitSha`], which
+    /// accepts exactly 40 lowercase ASCII hex digits.
     pub fn with_code_sha(mut self, code_sha: impl Into<String>) -> Result<Self, GraphError> {
         let code_sha = code_sha.into();
-        if code_sha.len() != 40
-            || !code_sha
-                .bytes()
-                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-        {
-            return Err(GraphError::InvalidCodeSha { value: code_sha });
-        }
-        self.code_sha = Some(code_sha);
+        let parsed = CommitSha::parse(&code_sha)
+            .map_err(|_| GraphError::InvalidCodeSha { value: code_sha })?;
+        self.code_sha = Some(parsed);
         Ok(self)
     }
 
@@ -375,7 +373,7 @@ impl GraphNode {
 
     /// The code SHA, or `None` when absent.
     pub fn code_sha(&self) -> Option<&str> {
-        self.code_sha.as_deref()
+        self.code_sha.as_ref().map(CommitSha::as_str)
     }
 
     /// The workspace id, or `None` when absent.
