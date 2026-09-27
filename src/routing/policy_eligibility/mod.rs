@@ -6,16 +6,20 @@
 //! stores evidence and evaluates only the provider-policy gate.
 
 mod date_time;
+mod date_time_order;
 mod evaluator;
 mod provider_policy_eligibility;
 
 pub use date_time::{ModelRoutingDateTimeV1, ModelRoutingDateTimeV1Error};
+pub use date_time_order::{ModelRoutingDateTimeComparisonError, compare_instants};
 pub use evaluator::PolicyEligibilityEvaluator;
 pub use provider_policy_eligibility::{
     PolicyEvidenceLabel, PolicyStatus, ProviderPolicyEligibility, ProviderPolicyEligibilityError,
     TechnicalStatus,
 };
 
+#[cfg(test)]
+mod date_time_order_tests;
 #[cfg(test)]
 mod evaluator_tests;
 #[cfg(test)]
