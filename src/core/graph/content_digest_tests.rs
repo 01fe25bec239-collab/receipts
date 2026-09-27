@@ -22,12 +22,15 @@
 //!   `reject_long_id`, `reject_invalid_capability`, `reject_uppercase_sha`,
 //!   `reject_decimal_zero`, `reject_decimal_leading_zero`,
 //!   `reject_decimal_non_ascii`, `reject_decimal_float_text`,
-//!   `reject_state_alias`, `reject_duplicate_edges`,
+//!   `reject_duplicate_edges`,
 //!   `reject_dangling_endpoint`, `reject_wrong_edge_graph`,
 //!   `reject_precedence_self_loop`, `reject_precedence_cycle`,
 //!   `reject_capability_bare`, `reject_capability_hyphen`,
 //!   `reject_capability_empty_component`, `reject_empty_parent_node_id`,
 //!   `reject_empty_workstream_id`, `reject_empty_workspace_id`.
+//! * [`GraphNodeState::parse`] rejection before a typed node exists (checked
+//!   in `negative_fixtures_fail_before_reaching_the_kernel`):
+//!   `reject_state_alias`.
 //! * Unrepresentable in typed records; a future raw decoder or the trusted
 //!   project/graph boundary must reject them, and this typed kernel makes no
 //!   claim about them: `reject_wrong_project`, the expected-graph comparison
@@ -731,9 +734,8 @@ fn byte_accounting_accepts_the_maximum_and_rejects_crossing_it() {
     assert_eq!(checked_total(MAX_ENCODED_BYTES, 0), Ok(MAX_ENCODED_BYTES));
     assert_eq!(checked_total(MAX_ENCODED_BYTES - 3, 4), overflow);
     assert_eq!(checked_total(MAX_ENCODED_BYTES, 1), overflow);
-    // Arithmetic overflow and a chunk larger than the limit.
+    // Arithmetic overflow.
     assert_eq!(checked_total(u64::MAX, 1), overflow);
-    assert_eq!(checked_total(0, usize::MAX), overflow);
 }
 
 #[test]

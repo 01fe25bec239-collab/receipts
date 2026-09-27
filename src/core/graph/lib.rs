@@ -26,7 +26,8 @@
 //!
 //! Boundary rules honored by this crate:
 //!
-//! * Rust `std` only; no dependencies, no feature flags;
+//! * dependencies are limited to canonical owner crates and declared `sha2`;
+//!   no feature flags;
 //! * no product API outside this bounded graph domain;
 //! * malformed input fails explicitly instead of becoming a permissive
 //!   successful state;
