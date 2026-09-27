@@ -1043,8 +1043,18 @@ fn utf16_store_returns_nodes_and_edges_in_utf8_id_order() {
         let conn = rusqlite::Connection::open(&db.0).unwrap();
         conn.execute_batch(&format!("PRAGMA encoding='{encoding}'"))
             .unwrap();
+        conn.execute_batch("CREATE TABLE encoding_anchor (value TEXT)")
+            .unwrap();
         drop(conn);
         let mut repo = SqliteStateRepository::open(&db.0).unwrap();
+        let actual_encoding: String = repo
+            .connection()
+            .query_row("PRAGMA encoding", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            actual_encoding.to_ascii_lowercase(),
+            encoding.to_ascii_lowercase()
+        );
         let graph = "g\0e\u{301}";
         let req = StateGraphGenesisV1::new(
             "p".into(),
@@ -1104,5 +1114,98 @@ fn utf16_store_returns_nodes_and_edges_in_utf8_id_order() {
             Some(["source\0é".to_string(), "source\0é".to_string()].as_slice())
         );
         assert_eq!(got.edges()[1].note(), Some("é\0e\u{301}"));
+    }
+}
+
+#[test]
+fn invalid_stored_text_decoding_is_read_corruption() {
+    use std::error::Error;
+
+    for (encoding, noncurrent, update, stored, expected_hex) in [
+        (
+            "UTF-8",
+            false,
+            "UPDATE graph_nodes SET title=CAST(x'ff' AS TEXT) WHERE project_id='p' AND graph_id='g' AND graph_version='1' AND node_id='n2'",
+            "SELECT typeof(title),hex(title) FROM graph_nodes WHERE project_id='p' AND graph_id='g' AND graph_version='1' AND node_id='n2'",
+            "FF",
+        ),
+        (
+            "UTF-8",
+            false,
+            "UPDATE graph_edges SET note=CAST(x'ff' AS TEXT) WHERE project_id='p' AND graph_id='g' AND graph_version='1' AND edge_id='e'",
+            "SELECT typeof(note),hex(note) FROM graph_edges WHERE project_id='p' AND graph_id='g' AND graph_version='1' AND edge_id='e'",
+            "FF",
+        ),
+        (
+            "UTF-8",
+            true,
+            "UPDATE graph_nodes SET title=CAST(x'ff' AS TEXT) WHERE project_id='p' AND graph_id='g' AND graph_version='2' AND node_id='v2-node'",
+            "SELECT typeof(title),hex(title) FROM graph_nodes WHERE project_id='p' AND graph_id='g' AND graph_version='2' AND node_id='v2-node'",
+            "FF",
+        ),
+        (
+            "UTF-8",
+            true,
+            "UPDATE graph_edges SET note=CAST(x'ff' AS TEXT) WHERE project_id='p' AND graph_id='g' AND graph_version='2' AND edge_id='v2-edge'",
+            "SELECT typeof(note),hex(note) FROM graph_edges WHERE project_id='p' AND graph_id='g' AND graph_version='2' AND edge_id='v2-edge'",
+            "FF",
+        ),
+        (
+            "UTF-16le",
+            false,
+            "UPDATE graph_nodes SET title=CAST(x'00d8' AS TEXT) WHERE project_id='p' AND graph_id='g' AND graph_version='1' AND node_id='n2'",
+            "SELECT typeof(title),hex(title) FROM graph_nodes WHERE project_id='p' AND graph_id='g' AND graph_version='1' AND node_id='n2'",
+            "00D8",
+        ),
+    ] {
+        let db = TempDb::new();
+        let conn = rusqlite::Connection::open(&db.0).unwrap();
+        conn.execute_batch(&format!("PRAGMA encoding='{encoding}'"))
+            .unwrap();
+        conn.execute_batch("CREATE TABLE encoding_anchor (value TEXT)")
+            .unwrap();
+        drop(conn);
+        let mut repo = SqliteStateRepository::open(&db.0).unwrap();
+        let actual_encoding: String = repo
+            .connection()
+            .query_row("PRAGMA encoding", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            actual_encoding.to_ascii_lowercase(),
+            encoding.to_ascii_lowercase()
+        );
+        repo.create_initial_graph_v1(&Clock("2026-09-27T10:00:00.000000000Z"), request("p", "g"))
+            .unwrap();
+        if noncurrent {
+            insert_valid_noncurrent_version(repo.connection(), "p", "g");
+        }
+        repo.connection().execute_batch(update).unwrap();
+        let stored_value: (String, String) = repo
+            .connection()
+            .query_row(stored, [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(stored_value, ("text".into(), expected_hex.into()));
+        drop(repo);
+
+        let reader = ReadOnlyGraphReader::open_existing(&db.0).unwrap();
+        let error = reader.read_current_v1("p", "g").unwrap_err();
+        assert!(matches!(
+            error,
+            StateError::GraphPersistence {
+                phase: Phase::Read,
+                code: Code::CorruptStore,
+                ..
+            }
+        ));
+        assert_eq!(error.to_string(), "graph persistence READ CORRUPT_STORE");
+        assert!(error.source().is_none());
+        assert!(!format!("{error:?}").contains("Utf8Error"));
+        drop(reader);
+
+        let conn = rusqlite::Connection::open(&db.0).unwrap();
+        let after: (String, String) = conn
+            .query_row(stored, [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(after, stored_value);
     }
 }

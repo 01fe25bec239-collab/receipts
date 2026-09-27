@@ -39,9 +39,9 @@ pub(crate) fn sqlite_error(phase: Phase, error: rusqlite::Error) -> StateError {
             }
             _ => Code::StorageFailure,
         },
-        rusqlite::Error::InvalidColumnType(..) | rusqlite::Error::FromSqlConversionFailure(..) => {
-            Code::CorruptStore
-        }
+        rusqlite::Error::InvalidColumnType(..)
+        | rusqlite::Error::FromSqlConversionFailure(..)
+        | rusqlite::Error::Utf8Error(..) => Code::CorruptStore,
         _ => Code::StorageFailure,
     };
     failure(phase, code, None)
