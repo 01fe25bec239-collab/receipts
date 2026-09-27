@@ -1038,83 +1038,82 @@ fn complete_partition_validation_includes_noncurrent_versions() {
 
 #[test]
 fn utf8_store_returns_nodes_and_edges_in_utf8_id_order() {
-    for encoding in ["UTF-8"] {
-        let db = TempDb::new();
-        let conn = rusqlite::Connection::open(&db.0).unwrap();
-        conn.execute_batch(&format!("PRAGMA encoding='{encoding}'"))
-            .unwrap();
-        conn.execute_batch("CREATE TABLE encoding_anchor (value TEXT)")
-            .unwrap();
-        drop(conn);
-        let mut repo = SqliteStateRepository::open(&db.0).unwrap();
-        let actual_encoding: String = repo
-            .connection()
-            .query_row("PRAGMA encoding", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(
-            actual_encoding.to_ascii_lowercase(),
-            encoding.to_ascii_lowercase()
-        );
-        let graph = "g\0e\u{301}";
-        let req = StateGraphGenesisV1::new(
-            "p".into(),
-            graph.into(),
-            "goal".into(),
-            "policy".into(),
-            None,
-            Some(vec!["source\0é".into(), "source\0é".into()]),
-            None,
-            "a".repeat(64),
-            vec![node(graph, "\u{10000}"), node(graph, "\u{e000}")],
-            vec![
-                StateGraphEdgeV1::new(
-                    "\u{10000}".into(),
-                    graph.into(),
-                    "\u{10000}".into(),
-                    "\u{e000}".into(),
-                    StateGraphEdgeRelationV1::Control("ON_PASS".into()),
-                    Some("é\0e\u{301}".into()),
-                )
-                .unwrap(),
-                StateGraphEdgeV1::new(
-                    "\u{e000}".into(),
-                    graph.into(),
-                    "\u{e000}".into(),
-                    "\u{10000}".into(),
-                    StateGraphEdgeRelationV1::Control("ON_PASS".into()),
-                    None,
-                )
-                .unwrap(),
-            ],
-            request("p", graph).genesis_provenance().clone(),
-        )
+    let encoding = "UTF-8";
+    let db = TempDb::new();
+    let conn = rusqlite::Connection::open(&db.0).unwrap();
+    conn.execute_batch(&format!("PRAGMA encoding='{encoding}'"))
         .unwrap();
-        repo.create_initial_graph_v1(&Clock("2026-09-27T10:00:00.000000000Z"), req)
-            .unwrap();
-        drop(repo);
-        let reader = ReadOnlyGraphReader::open_existing(&db.0).unwrap();
-        let got = reader.read_current_v1("p", graph).unwrap().unwrap();
-        assert_eq!(
-            got.nodes()
-                .iter()
-                .map(StateGraphNodeV1::node_id)
-                .collect::<Vec<_>>(),
-            ["\u{e000}", "\u{10000}"]
-        );
-        assert_eq!(
-            got.edges()
-                .iter()
-                .map(StateGraphEdgeV1::edge_id)
-                .collect::<Vec<_>>(),
-            ["\u{e000}", "\u{10000}"]
-        );
-        assert_eq!(got.graph_id(), graph);
-        assert_eq!(
-            got.compiled_from(),
-            Some(["source\0é".to_string(), "source\0é".to_string()].as_slice())
-        );
-        assert_eq!(got.edges()[1].note(), Some("é\0e\u{301}"));
-    }
+    conn.execute_batch("CREATE TABLE encoding_anchor (value TEXT)")
+        .unwrap();
+    drop(conn);
+    let mut repo = SqliteStateRepository::open(&db.0).unwrap();
+    let actual_encoding: String = repo
+        .connection()
+        .query_row("PRAGMA encoding", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        actual_encoding.to_ascii_lowercase(),
+        encoding.to_ascii_lowercase()
+    );
+    let graph = "g\0e\u{301}";
+    let req = StateGraphGenesisV1::new(
+        "p".into(),
+        graph.into(),
+        "goal".into(),
+        "policy".into(),
+        None,
+        Some(vec!["source\0é".into(), "source\0é".into()]),
+        None,
+        "a".repeat(64),
+        vec![node(graph, "\u{10000}"), node(graph, "\u{e000}")],
+        vec![
+            StateGraphEdgeV1::new(
+                "\u{10000}".into(),
+                graph.into(),
+                "\u{10000}".into(),
+                "\u{e000}".into(),
+                StateGraphEdgeRelationV1::Control("ON_PASS".into()),
+                Some("é\0e\u{301}".into()),
+            )
+            .unwrap(),
+            StateGraphEdgeV1::new(
+                "\u{e000}".into(),
+                graph.into(),
+                "\u{e000}".into(),
+                "\u{10000}".into(),
+                StateGraphEdgeRelationV1::Control("ON_PASS".into()),
+                None,
+            )
+            .unwrap(),
+        ],
+        request("p", graph).genesis_provenance().clone(),
+    )
+    .unwrap();
+    repo.create_initial_graph_v1(&Clock("2026-09-27T10:00:00.000000000Z"), req)
+        .unwrap();
+    drop(repo);
+    let reader = ReadOnlyGraphReader::open_existing(&db.0).unwrap();
+    let got = reader.read_current_v1("p", graph).unwrap().unwrap();
+    assert_eq!(
+        got.nodes()
+            .iter()
+            .map(StateGraphNodeV1::node_id)
+            .collect::<Vec<_>>(),
+        ["\u{e000}", "\u{10000}"]
+    );
+    assert_eq!(
+        got.edges()
+            .iter()
+            .map(StateGraphEdgeV1::edge_id)
+            .collect::<Vec<_>>(),
+        ["\u{e000}", "\u{10000}"]
+    );
+    assert_eq!(got.graph_id(), graph);
+    assert_eq!(
+        got.compiled_from(),
+        Some(["source\0é".to_string(), "source\0é".to_string()].as_slice())
+    );
+    assert_eq!(got.edges()[1].note(), Some("é\0e\u{301}"));
 }
 
 #[test]
