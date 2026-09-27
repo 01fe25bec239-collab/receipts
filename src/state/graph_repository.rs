@@ -1147,11 +1147,28 @@ fn read_projection(
     let members = member_stmt
         .query_map(params![project_id, graph_id], |r| r.get::<_, String>(0))
         .map_err(|e| sqlite_error(Phase::Read, e))?;
+    let mut current_projection = None;
     for member in members {
-        if !positive(&member.map_err(|e| sqlite_error(Phase::Read, e))?) {
+        let member = member.map_err(|e| sqlite_error(Phase::Read, e))?;
+        if !positive(&member) {
             return Err(corrupt());
         }
+        let projection =
+            read_version_projection(conn, project_id, graph_id, &current_version, &member)?;
+        if member == current_version {
+            current_projection = Some(projection);
+        }
     }
+    current_projection.ok_or_else(corrupt).map(Some)
+}
+
+fn read_version_projection(
+    conn: &Connection,
+    project_id: &str,
+    graph_id: &str,
+    current_version: &str,
+    member_version: &str,
+) -> Result<PersistedCurrentGraphV1, StateError> {
     type Version = (
         String,
         i64,
@@ -1170,7 +1187,7 @@ fn read_projection(
     );
     let version: Option<Version> = conn.query_row(
         "SELECT graph_version,parent_version_present,parent_version,goal_id,policy_id,created_at,compiled_from_present,context_epoch,resulting_digest,clock_source_id,clock_contract_version,compiler_id,source_ref,creation_reason FROM graph_versions WHERE project_id=?1 AND graph_id=?2 AND graph_version=?3",
-        params![project_id, graph_id, current_version], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?,r.get(12)?,r.get(13)?)))
+        params![project_id, graph_id, member_version], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?,r.get(12)?,r.get(13)?)))
         .optional().map_err(|e| sqlite_error(Phase::Read,e))?;
     let Some((
         graph_version,
@@ -1191,7 +1208,7 @@ fn read_projection(
     else {
         return Err(corrupt());
     };
-    if graph_version != current_version
+    if graph_version != member_version
         || !positive(&graph_version)
         || !id(&goal_id)
         || !id(&policy_id)
@@ -1219,7 +1236,7 @@ fn read_projection(
         "SELECT ordinal,source FROM graph_compiled_sources WHERE project_id=?1 AND graph_id=?2 AND graph_version=?3 ORDER BY ordinal",
         project_id,
         graph_id,
-        &current_version,
+        member_version,
         None,
     )?;
     if compiled_flag == 0 && !sources.is_empty() {
@@ -1234,7 +1251,7 @@ fn read_projection(
     let mut stmt = conn.prepare("SELECT node_id,graph_id,kind,state,title,parent_node_id,attempt_number,required_capabilities_present,task_capsule_ref,workstream_id,code_sha,workspace_id,result_ref,locked_reason_present,locked_reason,created_in_version FROM graph_nodes WHERE project_id=?1 AND graph_id=?2 AND graph_version=?3 ORDER BY node_id COLLATE BINARY")
         .map_err(|e| sqlite_error(Phase::Read,e))?;
     let mut rows = stmt
-        .query(params![project_id, graph_id, current_version])
+        .query(params![project_id, graph_id, member_version])
         .map_err(|e| sqlite_error(Phase::Read, e))?;
     let mut nodes = Vec::new();
     let mut node_ids = HashSet::new();
@@ -1257,7 +1274,7 @@ fn read_projection(
             "SELECT ordinal,capability FROM graph_node_capabilities WHERE project_id=?1 AND graph_id=?2 AND graph_version=?3 AND node_id=?4 ORDER BY ordinal",
             project_id,
             graph_id,
-            &current_version,
+            member_version,
             Some(&node_id),
         )?;
         if cap_flag == 0 && !caps.is_empty() {
@@ -1292,11 +1309,12 @@ fn read_projection(
     }
     drop(rows);
     drop(stmt);
+    nodes.sort_by(|a, b| a.node_id().as_bytes().cmp(b.node_id().as_bytes()));
 
     let mut stmt = conn.prepare("SELECT edge_id,graph_id,from_node,to_node,edge_class,precedence_kind,control_kind,note FROM graph_edges WHERE project_id=?1 AND graph_id=?2 AND graph_version=?3 ORDER BY edge_id COLLATE BINARY")
         .map_err(|e| sqlite_error(Phase::Read,e))?;
     let mut rows = stmt
-        .query(params![project_id, graph_id, current_version])
+        .query(params![project_id, graph_id, member_version])
         .map_err(|e| sqlite_error(Phase::Read, e))?;
     let mut edges = Vec::new();
     let mut edge_ids = HashSet::new();
@@ -1331,10 +1349,11 @@ fn read_projection(
         .map_err(|_| corrupt())?;
         edges.push(edge);
     }
-    Ok(Some(PersistedCurrentGraphV1 {
+    edges.sort_by(|a, b| a.edge_id().as_bytes().cmp(b.edge_id().as_bytes()));
+    Ok(PersistedCurrentGraphV1 {
         project_id: project_id.to_string(),
         graph_id: graph_id.to_string(),
-        current_version,
+        current_version: current_version.to_string(),
         graph_version,
         parent_version,
         goal_id,
@@ -1352,7 +1371,7 @@ fn read_projection(
         ),
         clock_source_id,
         clock_contract_version,
-    }))
+    })
 }
 
 pub(crate) fn configure_graph_writer(conn: &Connection) -> Result<(), StateError> {

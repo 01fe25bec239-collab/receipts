@@ -941,3 +941,168 @@ fn reader_sees_absence_then_complete_genesis_after_writer_lock() {
     assert_eq!(got.edges().len(), 1);
     assert_eq!(got.current_version(), "1");
 }
+
+fn insert_valid_noncurrent_version(conn: &rusqlite::Connection, project: &str, graph: &str) {
+    conn.execute(
+        "INSERT INTO graph_versions SELECT project_id,graph_id,'2',1,'1',goal_id,policy_id,created_at,1,context_epoch,resulting_digest,clock_source_id,clock_contract_version,compiler_id,source_ref,creation_reason FROM graph_versions WHERE project_id=?1 AND graph_id=?2 AND graph_version='1'",
+        rusqlite::params![project, graph],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO graph_nodes(project_id,graph_id,graph_version,node_id,kind,state,required_capabilities_present,locked_reason_present) VALUES (?1,?2,'2','v2-node','TASK','PLANNED',1,0)",
+        rusqlite::params![project, graph],
+    )
+    .unwrap();
+    for (ordinal, capability) in [(0, "graph.core"), (1, "graph.core")] {
+        conn.execute(
+            "INSERT INTO graph_node_capabilities(project_id,graph_id,graph_version,node_id,ordinal,capability) VALUES (?1,?2,'2','v2-node',?3,?4)",
+            rusqlite::params![project, graph, ordinal, capability],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO graph_edges(project_id,graph_id,graph_version,edge_id,from_node,to_node,edge_class,control_kind) VALUES (?1,?2,'2','v2-edge','v2-node','v2-node','CONTROL','ON_PASS')",
+        rusqlite::params![project, graph],
+    )
+    .unwrap();
+    for (ordinal, source) in [(0, "source\0one"), (1, "source\0one")] {
+        conn.execute(
+            "INSERT INTO graph_compiled_sources(project_id,graph_id,graph_version,ordinal,source) VALUES (?1,?2,'2',?3,?4)",
+            rusqlite::params![project, graph, ordinal, source],
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn complete_partition_validation_includes_noncurrent_versions() {
+    for sql in [
+        "UPDATE graph_versions SET goal_id='' WHERE project_id='p' AND graph_id='g' AND graph_version='2'",
+        "UPDATE graph_versions SET policy_id='' WHERE project_id='p' AND graph_id='g' AND graph_version='2'",
+        "UPDATE graph_versions SET created_at='SENTINEL-bad-time' WHERE project_id='p' AND graph_id='g' AND graph_version='2'",
+        "UPDATE graph_versions SET resulting_digest='SENTINEL-bad-digest' WHERE project_id='p' AND graph_id='g' AND graph_version='2'",
+        "UPDATE graph_versions SET compiler_id='SENTINEL-compiler' WHERE project_id='p' AND graph_id='g' AND graph_version='2'",
+        "UPDATE graph_versions SET source_ref='/tmp/SENTINEL' WHERE project_id='p' AND graph_id='g' AND graph_version='2'",
+        "UPDATE graph_versions SET creation_reason='SENTINEL-reason' WHERE project_id='p' AND graph_id='g' AND graph_version='2'",
+        "UPDATE graph_nodes SET kind='' WHERE project_id='p' AND graph_id='g' AND graph_version='2'",
+        "UPDATE graph_nodes SET state='SENTINEL-state' WHERE project_id='p' AND graph_id='g' AND graph_version='2'",
+        "UPDATE graph_nodes SET required_capabilities_present=0 WHERE project_id='p' AND graph_id='g' AND graph_version='2'",
+        "UPDATE graph_edges SET control_kind='SENTINEL-kind' WHERE project_id='p' AND graph_id='g' AND graph_version='2'",
+        "UPDATE graph_versions SET compiled_from_present=0 WHERE project_id='p' AND graph_id='g' AND graph_version='2'",
+        "UPDATE graph_node_capabilities SET ordinal=3 WHERE project_id='p' AND graph_id='g' AND graph_version='2' AND ordinal=1",
+        "UPDATE graph_compiled_sources SET ordinal=3 WHERE project_id='p' AND graph_id='g' AND graph_version='2' AND ordinal=1",
+        "DELETE FROM graph_edges WHERE project_id='p' AND graph_id='g' AND graph_version='2'; DELETE FROM graph_node_capabilities WHERE project_id='p' AND graph_id='g' AND graph_version='2'; DELETE FROM graph_nodes WHERE project_id='p' AND graph_id='g' AND graph_version='2'",
+    ] {
+        let db = TempDb::new();
+        let mut repo = SqliteStateRepository::open(&db.0).unwrap();
+        let clock = Clock("2026-09-27T10:00:00.000000000Z");
+        for (project, graph) in [("p", "g"), ("q", "g"), ("p", "other")] {
+            repo.create_initial_graph_v1(&clock, request(project, graph))
+                .unwrap();
+        }
+        insert_valid_noncurrent_version(repo.connection(), "p", "g");
+        drop(repo);
+        let reader = ReadOnlyGraphReader::open_existing(&db.0).unwrap();
+        let observer = rusqlite::Connection::open(&db.0).unwrap();
+        let before: i64 = observer
+            .query_row("PRAGMA data_version", [], |r| r.get(0))
+            .unwrap();
+        let current = reader.read_current_v1("p", "g").unwrap().unwrap();
+        assert_eq!(current.graph_version(), "1");
+        assert_eq!(current.nodes().len(), 2);
+        let after: i64 = observer
+            .query_row("PRAGMA data_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, after);
+        drop(observer);
+        drop(reader);
+        let conn = rusqlite::Connection::open(&db.0).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+        conn.execute_batch(sql).unwrap();
+        drop(conn);
+        let reader = ReadOnlyGraphReader::open_existing(&db.0).unwrap();
+        let error = reader.read_current_v1("p", "g").unwrap_err();
+        assert!(matches!(
+            error,
+            StateError::GraphPersistence {
+                phase: Phase::Read,
+                code: Code::CorruptStore,
+                ..
+            }
+        ));
+        assert!(!format!("{error:?} {error}").contains("SENTINEL"));
+        assert!(reader.read_current_v1("q", "g").unwrap().is_some());
+        assert!(reader.read_current_v1("p", "other").unwrap().is_some());
+    }
+}
+
+#[test]
+fn utf16_store_returns_nodes_and_edges_in_utf8_id_order() {
+    for encoding in ["UTF-8", "UTF-16le"] {
+        let db = TempDb::new();
+        let conn = rusqlite::Connection::open(&db.0).unwrap();
+        conn.execute_batch(&format!("PRAGMA encoding='{encoding}'"))
+            .unwrap();
+        drop(conn);
+        let mut repo = SqliteStateRepository::open(&db.0).unwrap();
+        let graph = "g\0e\u{301}";
+        let req = StateGraphGenesisV1::new(
+            "p".into(),
+            graph.into(),
+            "goal".into(),
+            "policy".into(),
+            None,
+            Some(vec!["source\0é".into(), "source\0é".into()]),
+            None,
+            "a".repeat(64),
+            vec![node(graph, "\u{10000}"), node(graph, "\u{e000}")],
+            vec![
+                StateGraphEdgeV1::new(
+                    "\u{10000}".into(),
+                    graph.into(),
+                    "\u{10000}".into(),
+                    "\u{e000}".into(),
+                    StateGraphEdgeRelationV1::Control("ON_PASS".into()),
+                    Some("é\0e\u{301}".into()),
+                )
+                .unwrap(),
+                StateGraphEdgeV1::new(
+                    "\u{e000}".into(),
+                    graph.into(),
+                    "\u{e000}".into(),
+                    "\u{10000}".into(),
+                    StateGraphEdgeRelationV1::Control("ON_PASS".into()),
+                    None,
+                )
+                .unwrap(),
+            ],
+            request("p", graph).genesis_provenance().clone(),
+        )
+        .unwrap();
+        repo.create_initial_graph_v1(&Clock("2026-09-27T10:00:00.000000000Z"), req)
+            .unwrap();
+        drop(repo);
+        let reader = ReadOnlyGraphReader::open_existing(&db.0).unwrap();
+        let got = reader.read_current_v1("p", graph).unwrap().unwrap();
+        assert_eq!(
+            got.nodes()
+                .iter()
+                .map(StateGraphNodeV1::node_id)
+                .collect::<Vec<_>>(),
+            ["\u{e000}", "\u{10000}"]
+        );
+        assert_eq!(
+            got.edges()
+                .iter()
+                .map(StateGraphEdgeV1::edge_id)
+                .collect::<Vec<_>>(),
+            ["\u{e000}", "\u{10000}"]
+        );
+        assert_eq!(got.graph_id(), graph);
+        assert_eq!(
+            got.compiled_from(),
+            Some(["source\0é".to_string(), "source\0é".to_string()].as_slice())
+        );
+        assert_eq!(got.edges()[1].note(), Some("é\0e\u{301}"));
+    }
+}
