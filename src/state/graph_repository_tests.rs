@@ -1037,8 +1037,8 @@ fn complete_partition_validation_includes_noncurrent_versions() {
 }
 
 #[test]
-fn utf16_store_returns_nodes_and_edges_in_utf8_id_order() {
-    for encoding in ["UTF-8", "UTF-16le"] {
+fn utf8_store_returns_nodes_and_edges_in_utf8_id_order() {
+    for encoding in ["UTF-8"] {
         let db = TempDb::new();
         let conn = rusqlite::Connection::open(&db.0).unwrap();
         conn.execute_batch(&format!("PRAGMA encoding='{encoding}'"))
@@ -1150,13 +1150,6 @@ fn invalid_stored_text_decoding_is_read_corruption() {
             "SELECT typeof(note),hex(note) FROM graph_edges WHERE project_id='p' AND graph_id='g' AND graph_version='2' AND edge_id='v2-edge'",
             "FF",
         ),
-        (
-            "UTF-16le",
-            false,
-            "UPDATE graph_nodes SET title=CAST(x'00d8' AS TEXT) WHERE project_id='p' AND graph_id='g' AND graph_version='1' AND node_id='n2'",
-            "SELECT typeof(title),hex(title) FROM graph_nodes WHERE project_id='p' AND graph_id='g' AND graph_version='1' AND node_id='n2'",
-            "00D8",
-        ),
     ] {
         let db = TempDb::new();
         let conn = rusqlite::Connection::open(&db.0).unwrap();
@@ -1207,5 +1200,207 @@ fn invalid_stored_text_decoding_is_read_corruption() {
             .query_row(stored, [], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap();
         assert_eq!(after, stored_value);
+    }
+}
+
+fn assert_unsupported_encoding(error: StateError, phase: Phase) {
+    use std::error::Error;
+
+    assert!(matches!(
+        error,
+        StateError::GraphPersistence {
+            phase: actual,
+            code: Code::UnsupportedSchema,
+            field: None,
+        } if actual == phase
+    ));
+    assert!(error.source().is_none());
+    let diagnostic = format!("{error:?} {error}");
+    for forbidden in ["UTF-16", "PRAGMA", "SELECT", "SENTINEL"] {
+        assert!(!diagnostic.contains(forbidden));
+    }
+}
+
+fn persisted_encoding_db(encoding: &str) -> TempDb {
+    let db = TempDb::new();
+    let conn = rusqlite::Connection::open(&db.0).unwrap();
+    conn.execute_batch(&format!(
+        "PRAGMA encoding='{encoding}'; CREATE TABLE encoding_anchor (value TEXT)"
+    ))
+    .unwrap();
+    let actual: String = conn
+        .query_row("PRAGMA encoding", [], |row| row.get(0))
+        .unwrap();
+    assert!(actual.eq_ignore_ascii_case(encoding));
+    drop(conn);
+    db
+}
+
+fn journal_mode(path: &std::path::Path) -> String {
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap()
+}
+
+#[test]
+fn utf8_preserves_noncharacters_in_graph_identity_and_metadata() {
+    let db = persisted_encoding_db("UTF-8");
+    let mut repo = SqliteStateRepository::open(&db.0).unwrap();
+    let graph = "g\0\u{fffe}";
+    let first = StateGraphNodeV1::new(
+        "\u{fffe}".into(),
+        graph.into(),
+        "TASK".into(),
+        "PLANNED".into(),
+        Some("title\u{fffe}\u{ffff}\0".into()),
+        None,
+        None,
+        Some(vec!["graph.core".into(), "graph.core".into()]),
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(Some("reason\u{ffff}".into())),
+        None,
+    )
+    .unwrap();
+    let second = node(graph, "\u{ffff}");
+    let edges = vec![
+        StateGraphEdgeV1::new(
+            "\u{fffe}".into(),
+            graph.into(),
+            "\u{fffe}".into(),
+            "\u{ffff}".into(),
+            StateGraphEdgeRelationV1::Control("ON_PASS".into()),
+            Some("note\u{fffe}\u{ffff}\0".into()),
+        )
+        .unwrap(),
+        StateGraphEdgeV1::new(
+            "\u{ffff}".into(),
+            graph.into(),
+            "\u{ffff}".into(),
+            "\u{fffe}".into(),
+            StateGraphEdgeRelationV1::Control("ON_PASS".into()),
+            None,
+        )
+        .unwrap(),
+    ];
+    let req = StateGraphGenesisV1::new(
+        "project\u{ffff}".into(),
+        graph.into(),
+        "goal\u{fffe}\u{ffff}".into(),
+        "policy\u{ffff}".into(),
+        Some(None),
+        Some(vec![
+            "source\u{fffe}".into(),
+            "source\u{ffff}".into(),
+            "source\u{ffff}".into(),
+        ]),
+        None,
+        "a".repeat(64),
+        vec![first.clone(), second.clone()],
+        edges.clone(),
+        request("p", graph).genesis_provenance().clone(),
+    )
+    .unwrap();
+    repo.create_initial_graph_v1(&Clock("2026-09-27T10:00:00.000000000Z"), req.clone())
+        .unwrap();
+    drop(repo);
+    let got = ReadOnlyGraphReader::open_existing(&db.0)
+        .unwrap()
+        .read_current_v1("project\u{ffff}", graph)
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.project_id(), req.project_id());
+    assert_eq!(got.graph_id(), req.graph_id());
+    assert_eq!(got.goal_id(), req.goal_id());
+    assert_eq!(got.policy_id(), req.policy_id());
+    assert_eq!(got.compiled_from(), req.compiled_from());
+    assert_eq!(got.nodes(), &[first, second]);
+    assert_eq!(got.edges(), edges);
+}
+
+#[test]
+fn utf16_graph_boundaries_refuse_without_mutating_store() {
+    for encoding in ["UTF-16le", "UTF-16be"] {
+        for version in [11, 12, 13] {
+            let db = persisted_encoding_db(encoding);
+            let mut repo = SqliteStateRepository::open_with_migrations(
+                &db.0,
+                &crate::migrations::registered()[..version],
+            )
+            .unwrap();
+            let actual: String = repo
+                .connection()
+                .query_row("PRAGMA encoding", [], |row| row.get(0))
+                .unwrap();
+            assert!(actual.eq_ignore_ascii_case(encoding));
+            if version == 13 {
+                let before: i64 = repo
+                    .connection()
+                    .query_row("SELECT COUNT(*) FROM trusted_time_watermark", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_unsupported_encoding(
+                    repo.create_initial_graph_v1(
+                        &Clock("2026-09-27T10:00:00.000000000Z"),
+                        request("p", "g"),
+                    )
+                    .unwrap_err(),
+                    Phase::Write,
+                );
+                let after: i64 = repo
+                    .connection()
+                    .query_row("SELECT COUNT(*) FROM trusted_time_watermark", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(before, after);
+            }
+            drop(repo);
+            let before_mode = journal_mode(&db.0);
+            let before_bytes = std::fs::read(&db.0).unwrap();
+            if version == 13 {
+                assert_unsupported_encoding(
+                    ReadOnlyGraphReader::open_existing(&db.0).unwrap_err(),
+                    Phase::Read,
+                );
+                let conn = rusqlite::Connection::open_with_flags(
+                    &db.0,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .unwrap();
+                let reader = ReadOnlyGraphReader::from_unverified_connection_for_test(conn);
+                assert_unsupported_encoding(
+                    reader.read_current_v1("absent", "graph").unwrap_err(),
+                    Phase::Read,
+                );
+            }
+            assert_unsupported_encoding(
+                SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap_err(),
+                Phase::Migration,
+            );
+            assert_eq!(journal_mode(&db.0), before_mode);
+            assert_eq!(std::fs::read(&db.0).unwrap(), before_bytes);
+            let conn = rusqlite::Connection::open_with_flags(
+                &db.0,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let head: i64 = conn
+                .query_row("SELECT MAX(version) FROM state_schema_version", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(head, version as i64);
+            let actual: String = conn
+                .query_row("PRAGMA encoding", [], |row| row.get(0))
+                .unwrap();
+            assert!(actual.eq_ignore_ascii_case(encoding));
+        }
     }
 }

@@ -57,6 +57,16 @@ fn schema_error(phase: Phase, error: rusqlite::Error) -> StateError {
     }
 }
 
+fn verify_graph_encoding(conn: &Connection, phase: Phase) -> Result<(), StateError> {
+    let encoding: String = conn
+        .query_row("PRAGMA encoding", [], |row| row.get(0))
+        .map_err(|error| sqlite_error(phase, error))?;
+    if encoding != "UTF-8" {
+        return Err(failure(phase, Code::UnsupportedSchema, None));
+    }
+    Ok(())
+}
+
 pub(crate) fn legacy_error(phase: Phase, error: StateError) -> StateError {
     let code =
         match error {
@@ -806,6 +816,7 @@ pub(crate) fn verify_schema(
     phase: Phase,
     graph: bool,
 ) -> Result<(), StateError> {
+    verify_graph_encoding(conn, phase)?;
     let integrity: String = conn
         .query_row("PRAGMA integrity_check", [], |r| r.get(0))
         .map_err(|e| schema_error(phase, e))?;
@@ -1036,6 +1047,10 @@ impl ReadOnlyGraphReader {
         let reader = Self { conn };
         reader.verify()?;
         Ok(reader)
+    }
+    #[cfg(test)]
+    pub(crate) fn from_unverified_connection_for_test(conn: Connection) -> Self {
+        Self { conn }
     }
     fn verify(&self) -> Result<(), StateError> {
         let exists: i64 = self.conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='state_schema_version'", [], |r| r.get(0))
@@ -1377,6 +1392,7 @@ fn read_version_projection(
 pub(crate) fn configure_graph_writer(conn: &Connection) -> Result<(), StateError> {
     conn.busy_timeout(Duration::from_millis(5000))
         .map_err(|e| sqlite_error(Phase::Migration, e))?;
+    verify_graph_encoding(conn, Phase::Migration)?;
     let mode: String = conn
         .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
         .map_err(|e| sqlite_error(Phase::Migration, e))?;
