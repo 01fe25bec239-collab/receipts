@@ -78,9 +78,9 @@ impl RuntimeAdapter for TrackingRuntimeAdapter {
         _task: &RuntimeCapsuleFamily,
         _workspace: &WorkspaceHandle,
         _policy: &FixtureExecutionPolicy,
-    ) -> FixtureAttemptHandle {
+    ) -> Result<FixtureAttemptHandle, FailureClass> {
         self.record(5);
-        FixtureAttemptHandle("started-attempt")
+        Ok(FixtureAttemptHandle("started-attempt"))
     }
 
     fn stream_events<'a>(&'a self, _handle: &'a FixtureAttemptHandle) -> OpaqueEventStream {
@@ -149,8 +149,8 @@ impl RuntimeAdapter for DefaultResumeRuntimeAdapter {
         _task: &RuntimeCapsuleFamily,
         _workspace: &WorkspaceHandle,
         _policy: &FixtureExecutionPolicy,
-    ) -> FixtureAttemptHandle {
-        FixtureAttemptHandle("unused")
+    ) -> Result<FixtureAttemptHandle, FailureClass> {
+        Ok(FixtureAttemptHandle("unused"))
     }
 
     fn stream_events<'a>(&'a self, _handle: &'a FixtureAttemptHandle) -> OpaqueEventStream {
@@ -202,7 +202,7 @@ fn start_uses_the_three_variant_canonical_capsule_family() {
         &RuntimeCapsuleFamily,
         &WorkspaceHandle,
         &FixtureExecutionPolicy,
-    ) -> FixtureAttemptHandle = TrackingRuntimeAdapter::start;
+    ) -> Result<FixtureAttemptHandle, FailureClass> = TrackingRuntimeAdapter::start;
 
     let _: fn(RuntimeCapsuleFamily) = |family| match family {
         RuntimeCapsuleFamily::Task(_) => {}
@@ -219,4 +219,92 @@ fn omitted_resume_override_means_unsupported() {
         adapter.resume(&AttemptId::new(" exact-試行-e\u{301} ").unwrap()),
         None
     );
+}
+
+// Synthetic Result-carrier checks only: no start invocation, provider
+// execution, trusted capsule/workspace construction or enforcement is claimed.
+type StartResult = Result<FixtureAttemptHandle, FailureClass>;
+
+const ALL_FAILURE_CLASSES: [FailureClass; 12] = [
+    FailureClass::RateLimited,
+    FailureClass::SessionExhausted,
+    FailureClass::AuthRequired,
+    FailureClass::ProviderDown,
+    FailureClass::Timeout,
+    FailureClass::SandboxDenied,
+    FailureClass::SafetyCheckPending,
+    FailureClass::PolicyBlocked,
+    FailureClass::RuntimeCrash,
+    FailureClass::InvalidOutput,
+    FailureClass::UserCancelled,
+    FailureClass::Unknown,
+];
+
+fn assert_failure_class_exhaustive(value: FailureClass) {
+    match value {
+        FailureClass::RateLimited
+        | FailureClass::SessionExhausted
+        | FailureClass::AuthRequired
+        | FailureClass::ProviderDown
+        | FailureClass::Timeout
+        | FailureClass::SandboxDenied
+        | FailureClass::SafetyCheckPending
+        | FailureClass::PolicyBlocked
+        | FailureClass::RuntimeCrash
+        | FailureClass::InvalidOutput
+        | FailureClass::UserCancelled
+        | FailureClass::Unknown => {}
+    }
+}
+
+#[test]
+fn synthetic_start_result_preserves_accepted_handle() {
+    let _: fn(
+        &TrackingRuntimeAdapter,
+        &RuntimeCapsuleFamily,
+        &WorkspaceHandle,
+        &FixtureExecutionPolicy,
+    ) -> StartResult = TrackingRuntimeAdapter::start;
+
+    let result: StartResult = Ok(FixtureAttemptHandle("started-attempt"));
+
+    assert_eq!(result, Ok(FixtureAttemptHandle("started-attempt")));
+    assert_eq!(result.err(), None);
+}
+
+#[test]
+fn synthetic_start_result_preserves_every_failure_without_handle() {
+    for (index, class) in ALL_FAILURE_CLASSES.into_iter().enumerate() {
+        assert_failure_class_exhaustive(class);
+        let result: StartResult = Err(class);
+
+        assert_eq!(result, Err(ALL_FAILURE_CLASSES[index]));
+        assert_eq!(result.as_ref().ok(), None, "{class:?} supplied a handle");
+        assert_eq!(result.err().map(FailureClass::as_str), Some(class.as_str()));
+        for other in &ALL_FAILURE_CLASSES[index + 1..] {
+            assert_ne!(Err::<FixtureAttemptHandle, _>(class), Err(*other));
+        }
+    }
+}
+
+#[test]
+fn synthetic_start_result_keeps_unknown_and_named_distinctions() {
+    let unknown: StartResult = Err(FailureClass::Unknown);
+    assert_eq!(unknown, Err(FailureClass::Unknown));
+    assert_eq!(unknown.err().map(FailureClass::as_str), Some("UNKNOWN"));
+
+    for (left, right) in [
+        (FailureClass::RateLimited, FailureClass::PolicyBlocked),
+        (
+            FailureClass::SafetyCheckPending,
+            FailureClass::PolicyBlocked,
+        ),
+        (FailureClass::AuthRequired, FailureClass::ProviderDown),
+    ] {
+        let left_result: StartResult = Err(left);
+        let right_result: StartResult = Err(right);
+        assert_ne!(left_result, right_result);
+        assert_eq!(left_result, Err(left));
+        assert_eq!(right_result, Err(right));
+    }
 }
