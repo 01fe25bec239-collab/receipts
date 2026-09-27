@@ -12,12 +12,14 @@ use std::fmt;
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{Connection, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 
 #[cfg(test)]
 use rusqlite::ToSql;
 
 use crate::error::StateError;
+use crate::error::{GraphFailureCode, GraphPhase};
+use crate::graph_repository;
 use crate::migrations::{self, Migration};
 
 /// Required `busy_timeout` in milliseconds (BUILD-A1 bootstrap decision).
@@ -65,25 +67,42 @@ impl SqliteStateRepository {
         Self::open_with_migrations(path, migrations::registered())
     }
 
-    /// Explicitly upgrades an exact v11 State database to v12.
+    /// Explicitly upgrades an exact v11 or v12 State database to v13.
     pub fn migrate_existing_to_current(path: impl AsRef<Path>) -> Result<u32, StateError> {
-        let mut conn = Connection::open(path.as_ref()).map_err(|e| StateError::OpenFailed {
-            detail: e.to_string(),
-        })?;
-        configure_connection(&conn)?;
-        let found = read_schema_version(&conn)?;
+        let mut conn =
+            Connection::open_with_flags(path.as_ref(), OpenFlags::SQLITE_OPEN_READ_WRITE)
+                .map_err(|e| graph_repository::sqlite_error(GraphPhase::Migration, e))?;
+        graph_repository::configure_graph_writer(&conn)?;
+        let found = graph_repository::schema_head(&conn, GraphPhase::Migration)?;
+        if found.is_some_and(|version| version < 0) {
+            return Err(StateError::GraphPersistence {
+                phase: GraphPhase::Migration,
+                code: GraphFailureCode::CorruptStore,
+                field: None,
+            });
+        }
         match found {
-            11 => {
-                verify_exact_ledger(&conn, &migrations::registered()[..11])?;
-                migrations::v0012_context_epoch_unbounded::apply(&mut conn)?;
-                verify_exact_ledger(&conn, migrations::registered())?;
-                Ok(12)
+            Some(11) => {
+                graph_repository::verify_ledger(&conn, 11, GraphPhase::Migration)?;
+                migrations::v0012_context_epoch_unbounded::apply(&mut conn)
+                    .map_err(|e| graph_repository::legacy_error(GraphPhase::Migration, e))?;
+                graph_repository::migrate_graph_store(&conn)?;
+                Ok(13)
             }
-            12 => {
-                verify_exact_ledger(&conn, migrations::registered())?;
-                Ok(12)
+            Some(12) => {
+                graph_repository::migrate_graph_store(&conn)?;
+                Ok(13)
             }
-            found => Err(StateError::ExplicitMigrationRefused { found }),
+            Some(13) => {
+                graph_repository::verify_ledger(&conn, 13, GraphPhase::Migration)?;
+                graph_repository::verify_schema(&conn, GraphPhase::Migration, true)?;
+                Ok(13)
+            }
+            _ => Err(StateError::GraphPersistence {
+                phase: GraphPhase::Migration,
+                code: GraphFailureCode::UnsupportedSchema,
+                field: None,
+            }),
         }
     }
 
@@ -103,7 +122,7 @@ impl SqliteStateRepository {
         let repo = Self { conn };
         match repo.read_schema_version()? {
             found if found == supported => {
-                if supported == 12 {
+                if supported == 13 {
                     verify_exact_ledger(repo.connection(), chain)?;
                 }
                 Ok(repo)

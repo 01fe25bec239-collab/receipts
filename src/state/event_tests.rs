@@ -174,7 +174,7 @@ fn check_values(sql: &str, column: &str) -> Vec<String> {
 fn t01_fresh_database_bootstraps_to_schema_version_7() {
     let tmp = TempDir::new("ev-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 12);
+    assert_eq!(repo.schema_version().expect("version read"), 13);
     assert!(
         repo.table_exists("event").expect("table check"),
         "event must exist after migration 4"
@@ -182,7 +182,7 @@ fn t01_fresh_database_bootstraps_to_schema_version_7() {
     // Exactly one metadata row per applied migration.
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        12
+        13
     );
 }
 
@@ -192,10 +192,10 @@ fn t02_version_7_database_reopens() {
     let tmp = TempDir::new("ev-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 12);
+        assert_eq!(repo.schema_version().expect("version read"), 13);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            12,
+            13,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -218,7 +218,7 @@ fn t03_ordinary_open_of_version_3_database_fails() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 3,
-                supported: 12
+                supported: 13
             }
         ),
         "unexpected error: {error}"
@@ -951,7 +951,7 @@ fn t45_migration4_preserves_logical_roles() {
         repo.run_transaction(|uow| uow.execute_batch(migration.sql))
             .expect("apply migration 4");
     }
-    // The ordinary registered chain now ends at version 12 and refuses to
+    // The ordinary registered chain now ends at version 13 and refuses to
     // open a version-4 database, so the migrated database is verified
     // through the version-4 prefix of the same chain.
     let version_4_chain = &migrations::registered()[..4];
@@ -1021,6 +1021,12 @@ fn t47_migration4_creates_only_event_schema() {
         "context_rehydration_repository_snapshot",
         "context_rehydration_source_evidence",
         "trusted_time_watermark",
+        "graphs",
+        "graph_versions",
+        "graph_nodes",
+        "graph_edges",
+        "graph_node_capabilities",
+        "graph_compiled_sources",
     ];
     expected.sort_unstable();
     assert_eq!(

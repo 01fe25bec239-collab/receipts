@@ -2,6 +2,150 @@
 
 use std::fmt;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphPhase {
+    Input,
+    Clock,
+    Migration,
+    Write,
+    Read,
+}
+impl GraphPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Input => "INPUT",
+            Self::Clock => "CLOCK",
+            Self::Migration => "MIGRATION",
+            Self::Write => "WRITE",
+            Self::Read => "READ",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphFailureCode {
+    InvalidShape,
+    InvalidProvenance,
+    IdentityMismatch,
+    AlreadyExists,
+    ClockInvalid,
+    ClockRegression,
+    ClockContinuity,
+    StoreUnavailable,
+    StoreBusy,
+    UnsupportedSchema,
+    CorruptStore,
+    StorageFailure,
+    RollbackFailure,
+}
+impl GraphFailureCode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::InvalidShape => "INVALID_SHAPE",
+            Self::InvalidProvenance => "INVALID_PROVENANCE",
+            Self::IdentityMismatch => "IDENTITY_MISMATCH",
+            Self::AlreadyExists => "ALREADY_EXISTS",
+            Self::ClockInvalid => "CLOCK_INVALID",
+            Self::ClockRegression => "CLOCK_REGRESSION",
+            Self::ClockContinuity => "CLOCK_CONTINUITY",
+            Self::StoreUnavailable => "STORE_UNAVAILABLE",
+            Self::StoreBusy => "STORE_BUSY",
+            Self::UnsupportedSchema => "UNSUPPORTED_SCHEMA",
+            Self::CorruptStore => "CORRUPT_STORE",
+            Self::StorageFailure => "STORAGE_FAILURE",
+            Self::RollbackFailure => "ROLLBACK_FAILURE",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphField {
+    ProjectId,
+    GraphId,
+    GoalId,
+    PolicyId,
+    ParentVersion,
+    CompiledFrom,
+    ContextEpoch,
+    ResultingDigest,
+    Nodes,
+    Edges,
+    NodeId,
+    Kind,
+    State,
+    Title,
+    ParentNodeId,
+    AttemptNumber,
+    RequiredCapabilities,
+    TaskCapsuleRef,
+    WorkstreamId,
+    CodeSha,
+    WorkspaceId,
+    ResultRef,
+    LockedReason,
+    CreatedInVersion,
+    EdgeId,
+    FromNode,
+    ToNode,
+    EdgeClass,
+    PrecedenceKind,
+    ControlKind,
+    Note,
+    CompilerId,
+    SourceRef,
+    CreationReason,
+    CreatedAt,
+    CurrentVersion,
+    GraphVersion,
+    ClockSourceId,
+    ClockContractVersion,
+}
+impl GraphField {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ProjectId => "project_id",
+            Self::GraphId => "graph_id",
+            Self::GoalId => "goal_id",
+            Self::PolicyId => "policy_id",
+            Self::ParentVersion => "parent_version",
+            Self::CompiledFrom => "compiled_from",
+            Self::ContextEpoch => "context_epoch",
+            Self::ResultingDigest => "resulting_digest",
+            Self::Nodes => "nodes",
+            Self::Edges => "edges",
+            Self::NodeId => "node_id",
+            Self::Kind => "kind",
+            Self::State => "state",
+            Self::Title => "title",
+            Self::ParentNodeId => "parent_node_id",
+            Self::AttemptNumber => "attempt_number",
+            Self::RequiredCapabilities => "required_capabilities",
+            Self::TaskCapsuleRef => "task_capsule_ref",
+            Self::WorkstreamId => "workstream_id",
+            Self::CodeSha => "code_sha",
+            Self::WorkspaceId => "workspace_id",
+            Self::ResultRef => "result_ref",
+            Self::LockedReason => "locked_reason",
+            Self::CreatedInVersion => "created_in_version",
+            Self::EdgeId => "edge_id",
+            Self::FromNode => "from_node",
+            Self::ToNode => "to_node",
+            Self::EdgeClass => "edge_class",
+            Self::PrecedenceKind => "precedence_kind",
+            Self::ControlKind => "control_kind",
+            Self::Note => "note",
+            Self::CompilerId => "compiler_id",
+            Self::SourceRef => "source_ref",
+            Self::CreationReason => "creation_reason",
+            Self::CreatedAt => "created_at",
+            Self::CurrentVersion => "current_version",
+            Self::GraphVersion => "graph_version",
+            Self::ClockSourceId => "clock_source_id",
+            Self::ClockContractVersion => "clock_contract_version",
+        }
+    }
+}
+
 /// Errors produced by the State repository foundation.
 ///
 /// Every failure mode of opening, configuring, migrating, or transacting
@@ -10,6 +154,12 @@ use std::fmt;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum StateError {
+    /// Closed, content-free graph persistence diagnostic.
+    GraphPersistence {
+        phase: GraphPhase,
+        code: GraphFailureCode,
+        field: Option<GraphField>,
+    },
     /// A value was not canonical non-negative decimal State epoch text.
     InvalidStateEpochValue { value: String },
     /// A canonical State epoch cannot be represented by the compatibility i64 surface.
@@ -449,6 +599,13 @@ pub enum StateError {
 impl fmt::Display for StateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            StateError::GraphPersistence { phase, code, field } => {
+                write!(f, "graph persistence {} {}", phase.label(), code.label())?;
+                if let Some(field) = field {
+                    write!(f, " {}", field.label())?;
+                }
+                Ok(())
+            }
             StateError::InvalidStateEpochValue { value } => {
                 write!(f, "invalid StateEpochValueV1 {value:?}")
             }
