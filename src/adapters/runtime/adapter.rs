@@ -62,12 +62,49 @@ pub trait RuntimeAdapter {
     ///
     /// This interface operation grants no execution authority. The orchestrator
     /// dispatch gate must authorize dispatch before this boundary is reached.
+    ///
+    /// `Ok` carries the accepted attempt handle unchanged. `Err` carries the
+    /// canonical payload-free [`FailureClass`] and supplies no accepted handle;
+    /// `Unknown` remains a legitimate result. Refusal is never expressed as a
+    /// fake handle or a panic. This return binding neither defines execution
+    /// policy semantics nor claims any enforcement or process behavior.
+    ///
+    /// A caller must handle the result before it has an accepted handle:
+    ///
+    /// ```compile_fail,E0308
+    /// # use receipts_runtime_adapters::RuntimeAdapter;
+    /// # use receipts_runtime_bindings::RuntimeCapsuleFamily;
+    /// # use receipts_workspace_execution::WorkspaceHandle;
+    /// fn accepted_handle<A: RuntimeAdapter>(
+    ///     adapter: &A,
+    ///     task: &RuntimeCapsuleFamily,
+    ///     workspace: &WorkspaceHandle,
+    ///     policy: &A::ExecutionPolicy,
+    /// ) -> A::AttemptHandle {
+    ///     adapter.start(task, workspace, policy)
+    /// }
+    /// ```
+    ///
+    /// ```
+    /// # use receipts_runtime_adapters::{FailureClass, RuntimeAdapter};
+    /// # use receipts_runtime_bindings::RuntimeCapsuleFamily;
+    /// # use receipts_workspace_execution::WorkspaceHandle;
+    /// fn accepted_handle<A: RuntimeAdapter>(
+    ///     adapter: &A,
+    ///     task: &RuntimeCapsuleFamily,
+    ///     workspace: &WorkspaceHandle,
+    ///     policy: &A::ExecutionPolicy,
+    /// ) -> Result<A::AttemptHandle, FailureClass> {
+    ///     let handle = adapter.start(task, workspace, policy)?;
+    ///     Ok(handle)
+    /// }
+    /// ```
     fn start(
         &self,
         task: &RuntimeCapsuleFamily,
         workspace: &WorkspaceHandle,
         policy: &Self::ExecutionPolicy,
-    ) -> Self::AttemptHandle;
+    ) -> Result<Self::AttemptHandle, FailureClass>;
 
     fn stream_events<'a>(&'a self, handle: &'a Self::AttemptHandle) -> Self::EventStream<'a>;
 
