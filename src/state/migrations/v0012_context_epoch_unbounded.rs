@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 use crate::error::{GraphFailureCode, GraphPhase, StateError};
 use crate::graph_repository;
@@ -135,7 +135,7 @@ pub(crate) fn apply(conn: &mut Connection) -> Result<(), StateError> {
 }
 
 pub(crate) fn apply_graph(conn: &mut Connection) -> Result<(), StateError> {
-    apply_with(conn, &|error| {
+    apply_graph_locked(conn, &|error| {
         graph_repository::sqlite_error(GraphPhase::Migration, error)
     })
     .map_err(|error| match error {
@@ -147,6 +147,69 @@ pub(crate) fn apply_graph(conn: &mut Connection) -> Result<(), StateError> {
         },
         other => graph_repository::legacy_error(GraphPhase::Migration, other),
     })
+}
+
+fn apply_graph_locked(
+    conn: &mut Connection,
+    sql_error: &impl Fn(rusqlite::Error) -> StateError,
+) -> Result<(), StateError> {
+    require_foreign_keys(conn, 1, sql_error)?;
+    let migration_result = (|| {
+        conn.execute_batch("PRAGMA foreign_keys = OFF;")
+            .map_err(sql_error)?;
+        require_foreign_keys(conn, 0, sql_error)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let outcome = (|| {
+            match graph_repository::schema_head(&tx, GraphPhase::Migration)? {
+                Some(11) => graph_repository::verify_ledger(&tx, 11, GraphPhase::Migration)?,
+                Some(head @ (12 | 13)) => {
+                    graph_repository::verify_ledger(&tx, head as usize, GraphPhase::Migration)?;
+                    graph_repository::verify_schema(&tx, GraphPhase::Migration, head == 13)?;
+                    return Err(graph_failure(GraphFailureCode::UnsupportedSchema));
+                }
+                Some(head) if head >= 0 => {
+                    return Err(graph_failure(GraphFailureCode::UnsupportedSchema));
+                }
+                _ => return Err(graph_failure(GraphFailureCode::CorruptStore)),
+            }
+            require_no_foreign_key_violations(&tx, "before v12 migration", sql_error)?;
+            validate_legacy_epochs(&tx, sql_error)?;
+            rebuild_body(&tx, sql_error)
+        })();
+        match outcome {
+            Ok(()) => match tx.execute_batch("COMMIT") {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let mapped = sql_error(error);
+                    tx.execute_batch("ROLLBACK")
+                        .map_err(|_| graph_failure(GraphFailureCode::RollbackFailure))?;
+                    Err(mapped)
+                }
+            },
+            Err(error) => {
+                tx.execute_batch("ROLLBACK")
+                    .map_err(|_| graph_failure(GraphFailureCode::RollbackFailure))?;
+                Err(error)
+            }
+        }
+    })();
+    let restore_result = (|| {
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(sql_error)?;
+        require_foreign_keys(conn, 1, sql_error)?;
+        require_no_foreign_key_violations(conn, "after enabling foreign keys", sql_error)
+    })();
+    migration_result.and(restore_result)
+}
+
+fn graph_failure(code: GraphFailureCode) -> StateError {
+    StateError::GraphPersistence {
+        phase: GraphPhase::Migration,
+        code,
+        field: None,
+    }
 }
 
 fn apply_with(
@@ -162,9 +225,7 @@ fn apply_with(
 
     let migration_result = (|| {
         let tx = conn.transaction().map_err(sql_error)?;
-        tx.execute_batch(REBUILD_SQL).map_err(sql_error)?;
-        require_no_foreign_key_violations(&tx, "inside v12 transaction", sql_error)?;
-        validate_v12_schema(&tx, sql_error)?;
+        rebuild_body(&tx, sql_error)?;
         tx.commit().map_err(sql_error)
     })();
 
@@ -176,6 +237,15 @@ fn apply_with(
     })();
 
     migration_result.and(restore_result)
+}
+
+fn rebuild_body(
+    conn: &Connection,
+    sql_error: &impl Fn(rusqlite::Error) -> StateError,
+) -> Result<(), StateError> {
+    conn.execute_batch(REBUILD_SQL).map_err(sql_error)?;
+    require_no_foreign_key_violations(conn, "inside v12 transaction", sql_error)?;
+    validate_v12_schema(conn, sql_error)
 }
 
 fn validate_legacy_epochs(

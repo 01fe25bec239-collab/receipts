@@ -488,6 +488,304 @@ fn v11_helper_sql_failure_keeps_graph_diagnostics_closed_and_legacy_error() {
     assert!(!format!("{error} {error:?}").contains("SENTINEL"));
 }
 
+fn migration_image(path: &std::path::Path) -> (Vec<String>, Vec<String>, String, String) {
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let master = conn
+        .prepare("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name")
+        .unwrap()
+        .query_map([], |row| {
+            Ok(format!(
+                "{:?}|{:?}|{:?}|{:?}",
+                row.get_ref(0)?,
+                row.get_ref(1)?,
+                row.get_ref(2)?,
+                row.get_ref(3)?
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let tables = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let mut rows = Vec::new();
+    for table in tables {
+        let mut stmt = conn
+            .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+            .unwrap();
+        let width = stmt.column_count();
+        let values = stmt
+            .query_map([], |row| {
+                Ok((0..width)
+                    .map(|column| format!("{:?}", row.get_ref(column).unwrap()))
+                    .collect::<Vec<_>>()
+                    .join("|"))
+            })
+            .unwrap();
+        for value in values {
+            rows.push(format!("{table}:{}", value.unwrap()));
+        }
+    }
+    let mode = conn
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap();
+    let encoding = conn
+        .query_row("PRAGMA encoding", [], |row| row.get(0))
+        .unwrap();
+    (master, rows, mode, encoding)
+}
+
+fn migration_ledger(path: &std::path::Path) -> Vec<(i64, String)> {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.prepare("SELECT version,migration_name FROM state_schema_version ORDER BY version")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+#[test]
+fn stale_v11_graph_step_refuses_valid_advanced_store_without_rebuild() {
+    use std::error::Error;
+
+    for epoch_row in [false, true] {
+        for advanced_head in [12, 13] {
+            let db = TempDb::new();
+            let repo = SqliteStateRepository::open_with_migrations(
+                &db.0,
+                &crate::migrations::registered()[..11],
+            )
+            .unwrap();
+            if epoch_row {
+                repo.connection().execute_batch("INSERT INTO logical_role(role_id,project_id,role_type,status,current_context_epoch) VALUES ('SENTINEL-role','p','RUNTIME_A1','ACTIVE',0)").unwrap();
+            }
+            drop(repo);
+            let mut stale = rusqlite::Connection::open(&db.0).unwrap();
+            crate::graph_repository::configure_graph_writer(&stale).unwrap();
+            assert_eq!(
+                crate::graph_repository::schema_head(&stale, Phase::Migration).unwrap(),
+                Some(11)
+            );
+
+            if advanced_head == 12 {
+                let mut advancing = rusqlite::Connection::open(&db.0).unwrap();
+                crate::graph_repository::configure_graph_writer(&advancing).unwrap();
+                crate::migrations::v0012_context_epoch_unbounded::apply_graph(&mut advancing)
+                    .unwrap();
+            } else {
+                assert_eq!(
+                    SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
+                    13
+                );
+            }
+            let before = migration_image(&db.0);
+            let error = crate::migrations::v0012_context_epoch_unbounded::apply_graph(&mut stale)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                StateError::GraphPersistence {
+                    phase: Phase::Migration,
+                    code: Code::UnsupportedSchema,
+                    field: None
+                }
+            ));
+            assert!(error.source().is_none());
+            let diagnostic = format!("{error} {error:?}");
+            for forbidden in ["SENTINEL", "PRAGMA", "SELECT", "database"] {
+                assert!(!diagnostic.contains(forbidden));
+            }
+            assert!(stale.is_autocommit());
+            assert_eq!(
+                stale
+                    .query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(migration_image(&db.0), before);
+            let expected: Vec<_> = crate::migrations::registered()[..advanced_head]
+                .iter()
+                .map(|item| (i64::from(item.version), item.name.to_string()))
+                .collect();
+            assert_eq!(migration_ledger(&db.0), expected);
+            drop(stale);
+            drop(
+                SqliteStateRepository::open_with_migrations(
+                    &db.0,
+                    &crate::migrations::registered()[..advanced_head],
+                )
+                .unwrap(),
+            );
+            assert_eq!(
+                SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
+                13
+            );
+            assert_eq!(migration_ledger(&db.0).len(), 13);
+            drop(SqliteStateRepository::open(&db.0).unwrap());
+        }
+    }
+}
+
+#[test]
+fn stale_v11_graph_step_rejects_corrupt_advanced_store_without_writes() {
+    for (advanced_head, corruption) in [
+        (
+            12,
+            "INSERT INTO state_schema_version(version,migration_name) VALUES (12,'SENTINEL-duplicate')",
+        ),
+        (12, "DROP INDEX idx_context_epoch_project_numeric_epoch"),
+        (
+            13,
+            "INSERT INTO state_schema_version(version,migration_name) VALUES (13,'SENTINEL-duplicate')",
+        ),
+        (13, "DROP TABLE graph_compiled_sources"),
+    ] {
+        let db = TempDb::new();
+        drop(
+            SqliteStateRepository::open_with_migrations(
+                &db.0,
+                &crate::migrations::registered()[..11],
+            )
+            .unwrap(),
+        );
+        let mut stale = rusqlite::Connection::open(&db.0).unwrap();
+        crate::graph_repository::configure_graph_writer(&stale).unwrap();
+        assert_eq!(
+            crate::graph_repository::schema_head(&stale, Phase::Migration).unwrap(),
+            Some(11)
+        );
+        if advanced_head == 12 {
+            let mut advancing = rusqlite::Connection::open(&db.0).unwrap();
+            crate::graph_repository::configure_graph_writer(&advancing).unwrap();
+            crate::migrations::v0012_context_epoch_unbounded::apply_graph(&mut advancing).unwrap();
+        } else {
+            assert_eq!(
+                SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
+                13
+            );
+        }
+        rusqlite::Connection::open(&db.0)
+            .unwrap()
+            .execute_batch(corruption)
+            .unwrap();
+        let before = migration_image(&db.0);
+        let error =
+            crate::migrations::v0012_context_epoch_unbounded::apply_graph(&mut stale).unwrap_err();
+        assert!(matches!(
+            error,
+            StateError::GraphPersistence {
+                phase: Phase::Migration,
+                code: Code::CorruptStore,
+                field: None
+            }
+        ));
+        assert!(stale.is_autocommit());
+        assert_eq!(migration_image(&db.0), before);
+        assert_eq!(
+            stale
+                .query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert!(!format!("{error} {error:?}").contains("SENTINEL"));
+    }
+}
+
+#[test]
+fn simultaneous_public_v11_maintenance_keeps_one_exact_ledger() {
+    use std::sync::{Arc, Barrier};
+
+    let db = TempDb::new();
+    drop(
+        SqliteStateRepository::open_with_migrations(&db.0, &crate::migrations::registered()[..11])
+            .unwrap(),
+    );
+    let barrier = Arc::new(Barrier::new(3));
+    let handles: Vec<_> = (0..2)
+        .map(|_| {
+            let path = db.0.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                SqliteStateRepository::migrate_existing_to_current(path)
+            })
+        })
+        .collect();
+    barrier.wait();
+    for result in handles.into_iter().map(|handle| handle.join().unwrap()) {
+        match result {
+            Ok(13) => (),
+            Err(StateError::GraphPersistence {
+                phase: Phase::Migration,
+                code: Code::StoreBusy | Code::UnsupportedSchema | Code::CorruptStore,
+                field: None,
+            }) => (),
+            other => panic!("unexpected maintenance result: {other:?}"),
+        }
+    }
+    assert_eq!(
+        SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
+        13
+    );
+    let expected: Vec<_> = crate::migrations::registered()
+        .iter()
+        .map(|item| (i64::from(item.version), item.name.to_string()))
+        .collect();
+    assert_eq!(migration_ledger(&db.0), expected);
+    drop(SqliteStateRepository::open(&db.0).unwrap());
+}
+
+#[test]
+fn graph_v11_commit_busy_rolls_back_and_restores_foreign_keys() {
+    use std::time::Duration;
+
+    let db = TempDb::new();
+    drop(
+        SqliteStateRepository::open_with_migrations(&db.0, &crate::migrations::registered()[..11])
+            .unwrap(),
+    );
+    let mut writer = rusqlite::Connection::open(&db.0).unwrap();
+    writer
+        .execute_batch("PRAGMA journal_mode=DELETE; PRAGMA foreign_keys=ON")
+        .unwrap();
+    writer.busy_timeout(Duration::from_millis(30)).unwrap();
+    let reader = rusqlite::Connection::open(&db.0).unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT COUNT(*) FROM state_schema_version")
+        .unwrap();
+    let before = migration_image(&db.0);
+    let error =
+        crate::migrations::v0012_context_epoch_unbounded::apply_graph(&mut writer).unwrap_err();
+    assert!(matches!(
+        error,
+        StateError::GraphPersistence {
+            phase: Phase::Migration,
+            code: Code::StoreBusy,
+            field: None
+        }
+    ));
+    assert!(writer.is_autocommit());
+    assert_eq!(
+        writer
+            .query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(migration_image(&db.0), before);
+    assert_eq!(migration_ledger(&db.0).len(), 11);
+    reader.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(
+        SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
+        13
+    );
+}
+
 #[test]
 fn busy_writer_and_concurrent_duplicate_are_closed() {
     use std::time::Duration;

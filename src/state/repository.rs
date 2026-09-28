@@ -83,7 +83,6 @@ impl SqliteStateRepository {
         }
         match found {
             Some(11) => {
-                graph_repository::verify_ledger(&conn, 11, GraphPhase::Migration)?;
                 migrations::v0012_context_epoch_unbounded::apply_graph(&mut conn)?;
                 graph_repository::migrate_graph_store(&conn)?;
                 Ok(13)
