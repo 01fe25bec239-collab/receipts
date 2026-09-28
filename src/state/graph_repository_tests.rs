@@ -334,6 +334,161 @@ fn v13_migration_collision_preserves_v12_and_v11_second_step() {
 }
 
 #[test]
+fn v11_graph_maintenance_preserves_typed_busy_and_durable_state() {
+    use std::error::Error;
+    use std::path::Path;
+
+    fn snapshot(path: &Path) -> (Vec<u8>, String, String, Vec<String>) {
+        let conn =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        let encoding: String = conn
+            .query_row("PRAGMA encoding", [], |row| row.get(0))
+            .unwrap();
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap();
+        let tables = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        drop(stmt);
+        let mut rows = Vec::new();
+        for table in tables {
+            let mut stmt = conn
+                .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                .unwrap();
+            let width = stmt.column_count();
+            let values = stmt
+                .query_map([], |row| {
+                    Ok((0..width)
+                        .map(|index| format!("{:?}", row.get_ref(index).unwrap()))
+                        .collect::<Vec<_>>()
+                        .join("|"))
+                })
+                .unwrap();
+            for value in values {
+                rows.push(format!("{table}:{}", value.unwrap()));
+            }
+        }
+        (std::fs::read(path).unwrap(), mode, encoding, rows)
+    }
+
+    for version in [11, 12] {
+        let db = TempDb::new();
+        let repo = SqliteStateRepository::open_with_migrations(
+            &db.0,
+            &crate::migrations::registered()[..version],
+        )
+        .unwrap();
+        repo.connection()
+            .execute(
+                "INSERT INTO trusted_time_watermark(project_id,clock_source_id,clock_contract_version,last_accepted_trusted_time) VALUES ('SENTINEL-project','clock','1','2026-09-27T10:00:00.000000000Z')",
+                [],
+            )
+            .unwrap();
+        drop(repo);
+        let blocker = rusqlite::Connection::open(&db.0).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let before = snapshot(&db.0);
+        assert_eq!(before.1, "wal");
+        assert_eq!(before.2, "UTF-8");
+        let error = SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap_err();
+        assert!(matches!(
+            error,
+            StateError::GraphPersistence {
+                phase: Phase::Migration,
+                code: Code::StoreBusy,
+                field: None,
+            }
+        ));
+        assert!(error.source().is_none());
+        let diagnostic = format!("{error} {error:?}");
+        for forbidden in ["SENTINEL", "database is locked", "PRAGMA", "SELECT"] {
+            assert!(!diagnostic.contains(forbidden));
+        }
+        assert_eq!(snapshot(&db.0), before);
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drop(blocker);
+        assert_eq!(
+            SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
+            13
+        );
+    }
+}
+
+#[test]
+fn v11_helper_sql_failure_keeps_graph_diagnostics_closed_and_legacy_error() {
+    use std::error::Error;
+
+    for graph_path in [false, true] {
+        let db = TempDb::new();
+        let repo = SqliteStateRepository::open_with_migrations(
+            &db.0,
+            &crate::migrations::registered()[..11],
+        )
+        .unwrap();
+        repo.connection()
+            .execute_batch("CREATE TABLE logical_role_v12 (SENTINEL TEXT)")
+            .unwrap();
+        drop(repo);
+        if graph_path {
+            let error = SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap_err();
+            assert!(matches!(
+                error,
+                StateError::GraphPersistence {
+                    phase: Phase::Migration,
+                    code: Code::StorageFailure,
+                    field: None
+                }
+            ));
+            assert!(error.source().is_none());
+            assert!(!format!("{error} {error:?}").contains("SENTINEL"));
+        } else {
+            let mut conn = rusqlite::Connection::open(&db.0).unwrap();
+            conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+            assert!(matches!(
+                crate::migrations::v0012_context_epoch_unbounded::apply(&mut conn),
+                Err(StateError::V12PhysicalMigrationFailed { .. })
+            ));
+            let foreign_keys: i64 = conn
+                .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(foreign_keys, 1);
+        }
+        let repo = SqliteStateRepository::open_with_migrations(
+            &db.0,
+            &crate::migrations::registered()[..11],
+        )
+        .unwrap();
+        assert_eq!(repo.schema_version().unwrap(), 11);
+        assert_eq!(repo.count_table_rows("state_schema_version").unwrap(), 11);
+    }
+
+    let db = TempDb::new();
+    let repo =
+        SqliteStateRepository::open_with_migrations(&db.0, &crate::migrations::registered()[..11])
+            .unwrap();
+    repo.connection().execute_batch("PRAGMA foreign_keys=OFF; INSERT INTO context_epoch_invalidated_role(project_id,epoch,role_id) VALUES ('SENTINEL-project',0,'missing')").unwrap();
+    drop(repo);
+    let error = SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap_err();
+    assert!(matches!(
+        error,
+        StateError::GraphPersistence {
+            phase: Phase::Migration,
+            code: Code::CorruptStore,
+            field: None
+        }
+    ));
+    assert!(error.source().is_none());
+    assert!(!format!("{error} {error:?}").contains("SENTINEL"));
+}
+
+#[test]
 fn busy_writer_and_concurrent_duplicate_are_closed() {
     use std::time::Duration;
     let db = TempDb::new();
