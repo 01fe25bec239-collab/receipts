@@ -131,18 +131,43 @@ impl Workspace {
             self.identities(leaf).unwrap();
         });
     }
-    /// Runs one synchronous API call on a scoped thread while this thread observes
-    /// mandatory preparation on the same invocation clock. Requests and the helper
-    /// must already exist; the call is joined before any caller assertion.
+    /// Runs one synchronous API call on a scoped worker while this thread observes
+    /// mandatory preparation within `PREP`. Requests and the helper must already
+    /// exist; the worker is joined before any caller assertion.
     fn observed<T: Send>(&self, call: impl FnOnce() -> T + Send) -> (bool, T) {
-        let start = Instant::now();
+        let (_, prepared, result) = self.observed_within(PREP, || {}, call);
+        (prepared, result)
+    }
+    /// The worker takes the invocation clock immediately before its single call and
+    /// publishes that exact instant on an unbounded channel, so it never waits for
+    /// the observer. Worker scheduling before the instant is excluded; observer delay
+    /// after it stays charged to `budget`. `scheduled` runs on the worker before the
+    /// clock (callers pass nothing; the regression models scheduling delay with it).
+    /// Handoff, worker and API failures surface only after the join.
+    fn observed_within<T: Send>(
+        &self,
+        budget: Duration,
+        scheduled: impl FnOnce() + Send,
+        call: impl FnOnce() -> T + Send,
+    ) -> (Instant, bool, T) {
+        let (publish, invoked) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
-            let api = scope.spawn(call);
-            let prepared = self.prepared_within(start, PREP);
+            let api = scope.spawn(move || {
+                scheduled();
+                let start = Instant::now();
+                publish
+                    .send(start)
+                    .expect("the observer holds the receiver until join");
+                call()
+            });
+            let observed = invoked
+                .recv()
+                .map(|start| (start, self.prepared_within(start, budget)));
             let result = api
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-            (prepared, result)
+            let (start, prepared) = observed.expect("the worker published no invocation clock");
+            (start, prepared, result)
         })
     }
     /// Fixture identities, validated before any numerical observation: leader > 1,
@@ -1062,6 +1087,61 @@ fn fixture_evidence_checks_reject_missing_late_wrong_or_live_evidence() {
         detail: MARKER.into(),
     });
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| safe(&leaked))).is_err());
+}
+
+#[test]
+fn observed_clock_starts_at_worker_invocation_and_rejects_missing_or_late_preparation() {
+    // Clock origin, by instant ordering rather than timing: the published clock
+    // follows everything the worker did before invoking and precedes the call's own
+    // first instant. A parent clock taken before spawning (the rejected origin) is
+    // earlier than `scheduled`; a clock reset after the call is later than `entered`.
+    let ws = Workspace::new();
+    let (scheduled, entered) = (OnceLock::new(), OnceLock::new());
+    let (start, prepared, ()) = ws.observed_within(
+        PREP,
+        || {
+            // Guarantees a strictly later worker instant than any pre-spawn clock.
+            std::thread::sleep(Duration::from_millis(1));
+            scheduled.set(Instant::now()).unwrap();
+        },
+        || {
+            // OnceLock::set also fails on a second invocation.
+            entered.set(Instant::now()).unwrap();
+            ws.write("ready", "1");
+        },
+    );
+    assert!(
+        scheduled.get().unwrap() <= &start,
+        "clock predates worker invocation"
+    );
+    assert!(
+        &start <= entered.get().unwrap(),
+        "clock postdates API entry"
+    );
+    assert!(prepared);
+
+    // On that clock, missing and late preparation are still rejected.
+    let budget = Duration::from_millis(50);
+    let missing = Workspace::new();
+    assert!(!missing.observed_within(budget, || {}, || {}).1);
+    let late = Workspace::new();
+    let (_, prepared, ()) = late.observed_within(
+        budget,
+        || {},
+        || {
+            std::thread::sleep(budget * 2);
+            late.write("ready", "1");
+        },
+    );
+    assert!(!prepared && late.0.join("ready").exists());
+
+    // A worker failing before it publishes is joined and its failure raised; the
+    // observer does not hang on the disconnected channel or default a timestamp.
+    let failed = Workspace::new();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        failed.observed_within(budget, || panic!("worker failed before invocation"), || ())
+    }));
+    assert!(outcome.is_err());
 }
 
 #[test]
