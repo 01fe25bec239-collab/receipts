@@ -6,6 +6,9 @@ use crate::{
     RuntimeAuthStatus, RuntimeCapabilities,
 };
 
+// Transparent alias for the exact trait return; it adds no contract.
+type StartResult<A> = Result<<A as RuntimeAdapter>::AttemptHandle, FailureClass>;
+
 struct SurfaceWitness;
 struct OpaqueEventStream;
 
@@ -35,7 +38,14 @@ impl RuntimeAdapter for SurfaceWitness {
 
     fn models(&self) {}
 
-    fn start(&self, _task: &RuntimeCapsuleFamily, _workspace: &WorkspaceHandle, _policy: &()) {}
+    fn start(
+        &self,
+        _task: &RuntimeCapsuleFamily,
+        _workspace: &WorkspaceHandle,
+        _policy: &(),
+    ) -> Result<(), FailureClass> {
+        Ok(())
+    }
 
     fn stream_events<'a>(&'a self, _handle: &'a ()) -> Self::EventStream<'a> {
         OpaqueEventStream
@@ -109,7 +119,7 @@ fn canonical_parameters_leave_only_the_other_associated_placeholders() {
             &RuntimeCapsuleFamily,
             &WorkspaceHandle,
             &A::ExecutionPolicy,
-        ) -> A::AttemptHandle = A::start;
+        ) -> StartResult<A> = A::start;
         let _: fn(&A, &crate::RawFailure) -> FailureClass = A::classify_failure;
         let _: fn(&A, &crate::AttemptId) -> Option<A::AttemptHandle> = A::resume;
     }
@@ -133,6 +143,7 @@ fn canonical_parameters_leave_only_the_other_associated_placeholders() {
             "CancelReason;",
         ]
     );
+    assert!(source.contains(") -> Result<Self::AttemptHandle, FailureClass>;"));
     assert!(source.contains("fn classify_failure(&self, error: &RawFailure) -> FailureClass;"));
     assert!(
         source.contains("fn resume(&self, _attempt_id: &AttemptId) -> Option<Self::AttemptHandle>")

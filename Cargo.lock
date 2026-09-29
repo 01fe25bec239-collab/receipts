@@ -304,6 +304,7 @@ version = "0.1.0"
 dependencies = [
  "receipts-state",
  "receipts-workspace-execution",
+ "sha2",
 ]
 
 [[package]]

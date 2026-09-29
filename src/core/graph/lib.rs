@@ -26,7 +26,8 @@
 //!
 //! Boundary rules honored by this crate:
 //!
-//! * Rust `std` only; no dependencies, no feature flags;
+//! * dependencies are limited to canonical owner crates and declared `sha2`;
+//!   no feature flags;
 //! * no product API outside this bounded graph domain;
 //! * malformed input fails explicitly instead of becoming a permissive
 //!   successful state;
@@ -35,6 +36,7 @@
 //!   model/provider routing.
 
 pub mod accepted_integration_transition;
+pub mod content_digest;
 pub mod edge;
 pub mod error;
 pub mod execution_graph;
@@ -68,6 +70,8 @@ mod accepted_integration_transition_tests;
 #[cfg(test)]
 mod capability_name_tests;
 #[cfg(test)]
+mod content_digest_tests;
+#[cfg(test)]
 mod execution_graph_tests;
 #[cfg(test)]
 mod graph_mutation_actor_policy_tests;
@@ -98,6 +102,7 @@ pub use accepted_integration_transition::{
     AUTHORIZED_ACCEPTED_INTEGRATION_TRANSITIONS, AcceptedIntegrationTransitionError,
     validate_accepted_integration_transition,
 };
+pub use content_digest::{GraphContentDigestError, graph_content_digest_v1};
 pub use edge::{ControlKind, EdgeClass, GraphEdge, GraphEdgeRelation, PrecedenceKind};
 pub use error::{GraphError, MAX_IDENTIFIER_LENGTH};
 pub use execution_graph::ExecutionGraph;

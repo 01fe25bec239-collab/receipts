@@ -1,5 +1,14 @@
 //! Deterministic helpers only: no installed Claude/model/subscription is invoked.
 //! All execution and lifecycle evidence comes from the real Workspace process APIs.
+//!
+//! Live READY proves only stdin delivery/close, never helper preparation. Cases that
+//! need a running helper observe its `ready` marker within `PREP` on a clock started
+//! immediately before the API call, and positive originally-short cases use the
+//! accepted test-only total policy `PREP` + original allowance (10.7s/11s, grace
+//! unchanged). Workspace's deadline is still computed once inside the API and never
+//! rearmed; timeout is not promised exactly one allowance after preparation. Real
+//! early timeout before any application marker is covered separately with the
+//! original short policies (ADR BUILD-A1-ADR-RUNTIME-CLAUDE-FIXTURE-BUDGET-V1-001).
 use crate::claude_execution::build_claude_task_request;
 use crate::*;
 use receipts_workspace_execution::execution::{
@@ -23,6 +32,7 @@ use std::{fs,io::{Read,Write},path::Path,time::{Duration,Instant}};
 unsafe extern "C" { fn signal(sig:i32,handler:usize)->usize; fn getpgrp()->i32; }
 fn until(mut f:impl FnMut()->bool) { let t=Instant::now(); while !f() { assert!(t.elapsed()<Duration::from_secs(30)); std::thread::sleep(Duration::from_millis(2)); } }
 fn main() {
+ if Path::new("closed-gate").exists() { until(||false); }
  let args:Vec<_>=std::env::args().collect();
  let leaf=args.get(1).map(String::as_str)==Some("leaf");
  if leaf || Path::new("ignore").exists() { unsafe {signal(15,1);} }
@@ -96,33 +106,116 @@ impl Workspace {
         self.write("expected",format!("{}\n",serde_json::json!({"type":"user","session_id":"","message":{"role":"user","content":prompt},"parent_tool_use_id":null})));
         ClaudeTaskExecutionRequest::new(helper(), &self.0, &self.0, policy(timeout), mode, prompt)
     }
-    fn ready(&self) {
-        until(|| self.0.join("ready").exists());
-    }
-    fn prove_empty(&self) {
-        unsafe extern "C" {
-            fn kill(pid: i32, sig: i32) -> i32;
-            fn getpgrp() -> i32;
+    /// `ready` is written only after pid/pgid, argv/env/stdin validation, any
+    /// signal disposition and any requested leaf acknowledgment. Existence is read
+    /// before the clock, so `true` means it was observed within `budget` of `start`.
+    fn prepared_within(&self, start: Instant, budget: Duration) -> bool {
+        loop {
+            if self.0.join("ready").exists() {
+                return start.elapsed() < budget;
+            }
+            if start.elapsed() >= budget {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(2));
         }
-        let number = |name| {
+    }
+    /// Mandatory preparation of a live attempt, on the clock started immediately
+    /// before `start_claude_live_attempt`. Failure collects the owned attempt first.
+    fn ready(&self, start: Instant, attempt: &ClaudeLiveAttempt, leaf: bool) {
+        live(attempt, || {
+            assert!(
+                self.prepared_within(start, PREP),
+                "application preparation not observed within {PREP:?}"
+            );
+            self.identities(leaf).unwrap();
+        });
+    }
+    /// Runs one synchronous API call on a scoped worker while this thread observes
+    /// mandatory preparation within `PREP`. Requests and the helper must already
+    /// exist; the worker is joined before any caller assertion.
+    fn observed<T: Send>(&self, call: impl FnOnce() -> T + Send) -> (bool, T) {
+        let (_, prepared, result) = self.observed_within(PREP, || {}, call);
+        (prepared, result)
+    }
+    /// The worker takes the invocation clock immediately before its single call and
+    /// publishes that exact instant on an unbounded channel, so it never waits for
+    /// the observer. Worker scheduling before the instant is excluded; observer delay
+    /// after it stays charged to `budget`. `scheduled` runs on the worker before the
+    /// clock (callers pass nothing; the regression models scheduling delay with it).
+    /// Handoff, worker and API failures surface only after the join.
+    fn observed_within<T: Send>(
+        &self,
+        budget: Duration,
+        scheduled: impl FnOnce() + Send,
+        call: impl FnOnce() -> T + Send,
+    ) -> (Instant, bool, T) {
+        let (publish, invoked) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let api = scope.spawn(move || {
+                scheduled();
+                let start = Instant::now();
+                publish
+                    .send(start)
+                    .expect("the observer holds the receiver until join");
+                call()
+            });
+            let observed = invoked
+                .recv()
+                .map(|start| (start, self.prepared_within(start, budget)));
+            let result = api
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            let (start, prepared) = observed.expect("the worker published no invocation clock");
+            (start, prepared, result)
+        })
+    }
+    /// Fixture identities, validated before any numerical observation: leader > 1,
+    /// leader == group, group != caller group; a requested leaf must have
+    /// acknowledged and share that group. Never a production ownership handle.
+    fn identities(&self, leaf: bool) -> Result<Vec<i32>, String> {
+        let number = |name: &str| {
             fs::read_to_string(self.0.join(name))
-                .unwrap()
+                .map_err(|error| format!("{name}: {:?}", error.kind()))?
                 .parse::<i32>()
-                .unwrap()
+                .map_err(|_| format!("{name}: not a number"))
         };
-        let pid = number("pid");
-        assert!(pid > 1);
-        assert_eq!(pid, number("pgid"));
-        assert_ne!(pid, unsafe { getpgrp() });
-        for target in [pid, -pid]
-            .into_iter()
-            .chain(self.0.join("leaf-pid").exists().then(|| number("leaf-pid")))
-        {
-            // Observation only; Runtime tests never signal or reap the helper.
-            assert_eq!(unsafe { kill(target, 0) }, -1);
-            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(3));
+        let pid = number("pid")?;
+        if pid <= 1 || number("pgid")? != pid || pid == unsafe { getpgrp() } {
+            return Err(format!("invalid leader/group identity {pid}"));
         }
+        let mut targets = vec![pid, -pid];
+        if leaf {
+            let leaf_pid = number("leaf-pid")?;
+            if !self.0.join("leaf-ready").exists()
+                || leaf_pid <= 1
+                || leaf_pid == pid
+                || number("leaf-pgid")? != pid
+            {
+                return Err(format!("leaf {leaf_pid} not acknowledged in group {pid}"));
+            }
+            targets.push(leaf_pid);
+        }
+        Ok(targets)
     }
+    fn gone(&self, leaf: bool) -> Result<(), String> {
+        for target in self.identities(leaf)? {
+            // Observation only; Runtime tests never signal or reap the helper.
+            if unsafe { kill(target, 0) } != -1
+                || std::io::Error::last_os_error().raw_os_error() != Some(3)
+            {
+                return Err(format!("owned identity {target} is still observable"));
+            }
+        }
+        Ok(())
+    }
+    fn prove_empty(&self, leaf: bool) {
+        self.gone(leaf).unwrap();
+    }
+}
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+    fn getpgrp() -> i32;
 }
 impl Drop for Workspace {
     fn drop(&mut self) {
@@ -154,18 +247,75 @@ fn helper() -> &'static Path {
         binary
     })
 }
+/// Test-only preparation reservation B, from the existing parent readiness bound.
+const PREP: Duration = Duration::from_secs(10);
 fn policy(timeout: Duration) -> ProcessTimeoutPolicy {
     ProcessTimeoutPolicy::new(timeout, Duration::from_millis(100)).unwrap()
 }
-fn until(mut condition: impl FnMut() -> bool) {
+fn until(condition: impl FnMut() -> bool) {
+    until_for(Duration::from_secs(10), condition);
+}
+/// Finite stage wait; it never extends any Workspace deadline.
+fn until_for(limit: Duration, mut condition: impl FnMut() -> bool) {
     let start = Instant::now();
     while !condition() {
         assert!(
-            start.elapsed() < Duration::from_secs(10),
-            "condition not reached"
+            start.elapsed() < limit,
+            "condition not reached within {limit:?}"
         );
         std::thread::sleep(Duration::from_millis(2));
     }
+}
+/// Checks made while an owned attempt is uncollected. Any failure first cancels
+/// and collects only that attempt through Workspace, reports it, then fails.
+fn live(attempt: &ClaudeLiveAttempt, checks: impl FnOnce()) {
+    if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(checks)) {
+        eprintln!(
+            "cancel {:?}; owned collection {}",
+            attempt.cancel(),
+            collected(attempt)
+        );
+        std::panic::resume_unwind(panic);
+    }
+}
+fn collected(attempt: &ClaudeLiveAttempt) -> String {
+    match attempt.wait_collect() {
+        Ok(outcome) => format!(
+            "{:?} forced={}",
+            outcome.process().terminal_cause(),
+            outcome.process().forced_kill_required()
+        ),
+        Err(error) => format!("{:?}", RawFailure::from(&error)),
+    }
+}
+/// Drop coverage requires an uncollected attempt observed nonterminal just before Drop.
+fn nonterminal(attempt: &ClaudeLiveAttempt) -> Result<(), String> {
+    attempt
+        .terminal_cause()
+        .map_or(Ok(()), |cause| Err(format!("{cause:?} before Drop")))
+}
+/// Orphan cleanup evidence: successful collection (verified reap, reader EOF and
+/// complete-stream digests) of an unsuccessful forced timeout.
+fn forced_timeout(
+    result: Result<&ClaudeLiveOutcome, &LiveProcessAttemptError>,
+) -> Result<(), String> {
+    let outcome = result
+        .map_err(|error| format!("collection {:?}", RawFailure::from(error)))?
+        .process();
+    if outcome.terminal_cause() != Cause::TimedOut
+        || !outcome.forced_kill_required()
+        || outcome.success()
+        || outcome.stdout().digest().is_none()
+        || outcome.stderr().digest().is_none()
+    {
+        return Err(format!(
+            "{:?} forced={} success={}",
+            outcome.terminal_cause(),
+            outcome.forced_kill_required(),
+            outcome.success()
+        ));
+    }
+    Ok(())
 }
 fn input(request: &receipts_workspace_execution::execution::ProcessRunRequest) -> &[u8] {
     match request.stdin() {
@@ -190,7 +340,7 @@ fn complete(stdout: &[u8], stderr: &[u8], code: i32) -> ClaudeTaskExecutionResul
         ProcessTermination::Completed
     );
     assert_eq!(result.process().outcome().exit_code(), Some(code));
-    ws.prove_empty();
+    ws.prove_empty(false);
     result
 }
 fn safe(error: &(dyn Error + 'static)) {
@@ -255,7 +405,7 @@ fn fixed_argv_and_exact_structured_stdin_preserve_all_prompt_semantics() {
             let result = execute_claude_task_once(&request).unwrap();
             assert!(result.process().outcome().success());
             assert_eq!(fs::read(ws.0.join("received")).unwrap(), bytes);
-            ws.prove_empty();
+            ws.prove_empty(false);
         }
     }
 }
@@ -284,7 +434,7 @@ fn encoded_bound_includes_json_escaping_and_newline_and_prevents_spawn() {
         fs::read(ws.0.join("received")).unwrap().len(),
         MAX_STDIN_BYTES
     );
-    ws.prove_empty();
+    ws.prove_empty(false);
     for prompt in [
         "a".repeat(room + 1),
         "\"".repeat(room / 2 + 1),
@@ -411,14 +561,20 @@ fn live_uses_same_input_for_both_modes_and_preserves_natural_zero_and_nonzero_co
             ws.write("stdout", RECORDS);
             ws.write("stderr", MARKER);
             ws.write("exit", code.to_string());
-            let attempt =
-                start_claude_live_attempt(&ws.request("--version", mode, Duration::from_secs(10)))
-                    .unwrap();
-            ws.ready();
+            let request = ws.request("--version", mode, Duration::from_secs(10));
+            let start = Instant::now();
+            let attempt = start_claude_live_attempt(&request).unwrap();
+            ws.ready(start, &attempt, false);
             ws.write("release", "1");
-            until(|| attempt.terminal_cause() == Some(Cause::Completed));
-            assert_eq!(attempt.cancel(), Acceptance::AlreadyTerminalOrTerminating);
+            live(&attempt, || {
+                until(|| attempt.terminal_cause() == Some(Cause::Completed));
+                // Negative: an observed terminal attempt is not valid Drop coverage.
+                assert!(nonterminal(&attempt).is_err());
+                assert_eq!(attempt.cancel(), Acceptance::AlreadyTerminalOrTerminating);
+            });
             let result = attempt.wait_collect().unwrap();
+            // Negative: natural completion is not forced-timeout orphan cleanup.
+            assert!(forced_timeout(Ok(&result)).is_err());
             assert_eq!(result.process().terminal_cause(), Cause::Completed);
             assert_eq!(result.process().exit_code(), Some(code));
             assert_eq!(result.process().success(), code == 0);
@@ -437,8 +593,10 @@ fn live_uses_same_input_for_both_modes_and_preserves_natural_zero_and_nonzero_co
                 error,
                 LiveProcessAttemptError::AlreadyCollectedOrCollecting
             ));
+            // Negative: a collection error is never orphan cleanup evidence.
+            assert!(forced_timeout(Err(&error)).is_err());
             safe(&RawFailure::from(&error));
-            ws.prove_empty();
+            ws.prove_empty(false);
         }
     }
 }
@@ -453,26 +611,35 @@ fn live_cancel_timeout_and_forced_kill_are_independent_workspace_facts() {
             if forced {
                 ws.write("ignore", "1");
             }
+            // Timed rows: PREP plus the original 700ms; cancel rows keep 10s.
             let timeout = if timed_out {
-                Duration::from_millis(700)
+                PREP + Duration::from_millis(700)
             } else {
                 Duration::from_secs(10)
             };
-            let attempt = start_claude_live_attempt(&ws.request(
-                "fixture",
-                ClaudePermissionMode::Plan,
-                timeout,
-            ))
-            .unwrap();
-            ws.ready();
-            if timed_out {
-                until(|| attempt.terminal_cause() == Some(Cause::TimedOut));
-                assert_eq!(attempt.cancel(), Acceptance::AlreadyTerminalOrTerminating);
-            } else {
-                assert_eq!(attempt.cancel(), Acceptance::CancelAccepted);
-                assert_eq!(attempt.cancel(), Acceptance::AlreadyTerminalOrTerminating);
-            }
+            let request = ws.request("fixture", ClaudePermissionMode::Plan, timeout);
+            let start = Instant::now();
+            let attempt = start_claude_live_attempt(&request).unwrap();
+            ws.ready(start, &attempt, false);
+            live(&attempt, || {
+                if timed_out {
+                    // The claim follows the one in-API deadline; this wait only outlasts it.
+                    until_for(timeout + Duration::from_secs(5), || {
+                        attempt.terminal_cause() == Some(Cause::TimedOut)
+                    });
+                    assert_eq!(attempt.cancel(), Acceptance::AlreadyTerminalOrTerminating);
+                } else {
+                    assert_eq!(attempt.cancel(), Acceptance::CancelAccepted);
+                    assert_eq!(attempt.cancel(), Acceptance::AlreadyTerminalOrTerminating);
+                }
+            });
             let result = attempt.wait_collect().unwrap();
+            // Negatives: wrong cause or forced flag is not orphan cleanup evidence.
+            assert_eq!(
+                forced_timeout(Ok(&result)).is_ok(),
+                timed_out && forced,
+                "{timed_out} {forced}"
+            );
             assert_eq!(
                 result.process().terminal_cause(),
                 if timed_out {
@@ -495,7 +662,7 @@ fn live_cancel_timeout_and_forced_kill_are_independent_workspace_facts() {
                     FailureClass::Unknown
                 })
             );
-            ws.prove_empty();
+            ws.prove_empty(false);
         }
     }
 }
@@ -507,47 +674,50 @@ fn live_partial_snapshots_can_later_parse_without_accumulation_or_lifecycle_infe
     ws.write("suffix", "\"future\",\"data\":\"世界\"}\n");
     ws.write("hold-suffix", "1");
     ws.write("stderr", RECORDS);
-    let attempt = start_claude_live_attempt(&ws.request(
+    let request = ws.request(
         "fixture",
         ClaudePermissionMode::Plan,
         Duration::from_secs(10),
-    ))
-    .unwrap();
-    ws.ready();
-    until(|| {
-        attempt
-            .snapshot_output()
-            .unwrap()
-            .output()
-            .stdout()
-            .total_bytes()
-            == 8
-    });
-    for _ in 0..20 {
-        let snapshot = attempt.snapshot_output().unwrap();
-        assert_eq!(
-            snapshot.protocol().err(),
-            Some(ClaudeStreamJsonError::IncompleteJson { line: 1 })
-        );
-        assert_eq!(attempt.terminal_cause(), None);
-        assert!(snapshot.output().stdout().captured_bytes() <= STREAM_CAPTURE_LIMIT_BYTES);
-    }
-    ws.write("release", "1");
-    until(|| attempt.snapshot_output().unwrap().protocol().is_ok());
-    assert_eq!(attempt.terminal_cause(), None);
-    assert_eq!(
-        attempt
-            .snapshot_output()
-            .unwrap()
-            .protocol()
-            .unwrap()
-            .records()
-            .len(),
-        1
     );
+    let start = Instant::now();
+    let attempt = start_claude_live_attempt(&request).unwrap();
+    ws.ready(start, &attempt, false);
+    live(&attempt, || {
+        until(|| {
+            attempt
+                .snapshot_output()
+                .unwrap()
+                .output()
+                .stdout()
+                .total_bytes()
+                == 8
+        });
+        for _ in 0..20 {
+            let snapshot = attempt.snapshot_output().unwrap();
+            assert_eq!(
+                snapshot.protocol().err(),
+                Some(ClaudeStreamJsonError::IncompleteJson { line: 1 })
+            );
+            assert_eq!(attempt.terminal_cause(), None);
+            assert!(snapshot.output().stdout().captured_bytes() <= STREAM_CAPTURE_LIMIT_BYTES);
+        }
+        ws.write("release", "1");
+        until(|| attempt.snapshot_output().unwrap().protocol().is_ok());
+        assert_eq!(attempt.terminal_cause(), None);
+        assert_eq!(
+            attempt
+                .snapshot_output()
+                .unwrap()
+                .protocol()
+                .unwrap()
+                .records()
+                .len(),
+            1
+        );
+    });
     ws.write("finish", "1");
     assert!(attempt.wait_collect().unwrap().protocol().is_ok());
-    ws.prove_empty();
+    ws.prove_empty(false);
 }
 
 #[test]
@@ -557,39 +727,42 @@ fn repeated_truncated_live_snapshots_never_join_head_and_tail() {
         "stdout",
         "{}\n".repeat(usize::try_from(STREAM_CAPTURE_LIMIT_BYTES).unwrap() / 3 + 20),
     );
-    let attempt = start_claude_live_attempt(&ws.request(
+    let request = ws.request(
         "fixture",
         ClaudePermissionMode::Plan,
         Duration::from_secs(10),
-    ))
-    .unwrap();
-    ws.ready();
-    until(|| {
-        attempt
-            .snapshot_output()
-            .unwrap()
-            .output()
-            .stdout()
-            .truncated()
+    );
+    let start = Instant::now();
+    let attempt = start_claude_live_attempt(&request).unwrap();
+    ws.ready(start, &attempt, false);
+    live(&attempt, || {
+        until(|| {
+            attempt
+                .snapshot_output()
+                .unwrap()
+                .output()
+                .stdout()
+                .truncated()
+        });
+        for _ in 0..20 {
+            let snapshot = attempt.snapshot_output().unwrap();
+            assert_eq!(
+                snapshot.protocol().err(),
+                Some(ClaudeStreamJsonError::StdoutTruncated)
+            );
+            assert_eq!(
+                snapshot.output().stdout().captured_bytes(),
+                STREAM_CAPTURE_LIMIT_BYTES
+            );
+        }
     });
-    for _ in 0..20 {
-        let snapshot = attempt.snapshot_output().unwrap();
-        assert_eq!(
-            snapshot.protocol().err(),
-            Some(ClaudeStreamJsonError::StdoutTruncated)
-        );
-        assert_eq!(
-            snapshot.output().stdout().captured_bytes(),
-            STREAM_CAPTURE_LIMIT_BYTES
-        );
-    }
     ws.write("release", "1");
     let result = attempt.wait_collect().unwrap();
     assert_eq!(
         result.protocol().err(),
         Some(ClaudeStreamJsonError::StdoutTruncated)
     );
-    ws.prove_empty();
+    ws.prove_empty(false);
 }
 
 #[test]
@@ -597,24 +770,28 @@ fn drop_before_collect_and_orphan_cleanup_remain_workspace_owned() {
     for drop_early in [false, true] {
         let ws = Workspace::new();
         ws.write("spawn-leaf", "1");
-        let attempt = start_claude_live_attempt(&ws.request(
+        let request = ws.request(
             "fixture",
             ClaudePermissionMode::Plan,
-            Duration::from_secs(1),
-        ))
-        .unwrap();
-        ws.ready();
+            PREP + Duration::from_secs(1),
+        );
+        let start = Instant::now();
+        let attempt = start_claude_live_attempt(&request).unwrap();
+        // Mandatory parent plus acknowledged SIGTERM-ignoring leaf in the parent's group.
+        ws.ready(start, &attempt, true);
         if drop_early {
+            // Actual uncollected Drop, with no collect/cancel substitute. Workspace Drop
+            // suppresses its typed cleanup result, and preemption between this observation
+            // and Drop may still let the deadline win: no cause or Drop outcome is claimed.
+            live(&attempt, || nonterminal(&attempt).unwrap());
             drop(attempt);
         } else {
             ws.write("release", "1");
-            let result = attempt.wait_collect().unwrap();
             // The orphan keeps both output pipes open and ignores SIGTERM.
             // Workspace requires reader EOF and group cleanup for completion.
-            assert_eq!(result.process().terminal_cause(), Cause::TimedOut);
-            assert!(result.process().forced_kill_required());
+            forced_timeout(attempt.wait_collect().as_ref()).unwrap();
         }
-        ws.prove_empty();
+        ws.prove_empty(true);
     }
 }
 
@@ -627,9 +804,22 @@ fn terminal_before_ready_timeout_is_real_and_payload_safe() {
     let request = ws.request(
         &prompt,
         ClaudePermissionMode::Plan,
-        Duration::from_millis(700),
+        PREP + Duration::from_millis(700),
     );
-    let error = start_claude_live_attempt(&request).err().unwrap();
+    // `ready` proves the no-read branch and SIGTERM ignore were genuinely installed.
+    let (prepared, result) = ws.observed(|| start_claude_live_attempt(&request));
+    let error = match result {
+        Err(error) => error,
+        Ok(attempt) => panic!(
+            "unexpected READY; cancel {:?}; owned collection {}",
+            attempt.cancel(),
+            collected(&attempt)
+        ),
+    };
+    assert!(
+        prepared,
+        "no-read preparation not observed within {PREP:?}: {error:?}"
+    );
     let ClaudeLiveStartError::Workspace(LiveProcessStartError::TerminalBeforeReady(ref outcome)) =
         error
     else {
@@ -650,7 +840,7 @@ fn terminal_before_ready_timeout_is_real_and_payload_safe() {
     ));
     safe(&error);
     safe(&raw);
-    ws.prove_empty();
+    ws.prove_empty(false);
 }
 
 #[test]
@@ -688,7 +878,7 @@ fn terminal_before_ready_completed_projection_preserves_real_workspace_outcome()
     );
     safe(&error);
     safe(&raw);
-    ws.prove_empty();
+    ws.prove_empty(false);
 }
 
 #[test]
@@ -716,7 +906,7 @@ fn auth_exact_argv_exit_mapping_discards_payload_without_policy_or_expiry_infere
         assert_eq!(status, expected);
         assert!(!format!("{status:?}").contains(MARKER));
         assert!(fs::read(ws.0.join("received")).unwrap().is_empty());
-        ws.prove_empty();
+        ws.prove_empty(false);
         // The return type contains only technical status, no eligibility/routing grant.
     }
 }
@@ -740,16 +930,25 @@ fn auth_execution_and_timeout_errors_are_typed_conservative_and_secret_safe() {
     safe(&RawFailure::from(&error));
     ws.write("stdout", MARKER);
     ws.write("stderr", MARKER);
-    let error = observe_claude_auth_status(helper(), &ws.0, &ws.0, &policy(Duration::from_secs(1)))
-        .unwrap_err();
+    let executable = helper();
+    let timeout = policy(PREP + Duration::from_secs(1));
+    let (prepared, result) =
+        ws.observed(|| observe_claude_auth_status(executable, &ws.0, &ws.0, &timeout));
+    // Mandatory running helper: fixed auth argv, empty env/stdin and pid/pgid first.
+    assert!(
+        prepared,
+        "auth preparation not observed within {PREP:?}: {result:?}"
+    );
+    let error = result.unwrap_err();
     assert!(matches!(error, ClaudeAuthStatusError::TimedOut(_)));
+    assert!(fs::read(ws.0.join("received")).unwrap().is_empty());
     assert_eq!(
         RawFailure::from(&error).classify_failure(),
         FailureClass::Timeout
     );
     safe(&error);
     safe(&RawFailure::from(&error));
-    ws.prove_empty();
+    ws.prove_empty(false);
     // Invalid caller construction cannot turn Completed into typed timeout evidence.
     assert_eq!(
         RawFailure::from(&ClaudeAuthStatusError::TimedOut(
@@ -758,6 +957,191 @@ fn auth_execution_and_timeout_errors_are_typed_conservative_and_secret_safe() {
         .classify_failure(),
         FailureClass::Unknown
     );
+}
+
+#[test]
+fn early_timeout_before_application_markers_keeps_original_short_policies() {
+    // A per-fixture closed gate precedes every normal marker, so the original 1s/700ms
+    // policies expire there. Marker absence proves neither no spawn nor ESRCH: no
+    // identity or numerical cleanup is claimed; typed Workspace outcomes are the evidence.
+    let markers = |ws: &Workspace| {
+        ["pid", "pgid", "received", "ready", "leaf-pid"]
+            .into_iter()
+            .filter(|name| ws.0.join(name).exists())
+            .collect::<Vec<_>>()
+    };
+    let ws = Workspace::new();
+    ws.write("closed-gate", "1");
+    let error = observe_claude_auth_status(helper(), &ws.0, &ws.0, &policy(Duration::from_secs(1)))
+        .unwrap_err();
+    let ClaudeAuthStatusError::TimedOut(termination) = error else {
+        panic!("{error:?}");
+    };
+    assert!(termination.is_timed_out());
+    let raw = RawFailure::from(&error);
+    assert_eq!(raw.origin(), RawFailureSource::ClaudeAuthStatus);
+    assert_eq!(raw.evidence(), RawFailureEvidence::TimedOut(termination));
+    assert_eq!(raw.classify_failure(), FailureClass::Timeout);
+    safe(&error);
+    safe(&raw);
+    assert_eq!(markers(&ws), Vec::<&str>::new());
+
+    let ws = Workspace::new();
+    ws.write("closed-gate", "1");
+    let request = ws.request(
+        MARKER,
+        ClaudePermissionMode::Plan,
+        Duration::from_millis(700),
+    );
+    match start_claude_live_attempt(&request) {
+        // Usual path: stdin fits the pipe, so READY precedes the deadline.
+        Ok(attempt) => {
+            let result = attempt.wait_collect().unwrap();
+            assert_eq!(result.process().terminal_cause(), Cause::TimedOut);
+            assert!(!result.process().success());
+            assert!(result.process().stdout().digest().is_some());
+            assert!(result.process().stderr().digest().is_some());
+            assert_eq!(
+                classify_claude_live_outcome(&result),
+                Some(FailureClass::Timeout)
+            );
+        }
+        // A deadline before READY is the same typed early timeout, collected by Workspace.
+        Err(error) => {
+            let ClaudeLiveStartError::Workspace(LiveProcessStartError::TerminalBeforeReady(
+                ref outcome,
+            )) = error
+            else {
+                panic!("{error:?}");
+            };
+            assert_eq!(outcome.terminal_cause(), Cause::TimedOut);
+            assert_eq!(
+                RawFailure::from(&error).classify_failure(),
+                FailureClass::Timeout
+            );
+            safe(&error);
+            safe(&RawFailure::from(&error));
+        }
+    }
+    assert_eq!(markers(&ws), Vec::<&str>::new());
+}
+
+#[test]
+fn fixture_evidence_checks_reject_missing_late_wrong_or_live_evidence() {
+    // Preparation: missing and late observations fail; timely observation passes.
+    let ws = Workspace::new();
+    assert!(!ws.prepared_within(Instant::now(), Duration::from_millis(20)));
+    ws.write("ready", "1");
+    assert!(!ws.prepared_within(Instant::now().checked_sub(PREP).unwrap(), PREP));
+    assert!(ws.prepared_within(Instant::now(), PREP));
+    // Fabricated identities are rejected before any observation; `gone`, the only
+    // kill(id, 0) observer, is never called on them.
+    assert!(ws.identities(false).is_err());
+    let caller = unsafe { getpgrp() }.to_string();
+    for (pid, pgid) in [
+        ("1", "1"),
+        ("424242", "424243"),
+        (caller.as_str(), caller.as_str()),
+    ] {
+        ws.write("pid", pid);
+        ws.write("pgid", pgid);
+        assert!(ws.identities(false).is_err(), "{pid} {pgid}");
+    }
+    ws.write("pid", "424242");
+    ws.write("pgid", "424242");
+    assert!(ws.identities(false).is_ok());
+    assert!(ws.identities(true).is_err());
+    ws.write("leaf-pid", "424243");
+    ws.write("leaf-pgid", "424242");
+    assert!(ws.identities(true).is_err(), "unacknowledged leaf");
+    ws.write("leaf-ready", "1");
+    assert!(ws.identities(true).is_ok());
+    for (leaf_pid, leaf_pgid) in [("424243", "424244"), ("424242", "424242")] {
+        ws.write("leaf-pid", leaf_pid);
+        ws.write("leaf-pgid", leaf_pgid);
+        assert!(ws.identities(true).is_err(), "{leaf_pid} {leaf_pgid}");
+    }
+
+    // Real running attempt: a missing requested leaf and retained leader/group are
+    // rejected; only then does Workspace cancellation discharge ownership.
+    let ws = Workspace::new();
+    let request = ws.request(
+        "fixture",
+        ClaudePermissionMode::Plan,
+        Duration::from_secs(10),
+    );
+    let start = Instant::now();
+    let attempt = start_claude_live_attempt(&request).unwrap();
+    ws.ready(start, &attempt, false);
+    let (leafless, retained) = (ws.identities(true), ws.gone(false));
+    assert_eq!(attempt.cancel(), Acceptance::CancelAccepted);
+    let result = attempt.wait_collect().unwrap();
+    assert!(leafless.is_err(), "{leafless:?}");
+    assert!(retained.is_err(), "{retained:?}");
+    assert_eq!(result.process().terminal_cause(), Cause::Cancelled);
+    assert!(forced_timeout(Ok(&result)).is_err());
+    ws.prove_empty(false);
+
+    // Secret-bearing diagnostics are rejected.
+    let leaked = LiveProcessAttemptError::Execution(ExecutionError::ProcessSpawnFailed {
+        detail: MARKER.into(),
+    });
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| safe(&leaked))).is_err());
+}
+
+#[test]
+fn observed_clock_starts_at_worker_invocation_and_rejects_missing_or_late_preparation() {
+    // Clock origin, by instant ordering rather than timing: the published clock
+    // follows everything the worker did before invoking and precedes the call's own
+    // first instant. A parent clock taken before spawning (the rejected origin) is
+    // earlier than `scheduled`; a clock reset after the call is later than `entered`.
+    let ws = Workspace::new();
+    let (scheduled, entered) = (OnceLock::new(), OnceLock::new());
+    let (start, prepared, ()) = ws.observed_within(
+        PREP,
+        || {
+            // Guarantees a strictly later worker instant than any pre-spawn clock.
+            std::thread::sleep(Duration::from_millis(1));
+            scheduled.set(Instant::now()).unwrap();
+        },
+        || {
+            // OnceLock::set also fails on a second invocation.
+            entered.set(Instant::now()).unwrap();
+            ws.write("ready", "1");
+        },
+    );
+    assert!(
+        scheduled.get().unwrap() <= &start,
+        "clock predates worker invocation"
+    );
+    assert!(
+        &start <= entered.get().unwrap(),
+        "clock postdates API entry"
+    );
+    assert!(prepared);
+
+    // On that clock, missing and late preparation are still rejected.
+    let budget = Duration::from_millis(50);
+    let missing = Workspace::new();
+    assert!(!missing.observed_within(budget, || {}, || {}).1);
+    let late = Workspace::new();
+    let (_, prepared, ()) = late.observed_within(
+        budget,
+        || {},
+        || {
+            std::thread::sleep(budget * 2);
+            late.write("ready", "1");
+        },
+    );
+    assert!(!prepared && late.0.join("ready").exists());
+
+    // A worker failing before it publishes is joined and its failure raised; the
+    // observer does not hang on the disconnected channel or default a timestamp.
+    let failed = Workspace::new();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        failed.observed_within(budget, || panic!("worker failed before invocation"), || ())
+    }));
+    assert!(outcome.is_err());
 }
 
 #[test]
@@ -783,19 +1167,29 @@ fn task_timeout_only_uses_typed_evidence_and_diagnostic_prose_never_classifies()
     let ws = Workspace::new();
     ws.write("stdout", RECORDS);
     ws.write("stderr", MARKER);
-    let result = execute_claude_task_once(&ws.request(
+    let request = ws.request(
         "fixture",
         ClaudePermissionMode::Plan,
-        Duration::from_millis(700),
-    ))
-    .unwrap();
+        PREP + Duration::from_millis(700),
+    );
+    // `ready` follows the actual fixture output, so the timed-out run really produced it.
+    let (prepared, result) = ws.observed(|| execute_claude_task_once(&request));
+    assert!(
+        prepared,
+        "task-output preparation not observed within {PREP:?}: {:?}",
+        result
+            .as_ref()
+            .map(|result| result.process().outcome().termination())
+            .map_err(RawFailure::from)
+    );
+    let result = result.unwrap();
     assert!(result.process().outcome().timed_out());
     assert!(result.protocol().is_ok());
     assert_eq!(
         classify_claude_task_execution_result(&result),
         Some(FailureClass::Timeout)
     );
-    ws.prove_empty();
+    ws.prove_empty(false);
     let error = ClaudeTaskExecutionError(ExecutionError::TimeoutFinalWaitFailed {
         detail: MARKER.into(),
     });

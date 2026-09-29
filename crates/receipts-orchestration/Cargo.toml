@@ -11,3 +11,4 @@ path = "../../src/core/lib.rs"
 [dependencies]
 receipts-state = { path = "../.." }
 receipts-workspace-execution = { path = "../receipts-workspace-execution" }
+sha2 = "=0.11.0"
