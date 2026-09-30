@@ -1,6 +1,7 @@
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
-use crate::error::StateError;
+use crate::error::{GraphFailureCode, GraphPhase, StateError};
+use crate::graph_repository;
 
 use super::Migration;
 
@@ -130,32 +131,127 @@ INSERT INTO state_schema_version (version, migration_name) VALUES (12, 'context_
 "#;
 
 pub(crate) fn apply(conn: &mut Connection) -> Result<(), StateError> {
-    require_foreign_keys(conn, 1)?;
-    require_no_foreign_key_violations(conn, "before v12 migration")?;
-    validate_legacy_epochs(conn)?;
+    apply_with(conn, &v12_failure)
+}
+
+pub(crate) fn apply_graph(conn: &mut Connection) -> Result<(), StateError> {
+    apply_graph_locked(conn, &|error| {
+        graph_repository::sqlite_error(GraphPhase::Migration, error)
+    })
+    .map_err(|error| match error {
+        graph @ StateError::GraphPersistence { .. } => graph,
+        StateError::V12PhysicalMigrationFailed { .. } => StateError::GraphPersistence {
+            phase: GraphPhase::Migration,
+            code: GraphFailureCode::CorruptStore,
+            field: None,
+        },
+        other => graph_repository::legacy_error(GraphPhase::Migration, other),
+    })
+}
+
+fn apply_graph_locked(
+    conn: &mut Connection,
+    sql_error: &impl Fn(rusqlite::Error) -> StateError,
+) -> Result<(), StateError> {
+    require_foreign_keys(conn, 1, sql_error)?;
+    let migration_result = (|| {
+        conn.execute_batch("PRAGMA foreign_keys = OFF;")
+            .map_err(sql_error)?;
+        require_foreign_keys(conn, 0, sql_error)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let outcome = (|| {
+            match graph_repository::schema_head(&tx, GraphPhase::Migration)? {
+                Some(11) => graph_repository::verify_ledger(&tx, 11, GraphPhase::Migration)?,
+                Some(head @ (12 | 13)) => {
+                    graph_repository::verify_ledger(&tx, head as usize, GraphPhase::Migration)?;
+                    graph_repository::verify_schema(&tx, GraphPhase::Migration, head == 13)?;
+                    return Err(graph_failure(GraphFailureCode::UnsupportedSchema));
+                }
+                Some(head) if head >= 0 => {
+                    return Err(graph_failure(GraphFailureCode::UnsupportedSchema));
+                }
+                _ => return Err(graph_failure(GraphFailureCode::CorruptStore)),
+            }
+            require_no_foreign_key_violations(&tx, "before v12 migration", sql_error)?;
+            validate_legacy_epochs(&tx, sql_error)?;
+            rebuild_body(&tx, sql_error)
+        })();
+        match outcome {
+            Ok(()) => match tx.execute_batch("COMMIT") {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let mapped = sql_error(error);
+                    tx.execute_batch("ROLLBACK")
+                        .map_err(|_| graph_failure(GraphFailureCode::RollbackFailure))?;
+                    Err(mapped)
+                }
+            },
+            Err(error) => {
+                tx.execute_batch("ROLLBACK")
+                    .map_err(|_| graph_failure(GraphFailureCode::RollbackFailure))?;
+                Err(error)
+            }
+        }
+    })();
+    let restore_result = (|| {
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(sql_error)?;
+        require_foreign_keys(conn, 1, sql_error)?;
+        require_no_foreign_key_violations(conn, "after enabling foreign keys", sql_error)
+    })();
+    migration_result.and(restore_result)
+}
+
+fn graph_failure(code: GraphFailureCode) -> StateError {
+    StateError::GraphPersistence {
+        phase: GraphPhase::Migration,
+        code,
+        field: None,
+    }
+}
+
+fn apply_with(
+    conn: &mut Connection,
+    sql_error: &impl Fn(rusqlite::Error) -> StateError,
+) -> Result<(), StateError> {
+    require_foreign_keys(conn, 1, sql_error)?;
+    require_no_foreign_key_violations(conn, "before v12 migration", sql_error)?;
+    validate_legacy_epochs(conn, sql_error)?;
     conn.execute_batch("PRAGMA foreign_keys = OFF;")
-        .map_err(v12_failure)?;
-    require_foreign_keys(conn, 0)?;
+        .map_err(sql_error)?;
+    require_foreign_keys(conn, 0, sql_error)?;
 
     let migration_result = (|| {
-        let tx = conn.transaction().map_err(v12_failure)?;
-        tx.execute_batch(REBUILD_SQL).map_err(v12_failure)?;
-        require_no_foreign_key_violations(&tx, "inside v12 transaction")?;
-        validate_v12_schema(&tx)?;
-        tx.commit().map_err(v12_failure)
+        let tx = conn.transaction().map_err(sql_error)?;
+        rebuild_body(&tx, sql_error)?;
+        tx.commit().map_err(sql_error)
     })();
 
     let restore_result = (|| {
         conn.execute_batch("PRAGMA foreign_keys = ON;")
-            .map_err(v12_failure)?;
-        require_foreign_keys(conn, 1)?;
-        require_no_foreign_key_violations(conn, "after enabling foreign keys")
+            .map_err(sql_error)?;
+        require_foreign_keys(conn, 1, sql_error)?;
+        require_no_foreign_key_violations(conn, "after enabling foreign keys", sql_error)
     })();
 
     migration_result.and(restore_result)
 }
 
-fn validate_legacy_epochs(conn: &Connection) -> Result<(), StateError> {
+fn rebuild_body(
+    conn: &Connection,
+    sql_error: &impl Fn(rusqlite::Error) -> StateError,
+) -> Result<(), StateError> {
+    conn.execute_batch(REBUILD_SQL).map_err(sql_error)?;
+    require_no_foreign_key_violations(conn, "inside v12 transaction", sql_error)?;
+    validate_v12_schema(conn, sql_error)
+}
+
+fn validate_legacy_epochs(
+    conn: &Connection,
+    sql_error: &impl Fn(rusqlite::Error) -> StateError,
+) -> Result<(), StateError> {
     for (table, column) in [
         ("logical_role", "current_context_epoch"),
         ("event", "epoch"),
@@ -171,7 +267,7 @@ fn validate_legacy_epochs(conn: &Connection) -> Result<(), StateError> {
                 [],
                 |row| row.get(0),
             )
-            .map_err(v12_failure)?;
+            .map_err(sql_error)?;
         if invalid != 0 {
             return Err(StateError::V12PhysicalMigrationFailed {
                 detail: format!(
@@ -183,7 +279,10 @@ fn validate_legacy_epochs(conn: &Connection) -> Result<(), StateError> {
     Ok(())
 }
 
-fn validate_v12_schema(conn: &Connection) -> Result<(), StateError> {
+fn validate_v12_schema(
+    conn: &Connection,
+    sql_error: &impl Fn(rusqlite::Error) -> StateError,
+) -> Result<(), StateError> {
     for (table, column) in [
         ("logical_role", "current_context_epoch"),
         ("event", "epoch"),
@@ -195,14 +294,14 @@ fn validate_v12_schema(conn: &Connection) -> Result<(), StateError> {
     ] {
         let mut statement = conn
             .prepare(&format!("PRAGMA table_info({table})"))
-            .map_err(v12_failure)?;
+            .map_err(sql_error)?;
         let declared = statement
             .query_map([], |row| {
                 Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
             })
-            .map_err(v12_failure)?
+            .map_err(sql_error)?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(v12_failure)?
+            .map_err(sql_error)?
             .into_iter()
             .find_map(|(name, ty)| (name == column).then_some(ty));
         if declared.as_deref() != Some("TEXT") {
@@ -216,7 +315,7 @@ fn validate_v12_schema(conn: &Connection) -> Result<(), StateError> {
                 [table],
                 |row| row.get(0),
             )
-            .map_err(v12_failure)?;
+            .map_err(sql_error)?;
         for fragment in [
             format!("typeof({column}) = 'text'"),
             format!("length({column}) >= 1"),
@@ -237,7 +336,7 @@ fn validate_v12_schema(conn: &Connection) -> Result<(), StateError> {
             |row| row.get(0),
         )
         .optional()
-        .map_err(v12_failure)?;
+        .map_err(sql_error)?;
     if !index_sql.as_deref().is_some_and(|sql| {
         sql.contains("(project_id, length(epoch) DESC, epoch COLLATE BINARY DESC)")
     }) {
@@ -248,10 +347,14 @@ fn validate_v12_schema(conn: &Connection) -> Result<(), StateError> {
     Ok(())
 }
 
-fn require_foreign_keys(conn: &Connection, expected: i64) -> Result<(), StateError> {
+fn require_foreign_keys(
+    conn: &Connection,
+    expected: i64,
+    sql_error: &impl Fn(rusqlite::Error) -> StateError,
+) -> Result<(), StateError> {
     let found: i64 = conn
         .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
-        .map_err(v12_failure)?;
+        .map_err(sql_error)?;
     if found != expected {
         return Err(StateError::V12PhysicalMigrationFailed {
             detail: format!("foreign_keys expected {expected}, found {found}"),
@@ -260,13 +363,17 @@ fn require_foreign_keys(conn: &Connection, expected: i64) -> Result<(), StateErr
     Ok(())
 }
 
-fn require_no_foreign_key_violations(conn: &Connection, phase: &str) -> Result<(), StateError> {
+fn require_no_foreign_key_violations(
+    conn: &Connection,
+    phase: &str,
+    sql_error: &impl Fn(rusqlite::Error) -> StateError,
+) -> Result<(), StateError> {
     let violation: Option<(String, i64, String, i64)> = conn
         .query_row("PRAGMA foreign_key_check", [], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })
         .optional()
-        .map_err(v12_failure)?;
+        .map_err(sql_error)?;
     if let Some(violation) = violation {
         return Err(StateError::V12PhysicalMigrationFailed {
             detail: format!("foreign_key_check failed {phase}: {violation:?}"),

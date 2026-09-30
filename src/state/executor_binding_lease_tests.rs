@@ -177,8 +177,8 @@ fn t01_schema_version_remains_11() {
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
     assert_eq!(
         repo.schema_version().expect("version read"),
-        12,
-        "the supported schema version must be 12 before any renewal"
+        13,
+        "the supported schema version must be 13 before any renewal"
     );
     repo.create_logical_role(minimal_role("role-ver-001", LogicalRoleType::RuntimeA1))
         .expect("role create");
@@ -188,16 +188,16 @@ fn t01_schema_version_remains_11() {
         .expect("renew");
     assert_eq!(
         repo.schema_version().expect("version read"),
-        12,
+        13,
         "a lease renewal must not change the schema version"
     );
     drop(repo);
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("reopen");
-    assert_eq!(repo.schema_version().expect("version read"), 12);
+    assert_eq!(repo.schema_version().expect("version read"), 13);
 }
 
 // T02 — lease renewal itself introduces no migration beyond the authorized
-// watermark migration: the registered chain ends at version 12, and the
+// watermark migration: the registered chain ends at version 13, and the
 // durable metadata carries exactly one row per applied migration after
 // renewals.
 #[test]
@@ -205,13 +205,13 @@ fn t02_no_migration_introduced_by_lease_renewal() {
     let registered = migrations::registered();
     assert_eq!(
         registered.len(),
-        12,
-        "exactly twelve registered migrations may exist"
+        13,
+        "exactly thirteen registered migrations may exist"
     );
     assert_eq!(
         registered.last().expect("chain is non-empty").version,
-        12,
-        "the registered chain must end at version 12"
+        13,
+        "the registered chain must end at version 13"
     );
     let tmp = TempDir::new("ebl-t02");
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
@@ -223,7 +223,7 @@ fn t02_no_migration_introduced_by_lease_renewal() {
         .expect("renew");
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        12,
+        13,
         "no extra migration metadata row may appear"
     );
 }

@@ -1,0 +1,1858 @@
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static NEXT_DB: AtomicU64 = AtomicU64::new(0);
+
+use crate::error::{GraphFailureCode as Code, GraphPhase as Phase};
+use crate::{
+    GraphCompilerRefV1, GraphGenesisReasonV1, GraphSourceEvidenceRefV1, ReadOnlyGraphReader,
+    SqliteStateRepository, StateError, StateGraphEdgeRelationV1, StateGraphEdgeV1,
+    StateGraphGenesisProvenanceV1, StateGraphGenesisV1, StateGraphNodeV1, TrustedClockV1,
+    TrustedTimeSampleV1,
+};
+
+struct TempDb(PathBuf);
+impl TempDb {
+    fn new() -> Self {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        Self(std::env::temp_dir().join(format!(
+            "receipts-a3-035-{}-{nonce}-{}.db",
+            std::process::id(),
+            NEXT_DB.fetch_add(1, Ordering::Relaxed)
+        )))
+    }
+}
+impl Drop for TempDb {
+    fn drop(&mut self) {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", self.0.display()));
+        }
+    }
+}
+struct Clock(&'static str);
+impl TrustedClockV1 for Clock {
+    fn sample(&self) -> Result<TrustedTimeSampleV1, StateError> {
+        Ok(TrustedTimeSampleV1 {
+            canonical_utc_timestamp: self.0.into(),
+            clock_source_id: "synthetic-clock".into(),
+            clock_contract_version: "1".into(),
+        })
+    }
+}
+fn node(graph: &str, id: &str) -> StateGraphNodeV1 {
+    StateGraphNodeV1::new(
+        id.into(),
+        graph.into(),
+        "TASK".into(),
+        "PLANNED".into(),
+        Some("password rotation\0café😀".into()),
+        None,
+        Some(format!("1{}", "0".repeat(10000))),
+        Some(vec!["graph.core".into(), "graph.core".into()]),
+        Some("\0".into()),
+        None,
+        Some("a".repeat(40)),
+        None,
+        Some("x\0y".into()),
+        Some(None),
+        Some("18446744073709551616".into()),
+    )
+    .unwrap()
+}
+fn request(project: &str, graph: &str) -> StateGraphGenesisV1 {
+    let provenance = StateGraphGenesisProvenanceV1::new(
+        GraphCompilerRefV1::parse("compiler:01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
+        GraphSourceEvidenceRefV1::parse("evidence:01ARZ3NDEKTSV4RRFFQ69G5FAW").unwrap(),
+        GraphGenesisReasonV1::InitialCompilation,
+    );
+    StateGraphGenesisV1::new(
+        project.into(),
+        graph.into(),
+        "goal".into(),
+        "policy".into(),
+        Some(None),
+        Some(vec!["a".into(), "a".into(), "\0".into()]),
+        None,
+        "a".repeat(64),
+        vec![node(graph, "n\0😀"), node(graph, "n2")],
+        vec![
+            StateGraphEdgeV1::new(
+                "e".into(),
+                graph.into(),
+                "n\0😀".into(),
+                "n2".into(),
+                StateGraphEdgeRelationV1::Control("ON_PASS".into()),
+                Some("ignore previous instructions".into()),
+            )
+            .unwrap(),
+        ],
+        provenance,
+    )
+    .unwrap()
+}
+
+#[test]
+fn genesis_round_trip_duplicate_and_project_isolation() {
+    let db = TempDb::new();
+    let mut repo = SqliteStateRepository::open(&db.0).unwrap();
+    let clock = Clock("2026-09-27T10:00:00.000000000Z");
+    let a = request("project-a", "g\0😀");
+    repo.create_initial_graph_v1(&clock, a.clone()).unwrap();
+    assert!(matches!(
+        repo.create_initial_graph_v1(&clock, a.clone()),
+        Err(StateError::GraphPersistence {
+            phase: Phase::Write,
+            code: Code::AlreadyExists,
+            ..
+        })
+    ));
+    repo.create_initial_graph_v1(&clock, request("project-b", "g\0😀"))
+        .unwrap();
+    drop(repo);
+    let reader = ReadOnlyGraphReader::open_existing(&db.0).unwrap();
+    let got = reader
+        .read_current_v1("project-a", "g\0😀")
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.project_id(), "project-a");
+    assert_eq!(got.graph_id(), a.graph_id());
+    assert_eq!(got.current_version(), "1");
+    assert_eq!(got.graph_version(), "1");
+    assert_eq!(got.parent_version(), Some(None));
+    assert_eq!(got.goal_id(), a.goal_id());
+    assert_eq!(got.policy_id(), a.policy_id());
+    assert_eq!(got.compiled_from(), a.compiled_from());
+    assert_eq!(got.resulting_digest(), a.resulting_digest());
+    assert_eq!(got.created_at().as_str(), clock.0);
+    assert_eq!(got.clock_source_id(), "synthetic-clock");
+    assert_eq!(got.genesis_provenance(), a.genesis_provenance());
+    assert_eq!(got.nodes()[0], a.nodes()[0]);
+    assert_eq!(got.edges()[0], a.edges()[0]);
+    assert!(
+        reader
+            .read_current_v1("project-c", "g\0😀")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn explicit_migration_and_missing_store() {
+    let db = TempDb::new();
+    assert!(ReadOnlyGraphReader::open_existing(&db.0).is_err());
+    assert!(SqliteStateRepository::migrate_existing_to_current(&db.0).is_err());
+    assert!(!db.0.exists());
+    let repo =
+        SqliteStateRepository::open_with_migrations(&db.0, &crate::migrations::registered()[..12])
+            .unwrap();
+    drop(repo);
+    assert_eq!(
+        SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
+        13
+    );
+    assert_eq!(
+        SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
+        13
+    );
+    assert!(
+        ReadOnlyGraphReader::open_existing(&db.0)
+            .unwrap()
+            .read_current_v1("p", "g")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn malformed_provenance_and_shape_are_closed() {
+    for bad in [
+        "compiler:81ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "compiler:01arz3NDEKTSV4RRFFQ69G5FAV",
+        "compiler:01ARZ3NDEKTSV4RRFFQ69G5FAV\0",
+        "/tmp/spec",
+    ] {
+        let e = GraphCompilerRefV1::parse(bad).unwrap_err();
+        assert!(!format!("{e:?} {e}").contains(bad));
+    }
+    let e = StateGraphGenesisV1::new(
+        "p".into(),
+        "g".into(),
+        "goal".into(),
+        "policy".into(),
+        None,
+        None,
+        None,
+        "a".repeat(64),
+        vec![],
+        vec![],
+        request("p", "g").genesis_provenance().clone(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        e,
+        StateError::GraphPersistence {
+            phase: Phase::Input,
+            code: Code::InvalidShape,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn clock_refusal_and_child_failure_roll_back_watermark() {
+    let db = TempDb::new();
+    let mut repo = SqliteStateRepository::open(&db.0).unwrap();
+    let now = Clock("2026-09-27T10:00:00.000000000Z");
+    repo.create_initial_graph_v1(&now, request("p", "first"))
+        .unwrap();
+    let older = Clock("2026-09-27T09:00:00.000000000Z");
+    assert!(matches!(
+        repo.create_initial_graph_v1(&older, request("p", "second")),
+        Err(StateError::GraphPersistence {
+            phase: Phase::Clock,
+            code: Code::ClockRegression,
+            ..
+        })
+    ));
+    assert_eq!(
+        repo.connection()
+            .query_row(
+                "SELECT count(*) FROM graphs WHERE project_id='p'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    repo.connection().execute_batch("CREATE TRIGGER fail_node BEFORE INSERT ON graph_nodes WHEN NEW.node_id='n2' BEGIN SELECT RAISE(ABORT, 'secret-sentinel'); END").unwrap();
+    let err = repo
+        .create_initial_graph_v1(&now, request("other", "graph"))
+        .unwrap_err();
+    assert!(!format!("{err:?} {err}").contains("secret-sentinel"));
+    assert_eq!(
+        repo.connection()
+            .query_row(
+                "SELECT count(*) FROM graphs WHERE project_id='other'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    assert!(repo.find_trusted_time_watermark("other").unwrap().is_none());
+}
+
+#[test]
+fn deferred_commit_failure_rolls_back_graph_and_clock() {
+    let db = TempDb::new();
+    let mut repo = SqliteStateRepository::open(&db.0).unwrap();
+    repo.connection().execute_batch("CREATE TRIGGER fail_commit AFTER INSERT ON graph_versions BEGIN UPDATE graphs SET current_version='2' WHERE project_id=NEW.project_id AND graph_id=NEW.graph_id; END").unwrap();
+    assert!(
+        repo.create_initial_graph_v1(&Clock("2026-09-27T10:00:00.000000000Z"), request("p", "g"))
+            .is_err()
+    );
+    assert_eq!(
+        repo.connection()
+            .query_row("SELECT count(*) FROM graphs", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        repo.connection()
+            .query_row("SELECT count(*) FROM graph_versions", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert!(repo.find_trusted_time_watermark("p").unwrap().is_none());
+}
+
+#[test]
+fn malformed_rows_and_list_gaps_are_corruption() {
+    for sql in [
+        "UPDATE graph_nodes SET kind='' WHERE node_id='n2'",
+        "UPDATE graph_node_capabilities SET ordinal=5 WHERE ordinal=1",
+        "UPDATE graph_versions SET compiler_id='compiler:81ARZ3NDEKTSV4RRFFQ69G5FAV'",
+        "UPDATE graph_versions SET source_ref='/tmp/sentinel'",
+        "UPDATE graph_versions SET creation_reason='free-form sentinel'",
+        "UPDATE graph_versions SET resulting_digest='bad'",
+        "UPDATE graphs SET current_version='2'",
+    ] {
+        let db = TempDb::new();
+        let mut repo = SqliteStateRepository::open(&db.0).unwrap();
+        repo.create_initial_graph_v1(&Clock("2026-09-27T10:00:00.000000000Z"), request("p", "g"))
+            .unwrap();
+        if sql.starts_with("UPDATE graphs") {
+            repo.connection()
+                .execute_batch("PRAGMA foreign_keys=OFF")
+                .unwrap();
+        }
+        repo.connection().execute_batch(sql).unwrap();
+        drop(repo);
+        let error = match ReadOnlyGraphReader::open_existing(&db.0) {
+            Ok(reader) => reader.read_current_v1("p", "g").unwrap_err(),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            StateError::GraphPersistence {
+                phase: Phase::Read,
+                code: Code::CorruptStore,
+                ..
+            }
+        ));
+    }
+}
+
+#[test]
+fn v13_migration_collision_preserves_v12_and_v11_second_step() {
+    for start in [11, 12] {
+        let db = TempDb::new();
+        let repo = SqliteStateRepository::open_with_migrations(
+            &db.0,
+            &crate::migrations::registered()[..start],
+        )
+        .unwrap();
+        repo.connection()
+            .execute_batch("CREATE TABLE graphs (collision TEXT)")
+            .unwrap();
+        drop(repo);
+        assert!(SqliteStateRepository::migrate_existing_to_current(&db.0).is_err());
+        let repo = SqliteStateRepository::open_with_migrations(
+            &db.0,
+            &crate::migrations::registered()[..12],
+        )
+        .unwrap();
+        assert_eq!(repo.schema_version().unwrap(), 12);
+        assert_eq!(repo.count_table_rows("state_schema_version").unwrap(), 12);
+        assert!(!repo.table_exists("graph_versions").unwrap());
+    }
+}
+
+#[test]
+fn v11_graph_maintenance_preserves_typed_busy_and_durable_state() {
+    use std::error::Error;
+    use std::path::Path;
+
+    fn snapshot(path: &Path) -> (Vec<u8>, String, String, Vec<String>) {
+        let conn =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        let encoding: String = conn
+            .query_row("PRAGMA encoding", [], |row| row.get(0))
+            .unwrap();
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap();
+        let tables = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        drop(stmt);
+        let mut rows = Vec::new();
+        for table in tables {
+            let mut stmt = conn
+                .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                .unwrap();
+            let width = stmt.column_count();
+            let values = stmt
+                .query_map([], |row| {
+                    Ok((0..width)
+                        .map(|index| format!("{:?}", row.get_ref(index).unwrap()))
+                        .collect::<Vec<_>>()
+                        .join("|"))
+                })
+                .unwrap();
+            for value in values {
+                rows.push(format!("{table}:{}", value.unwrap()));
+            }
+        }
+        (std::fs::read(path).unwrap(), mode, encoding, rows)
+    }
+
+    for version in [11, 12] {
+        let db = TempDb::new();
+        let repo = SqliteStateRepository::open_with_migrations(
+            &db.0,
+            &crate::migrations::registered()[..version],
+        )
+        .unwrap();
+        repo.connection()
+            .execute(
+                "INSERT INTO trusted_time_watermark(project_id,clock_source_id,clock_contract_version,last_accepted_trusted_time) VALUES ('SENTINEL-project','clock','1','2026-09-27T10:00:00.000000000Z')",
+                [],
+            )
+            .unwrap();
+        drop(repo);
+        let blocker = rusqlite::Connection::open(&db.0).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let before = snapshot(&db.0);
+        assert_eq!(before.1, "wal");
+        assert_eq!(before.2, "UTF-8");
+        let error = SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap_err();
+        assert!(matches!(
+            error,
+            StateError::GraphPersistence {
+                phase: Phase::Migration,
+                code: Code::StoreBusy,
+                field: None,
+            }
+        ));
+        assert!(error.source().is_none());
+        let diagnostic = format!("{error} {error:?}");
+        for forbidden in ["SENTINEL", "database is locked", "PRAGMA", "SELECT"] {
+            assert!(!diagnostic.contains(forbidden));
+        }
+        assert_eq!(snapshot(&db.0), before);
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drop(blocker);
+        assert_eq!(
+            SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
+            13
+        );
+    }
+}
+
+#[test]
+fn v11_helper_sql_failure_keeps_graph_diagnostics_closed_and_legacy_error() {
+    use std::error::Error;
+
+    for graph_path in [false, true] {
+        let db = TempDb::new();
+        let repo = SqliteStateRepository::open_with_migrations(
+            &db.0,
+            &crate::migrations::registered()[..11],
+        )
+        .unwrap();
+        repo.connection()
+            .execute_batch("CREATE TABLE logical_role_v12 (SENTINEL TEXT)")
+            .unwrap();
+        drop(repo);
+        if graph_path {
+            let error = SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap_err();
+            assert!(matches!(
+                error,
+                StateError::GraphPersistence {
+                    phase: Phase::Migration,
+                    code: Code::StorageFailure,
+                    field: None
+                }
+            ));
+            assert!(error.source().is_none());
+            assert!(!format!("{error} {error:?}").contains("SENTINEL"));
+        } else {
+            let mut conn = rusqlite::Connection::open(&db.0).unwrap();
+            conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+            assert!(matches!(
+                crate::migrations::v0012_context_epoch_unbounded::apply(&mut conn),
+                Err(StateError::V12PhysicalMigrationFailed { .. })
+            ));
+            let foreign_keys: i64 = conn
+                .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(foreign_keys, 1);
+        }
+        let repo = SqliteStateRepository::open_with_migrations(
+            &db.0,
+            &crate::migrations::registered()[..11],
+        )
+        .unwrap();
+        assert_eq!(repo.schema_version().unwrap(), 11);
+        assert_eq!(repo.count_table_rows("state_schema_version").unwrap(), 11);
+    }
+
+    let db = TempDb::new();
+    let repo =
+        SqliteStateRepository::open_with_migrations(&db.0, &crate::migrations::registered()[..11])
+            .unwrap();
+    repo.connection().execute_batch("PRAGMA foreign_keys=OFF; INSERT INTO context_epoch_invalidated_role(project_id,epoch,role_id) VALUES ('SENTINEL-project',0,'missing')").unwrap();
+    drop(repo);
+    let error = SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap_err();
+    assert!(matches!(
+        error,
+        StateError::GraphPersistence {
+            phase: Phase::Migration,
+            code: Code::CorruptStore,
+            field: None
+        }
+    ));
+    assert!(error.source().is_none());
+    assert!(!format!("{error} {error:?}").contains("SENTINEL"));
+}
+
+fn migration_image(path: &std::path::Path) -> (Vec<String>, Vec<String>, String, String) {
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let master = conn
+        .prepare("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name")
+        .unwrap()
+        .query_map([], |row| {
+            Ok(format!(
+                "{:?}|{:?}|{:?}|{:?}",
+                row.get_ref(0)?,
+                row.get_ref(1)?,
+                row.get_ref(2)?,
+                row.get_ref(3)?
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let tables = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let mut rows = Vec::new();
+    for table in tables {
+        let mut stmt = conn
+            .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+            .unwrap();
+        let width = stmt.column_count();
+        let values = stmt
+            .query_map([], |row| {
+                Ok((0..width)
+                    .map(|column| format!("{:?}", row.get_ref(column).unwrap()))
+                    .collect::<Vec<_>>()
+                    .join("|"))
+            })
+            .unwrap();
+        for value in values {
+            rows.push(format!("{table}:{}", value.unwrap()));
+        }
+    }
+    let mode = conn
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap();
+    let encoding = conn
+        .query_row("PRAGMA encoding", [], |row| row.get(0))
+        .unwrap();
+    (master, rows, mode, encoding)
+}
+
+fn migration_ledger(path: &std::path::Path) -> Vec<(i64, String)> {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.prepare("SELECT version,migration_name FROM state_schema_version ORDER BY version")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+#[test]
+fn stale_v11_graph_step_refuses_valid_advanced_store_without_rebuild() {
+    use std::error::Error;
+
+    for epoch_row in [false, true] {
+        for advanced_head in [12, 13] {
+            let db = TempDb::new();
+            let repo = SqliteStateRepository::open_with_migrations(
+                &db.0,
+                &crate::migrations::registered()[..11],
+            )
+            .unwrap();
+            if epoch_row {
+                repo.connection().execute_batch("INSERT INTO logical_role(role_id,project_id,role_type,status,current_context_epoch) VALUES ('SENTINEL-role','p','RUNTIME_A1','ACTIVE',0)").unwrap();
+            }
+            drop(repo);
+            let mut stale = rusqlite::Connection::open(&db.0).unwrap();
+            crate::graph_repository::configure_graph_writer(&stale).unwrap();
+            assert_eq!(
+                crate::graph_repository::schema_head(&stale, Phase::Migration).unwrap(),
+                Some(11)
+            );
+
+            if advanced_head == 12 {
+                let mut advancing = rusqlite::Connection::open(&db.0).unwrap();
+                crate::graph_repository::configure_graph_writer(&advancing).unwrap();
+                crate::migrations::v0012_context_epoch_unbounded::apply_graph(&mut advancing)
+                    .unwrap();
+            } else {
+                assert_eq!(
+                    SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
+                    13
+                );
+            }
+            let before = migration_image(&db.0);
+            let error = crate::migrations::v0012_context_epoch_unbounded::apply_graph(&mut stale)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                StateError::GraphPersistence {
+                    phase: Phase::Migration,
+                    code: Code::UnsupportedSchema,
+                    field: None
+                }
+            ));
+            assert!(error.source().is_none());
+            let diagnostic = format!("{error} {error:?}");
+            for forbidden in ["SENTINEL", "PRAGMA", "SELECT", "database"] {
+                assert!(!diagnostic.contains(forbidden));
+            }
+            assert!(stale.is_autocommit());
+            assert_eq!(
+                stale
+                    .query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(migration_image(&db.0), before);
+            let expected: Vec<_> = crate::migrations::registered()[..advanced_head]
+                .iter()
+                .map(|item| (i64::from(item.version), item.name.to_string()))
+                .collect();
+            assert_eq!(migration_ledger(&db.0), expected);
+            drop(stale);
+            drop(
+                SqliteStateRepository::open_with_migrations(
+                    &db.0,
+                    &crate::migrations::registered()[..advanced_head],
+                )
+                .unwrap(),
+            );
+            assert_eq!(
+                SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
+                13
+            );
+            assert_eq!(migration_ledger(&db.0).len(), 13);
+            drop(SqliteStateRepository::open(&db.0).unwrap());
+        }
+    }
+}
+
+#[test]
+fn stale_v11_graph_step_rejects_corrupt_advanced_store_without_writes() {
+    for (advanced_head, corruption) in [
+        (
+            12,
+            "INSERT INTO state_schema_version(version,migration_name) VALUES (12,'SENTINEL-duplicate')",
+        ),
+        (12, "DROP INDEX idx_context_epoch_project_numeric_epoch"),
+        (
+            13,
+            "INSERT INTO state_schema_version(version,migration_name) VALUES (13,'SENTINEL-duplicate')",
+        ),
+        (13, "DROP TABLE graph_compiled_sources"),
+    ] {
+        let db = TempDb::new();
+        drop(
+            SqliteStateRepository::open_with_migrations(
+                &db.0,
+                &crate::migrations::registered()[..11],
+            )
+            .unwrap(),
+        );
+        let mut stale = rusqlite::Connection::open(&db.0).unwrap();
+        crate::graph_repository::configure_graph_writer(&stale).unwrap();
+        assert_eq!(
+            crate::graph_repository::schema_head(&stale, Phase::Migration).unwrap(),
+            Some(11)
+        );
+        if advanced_head == 12 {
+            let mut advancing = rusqlite::Connection::open(&db.0).unwrap();
+            crate::graph_repository::configure_graph_writer(&advancing).unwrap();
+            crate::migrations::v0012_context_epoch_unbounded::apply_graph(&mut advancing).unwrap();
+        } else {
+            assert_eq!(
+                SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
+                13
+            );
+        }
+        rusqlite::Connection::open(&db.0)
+            .unwrap()
+            .execute_batch(corruption)
+            .unwrap();
+        let before = migration_image(&db.0);
+        let error =
+            crate::migrations::v0012_context_epoch_unbounded::apply_graph(&mut stale).unwrap_err();
+        assert!(matches!(
+            error,
+            StateError::GraphPersistence {
+                phase: Phase::Migration,
+                code: Code::CorruptStore,
+                field: None
+            }
+        ));
+        assert!(stale.is_autocommit());
+        assert_eq!(migration_image(&db.0), before);
+        assert_eq!(
+            stale
+                .query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert!(!format!("{error} {error:?}").contains("SENTINEL"));
+    }
+}
+
+#[test]
+fn simultaneous_public_v11_maintenance_keeps_one_exact_ledger() {
+    use std::sync::{Arc, Barrier};
+
+    let db = TempDb::new();
+    drop(
+        SqliteStateRepository::open_with_migrations(&db.0, &crate::migrations::registered()[..11])
+            .unwrap(),
+    );
+    let barrier = Arc::new(Barrier::new(3));
+    let handles: Vec<_> = (0..2)
+        .map(|_| {
+            let path = db.0.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                SqliteStateRepository::migrate_existing_to_current(path)
+            })
+        })
+        .collect();
+    barrier.wait();
+    for result in handles.into_iter().map(|handle| handle.join().unwrap()) {
+        match result {
+            Ok(13) => (),
+            Err(StateError::GraphPersistence {
+                phase: Phase::Migration,
+                code: Code::StoreBusy | Code::UnsupportedSchema | Code::CorruptStore,
+                field: None,
+            }) => (),
+            other => panic!("unexpected maintenance result: {other:?}"),
+        }
+    }
+    assert_eq!(
+        SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
+        13
+    );
+    let expected: Vec<_> = crate::migrations::registered()
+        .iter()
+        .map(|item| (i64::from(item.version), item.name.to_string()))
+        .collect();
+    assert_eq!(migration_ledger(&db.0), expected);
+    drop(SqliteStateRepository::open(&db.0).unwrap());
+}
+
+#[test]
+fn graph_v11_commit_busy_rolls_back_and_restores_foreign_keys() {
+    use std::time::Duration;
+
+    let db = TempDb::new();
+    drop(
+        SqliteStateRepository::open_with_migrations(&db.0, &crate::migrations::registered()[..11])
+            .unwrap(),
+    );
+    let mut writer = rusqlite::Connection::open(&db.0).unwrap();
+    writer
+        .execute_batch("PRAGMA journal_mode=DELETE; PRAGMA foreign_keys=ON")
+        .unwrap();
+    writer.busy_timeout(Duration::from_millis(30)).unwrap();
+    let reader = rusqlite::Connection::open(&db.0).unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT COUNT(*) FROM state_schema_version")
+        .unwrap();
+    let before = migration_image(&db.0);
+    let error =
+        crate::migrations::v0012_context_epoch_unbounded::apply_graph(&mut writer).unwrap_err();
+    assert!(matches!(
+        error,
+        StateError::GraphPersistence {
+            phase: Phase::Migration,
+            code: Code::StoreBusy,
+            field: None
+        }
+    ));
+    assert!(writer.is_autocommit());
+    assert_eq!(
+        writer
+            .query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(migration_image(&db.0), before);
+    assert_eq!(migration_ledger(&db.0).len(), 11);
+    reader.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(
+        SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
+        13
+    );
+}
+
+#[test]
+fn busy_writer_and_concurrent_duplicate_are_closed() {
+    use std::time::Duration;
+    let db = TempDb::new();
+    let mut repo = SqliteStateRepository::open(&db.0).unwrap();
+    let blocker = rusqlite::Connection::open(&db.0).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    repo.connection()
+        .busy_timeout(Duration::from_millis(30))
+        .unwrap();
+    assert!(matches!(
+        repo.create_initial_graph_v1(&Clock("2026-09-27T10:00:00.000000000Z"), request("p", "g")),
+        Err(StateError::GraphPersistence {
+            phase: Phase::Write,
+            code: Code::StoreBusy,
+            ..
+        })
+    ));
+    blocker.execute_batch("ROLLBACK").unwrap();
+    drop(repo);
+    let path = db.0.clone();
+    let handles: Vec<_> = (0..2)
+        .map(|_| {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                SqliteStateRepository::open(path)
+                    .unwrap()
+                    .create_initial_graph_v1(
+                        &Clock("2026-09-27T10:00:00.000000000Z"),
+                        request("p", "g"),
+                    )
+            })
+        })
+        .collect();
+    let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    assert_eq!(outcomes.iter().filter(|x| x.is_ok()).count(), 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|x| matches!(
+                x,
+                Err(StateError::GraphPersistence {
+                    code: Code::AlreadyExists,
+                    ..
+                })
+            ))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn clock_source_change_and_lock_wait_regression_refuse_without_mutation() {
+    use std::sync::mpsc;
+    struct SignallingClock(mpsc::Sender<()>);
+    impl TrustedClockV1 for SignallingClock {
+        fn sample(&self) -> Result<TrustedTimeSampleV1, StateError> {
+            self.0.send(()).unwrap();
+            Clock("2026-09-27T10:00:00.000000000Z").sample()
+        }
+    }
+    let db = TempDb::new();
+    let mut repo = SqliteStateRepository::open(&db.0).unwrap();
+    repo.create_initial_graph_v1(
+        &Clock("2026-09-27T10:00:00.000000000Z"),
+        request("p", "first"),
+    )
+    .unwrap();
+    struct ChangedClock;
+    impl TrustedClockV1 for ChangedClock {
+        fn sample(&self) -> Result<TrustedTimeSampleV1, StateError> {
+            let mut s = Clock("2026-09-27T11:00:00.000000000Z").sample()?;
+            s.clock_source_id = "different".into();
+            Ok(s)
+        }
+    }
+    assert!(matches!(
+        repo.create_initial_graph_v1(&ChangedClock, request("p", "second")),
+        Err(StateError::GraphPersistence {
+            phase: Phase::Clock,
+            code: Code::ClockContinuity,
+            ..
+        })
+    ));
+    let blocker = rusqlite::Connection::open(&db.0).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    blocker.execute("INSERT INTO trusted_time_watermark(project_id,clock_source_id,clock_contract_version,last_accepted_trusted_time) VALUES ('late','synthetic-clock','1','2026-09-27T11:00:00.000000000Z')",[]).unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let path = db.0.clone();
+    let handle = std::thread::spawn(move || {
+        SqliteStateRepository::open(path)
+            .unwrap()
+            .create_initial_graph_v1(&SignallingClock(sender), request("late", "second"))
+    });
+    receiver.recv().unwrap();
+    blocker.execute_batch("COMMIT").unwrap();
+    assert!(matches!(
+        handle.join().unwrap(),
+        Err(StateError::GraphPersistence {
+            phase: Phase::Clock,
+            code: Code::ClockRegression,
+            ..
+        })
+    ));
+    assert_eq!(
+        repo.connection()
+            .query_row(
+                "SELECT count(*) FROM graphs WHERE project_id='p'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+}
+
+fn bare_node(
+    graph: &str,
+    id: &str,
+    caps: Option<Vec<String>>,
+    lock: Option<Option<String>>,
+    attempt: Option<String>,
+) -> Result<StateGraphNodeV1, StateError> {
+    StateGraphNodeV1::new(
+        id.into(),
+        graph.into(),
+        "\0open kind".into(),
+        "PLANNED".into(),
+        Some("é/e\u{301}/😀\0".into()),
+        None,
+        attempt,
+        caps,
+        None,
+        None,
+        None,
+        None,
+        None,
+        lock,
+        None,
+    )
+}
+
+#[test]
+fn optional_shapes_and_unicode_nul_ids_round_trip() {
+    let db = TempDb::new();
+    let mut repo = SqliteStateRepository::open(&db.0).unwrap();
+    for (i, (caps, lock, sources)) in [
+        (None, None, None),
+        (Some(vec![]), Some(None), Some(vec![])),
+        (
+            Some(vec!["graph.core".into(), "graph.core".into()]),
+            Some(Some(String::new())),
+            Some(vec!["".into(), "".into()]),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let graph = format!("\0ge\u{301}😀\0{i}");
+        let node = bare_node(&graph, "\0node\0", caps, lock, None).unwrap();
+        let req = StateGraphGenesisV1::new(
+            format!("p{i}"),
+            graph.clone(),
+            "goal".into(),
+            "policy".into(),
+            None,
+            sources,
+            None,
+            "a".repeat(64),
+            vec![node.clone()],
+            vec![],
+            request("p", "g").genesis_provenance().clone(),
+        )
+        .unwrap();
+        repo.create_initial_graph_v1(&Clock("2026-09-27T10:00:00.000000000Z"), req.clone())
+            .unwrap();
+        let got = ReadOnlyGraphReader::open_existing(&db.0)
+            .unwrap()
+            .read_current_v1(req.project_id(), &graph)
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.nodes(), req.nodes());
+        assert_eq!(got.compiled_from(), req.compiled_from());
+        assert_eq!(got.parent_version(), None);
+    }
+    let storage: String = repo
+        .connection()
+        .query_row(
+            "SELECT typeof(attempt_number) FROM graph_nodes WHERE project_id='p0'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(storage, "null");
+}
+
+#[test]
+fn lexical_domains_and_child_containment_fail_before_write() {
+    for invalid in ["0", "01", "+1", "1\0bad", "18446744073709551616x"] {
+        let error = bare_node("g", "n", None, None, Some(invalid.into())).unwrap_err();
+        assert!(matches!(
+            error,
+            StateError::GraphPersistence {
+                phase: Phase::Input,
+                code: Code::InvalidShape,
+                ..
+            }
+        ));
+        assert!(!format!("{error:?} {error}").contains(invalid));
+    }
+    for caps in [
+        "graph.core\n",
+        "Graph.core",
+        "graph",
+        "graph..core",
+        "graph.1core",
+    ] {
+        assert!(bare_node("g", "n", Some(vec![caps.into()]), None, None).is_err());
+    }
+    assert!(bare_node("g", "n", None, None, Some("1".repeat(10001))).is_ok());
+    assert!(bare_node("g", &"a".repeat(201), None, None, None).is_err());
+    assert!(
+        StateGraphNodeV1::new(
+            "n".into(),
+            "g".into(),
+            "TASK".into(),
+            "PLANNED".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("BAD".into()),
+            None,
+            None,
+            None,
+            None
+        )
+        .is_err()
+    );
+    assert!(
+        StateGraphEdgeV1::new(
+            "e".into(),
+            "g".into(),
+            "n".into(),
+            "n".into(),
+            StateGraphEdgeRelationV1::Control("BAD".into()),
+            None
+        )
+        .is_err()
+    );
+    assert!(
+        StateGraphEdgeV1::new(
+            "e".into(),
+            "g".into(),
+            "n".into(),
+            "n".into(),
+            StateGraphEdgeRelationV1::Precedence("BAD".into()),
+            None
+        )
+        .is_err()
+    );
+    let provenance = request("p", "g").genesis_provenance().clone();
+    let child = bare_node("other", "n", None, None, None).unwrap();
+    assert!(matches!(
+        StateGraphGenesisV1::new(
+            "p".into(),
+            "g".into(),
+            "goal".into(),
+            "policy".into(),
+            None,
+            None,
+            None,
+            "a".repeat(64),
+            vec![child],
+            vec![],
+            provenance.clone()
+        ),
+        Err(StateError::GraphPersistence {
+            phase: Phase::Input,
+            code: Code::IdentityMismatch,
+            ..
+        })
+    ));
+    let child = bare_node("g", "n", None, None, None).unwrap();
+    assert!(
+        StateGraphGenesisV1::new(
+            "p".into(),
+            "g".into(),
+            "goal".into(),
+            "policy".into(),
+            None,
+            None,
+            None,
+            "A".repeat(64),
+            vec![child.clone()],
+            vec![],
+            provenance.clone()
+        )
+        .is_err()
+    );
+    let edge = StateGraphEdgeV1::new(
+        "e".into(),
+        "g".into(),
+        "n".into(),
+        "missing".into(),
+        StateGraphEdgeRelationV1::Control("ON_PASS".into()),
+        None,
+    )
+    .unwrap();
+    assert!(
+        StateGraphGenesisV1::new(
+            "p".into(),
+            "g".into(),
+            "goal".into(),
+            "policy".into(),
+            None,
+            None,
+            None,
+            "a".repeat(64),
+            vec![child.clone(), child.clone()],
+            vec![],
+            provenance.clone()
+        )
+        .is_err()
+    );
+    assert!(
+        StateGraphGenesisV1::new(
+            "p".into(),
+            "g".into(),
+            "goal".into(),
+            "policy".into(),
+            None,
+            None,
+            None,
+            "a".repeat(64),
+            vec![child],
+            vec![edge],
+            provenance
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn numeric_storage_is_not_decoded_as_decimal_text() {
+    let db = TempDb::new();
+    let mut repo = SqliteStateRepository::open(&db.0).unwrap();
+    repo.create_initial_graph_v1(&Clock("2026-09-27T10:00:00.000000000Z"), request("p", "g"))
+        .unwrap();
+    let (storage, decimal): (String, String) = repo
+        .connection()
+        .query_row(
+            "SELECT typeof(attempt_number),attempt_number FROM graph_nodes WHERE node_id='n2'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(storage, "text");
+    assert_eq!(decimal, format!("1{}", "0".repeat(10000)));
+    repo.connection().execute_batch("PRAGMA ignore_check_constraints=ON; UPDATE graph_nodes SET attempt_number=1 WHERE node_id='n2';").unwrap();
+    drop(repo);
+    let error = ReadOnlyGraphReader::open_existing(&db.0)
+        .unwrap()
+        .read_current_v1("p", "g")
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StateError::GraphPersistence {
+            phase: Phase::Read,
+            code: Code::CorruptStore,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn ledger_failure_rolls_back_all_v13_tables() {
+    let db = TempDb::new();
+    let repo =
+        SqliteStateRepository::open_with_migrations(&db.0, &crate::migrations::registered()[..12])
+            .unwrap();
+    repo.connection().execute_batch("CREATE TRIGGER fail_ledger BEFORE INSERT ON state_schema_version WHEN NEW.version=13 BEGIN SELECT RAISE(ABORT,'ledger-sentinel'); END").unwrap();
+    drop(repo);
+    let error = SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap_err();
+    assert!(!format!("{error:?} {error}").contains("ledger-sentinel"));
+    let repo =
+        SqliteStateRepository::open_with_migrations(&db.0, &crate::migrations::registered()[..12])
+            .unwrap();
+    assert_eq!(repo.schema_version().unwrap(), 12);
+    for table in [
+        "graphs",
+        "graph_versions",
+        "graph_nodes",
+        "graph_edges",
+        "graph_node_capabilities",
+        "graph_compiled_sources",
+    ] {
+        assert!(!repo.table_exists(table).unwrap());
+    }
+}
+
+#[test]
+fn full_tuple_keys_and_orphans_fail_closed() {
+    let db = TempDb::new();
+    let mut repo = SqliteStateRepository::open(&db.0).unwrap();
+    let now = Clock("2026-09-27T10:00:00.000000000Z");
+    repo.create_initial_graph_v1(&now, request("a", "g"))
+        .unwrap();
+    repo.create_initial_graph_v1(&now, request("b", "g"))
+        .unwrap();
+    assert!(repo.connection().execute("INSERT INTO graph_node_capabilities(project_id,graph_id,graph_version,node_id,ordinal,capability) VALUES ('c','g','1','n2',0,'graph.core')",[]).is_err());
+    assert!(repo.connection().execute("INSERT INTO graph_edges(project_id,graph_id,graph_version,edge_id,from_node,to_node,edge_class,precedence_kind,control_kind,note) VALUES ('c','g','1','e','n2','n2','CONTROL',NULL,'ON_PASS',NULL)",[]).is_err());
+    repo.connection().execute_batch("PRAGMA foreign_keys=OFF; INSERT INTO graph_node_capabilities(project_id,graph_id,graph_version,node_id,ordinal,capability) VALUES ('c','g','1','n2',0,'graph.core')").unwrap();
+    drop(repo);
+    let error = ReadOnlyGraphReader::open_existing(&db.0).unwrap_err();
+    assert!(matches!(
+        error,
+        StateError::GraphPersistence {
+            phase: Phase::Read,
+            code: Code::CorruptStore,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn source_reason_and_clock_diagnostics_never_echo_sentinels() {
+    for bad in [
+        "evidence:81ARZ3NDEKTSV4RRFFQ69G5FAW",
+        "evidence:01arz3NDEKTSV4RRFFQ69G5FAW",
+        "/tmp/sentinel",
+        "https://sentinel.invalid",
+        "evidence:01ARZ3NDEKTSV4RRFFQ69G5FAW\n",
+    ] {
+        let error = GraphSourceEvidenceRefV1::parse(bad).unwrap_err();
+        assert!(!format!("{error:?} {error}").contains(bad));
+    }
+    let error = GraphGenesisReasonV1::parse("compiled from sentinel").unwrap_err();
+    assert!(!format!("{error:?} {error}").contains("sentinel"));
+    let db = TempDb::new();
+    let mut repo = SqliteStateRepository::open(&db.0).unwrap();
+    let error = repo
+        .create_initial_graph_v1(&Clock("sentinel-invalid-time"), request("p", "g"))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StateError::GraphPersistence {
+            phase: Phase::Clock,
+            code: Code::ClockInvalid,
+            ..
+        }
+    ));
+    assert!(!format!("{error:?} {error}").contains("sentinel"));
+    assert!(repo.find_trusted_time_watermark("p").unwrap().is_none());
+    let path = std::env::temp_dir().join("missing-sentinel-graph-store/absent.db");
+    let error = ReadOnlyGraphReader::open_existing(path).unwrap_err();
+    assert!(!format!("{error:?} {error}").contains("sentinel"));
+}
+
+#[test]
+fn accepted_minimal_vector_fields_and_digest_are_preserved() {
+    // PROFILE v1 `minimal`: State stores the supplied accepted digest; it does not hash.
+    let db = TempDb::new();
+    let mut repo = SqliteStateRepository::open(&db.0).unwrap();
+    let node = StateGraphNodeV1::new(
+        "n".into(),
+        "g".into(),
+        "TASK".into(),
+        "PLANNED".into(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let digest = "5672b05de08463af659f705be8241857caa67177c9baed3b97aa0aec1bdc9e4f";
+    let request = StateGraphGenesisV1::new(
+        "p".into(),
+        "g".into(),
+        "goal".into(),
+        "policy".into(),
+        None,
+        None,
+        None,
+        digest.into(),
+        vec![node.clone()],
+        vec![],
+        request("p", "g").genesis_provenance().clone(),
+    )
+    .unwrap();
+    repo.create_initial_graph_v1(&Clock("2026-09-27T10:00:00.000000000Z"), request)
+        .unwrap();
+    let got = ReadOnlyGraphReader::open_existing(&db.0)
+        .unwrap()
+        .read_current_v1("p", "g")
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.nodes(), &[node]);
+    assert_eq!(got.resulting_digest(), digest);
+}
+
+#[test]
+fn context_epoch_and_decimal_sql_constraints() {
+    let db = TempDb::new();
+    let mut repo = SqliteStateRepository::open(&db.0).unwrap();
+    let epoch = crate::StateEpochValueV1::try_from(format!("1{}", "0".repeat(10000))).unwrap();
+    let request = StateGraphGenesisV1::new(
+        "p".into(),
+        "g".into(),
+        "goal".into(),
+        "policy".into(),
+        None,
+        None,
+        Some(epoch.clone()),
+        "a".repeat(64),
+        vec![bare_node("g", "n", None, None, None).unwrap()],
+        vec![],
+        request("p", "g").genesis_provenance().clone(),
+    )
+    .unwrap();
+    repo.create_initial_graph_v1(&Clock("2026-09-27T10:00:00.000000000Z"), request)
+        .unwrap();
+    let got = ReadOnlyGraphReader::open_existing(&db.0)
+        .unwrap()
+        .read_current_v1("p", "g")
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.context_epoch(), Some(&epoch));
+    for invalid in ["01", "1\0bad", "-1", "1e0", ""] {
+        assert!(
+            repo.connection()
+                .execute(
+                    "UPDATE graph_nodes SET attempt_number=?1 WHERE node_id='n'",
+                    [invalid]
+                )
+                .is_err()
+        );
+    }
+    assert!(
+        repo.connection()
+            .execute(
+                "UPDATE graph_nodes SET attempt_number=?1 WHERE node_id='n'",
+                [1_i64]
+            )
+            .is_err()
+    );
+    assert!(
+        repo.connection()
+            .execute(
+                "UPDATE graph_versions SET context_epoch=?1 WHERE graph_id='g'",
+                [1_i64]
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn nested_debug_and_source_chain_carry_no_graph_content() {
+    use std::error::Error;
+    let graph = request("secret-sentinel-project", "secret-sentinel-graph");
+    assert!(!format!("{graph:?}").contains("secret-sentinel"));
+    assert!(!format!("{:?}", graph.nodes()[0]).contains("password rotation"));
+    assert!(!format!("{:?}", graph.genesis_provenance()).contains("compiler:"));
+    let error = GraphCompilerRefV1::parse("secret-sentinel-compiler").unwrap_err();
+    assert!(error.source().is_none());
+    assert!(!format!("{error:?} {error}").contains("secret-sentinel"));
+}
+
+#[test]
+fn reader_sees_absence_then_complete_genesis_after_writer_lock() {
+    use std::sync::mpsc;
+    struct SignalClock(mpsc::Sender<()>);
+    impl TrustedClockV1 for SignalClock {
+        fn sample(&self) -> Result<TrustedTimeSampleV1, StateError> {
+            self.0.send(()).unwrap();
+            Clock("2026-09-27T10:00:00.000000000Z").sample()
+        }
+    }
+    let db = TempDb::new();
+    drop(SqliteStateRepository::open(&db.0).unwrap());
+    let reader = ReadOnlyGraphReader::open_existing(&db.0).unwrap();
+    let blocker = rusqlite::Connection::open(&db.0).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let path = db.0.clone();
+    let writer = std::thread::spawn(move || {
+        SqliteStateRepository::open(path)
+            .unwrap()
+            .create_initial_graph_v1(&SignalClock(sender), request("p", "g"))
+    });
+    receiver.recv().unwrap();
+    assert!(reader.read_current_v1("p", "g").unwrap().is_none());
+    blocker.execute_batch("COMMIT").unwrap();
+    writer.join().unwrap().unwrap();
+    let got = reader.read_current_v1("p", "g").unwrap().unwrap();
+    assert_eq!(got.nodes().len(), 2);
+    assert_eq!(got.edges().len(), 1);
+    assert_eq!(got.current_version(), "1");
+}
+
+fn insert_valid_noncurrent_version(conn: &rusqlite::Connection, project: &str, graph: &str) {
+    conn.execute(
+        "INSERT INTO graph_versions SELECT project_id,graph_id,'2',1,'1',goal_id,policy_id,created_at,1,context_epoch,resulting_digest,clock_source_id,clock_contract_version,compiler_id,source_ref,creation_reason FROM graph_versions WHERE project_id=?1 AND graph_id=?2 AND graph_version='1'",
+        rusqlite::params![project, graph],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO graph_nodes(project_id,graph_id,graph_version,node_id,kind,state,required_capabilities_present,locked_reason_present) VALUES (?1,?2,'2','v2-node','TASK','PLANNED',1,0)",
+        rusqlite::params![project, graph],
+    )
+    .unwrap();
+    for (ordinal, capability) in [(0, "graph.core"), (1, "graph.core")] {
+        conn.execute(
+            "INSERT INTO graph_node_capabilities(project_id,graph_id,graph_version,node_id,ordinal,capability) VALUES (?1,?2,'2','v2-node',?3,?4)",
+            rusqlite::params![project, graph, ordinal, capability],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO graph_edges(project_id,graph_id,graph_version,edge_id,from_node,to_node,edge_class,control_kind) VALUES (?1,?2,'2','v2-edge','v2-node','v2-node','CONTROL','ON_PASS')",
+        rusqlite::params![project, graph],
+    )
+    .unwrap();
+    for (ordinal, source) in [(0, "source\0one"), (1, "source\0one")] {
+        conn.execute(
+            "INSERT INTO graph_compiled_sources(project_id,graph_id,graph_version,ordinal,source) VALUES (?1,?2,'2',?3,?4)",
+            rusqlite::params![project, graph, ordinal, source],
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn complete_partition_validation_includes_noncurrent_versions() {
+    for sql in [
+        "UPDATE graph_versions SET goal_id='' WHERE project_id='p' AND graph_id='g' AND graph_version='2'",
+        "UPDATE graph_versions SET policy_id='' WHERE project_id='p' AND graph_id='g' AND graph_version='2'",
+        "UPDATE graph_versions SET created_at='SENTINEL-bad-time' WHERE project_id='p' AND graph_id='g' AND graph_version='2'",
+        "UPDATE graph_versions SET resulting_digest='SENTINEL-bad-digest' WHERE project_id='p' AND graph_id='g' AND graph_version='2'",
+        "UPDATE graph_versions SET compiler_id='SENTINEL-compiler' WHERE project_id='p' AND graph_id='g' AND graph_version='2'",
+        "UPDATE graph_versions SET source_ref='/tmp/SENTINEL' WHERE project_id='p' AND graph_id='g' AND graph_version='2'",
+        "UPDATE graph_versions SET creation_reason='SENTINEL-reason' WHERE project_id='p' AND graph_id='g' AND graph_version='2'",
+        "UPDATE graph_nodes SET kind='' WHERE project_id='p' AND graph_id='g' AND graph_version='2'",
+        "UPDATE graph_nodes SET state='SENTINEL-state' WHERE project_id='p' AND graph_id='g' AND graph_version='2'",
+        "UPDATE graph_nodes SET required_capabilities_present=0 WHERE project_id='p' AND graph_id='g' AND graph_version='2'",
+        "UPDATE graph_edges SET control_kind='SENTINEL-kind' WHERE project_id='p' AND graph_id='g' AND graph_version='2'",
+        "UPDATE graph_versions SET compiled_from_present=0 WHERE project_id='p' AND graph_id='g' AND graph_version='2'",
+        "UPDATE graph_node_capabilities SET ordinal=3 WHERE project_id='p' AND graph_id='g' AND graph_version='2' AND ordinal=1",
+        "UPDATE graph_compiled_sources SET ordinal=3 WHERE project_id='p' AND graph_id='g' AND graph_version='2' AND ordinal=1",
+        "DELETE FROM graph_edges WHERE project_id='p' AND graph_id='g' AND graph_version='2'; DELETE FROM graph_node_capabilities WHERE project_id='p' AND graph_id='g' AND graph_version='2'; DELETE FROM graph_nodes WHERE project_id='p' AND graph_id='g' AND graph_version='2'",
+    ] {
+        let db = TempDb::new();
+        let mut repo = SqliteStateRepository::open(&db.0).unwrap();
+        let clock = Clock("2026-09-27T10:00:00.000000000Z");
+        for (project, graph) in [("p", "g"), ("q", "g"), ("p", "other")] {
+            repo.create_initial_graph_v1(&clock, request(project, graph))
+                .unwrap();
+        }
+        insert_valid_noncurrent_version(repo.connection(), "p", "g");
+        drop(repo);
+        let reader = ReadOnlyGraphReader::open_existing(&db.0).unwrap();
+        let observer = rusqlite::Connection::open(&db.0).unwrap();
+        let before: i64 = observer
+            .query_row("PRAGMA data_version", [], |r| r.get(0))
+            .unwrap();
+        let current = reader.read_current_v1("p", "g").unwrap().unwrap();
+        assert_eq!(current.graph_version(), "1");
+        assert_eq!(current.nodes().len(), 2);
+        let after: i64 = observer
+            .query_row("PRAGMA data_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, after);
+        drop(observer);
+        drop(reader);
+        let conn = rusqlite::Connection::open(&db.0).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+        conn.execute_batch(sql).unwrap();
+        drop(conn);
+        let reader = ReadOnlyGraphReader::open_existing(&db.0).unwrap();
+        let error = reader.read_current_v1("p", "g").unwrap_err();
+        assert!(matches!(
+            error,
+            StateError::GraphPersistence {
+                phase: Phase::Read,
+                code: Code::CorruptStore,
+                ..
+            }
+        ));
+        assert!(!format!("{error:?} {error}").contains("SENTINEL"));
+        assert!(reader.read_current_v1("q", "g").unwrap().is_some());
+        assert!(reader.read_current_v1("p", "other").unwrap().is_some());
+    }
+}
+
+#[test]
+fn utf8_store_returns_nodes_and_edges_in_utf8_id_order() {
+    let encoding = "UTF-8";
+    let db = TempDb::new();
+    let conn = rusqlite::Connection::open(&db.0).unwrap();
+    conn.execute_batch(&format!("PRAGMA encoding='{encoding}'"))
+        .unwrap();
+    conn.execute_batch("CREATE TABLE encoding_anchor (value TEXT)")
+        .unwrap();
+    drop(conn);
+    let mut repo = SqliteStateRepository::open(&db.0).unwrap();
+    let actual_encoding: String = repo
+        .connection()
+        .query_row("PRAGMA encoding", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        actual_encoding.to_ascii_lowercase(),
+        encoding.to_ascii_lowercase()
+    );
+    let graph = "g\0e\u{301}";
+    let req = StateGraphGenesisV1::new(
+        "p".into(),
+        graph.into(),
+        "goal".into(),
+        "policy".into(),
+        None,
+        Some(vec!["source\0é".into(), "source\0é".into()]),
+        None,
+        "a".repeat(64),
+        vec![node(graph, "\u{10000}"), node(graph, "\u{e000}")],
+        vec![
+            StateGraphEdgeV1::new(
+                "\u{10000}".into(),
+                graph.into(),
+                "\u{10000}".into(),
+                "\u{e000}".into(),
+                StateGraphEdgeRelationV1::Control("ON_PASS".into()),
+                Some("é\0e\u{301}".into()),
+            )
+            .unwrap(),
+            StateGraphEdgeV1::new(
+                "\u{e000}".into(),
+                graph.into(),
+                "\u{e000}".into(),
+                "\u{10000}".into(),
+                StateGraphEdgeRelationV1::Control("ON_PASS".into()),
+                None,
+            )
+            .unwrap(),
+        ],
+        request("p", graph).genesis_provenance().clone(),
+    )
+    .unwrap();
+    repo.create_initial_graph_v1(&Clock("2026-09-27T10:00:00.000000000Z"), req)
+        .unwrap();
+    drop(repo);
+    let reader = ReadOnlyGraphReader::open_existing(&db.0).unwrap();
+    let got = reader.read_current_v1("p", graph).unwrap().unwrap();
+    assert_eq!(
+        got.nodes()
+            .iter()
+            .map(StateGraphNodeV1::node_id)
+            .collect::<Vec<_>>(),
+        ["\u{e000}", "\u{10000}"]
+    );
+    assert_eq!(
+        got.edges()
+            .iter()
+            .map(StateGraphEdgeV1::edge_id)
+            .collect::<Vec<_>>(),
+        ["\u{e000}", "\u{10000}"]
+    );
+    assert_eq!(got.graph_id(), graph);
+    assert_eq!(
+        got.compiled_from(),
+        Some(["source\0é".to_string(), "source\0é".to_string()].as_slice())
+    );
+    assert_eq!(got.edges()[1].note(), Some("é\0e\u{301}"));
+}
+
+#[test]
+fn invalid_stored_text_decoding_is_read_corruption() {
+    use std::error::Error;
+
+    for (encoding, noncurrent, update, stored, expected_hex) in [
+        (
+            "UTF-8",
+            false,
+            "UPDATE graph_nodes SET title=CAST(x'ff' AS TEXT) WHERE project_id='p' AND graph_id='g' AND graph_version='1' AND node_id='n2'",
+            "SELECT typeof(title),hex(title) FROM graph_nodes WHERE project_id='p' AND graph_id='g' AND graph_version='1' AND node_id='n2'",
+            "FF",
+        ),
+        (
+            "UTF-8",
+            false,
+            "UPDATE graph_edges SET note=CAST(x'ff' AS TEXT) WHERE project_id='p' AND graph_id='g' AND graph_version='1' AND edge_id='e'",
+            "SELECT typeof(note),hex(note) FROM graph_edges WHERE project_id='p' AND graph_id='g' AND graph_version='1' AND edge_id='e'",
+            "FF",
+        ),
+        (
+            "UTF-8",
+            true,
+            "UPDATE graph_nodes SET title=CAST(x'ff' AS TEXT) WHERE project_id='p' AND graph_id='g' AND graph_version='2' AND node_id='v2-node'",
+            "SELECT typeof(title),hex(title) FROM graph_nodes WHERE project_id='p' AND graph_id='g' AND graph_version='2' AND node_id='v2-node'",
+            "FF",
+        ),
+        (
+            "UTF-8",
+            true,
+            "UPDATE graph_edges SET note=CAST(x'ff' AS TEXT) WHERE project_id='p' AND graph_id='g' AND graph_version='2' AND edge_id='v2-edge'",
+            "SELECT typeof(note),hex(note) FROM graph_edges WHERE project_id='p' AND graph_id='g' AND graph_version='2' AND edge_id='v2-edge'",
+            "FF",
+        ),
+    ] {
+        let db = TempDb::new();
+        let conn = rusqlite::Connection::open(&db.0).unwrap();
+        conn.execute_batch(&format!("PRAGMA encoding='{encoding}'"))
+            .unwrap();
+        conn.execute_batch("CREATE TABLE encoding_anchor (value TEXT)")
+            .unwrap();
+        drop(conn);
+        let mut repo = SqliteStateRepository::open(&db.0).unwrap();
+        let actual_encoding: String = repo
+            .connection()
+            .query_row("PRAGMA encoding", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            actual_encoding.to_ascii_lowercase(),
+            encoding.to_ascii_lowercase()
+        );
+        repo.create_initial_graph_v1(&Clock("2026-09-27T10:00:00.000000000Z"), request("p", "g"))
+            .unwrap();
+        if noncurrent {
+            insert_valid_noncurrent_version(repo.connection(), "p", "g");
+        }
+        repo.connection().execute_batch(update).unwrap();
+        let stored_value: (String, String) = repo
+            .connection()
+            .query_row(stored, [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(stored_value, ("text".into(), expected_hex.into()));
+        drop(repo);
+
+        let reader = ReadOnlyGraphReader::open_existing(&db.0).unwrap();
+        let error = reader.read_current_v1("p", "g").unwrap_err();
+        assert!(matches!(
+            error,
+            StateError::GraphPersistence {
+                phase: Phase::Read,
+                code: Code::CorruptStore,
+                ..
+            }
+        ));
+        assert_eq!(error.to_string(), "graph persistence READ CORRUPT_STORE");
+        assert!(error.source().is_none());
+        assert!(!format!("{error:?}").contains("Utf8Error"));
+        drop(reader);
+
+        let conn = rusqlite::Connection::open(&db.0).unwrap();
+        let after: (String, String) = conn
+            .query_row(stored, [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(after, stored_value);
+    }
+}
+
+fn assert_unsupported_encoding(error: StateError, phase: Phase) {
+    use std::error::Error;
+
+    assert!(matches!(
+        error,
+        StateError::GraphPersistence {
+            phase: actual,
+            code: Code::UnsupportedSchema,
+            field: None,
+        } if actual == phase
+    ));
+    assert!(error.source().is_none());
+    let diagnostic = format!("{error:?} {error}");
+    for forbidden in ["UTF-16", "PRAGMA", "SELECT", "SENTINEL"] {
+        assert!(!diagnostic.contains(forbidden));
+    }
+}
+
+fn persisted_encoding_db(encoding: &str) -> TempDb {
+    let db = TempDb::new();
+    let conn = rusqlite::Connection::open(&db.0).unwrap();
+    conn.execute_batch(&format!(
+        "PRAGMA encoding='{encoding}'; CREATE TABLE encoding_anchor (value TEXT)"
+    ))
+    .unwrap();
+    let actual: String = conn
+        .query_row("PRAGMA encoding", [], |row| row.get(0))
+        .unwrap();
+    assert!(actual.eq_ignore_ascii_case(encoding));
+    drop(conn);
+    db
+}
+
+fn journal_mode(path: &std::path::Path) -> String {
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap()
+}
+
+#[test]
+fn utf8_preserves_noncharacters_in_graph_identity_and_metadata() {
+    let db = persisted_encoding_db("UTF-8");
+    let mut repo = SqliteStateRepository::open(&db.0).unwrap();
+    let graph = "g\0\u{fffe}";
+    let first = StateGraphNodeV1::new(
+        "\u{fffe}".into(),
+        graph.into(),
+        "TASK".into(),
+        "PLANNED".into(),
+        Some("title\u{fffe}\u{ffff}\0".into()),
+        None,
+        None,
+        Some(vec!["graph.core".into(), "graph.core".into()]),
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(Some("reason\u{ffff}".into())),
+        None,
+    )
+    .unwrap();
+    let second = node(graph, "\u{ffff}");
+    let edges = vec![
+        StateGraphEdgeV1::new(
+            "\u{fffe}".into(),
+            graph.into(),
+            "\u{fffe}".into(),
+            "\u{ffff}".into(),
+            StateGraphEdgeRelationV1::Control("ON_PASS".into()),
+            Some("note\u{fffe}\u{ffff}\0".into()),
+        )
+        .unwrap(),
+        StateGraphEdgeV1::new(
+            "\u{ffff}".into(),
+            graph.into(),
+            "\u{ffff}".into(),
+            "\u{fffe}".into(),
+            StateGraphEdgeRelationV1::Control("ON_PASS".into()),
+            None,
+        )
+        .unwrap(),
+    ];
+    let req = StateGraphGenesisV1::new(
+        "project\u{ffff}".into(),
+        graph.into(),
+        "goal\u{fffe}\u{ffff}".into(),
+        "policy\u{ffff}".into(),
+        Some(None),
+        Some(vec![
+            "source\u{fffe}".into(),
+            "source\u{ffff}".into(),
+            "source\u{ffff}".into(),
+        ]),
+        None,
+        "a".repeat(64),
+        vec![first.clone(), second.clone()],
+        edges.clone(),
+        request("p", graph).genesis_provenance().clone(),
+    )
+    .unwrap();
+    repo.create_initial_graph_v1(&Clock("2026-09-27T10:00:00.000000000Z"), req.clone())
+        .unwrap();
+    drop(repo);
+    let got = ReadOnlyGraphReader::open_existing(&db.0)
+        .unwrap()
+        .read_current_v1("project\u{ffff}", graph)
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.project_id(), req.project_id());
+    assert_eq!(got.graph_id(), req.graph_id());
+    assert_eq!(got.goal_id(), req.goal_id());
+    assert_eq!(got.policy_id(), req.policy_id());
+    assert_eq!(got.compiled_from(), req.compiled_from());
+    assert_eq!(got.nodes(), &[first, second]);
+    assert_eq!(got.edges(), edges);
+}
+
+#[test]
+fn utf16_graph_boundaries_refuse_without_mutating_store() {
+    for encoding in ["UTF-16le", "UTF-16be"] {
+        for version in [11, 12, 13] {
+            let db = persisted_encoding_db(encoding);
+            let mut repo = SqliteStateRepository::open_with_migrations(
+                &db.0,
+                &crate::migrations::registered()[..version],
+            )
+            .unwrap();
+            let actual: String = repo
+                .connection()
+                .query_row("PRAGMA encoding", [], |row| row.get(0))
+                .unwrap();
+            assert!(actual.eq_ignore_ascii_case(encoding));
+            if version == 13 {
+                let before: i64 = repo
+                    .connection()
+                    .query_row("SELECT COUNT(*) FROM trusted_time_watermark", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_unsupported_encoding(
+                    repo.create_initial_graph_v1(
+                        &Clock("2026-09-27T10:00:00.000000000Z"),
+                        request("p", "g"),
+                    )
+                    .unwrap_err(),
+                    Phase::Write,
+                );
+                let after: i64 = repo
+                    .connection()
+                    .query_row("SELECT COUNT(*) FROM trusted_time_watermark", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(before, after);
+            }
+            drop(repo);
+            let before_mode = journal_mode(&db.0);
+            let before_bytes = std::fs::read(&db.0).unwrap();
+            if version == 13 {
+                assert_unsupported_encoding(
+                    ReadOnlyGraphReader::open_existing(&db.0).unwrap_err(),
+                    Phase::Read,
+                );
+                let conn = rusqlite::Connection::open_with_flags(
+                    &db.0,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .unwrap();
+                let reader = ReadOnlyGraphReader::from_unverified_connection_for_test(conn);
+                assert_unsupported_encoding(
+                    reader.read_current_v1("absent", "graph").unwrap_err(),
+                    Phase::Read,
+                );
+            }
+            assert_unsupported_encoding(
+                SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap_err(),
+                Phase::Migration,
+            );
+            assert_eq!(journal_mode(&db.0), before_mode);
+            assert_eq!(std::fs::read(&db.0).unwrap(), before_bytes);
+            let conn = rusqlite::Connection::open_with_flags(
+                &db.0,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let head: i64 = conn
+                .query_row("SELECT MAX(version) FROM state_schema_version", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(head, version as i64);
+            let actual: String = conn
+                .query_row("PRAGMA encoding", [], |row| row.get(0))
+                .unwrap();
+            assert!(actual.eq_ignore_ascii_case(encoding));
+        }
+    }
+}

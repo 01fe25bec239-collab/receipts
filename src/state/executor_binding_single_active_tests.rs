@@ -142,10 +142,10 @@ fn named_binding_indexes(repo: &SqliteStateRepository) -> Vec<(String, String)> 
 fn t01_fresh_database_bootstraps_through_schema_7() {
     let tmp = TempDir::new("sab-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 12);
+    assert_eq!(repo.schema_version().expect("version read"), 13);
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        12,
+        13,
         "one metadata row per applied migration"
     );
     // The guard index is part of the fresh bootstrap.
@@ -165,10 +165,10 @@ fn t02_schema_version_7_reopens() {
     let tmp = TempDir::new("sab-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 12);
+        assert_eq!(repo.schema_version().expect("version read"), 13);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            12,
+            13,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -187,7 +187,7 @@ fn t03_ordinary_open_of_version_4_fails_closed() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 4,
-                supported: 12
+                supported: 13
             }
         ),
         "unexpected error: {error}"
@@ -233,7 +233,7 @@ fn t04_migration_v5_adds_exactly_one_partial_unique_index() {
     }
 
     // The database now records version 5, so it opens with the version-5
-    // prefix of the registered chain (the ordinary chain ends at version 12
+    // prefix of the registered chain (the ordinary chain ends at version 13
     // and refuses a version-5 database).
     let version_5_chain = &migrations::registered()[..5];
     let repo = SqliteStateRepository::open_with_migrations(tmp.db_path(), version_5_chain)
@@ -1262,7 +1262,7 @@ fn t50_migration_preserves_binding_history() {
             .expect("apply migration 5 over conforming version-4 history");
     }
     // The database now records version 5, so it opens with the version-5
-    // prefix of the registered chain (the ordinary chain ends at version 12
+    // prefix of the registered chain (the ordinary chain ends at version 13
     // and refuses a version-5 database).
     let repo =
         SqliteStateRepository::open_with_migrations(tmp.db_path(), &migrations::registered()[..5])

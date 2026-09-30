@@ -25,6 +25,7 @@ pub mod error;
 pub mod event;
 pub mod executor_binding;
 pub mod executor_binding_lease_expiry;
+pub mod graph_repository;
 pub mod logical_role;
 pub mod repository;
 pub mod startup_recovery;
@@ -52,6 +53,9 @@ mod context_rehydration_tests;
 
 #[cfg(test)]
 mod event_tests;
+
+#[cfg(test)]
+mod graph_repository_tests;
 
 #[cfg(test)]
 mod epoch_value_tests;
@@ -104,7 +108,7 @@ pub use context_rehydration::{
     context_rehydration_event_payload, context_source_digest_v1,
 };
 pub use epoch_value::StateEpochValueV1;
-pub use error::StateError;
+pub use error::{GraphFailureCode, GraphField, GraphPhase, StateError};
 pub use event::{
     ActorKind, EventActor, EventEnvelope, EventPayloadReference, EventSubject, EventType,
     SubjectKind,
@@ -113,6 +117,11 @@ pub use executor_binding::{ExecutorBinding, ReleaseReason};
 pub use executor_binding_lease_expiry::{
     ExecutorLeaseExpiryOutcomeV1, ExecutorLeaseExpiryRequestV2,
     ExecutorReleasedLifecycleAuthorityV1,
+};
+pub use graph_repository::{
+    GraphCompilerRefV1, GraphGenesisReasonV1, GraphSourceEvidenceRefV1, PersistedCurrentGraphV1,
+    ReadOnlyGraphReader, StateGraphEdgeRelationV1, StateGraphEdgeV1, StateGraphGenesisProvenanceV1,
+    StateGraphGenesisV1, StateGraphNodeV1,
 };
 pub use logical_role::{LogicalRole, LogicalRoleStatus, LogicalRoleType};
 pub use repository::SqliteStateRepository;
