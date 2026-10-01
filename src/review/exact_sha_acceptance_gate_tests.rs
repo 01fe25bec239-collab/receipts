@@ -33,15 +33,26 @@ struct Evidence {
     blocking: Vec<A4ReviewFinding>,
     nonblocking: Vec<A4ReviewFinding>,
     writes: Option<Vec<String>>,
+    ready: bool,
+    blocker: Option<A3HandoffBlocker>,
+    blocking_categories: Vec<String>,
 }
 
 fn core(sha: &str) -> WorkspaceCheckpointExecutedCheckCore {
+    executed(sha, Source::WorkerExecution, 0, Some(false))
+}
+fn executed(
+    sha: &str,
+    source: Source,
+    exit_code: i64,
+    timed_out: Option<bool>,
+) -> WorkspaceCheckpointExecutedCheckCore {
     WorkspaceCheckpointExecutedCheckCore::new(
-        Source::WorkerExecution,
+        source,
         vec!["check".into()],
-        0,
+        exit_code,
         CommitSha::parse(sha).unwrap(),
-        Some(false),
+        timed_out,
         None,
     )
     .unwrap()
@@ -68,10 +79,13 @@ fn reproduction(
     A4ReviewReproduction::new(performed, checks, A4ReviewReproductionLimitation::Omitted)
 }
 fn finding(blocking: bool) -> A4ReviewFinding {
+    categorized(A4ReviewFindingCategory::Style, blocking)
+}
+fn categorized(category: A4ReviewFindingCategory, blocking: bool) -> A4ReviewFinding {
     A4ReviewFinding::new(
         "finding".into(),
         A4ReviewFindingSeverity::Low,
-        A4ReviewFindingCategory::Style,
+        category,
         "resolved according to prose".into(),
         blocking,
         None,
@@ -118,6 +132,80 @@ impl Evidence {
             blocking: vec![],
             nonblocking: vec![],
             writes: Some(vec![]),
+            ready: true,
+            blocker: None,
+            blocking_categories: vec!["CONTRACT_VIOLATION".into()],
+        }
+    }
+    // Appends one current check with an explicit PASS/FAIL/absent result.
+    fn push_check(
+        &mut self,
+        record: AcceptanceEvidenceRecord,
+        source: Source,
+        exit_code: i64,
+        timed_out: Option<bool>,
+        passing: Option<bool>,
+    ) {
+        let check = executed(CURRENT, source, exit_code, timed_out);
+        match record {
+            A3Handoff => self.worker_checks.push(A3HandoffCheck::new(
+                check,
+                passing.map(|pass| {
+                    if pass {
+                        A3HandoffCheckResult::Pass
+                    } else {
+                        A3HandoffCheckResult::Fail
+                    }
+                }),
+            )),
+            ReviewCapsule => {
+                self.capsule_checks
+                    .get_or_insert_with(Vec::new)
+                    .push(ReviewCapsuleCheck::new(
+                        check,
+                        passing.map(|pass| {
+                            if pass {
+                                ReviewCapsuleCheckResult::Pass
+                            } else {
+                                ReviewCapsuleCheckResult::Fail
+                            }
+                        }),
+                    ))
+            }
+            A4Review => {
+                let mut checks = self
+                    .reproduction
+                    .as_ref()
+                    .and_then(|r| r.checks())
+                    .unwrap_or_default()
+                    .to_vec();
+                checks.push(
+                    A4ReviewReproductionCheck::new(
+                        source,
+                        vec!["check".into()],
+                        exit_code,
+                        CURRENT.into(),
+                        timed_out,
+                        None,
+                        passing.map(|pass| {
+                            if pass {
+                                A4ReviewReproductionCheckResult::Pass
+                            } else {
+                                A4ReviewReproductionCheckResult::Fail
+                            }
+                        }),
+                    )
+                    .unwrap(),
+                );
+                self.reproduction = Some(reproduction(Some(true), Some(checks)));
+            }
+        }
+    }
+    fn clear_checks(&mut self, record: AcceptanceEvidenceRecord) {
+        match record {
+            A3Handoff => self.worker_checks.clear(),
+            ReviewCapsule => self.capsule_checks = Some(vec![]),
+            A4Review => self.reproduction = Some(reproduction(Some(true), Some(vec![]))),
         }
     }
     fn handoff(&self) -> A3HandoffNonTemporalCore {
@@ -129,7 +217,7 @@ impl Evidence {
             "build/review-integration-a3-007-exact-sha-staleness-gate".into(),
             vec!["src/review/example.rs".into()],
             self.worker_checks.clone(),
-            true,
+            self.ready,
             None,
             None,
             None,
@@ -143,7 +231,7 @@ impl Evidence {
             None,
             None,
             None,
-            None,
+            self.blocker.clone(),
         )
         .unwrap()
     }
@@ -196,7 +284,7 @@ impl Evidence {
             self.capsule_checks.clone(),
             None,
             ReviewCapsuleReviewScope::Full,
-            ReviewCapsuleSeverityPolicy::new(vec!["CONTRACT_VIOLATION".into()], None).unwrap(),
+            ReviewCapsuleSeverityPolicy::new(self.blocking_categories.clone(), None).unwrap(),
             self.reproduction_required,
             None,
             0,
@@ -800,4 +888,233 @@ fn malformed_baseline_inputs_fail_without_normalization() {
             "{sha:?}"
         );
     }
+}
+
+const CHANNELS: [AcceptanceEvidenceRecord; 3] = [A3Handoff, ReviewCapsule, A4Review];
+fn role(record: AcceptanceEvidenceRecord) -> Source {
+    if record == A4Review {
+        Source::ReviewExecution
+    } else {
+        Source::WorkerExecution
+    }
+}
+// Reproduction is checked both as required and as optional supplied evidence.
+fn channel_cases() -> Vec<(AcceptanceEvidenceRecord, bool)> {
+    vec![
+        (A3Handoff, true),
+        (ReviewCapsule, true),
+        (A4Review, true),
+        (A4Review, false),
+    ]
+}
+#[test]
+fn timed_out_pass_after_good_check_fails_in_every_channel_regardless_of_exit() {
+    for (record, required) in channel_cases() {
+        for exit_code in [0, 7] {
+            let mut evidence = Evidence::valid();
+            evidence.reproduction_required = required;
+            evidence.push_check(record, role(record), exit_code, Some(true), Some(true));
+            assert_eq!(
+                evidence.evaluate(),
+                Err(Error::EvidenceTimedOut {
+                    record,
+                    check_index: 1
+                }),
+                "{record:?} required={required} exit={exit_code}"
+            );
+        }
+    }
+}
+#[test]
+fn wrong_source_role_after_good_check_fails_in_every_channel() {
+    for (record, required) in channel_cases() {
+        for source in Source::ALL.into_iter().filter(|s| *s != role(record)) {
+            let mut evidence = Evidence::valid();
+            evidence.reproduction_required = required;
+            evidence.push_check(record, source, 0, Some(false), Some(true));
+            assert_eq!(
+                evidence.evaluate(),
+                Err(Error::EvidenceSourceMismatch {
+                    record,
+                    check_index: 1
+                }),
+                "{record:?} required={required} {source:?}"
+            );
+        }
+    }
+}
+#[test]
+fn absent_or_false_timeout_needs_explicit_pass_and_nonzero_exit_is_not_judged() {
+    for record in CHANNELS {
+        for timed_out in [None, Some(false)] {
+            for exit_code in [0, 7] {
+                for passing in [Some(true), Some(false), None] {
+                    let mut evidence = Evidence::valid();
+                    evidence.clear_checks(record);
+                    evidence.push_check(record, role(record), exit_code, timed_out, passing);
+                    assert_result(evidence.evaluate(), record, passing);
+                }
+            }
+        }
+    }
+}
+#[test]
+fn handoff_must_be_ready_without_text_blocker() {
+    let mut evidence = Evidence::valid();
+    evidence.ready = false;
+    assert_eq!(evidence.evaluate(), Err(Error::HandoffNotReadyForReview));
+    evidence.ready = true;
+    for text in ["blocked", ""] {
+        evidence.blocker = Some(A3HandoffBlocker::Text(text.into()));
+        assert_eq!(evidence.evaluate(), Err(Error::HandoffBlocked), "{text:?}");
+    }
+    for blocker in [None, Some(A3HandoffBlocker::ExplicitNull)] {
+        evidence.blocker = blocker;
+        assert!(evidence.evaluate().is_ok());
+        assert_eq!(evidence.handoff().blocker(), evidence.blocker.as_ref());
+    }
+}
+#[test]
+fn every_floor_and_negative_test_category_blocks_despite_false_flag_and_capsule_policy() {
+    let mandatory: Vec<_> = A4ReviewFindingCategory::ALL
+        .into_iter()
+        .filter(|c| {
+            is_assurance_profile_blocking_floor(*c)
+                || *c == A4ReviewFindingCategory::MissingRequiredNegativeTest
+        })
+        .collect();
+    assert_eq!(mandatory.len(), 9);
+    for policy in ["CONTRACT_VIOLATION", "UNKNOWN_POLICY_CATEGORY"] {
+        for category in mandatory.iter().copied() {
+            for verdict in [
+                A4ReviewVerdict::PassWithNonblockingFindings,
+                A4ReviewVerdict::Pass,
+            ] {
+                let mut evidence = Evidence::valid();
+                evidence.blocking_categories = vec![policy.into()];
+                evidence.verdict = verdict;
+                evidence.nonblocking.push(categorized(category, false));
+                assert_eq!(
+                    evidence.evaluate(),
+                    Err(Error::BlockingFindingsPresent),
+                    "{policy} {category:?} {verdict:?}"
+                );
+            }
+        }
+    }
+}
+#[test]
+fn capsule_blocking_category_requires_exact_string_and_preserves_unknowns() {
+    let ordinary = A4ReviewFindingCategory::ALL.into_iter().filter(|c| {
+        !is_assurance_profile_blocking_floor(*c)
+            && *c != A4ReviewFindingCategory::MissingRequiredNegativeTest
+    });
+    for category in ordinary {
+        let name = category.as_str();
+        let mut evidence = Evidence::valid();
+        evidence.verdict = A4ReviewVerdict::PassWithNonblockingFindings;
+        evidence.nonblocking.push(categorized(category, false));
+        assert!(evidence.evaluate().is_ok(), "{name}");
+        evidence.blocking_categories = vec!["UNKNOWN_POLICY_CATEGORY".into(), name.into()];
+        assert_eq!(
+            evidence.evaluate(),
+            Err(Error::BlockingFindingsPresent),
+            "{name}"
+        );
+        for near in [name.to_lowercase(), format!("{name} "), format!(" {name}")] {
+            evidence.blocking_categories = vec!["UNKNOWN_POLICY_CATEGORY".into(), near.clone()];
+            assert!(evidence.evaluate().is_ok(), "{near:?}");
+            assert_eq!(
+                evidence.capsule().severity_policy().blocking_categories(),
+                ["UNKNOWN_POLICY_CATEGORY".to_string(), near]
+            );
+        }
+    }
+}
+#[test]
+fn pass_with_any_finding_is_inconsistent_but_matching_nonblocking_verdict_passes() {
+    let mut evidence = Evidence::valid();
+    evidence.nonblocking.push(finding(false));
+    assert_eq!(evidence.evaluate(), Err(Error::VerdictFindingsMismatch));
+    evidence.verdict = A4ReviewVerdict::PassWithNonblockingFindings;
+    assert!(evidence.evaluate().is_ok());
+    evidence.nonblocking.clear();
+    assert!(evidence.evaluate().is_ok());
+}
+#[test]
+fn blocking_flag_outside_blocking_array_fails_under_both_passing_verdicts() {
+    for verdict in [
+        A4ReviewVerdict::Pass,
+        A4ReviewVerdict::PassWithNonblockingFindings,
+    ] {
+        let mut evidence = Evidence::valid();
+        evidence.verdict = verdict;
+        evidence.nonblocking.push(finding(false));
+        evidence.nonblocking.push(finding(true));
+        assert_eq!(evidence.evaluate(), Err(Error::BlockingFindingsPresent));
+    }
+}
+#[test]
+fn new_vetoes_judge_only_the_current_pair_of_repair_history() {
+    let mut old = Evidence::valid();
+    old.final_sha = OLD;
+    old.reviewed = OLD;
+    old.verdict = A4ReviewVerdict::Reject;
+    old.review_id = "old-review";
+    old.ready = false;
+    old.blocker = Some(A3HandoffBlocker::Text("blocked".into()));
+    old.worker_checks = vec![A3HandoffCheck::new(
+        executed(OLD, Source::ReviewExecution, 1, Some(true)),
+        Some(A3HandoffCheckResult::Pass),
+    )];
+    old.nonblocking.push(categorized(
+        A4ReviewFindingCategory::MissingRequiredNegativeTest,
+        false,
+    ));
+    let current = Evidence::valid();
+    let handoffs = [old.handoff(), current.handoff()];
+    let reviews = [old.review(), current.review()];
+    let result = evaluate(
+        &handoffs,
+        &reviews,
+        Some(&current.capsule()),
+        Some(CURRENT),
+        Some(BASE),
+        &[],
+        1,
+    );
+    assert_eq!(result, current.evaluate());
+    assert!(result.is_ok());
+}
+#[test]
+fn presence_and_repair_errors_precede_new_vetoes() {
+    let mut evidence = Evidence::valid();
+    evidence.ready = false;
+    evidence.verdict = A4ReviewVerdict::Reject;
+    evidence.nonblocking.push(finding(false));
+    assert_eq!(
+        evidence.evaluate(),
+        Err(Error::RepairCycleNotClear(
+            RepairCycleDisposition::RepairRequired
+        ))
+    );
+    evidence.independent = false;
+    assert_eq!(
+        evidence.evaluate(),
+        Err(Error::RepairHistory(
+            RepairCycleControlError::IndependenceNotAttested { attempt_index: 0 }
+        ))
+    );
+    assert_eq!(
+        evaluate(
+            &[evidence.handoff()],
+            &[],
+            Some(&evidence.capsule()),
+            Some(CURRENT),
+            Some(BASE),
+            &[],
+            0
+        ),
+        Err(Error::MissingA4Review)
+    );
 }
