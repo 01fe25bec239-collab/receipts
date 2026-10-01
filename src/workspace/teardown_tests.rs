@@ -14,7 +14,7 @@ use crate::error::WorkspaceError;
 use crate::handle::{CommitSha, WorkspaceHandle, WorkspaceIsolation, WorkspaceState};
 use crate::provision::WorkspaceProvisionRequest;
 use crate::remote_publish_policy::WorkspaceRemotePublishPolicy;
-use crate::teardown::WorkspaceTeardownRequest;
+use crate::teardown::{WorkspaceTeardownRequest, parse_worktree_list};
 use crate::test_support::{
     TestRepo, branch_exists, git, porcelain_status, stdout_trimmed, worktree_list_porcelain,
     worktree_meta_dir, worktree_registered,
@@ -579,6 +579,13 @@ pub(crate) fn run_post_removal_gate() {
 fn finalized_fixture(
     policy: Option<WorkspaceRemotePublishPolicy>,
 ) -> (TestRepo, crate::WorkspaceAttemptFinalizationEvidence) {
+    finalized_fixture_named(policy, "task worktree")
+}
+
+fn finalized_fixture_named(
+    policy: Option<WorkspaceRemotePublishPolicy>,
+    worktree_name: &str,
+) -> (TestRepo, crate::WorkspaceAttemptFinalizationEvidence) {
     use crate::execution::{ProcessRunRequest, ProcessTimeoutPolicy, start_live_process_attempt};
     use crate::{
         WorkspaceAttemptFinalizationRequest, WorkspaceCheckpointCaptureCore,
@@ -590,7 +597,7 @@ fn finalized_fixture(
     repo.commit_file("implementation.txt", "base");
     let path = std::fs::canonicalize(repo.root.path())
         .unwrap()
-        .join("task worktree");
+        .join(worktree_name);
     let mut request = WorkspaceProvisionRequest::new(
         repo.path(),
         "workspace-finalized",
@@ -750,6 +757,7 @@ fn finalized_teardown_fresh_failures_are_typed_and_repeatedly_nonmutating() {
         "hidden-untracked",
         "absent",
         "unregistered",
+        "duplicate-registration",
         "wrong-repository",
         "missing-root",
     ] {
@@ -787,6 +795,7 @@ fn finalized_teardown_fresh_failures_are_typed_and_repeatedly_nonmutating() {
             "unregistered" => {
                 std::fs::remove_dir_all(worktree_meta_dir(&repo, path).unwrap()).unwrap();
             }
+            "duplicate-registration" => duplicate_registration(&repo, path),
             _ => {}
         }
         let before = teardown_snapshot(repo.root.path());
@@ -810,7 +819,7 @@ fn finalized_teardown_fresh_failures_are_typed_and_repeatedly_nonmutating() {
                 (WorkspaceError::WorktreeUnresolvable { .. }, "absent") => true,
                 (
                     WorkspaceError::TeardownWorktreeNotRegistered { .. },
-                    "unregistered" | "wrong-repository",
+                    "unregistered" | "duplicate-registration" | "wrong-repository",
                 ) => true,
                 (WorkspaceError::RepositoryRootUnresolvable { .. }, "missing-root") => true,
                 _ => false,
@@ -924,4 +933,283 @@ fn finalized_teardown_has_only_local_git_operations() {
     }
     assert!(source.contains("self.teardown_verified_head(handle, evidence.final_sha())"));
     assert!(!source.contains("std::process::Command"));
+}
+
+/// Independent identity oracle: how many raw `worktree` path fields of native
+/// `git worktree list --porcelain -z` equal `path`'s exact bytes. Splits Git's
+/// stdout directly instead of using the production parser or the line helper.
+fn native_registrations(repo: &TestRepo, path: &Path) -> usize {
+    use std::os::unix::ffi::OsStrExt;
+    let expected = [b"worktree ", path.as_os_str().as_bytes()].concat();
+    git(repo.path(), &["worktree", "list", "--porcelain", "-z"])
+        .stdout
+        .split(|&byte| byte == 0)
+        .filter(|field| *field == expected)
+        .count()
+}
+
+/// Copies the worktree's administrative registration under a second name,
+/// so Git reports two records for the same checkout path.
+fn duplicate_registration(repo: &TestRepo, worktree: &Path) {
+    let meta = worktree_meta_dir(repo, worktree).expect("registration to duplicate");
+    let copy = meta.with_file_name("duplicate-registration");
+    for (relative, bytes) in teardown_snapshot(&meta) {
+        let file = copy.join(relative);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, bytes).unwrap();
+    }
+    assert_eq!(
+        native_registrations(repo, &std::fs::canonicalize(worktree).unwrap()),
+        2
+    );
+}
+
+/// Names a line-oriented or C-unquoting reader could not carry exactly,
+/// including literal names spelled like Git C-quoted paths.
+const EXOTIC_WORKTREE_NAMES: [&str; 7] = [
+    "spaced worktree",
+    "quote\"d 'single' worktree",
+    "back\\slash worktree",
+    "tab\tand\nnewline worktree",
+    "unicodé wörktree ✓",
+    "\"a\\040b\"",
+    "\"caf\\303\\251\"",
+];
+
+fn ordinary_round_trip(name: &std::ffi::OsStr) {
+    let repo = TestRepo::new_nested("wtd-exotic", "repo");
+    repo.commit_file("notes.txt", "seeded");
+    let base_sha = repo.head_sha();
+    let path = std::fs::canonicalize(repo.root.path()).unwrap().join(name);
+    let handle = WorkspaceProvisionRequest::new(
+        repo.path(),
+        "ws-exotic",
+        None,
+        "task/exotic",
+        &path,
+        &base_sha,
+    )
+    .unwrap()
+    .provision()
+    .unwrap_or_else(|error| panic!("{name:?}: {error:?}"));
+    assert_eq!(native_registrations(&repo, &path), 1, "{name:?}");
+
+    let torn = teardown_request(&repo)
+        .teardown(&handle)
+        .unwrap_or_else(|error| panic!("{name:?}: {error:?}"));
+    assert_eq!(torn.state(), WorkspaceState::TornDown);
+    assert_eq!(torn.worktree_path(), path);
+    assert_eq!(native_registrations(&repo, &path), 0, "{name:?}");
+    assert!(!path.exists(), "{name:?}");
+    assert_eq!(retained_branch_target(&repo, "task/exotic"), base_sha);
+}
+
+#[test]
+fn exotic_paths_tear_down_by_exact_native_registration() {
+    for name in EXOTIC_WORKTREE_NAMES {
+        ordinary_round_trip(std::ffi::OsStr::new(name));
+    }
+}
+
+// macOS filesystems refuse non-UTF-8 names (EILSEQ); the raw-byte parser
+// fixture below covers those bytes there.
+#[cfg(target_os = "linux")]
+#[test]
+fn non_utf8_path_tears_down_by_exact_native_registration() {
+    use std::os::unix::ffi::OsStrExt;
+    ordinary_round_trip(std::ffi::OsStr::from_bytes(
+        b"non-utf8 \xff\xfe \"q\\040\"\n worktree",
+    ));
+}
+
+#[test]
+fn exotic_paths_tear_down_finalized_by_exact_native_registration() {
+    for name in EXOTIC_WORKTREE_NAMES {
+        let (repo, evidence) = finalized_fixture_named(None, name);
+        let path = evidence.handle().worktree_path();
+        assert_eq!(native_registrations(&repo, path), 1, "{name:?}");
+        let torn = teardown_request(&repo)
+            .teardown_finalized(&evidence)
+            .unwrap_or_else(|error| panic!("{name:?}: {error:?}"));
+        assert_eq!(torn.head_sha(), Some(evidence.final_sha()));
+        assert_eq!(native_registrations(&repo, path), 0, "{name:?}");
+        assert!(!path.exists(), "{name:?}");
+        assert_eq!(
+            retained_branch_target(&repo, evidence.handle().branch()),
+            evidence.final_sha().as_str()
+        );
+    }
+}
+
+// Two records naming the same checkout leave identity ambiguous: refuse
+// before removal and change nothing.
+#[test]
+fn duplicate_registrations_refuse_teardown_before_removal() {
+    let repo = TestRepo::new("wtd-duplicate");
+    repo.commit_file("notes.txt", "seeded");
+    let handle = provision_worktree(&repo, "ws-duplicate", "task/duplicate", "the worktree");
+    duplicate_registration(&repo, handle.worktree_path());
+    let before = teardown_snapshot(repo.root.path());
+    for _ in 0..2 {
+        let error = teardown_request(&repo).teardown(&handle).unwrap_err();
+        assert!(
+            matches!(error, WorkspaceError::TeardownWorktreeNotRegistered { .. }),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(teardown_snapshot(repo.root.path()), before);
+    }
+}
+
+// A registration whose path embeds `\nworktree <our path>` forged a second
+// record for line readers; as one raw field it is a different path.
+#[test]
+fn embedded_newline_registration_cannot_forge_identity() {
+    let repo = TestRepo::new("wtd-forged");
+    repo.commit_file("notes.txt", "seeded");
+    let handle = provision_worktree(&repo, "ws-forged", "task/forged", "the worktree");
+    let path = std::fs::canonicalize(handle.worktree_path()).unwrap();
+    let forged = repo.path().join(".git/worktrees/forged");
+    std::fs::create_dir_all(&forged).unwrap();
+    std::fs::write(forged.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(forged.join("commondir"), "../..\n").unwrap();
+    // Git reports a registration's gitdir minus its trailing `/.git`.
+    let mut forged_path = std::fs::canonicalize(repo.path())
+        .unwrap()
+        .join("elsewhere\nworktree ")
+        .into_os_string();
+    forged_path.push(&path);
+    let forged_path = PathBuf::from(forged_path);
+    std::fs::write(
+        forged.join("gitdir"),
+        forged_path.join(".git").as_os_str().as_encoded_bytes(),
+    )
+    .unwrap();
+    assert_eq!(native_registrations(&repo, &forged_path), 1);
+    assert_eq!(native_registrations(&repo, &path), 1);
+
+    teardown_request(&repo)
+        .teardown(&handle)
+        .expect("the forged line is not a second registration of this worktree");
+    assert_eq!(native_registrations(&repo, &path), 0);
+    assert_eq!(native_registrations(&repo, &forged_path), 1);
+}
+
+const RECORD_HEAD: &str = "1111111111111111111111111111111111111111";
+
+#[test]
+fn registration_parser_keeps_exact_bytes_of_every_native_record_kind() {
+    use std::os::unix::ffi::OsStrExt;
+    let listing = [
+        b"worktree /repo\0HEAD ".as_slice(),
+        RECORD_HEAD.as_bytes(),
+        b"\0branch refs/heads/main\0\0",
+        b"worktree /w/\xff\xfe tab\tnl\n\"a\\040b\" \0HEAD ",
+        RECORD_HEAD.as_bytes(),
+        b"\0branch refs/heads/task/\xff\0locked why\nworktree /forged\0",
+        b"prunable gitdir file points to non-existent location\0future-attribute x\0\0",
+        b"worktree /detached\0HEAD ",
+        RECORD_HEAD.as_bytes(),
+        b"\0detached\0\0worktree /bare.git\0bare\0\0",
+    ]
+    .concat();
+    let records = parse_worktree_list(&listing).expect("complete native listing");
+    let observed: Vec<(&[u8], Option<&[u8]>)> = records
+        .iter()
+        .map(|record| {
+            (
+                record.path.as_os_str().as_bytes(),
+                record.branch_ref.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        observed,
+        [
+            (b"/repo".as_slice(), Some(b"refs/heads/main".as_slice())),
+            (
+                b"/w/\xff\xfe tab\tnl\n\"a\\040b\" ".as_slice(),
+                Some(b"refs/heads/task/\xff".as_slice())
+            ),
+            (b"/detached".as_slice(), None),
+            (b"/bare.git".as_slice(), None),
+        ]
+    );
+
+    // A strict prefix is complete only when it ends on a record terminator;
+    // every other cut is refused rather than parsed as partial evidence.
+    for cut in 0..listing.len() {
+        let prefix = &listing[..cut];
+        match parse_worktree_list(prefix) {
+            Ok(partial) => {
+                assert!(prefix.ends_with(b"\0\0"), "cut {cut} parsed");
+                assert_eq!(
+                    partial.len(),
+                    prefix.windows(2).filter(|w| w == b"\0\0").count()
+                );
+            }
+            Err(_) => assert!(!prefix.ends_with(b"\0\0"), "cut {cut} refused"),
+        }
+    }
+}
+
+#[test]
+fn registration_parser_refuses_truncated_malformed_and_ambiguous_listings() {
+    for (case, listing) in [
+        ("empty", b"".as_slice()),
+        (
+            "line format",
+            b"worktree /a\nHEAD h\nbranch refs/heads/a\n\n",
+        ),
+        ("unterminated field", b"worktree /SECRET\0HEAD h"),
+        ("unterminated record", b"worktree /SECRET\0HEAD h\0"),
+        (
+            "truncated second record",
+            b"worktree /a\0HEAD h\0\0worktree /SECRET\0",
+        ),
+        ("stray terminator", b"\0"),
+        ("extra terminator", b"worktree /a\0HEAD h\0\0\0"),
+        (
+            "record not led by worktree",
+            b"HEAD SECRET\0worktree /a\0\0",
+        ),
+        ("relative path", b"worktree SECRET\0HEAD h\0\0"),
+        ("empty path", b"worktree \0HEAD h\0\0"),
+        ("valueless worktree", b"worktree\0HEAD h\0\0"),
+        (
+            "second path in record",
+            b"worktree /a\0HEAD h\0worktree /SECRET\0HEAD h\0\0",
+        ),
+        (
+            "repeated branch",
+            b"worktree /a\0HEAD h\0branch refs/heads/a\0branch refs/heads/SECRET\0\0",
+        ),
+        ("repeated HEAD", b"worktree /a\0HEAD h\0HEAD SECRET\0\0"),
+        (
+            "repeated detached",
+            b"worktree /a\0HEAD h\0detached\0detached\0\0",
+        ),
+        ("repeated bare", b"worktree /a\0bare\0bare\0\0"),
+        ("empty branch", b"worktree /a\0HEAD h\0branch \0\0"),
+        ("valueless branch", b"worktree /a\0HEAD h\0branch\0\0"),
+        ("empty HEAD", b"worktree /a\0HEAD \0\0"),
+        (
+            "valued detached",
+            b"worktree /a\0HEAD h\0detached SECRET\0\0",
+        ),
+        (
+            "branch and detached",
+            b"worktree /a\0HEAD h\0branch refs/heads/SECRET\0detached\0\0",
+        ),
+        (
+            "branch and bare",
+            b"worktree /a\0bare\0branch refs/heads/SECRET\0\0",
+        ),
+        ("HEAD and bare", b"worktree /a\0bare\0HEAD SECRET\0\0"),
+        ("neither HEAD nor bare", b"worktree /SECRET\0\0"),
+    ] {
+        let reason = parse_worktree_list(listing)
+            .err()
+            .unwrap_or_else(|| panic!("{case} must be refused"));
+        assert!(!reason.contains("SECRET"), "{case}: payload leaked");
+    }
 }
