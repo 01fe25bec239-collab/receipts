@@ -50,6 +50,7 @@ pub mod node_result_vocabulary;
 pub mod node_state;
 pub mod node_state_transition;
 pub mod passed_acceptance_transition;
+pub mod persisted_snapshot_projection;
 pub mod records;
 pub mod rejected_repair_transition;
 pub mod repair_completion_transition;
@@ -92,6 +93,8 @@ mod node_state_transition_tests;
 #[cfg(test)]
 mod passed_acceptance_transition_tests;
 #[cfg(test)]
+mod persisted_snapshot_projection_tests;
+#[cfg(test)]
 mod rejected_repair_transition_tests;
 #[cfg(test)]
 mod repair_completion_transition_tests;
@@ -129,6 +132,9 @@ pub use node_state_transition::{
 pub use passed_acceptance_transition::{
     AUTHORIZED_PASSED_ACCEPTANCE_TRANSITIONS, PassedAcceptanceTransitionError,
     validate_passed_acceptance_transition,
+};
+pub use persisted_snapshot_projection::{
+    GraphSnapshotProjectionErrorV1, project_persisted_current_graph_v1,
 };
 pub use rejected_repair_transition::{
     AUTHORIZED_REJECTED_REPAIR_TRANSITIONS, RejectedRepairTransitionError,
