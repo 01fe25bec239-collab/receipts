@@ -405,8 +405,10 @@ pub(crate) fn parse_worktree_list(stdout: &[u8]) -> Result<Vec<RegisteredWorktre
             if record.head == record.bare {
                 return Err("record must carry exactly one of HEAD or bare");
             }
-            if record.branch_ref.is_some() && (record.detached || record.bare) {
-                return Err("record names a branch but is detached or bare");
+            // Branch, detached and bare are mutually exclusive identities.
+            let identities = [record.branch_ref.is_some(), record.detached, record.bare];
+            if identities.into_iter().filter(|&set| set).count() > 1 {
+                return Err("record combines branch, detached or bare identities");
             }
             records.extend(open.take());
             continue;

@@ -1204,6 +1204,7 @@ fn registration_parser_refuses_truncated_malformed_and_ambiguous_listings() {
             "branch and bare",
             b"worktree /a\0bare\0branch refs/heads/SECRET\0\0",
         ),
+        ("bare and detached", b"worktree /SECRET\0bare\0detached\0\0"),
         ("HEAD and bare", b"worktree /a\0bare\0HEAD SECRET\0\0"),
         ("neither HEAD nor bare", b"worktree /SECRET\0\0"),
     ] {
