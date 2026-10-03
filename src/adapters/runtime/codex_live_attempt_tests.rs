@@ -39,10 +39,11 @@ fn main() {
         until(|| Path::new("release-descendant").exists());
         return;
     }
-    assert_eq!(args.len(), 6);
+    assert_eq!(args.len(), 7);
     assert_eq!(&args[1..4], &["exec", "--json", "--sandbox"]);
     assert_eq!(args[4].as_bytes(), fs::read("mode").unwrap());
-    assert_eq!(args[5].as_bytes(), fs::read("prompt").unwrap());
+    assert_eq!(args[5], "--");
+    assert_eq!(args[6].as_bytes(), fs::read("prompt").unwrap());
     assert!(std::env::vars_os().next().is_none());
     assert_eq!(std::io::stdin().read(&mut [0]).unwrap(), 0);
     if Path::new("spawn-descendant").exists() {
@@ -452,13 +453,12 @@ fn drop_before_collect_cleans_parent_and_descendant_via_workspace() {
     ws.prove_empty();
 }
 
+// The helper asserts exact argv bytes, empty environment and stdin EOF, so a
+// zero exit through either caller proves those boundary bytes only.
 #[test]
 fn exact_shared_request_modes_prompts_and_validation_reach_real_boundary() {
     for mode in [Sandbox::ReadOnly, Sandbox::WorkspaceWrite] {
-        for prompt in [
-            "   ",
-            "  hello\n世界 --sandbox danger-full-access $(false)  ",
-        ] {
+        for &prompt in crate::codex_task_execution_tests::BOUNDARY_PROMPTS {
             let ws = Workspace::new();
             ws.write("prompt", prompt);
             ws.write("mode", mode.cli_value());
@@ -476,8 +476,21 @@ fn exact_shared_request_modes_prompts_and_validation_reach_real_boundary() {
                 .unwrap()
                 .wait_collect()
                 .unwrap();
-            assert_eq!(outcome.process().exit_code(), Some(0));
+            assert_eq!(
+                outcome.process().exit_code(),
+                Some(0),
+                "live {prompt:?}: {}",
+                String::from_utf8_lossy(outcome.process().stderr().head())
+            );
             assert_eq!(outcome.sandbox_mode(), mode);
+            let once = crate::execute_codex_task_once(&request).unwrap();
+            assert_eq!(
+                once.exit_code(),
+                0,
+                "one-shot {prompt:?}: {}",
+                String::from_utf8_lossy(once.stderr())
+            );
+            assert_eq!(once.sandbox_mode(), mode);
         }
     }
     let ws = Workspace::new();

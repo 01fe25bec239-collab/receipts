@@ -5,7 +5,7 @@
 //! runner:
 //!
 //! ```text
-//! <absolute codex path> exec --json --sandbox <read-only|workspace-write> <PROMPT>
+//! <absolute codex path> exec --json --sandbox <read-only|workspace-write> -- <PROMPT>
 //! ```
 //!
 //! Frozen properties of this slice:
@@ -17,12 +17,21 @@
 //!   authoritative for absolute-executable validation, working-directory
 //!   containment, the empty inherited environment, timeouts, termination,
 //!   and bounded capture.
-//! * **Prompt is data.** The caller-supplied prompt travels as exactly one
-//!   argv element, verbatim. It is never trimmed, normalized, split,
-//!   interpolated, or interpreted; flag-looking prompt text cannot alter the
-//!   sandbox mode, the timeout, the working directory, or the executable.
-//!   Only the true empty string is rejected; whitespace-only prompts are
-//!   valid and preserved exactly.
+//! * **Prompt is argv data after `--`.** The caller-supplied prompt travels
+//!   as exactly one argv element, verbatim, immediately after the `--`
+//!   option terminator; stdin stays closed for every prompt. It is never
+//!   trimmed, normalized, split, encoded, interpolated, or interpreted here,
+//!   and no size limit is added. Only the true empty string is rejected;
+//!   whitespace-only prompts are valid and preserved exactly. The process
+//!   timeout, working directory, executable and empty environment come from
+//!   the Workspace request, never from the prompt.
+//! * **Argv bytes, not vendor semantics.** This module guarantees the argv
+//!   bytes only. Pinned Darwin arm64 Codex 0.158.0 and 0.159.2 were observed,
+//!   in both sandbox modes, to stop option/config parsing at `--`; other
+//!   versions and platforms are unverified. A prompt of exactly `-` remains
+//!   that CLI's stdin sentinel, so with closed stdin it is refused rather
+//!   than delivered literally. OS argv limits surface as typed launch
+//!   failures.
 //! * **Exactly two sandbox modes.** [`CodexTaskSandboxMode`] exposes
 //!   [`CodexTaskSandboxMode::ReadOnly`] and
 //!   [`CodexTaskSandboxMode::WorkspaceWrite`] only. The provider's unsafe
@@ -382,13 +391,15 @@ pub(crate) fn build_codex_task_request(
         return Err(CodexTaskExecutionError::EmptyPrompt);
     }
 
-    // The prompt becomes exactly one argv element, verbatim: no shell, no
-    // splitting, no interpolation, no added flags.
+    // The prompt becomes exactly one argv element, verbatim, after the `--`
+    // option terminator: no shell, no splitting, no interpolation, no other
+    // added flags. Stdin keeps the request default, Closed, even for `-`.
     let argv: Vec<OsString> = vec![
         OsString::from("exec"),
         OsString::from("--json"),
         OsString::from("--sandbox"),
         OsString::from(request.sandbox_mode().cli_value()),
+        OsString::from("--"),
         OsString::from(request.prompt()),
     ];
     ProcessRunRequest::new(
