@@ -6,11 +6,12 @@
 //! Caller-supplied current SHAs represent Git provenance; nothing is looked up.
 
 use crate::{
-    A3HandoffCheckResult, A3HandoffNonTemporalCore, A4ReviewNonTemporalCore,
-    A4ReviewReproductionCheckResult, DeterministicRepairCycleControlCore, RepairCycleControlError,
-    RepairCycleDisposition, ReviewCapsuleCheckResult, ReviewCapsuleNonTemporalCore,
+    A3HandoffBlocker, A3HandoffCheckResult, A3HandoffNonTemporalCore, A4ReviewFindingCategory,
+    A4ReviewNonTemporalCore, A4ReviewReproductionCheckResult, A4ReviewVerdict,
+    DeterministicRepairCycleControlCore, RepairCycleControlError, RepairCycleDisposition,
+    ReviewCapsuleCheckResult, ReviewCapsuleNonTemporalCore, is_assurance_profile_blocking_floor,
 };
-use receipts_workspace_execution::CommitSha;
+use receipts_workspace_execution::{CommitSha, WorkspaceCheckpointCheckSource};
 use std::fmt;
 
 /// IN_PROCESS, REVIEW_LOCAL, NON_WIRE, NON_PERSISTED.
@@ -61,11 +62,28 @@ pub enum ExactShaAcceptanceGateError {
     CandidateShaMismatch(AcceptanceEvidenceRecord),
     /// Whole-tree evidence is stale against the caller's current merge target.
     BaselineShaMismatch(AcceptanceEvidenceRecord),
+    /// Current handoff has ready_for_a4=false.
+    HandoffNotReadyForReview,
+    /// Current handoff carries blocker text, including empty text.
+    HandoffBlocked,
+    /// A blocking-array entry, or a nonblocking-array entry that is flagged or
+    /// policy-blocking (assurance floor, missing negative test, capsule category).
     BlockingFindingsPresent,
+    /// PASS with any finding; PASS_WITH_NONBLOCKING_FINDINGS remains eligible.
+    VerdictFindingsMismatch,
     WriteScopeEvidenceMissing,
     UnauthorizedFileChangesPresent,
     RequiredChecksMissing(AcceptanceEvidenceRecord),
     EvidenceShaMismatch {
+        record: AcceptanceEvidenceRecord,
+        check_index: usize,
+    },
+    /// Worker channels require WORKER_EXECUTION; A4 reproduction REVIEW_EXECUTION.
+    EvidenceSourceMismatch {
+        record: AcceptanceEvidenceRecord,
+        check_index: usize,
+    },
+    EvidenceTimedOut {
         record: AcceptanceEvidenceRecord,
         check_index: usize,
     },
@@ -111,12 +129,21 @@ impl ExactShaAcceptanceGate {
     /// Then parses caller SHAs with CommitSha and validates current links,
     /// findings, write scope, checks, reproduction, and dependency freshness.
     ///
+    /// The current handoff must be ready_for_a4 with an omitted or explicit-null
+    /// blocker. Findings are blocking when in the blocking array, flagged, in the
+    /// assurance floor, MISSING_REQUIRED_NEGATIVE_TEST (RUNTIME_A4_LIFECYCLE), or
+    /// an exact capsule blocking_categories string; PASS must carry no findings.
+    /// Only the current pair is checked; repair history is not re-judged.
+    ///
     /// All physically supplied current checks are acceptance support (strategy A
-    /// for capsule checks), requiring exact SHA and explicit PASS. Worker checks
-    /// must be nonempty; capsule checks remain optional as in the machine schema.
-    /// Required reproduction must be performed with nonempty checks. Even optional
+    /// for capsule checks), requiring exact SHA, channel source role, no
+    /// timed_out=Some(true), and explicit PASS. Worker checks must be nonempty;
+    /// capsule checks remain optional as in the machine schema. Required
+    /// reproduction must be performed with nonempty checks. Even optional
     /// supplied reproduction checks are validated; nonempty checks also require
-    /// performed=true. No result is inferred from exit_code, timed_out, or source.
+    /// performed=true. No result is inferred from exit_code or an absent/false
+    /// timeout, and exit_code is not judged: expected-exit mapping is held.
+    /// Source labels show role consistency only, never execution attestation.
     /// This does not establish criterion coverage or implement assurance profiles.
     pub fn evaluate(
         input: ExactShaAcceptanceGateInput<'_>,
@@ -173,13 +200,26 @@ impl ExactShaAcceptanceGate {
                 return Err(BaselineShaMismatch(record));
             }
         }
+        if !handoff.ready_for_a4() {
+            return Err(HandoffNotReadyForReview);
+        }
+        if let Some(A3HandoffBlocker::Text(_)) = handoff.blocker() {
+            return Err(HandoffBlocked);
+        }
+        let policy = capsule.severity_policy().blocking_categories();
         if !review.blocking_findings().is_empty()
-            || review
-                .nonblocking_findings()
-                .iter()
-                .any(|finding| finding.blocking())
+            || review.nonblocking_findings().iter().any(|finding| {
+                let category = finding.category();
+                finding.blocking()
+                    || is_assurance_profile_blocking_floor(category)
+                    || category == A4ReviewFindingCategory::MissingRequiredNegativeTest
+                    || policy.iter().any(|blocking| blocking == category.as_str())
+            })
         {
             return Err(BlockingFindingsPresent);
+        }
+        if review.verdict() == A4ReviewVerdict::Pass && !review.nonblocking_findings().is_empty() {
+            return Err(VerdictFindingsMismatch);
         }
         if !review
             .unauthorized_file_changes()
@@ -197,6 +237,8 @@ impl ExactShaAcceptanceGate {
                 index,
                 check.code_sha().as_str(),
                 &candidate,
+                check.source(),
+                check.timed_out(),
                 check
                     .result()
                     .map(|result| result == A3HandoffCheckResult::Pass),
@@ -208,6 +250,8 @@ impl ExactShaAcceptanceGate {
                 index,
                 check.code_sha().as_str(),
                 &candidate,
+                check.source(),
+                check.timed_out(),
                 check
                     .result()
                     .map(|result| result == ReviewCapsuleCheckResult::Pass),
@@ -232,6 +276,8 @@ impl ExactShaAcceptanceGate {
                     index,
                     check.code_sha(),
                     &candidate,
+                    check.source(),
+                    check.timed_out(),
                     check
                         .result()
                         .map(|result| result == A4ReviewReproductionCheckResult::Pass),
@@ -254,11 +300,31 @@ fn validate_check(
     check_index: usize,
     code_sha: &str,
     candidate: &CommitSha,
+    source: WorkspaceCheckpointCheckSource,
+    timed_out: Option<bool>,
     passing: Option<bool>,
 ) -> Result<(), ExactShaAcceptanceGateError> {
     use ExactShaAcceptanceGateError::*;
     if code_sha != candidate.as_str() {
         return Err(EvidenceShaMismatch {
+            record,
+            check_index,
+        });
+    }
+    let role = match record {
+        AcceptanceEvidenceRecord::A4Review => WorkspaceCheckpointCheckSource::ReviewExecution,
+        AcceptanceEvidenceRecord::A3Handoff | AcceptanceEvidenceRecord::ReviewCapsule => {
+            WorkspaceCheckpointCheckSource::WorkerExecution
+        }
+    };
+    if source != role {
+        return Err(EvidenceSourceMismatch {
+            record,
+            check_index,
+        });
+    }
+    if timed_out == Some(true) {
+        return Err(EvidenceTimedOut {
             record,
             check_index,
         });
