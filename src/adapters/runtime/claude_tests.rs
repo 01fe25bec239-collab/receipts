@@ -212,6 +212,14 @@ impl Workspace {
     fn prove_empty(&self, leaf: bool) {
         self.gone(leaf).unwrap();
     }
+    /// Stopped-attempt facts required whether or not collection completed: the
+    /// independently observed winning cause, then validated leader/group absence.
+    fn stopped(&self, attempt: &ClaudeLiveAttempt, cause: Cause) -> Result<(), String> {
+        match attempt.terminal_cause() {
+            Some(observed) if observed == cause => self.gone(false),
+            observed => Err(format!("{observed:?} is not the winning {cause:?}")),
+        }
+    }
 }
 unsafe extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
@@ -293,6 +301,17 @@ fn nonterminal(attempt: &ClaudeLiveAttempt) -> Result<(), String> {
     attempt
         .terminal_cause()
         .map_or(Ok(()), |cause| Err(format!("{cause:?} before Drop")))
+}
+/// The only permitted collection failure: Workspace's private EOF verifier found the
+/// stderr reader unfinished. Incomplete collection, never cleanup or outcome evidence.
+fn unverified_stderr_eof(error: &LiveProcessAttemptError) -> bool {
+    matches!(
+        error,
+        LiveProcessAttemptError::Execution(ExecutionError::CaptureReaderFailed {
+            stream: "stderr",
+            detail,
+        }) if detail == "live reader EOF verification exceeded two seconds"
+    )
 }
 /// Orphan cleanup evidence: successful collection (verified reap, reader EOF and
 /// complete-stream digests) of an unsuccessful forced timeout.
@@ -633,36 +652,46 @@ fn live_cancel_timeout_and_forced_kill_are_independent_workspace_facts() {
                     assert_eq!(attempt.cancel(), Acceptance::AlreadyTerminalOrTerminating);
                 }
             });
-            let result = attempt.wait_collect().unwrap();
-            // Negatives: wrong cause or forced flag is not orphan cleanup evidence.
-            assert_eq!(
-                forced_timeout(Ok(&result)).is_ok(),
-                timed_out && forced,
-                "{timed_out} {forced}"
-            );
-            assert_eq!(
-                result.process().terminal_cause(),
-                if timed_out {
-                    Cause::TimedOut
-                } else {
-                    Cause::Cancelled
+            let cause = if timed_out {
+                Cause::TimedOut
+            } else {
+                Cause::Cancelled
+            };
+            match attempt.wait_collect() {
+                Ok(result) => {
+                    // Negatives: wrong cause or forced flag is not orphan cleanup evidence.
+                    assert_eq!(
+                        forced_timeout(Ok(&result)).is_ok(),
+                        timed_out && forced,
+                        "{timed_out} {forced}"
+                    );
+                    assert_eq!(result.process().terminal_cause(), cause);
+                    assert_eq!(result.process().forced_kill_required(), forced);
+                    assert!(!result.process().success());
+                    assert_eq!(
+                        result.protocol().err(),
+                        Some(ClaudeStreamJsonError::IncompleteJson { line: 1 })
+                    );
+                    assert_eq!(
+                        classify_claude_live_outcome(&result),
+                        Some(if timed_out {
+                            FailureClass::Timeout
+                        } else {
+                            FailureClass::Unknown
+                        })
+                    );
                 }
-            );
-            assert_eq!(result.process().forced_kill_required(), forced);
-            assert!(!result.process().success());
-            assert_eq!(
-                result.protocol().err(),
-                Some(ClaudeStreamJsonError::IncompleteJson { line: 1 })
-            );
-            assert_eq!(
-                classify_claude_live_outcome(&result),
-                Some(if timed_out {
-                    FailureClass::Timeout
-                } else {
-                    FailureClass::Unknown
-                })
-            );
-            ws.prove_empty(false);
+                // Accepted incomplete collection: no outcome, forced bit or digest exists.
+                Err(error) => {
+                    assert!(
+                        unverified_stderr_eof(&error),
+                        "{timed_out} {forced} {:?}",
+                        RawFailure::from(&error)
+                    );
+                    assert!(forced_timeout(Err(&error)).is_err());
+                }
+            }
+            ws.stopped(&attempt, cause).unwrap();
         }
     }
 }
@@ -1074,19 +1103,77 @@ fn fixture_evidence_checks_reject_missing_late_wrong_or_live_evidence() {
     let attempt = start_claude_live_attempt(&request).unwrap();
     ws.ready(start, &attempt, false);
     let (leafless, retained) = (ws.identities(true), ws.gone(false));
+    let uncaused = ws.stopped(&attempt, Cause::Cancelled);
     assert_eq!(attempt.cancel(), Acceptance::CancelAccepted);
     let result = attempt.wait_collect().unwrap();
     assert!(leafless.is_err(), "{leafless:?}");
     assert!(retained.is_err(), "{retained:?}");
+    assert!(uncaused.is_err(), "{uncaused:?}");
     assert_eq!(result.process().terminal_cause(), Cause::Cancelled);
     assert!(forced_timeout(Ok(&result)).is_err());
-    ws.prove_empty(false);
+    // Absence alone is not the expected winning cause.
+    assert!(ws.stopped(&attempt, Cause::TimedOut).is_err());
+    ws.stopped(&attempt, Cause::Cancelled).unwrap();
 
     // Secret-bearing diagnostics are rejected.
     let leaked = LiveProcessAttemptError::Execution(ExecutionError::ProcessSpawnFailed {
         detail: MARKER.into(),
     });
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| safe(&leaked))).is_err());
+}
+
+#[test]
+fn collection_contract_permits_only_typed_unverified_stderr_eof_never_orphan_evidence() {
+    // Constructed carriers test selection only; they are not EOF fault injection.
+    use ExecutionError::*;
+    let eof = "live reader EOF verification exceeded two seconds";
+    let permitted = LiveProcessAttemptError::Execution(CaptureReaderFailed {
+        stream: "stderr",
+        detail: eof.into(),
+    });
+    assert!(unverified_stderr_eof(&permitted));
+    assert!(forced_timeout(Err(&permitted)).is_err());
+    assert_eq!(
+        RawFailure::from(&permitted).classify_failure(),
+        FailureClass::Unknown
+    );
+    safe(&permitted);
+    for error in [
+        CaptureReaderFailed {
+            stream: "stdout",
+            detail: eof.into(),
+        },
+        CaptureReaderFailed {
+            stream: "stderr",
+            detail: "the reader thread panicked: injected".into(),
+        },
+        CaptureReaderFailed {
+            stream: "stderr",
+            detail: format!("{eof}."),
+        },
+        CaptureReadFailed {
+            stream: "stderr",
+            detail: eof.into(),
+        },
+        CaptureReaderStartFailed {
+            stream: "stderr",
+            detail: eof.into(),
+        },
+        ProcessGroupControlFailed { detail: eof.into() },
+        GracefulTerminationFailed { detail: eof.into() },
+        TimeoutGraceWaitFailed { detail: eof.into() },
+        ForceKillFailed { detail: eof.into() },
+        TimeoutFinalWaitFailed { detail: eof.into() },
+        ProcessWaitFailed { detail: eof.into() },
+    ]
+    .map(LiveProcessAttemptError::Execution)
+    .into_iter()
+    .chain([
+        LiveProcessAttemptError::ControllerFailed,
+        LiveProcessAttemptError::AlreadyCollectedOrCollecting,
+    ]) {
+        assert!(!unverified_stderr_eof(&error), "{error:?}");
+    }
 }
 
 #[test]
