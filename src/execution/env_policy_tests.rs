@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use super::{
     BASE_NAMES, ChildEnvAuthMode, ChildEnvPolicy, ChildEnvProvider, MAX_PROJECT_ENV_BYTES,
-    NETWORK_NAMES, ProjectEnvConfirmation,
+    NETWORK_NAMES, PROJECT_OPEN_FLAGS, ProjectEnvConfirmation,
 };
 use crate::execution::runner::request_command;
 use crate::execution::{
@@ -653,6 +653,33 @@ fn fifo_project_file_refused_without_blocking() {
     let outcome = run_with_timeout(&request, &watchdog).unwrap();
     assert!(!outcome.timed_out(), "FIFO admission blocked: {outcome:?}");
     assert_eq!(outcome.exit_code(), Some(0), "{outcome:?}");
+}
+
+/// The single project-file open carries both `O_NONBLOCK` (no FIFO writer
+/// wait) and `O_NOCTTY` (no controlling-terminal assignment) on every
+/// supported target; unsupported targets have no flags and refuse before open.
+/// Expected values restate the platform definitions independently of source.
+#[test]
+fn project_file_open_flags_are_nonblocking_and_noctty() {
+    let expected = if cfg!(all(
+        target_os = "macos",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )) {
+        Some(0x0000_0004 | 0x0002_0000)
+    } else if cfg!(all(
+        any(target_os = "linux", target_os = "android"),
+        any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_arch = "arm",
+            target_arch = "aarch64"
+        )
+    )) {
+        Some(0o4000 | 0o400)
+    } else {
+        None
+    };
+    assert_eq!(PROJECT_OPEN_FLAGS, expected);
 }
 
 #[test]

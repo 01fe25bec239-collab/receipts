@@ -356,15 +356,18 @@ fn admit_project_file(
     Ok((extras, network))
 }
 
-/// `O_NONBLOCK`, only for targets whose value was checked against local
-/// authoritative definitions: the macOS SDK `sys/fcntl.h` (`0x00000004`) and
-/// libc 0.2.189 Linux gnu/musl and Android x86/x86_64/arm/aarch64 (`2048`).
+/// `O_NONBLOCK | O_NOCTTY`, only for targets whose values were checked against
+/// local authoritative definitions: the macOS SDK `sys/fcntl.h` (`0x00000004`,
+/// `0x00020000`) and libc 0.2.189 Linux gnu/musl and Android
+/// x86/x86_64/arm/aarch64 (`2048`, `256`; Linux UAPI `asm-generic/fcntl.h`).
+/// `O_NOCTTY` stops a terminal selected by the project path from becoming the
+/// caller's controlling tty during open, before the regular-file check.
 /// This is the same platform set as timed execution and `stdin.rs`.
 #[cfg(all(
     target_os = "macos",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-const NONBLOCKING_OPEN_FLAG: Option<i32> = Some(0x4);
+const PROJECT_OPEN_FLAGS: Option<i32> = Some(0x4 | 0x2_0000);
 #[cfg(all(
     any(target_os = "linux", target_os = "android"),
     any(
@@ -374,7 +377,7 @@ const NONBLOCKING_OPEN_FLAG: Option<i32> = Some(0x4);
         target_arch = "aarch64"
     )
 ))]
-const NONBLOCKING_OPEN_FLAG: Option<i32> = Some(0x800);
+const PROJECT_OPEN_FLAGS: Option<i32> = Some(0x800 | 0x100);
 #[cfg(not(any(
     all(
         target_os = "macos",
@@ -390,13 +393,14 @@ const NONBLOCKING_OPEN_FLAG: Option<i32> = Some(0x800);
         )
     )
 )))]
-const NONBLOCKING_OPEN_FLAG: Option<i32> = None;
+const PROJECT_OPEN_FLAGS: Option<i32> = None;
 
-/// Opens read-only with `O_NONBLOCK` so the open itself never waits for a
-/// FIFO writer. Unsupported targets are refused before any open is attempted.
+/// Opens read-only with `O_NONBLOCK | O_NOCTTY` so the open itself never waits
+/// for a FIFO writer or assigns a controlling terminal. Unsupported targets are
+/// refused before any open is attempted.
 fn open_nonblocking(path: &Path) -> Result<std::fs::File, ExecutionError> {
     let rejected = |reason| ExecutionError::ProjectEnvFileRejected { reason };
-    let Some(flag) = NONBLOCKING_OPEN_FLAG else {
+    let Some(flag) = PROJECT_OPEN_FLAGS else {
         return Err(rejected("nonblocking open unsupported on this platform"));
     };
     #[cfg(unix)]
