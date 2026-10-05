@@ -487,7 +487,7 @@ mod platform {
         let cwd = runner::validated_workspace_cwd(request.workspace_root(), request.cwd())?;
         let stdout = Arc::new(Mutex::new(runner::frozen_retention("stdout")?));
         let stderr = Arc::new(Mutex::new(runner::frozen_retention("stderr")?));
-        let mut command = runner::prepared_command(&executable, &cwd);
+        let mut command = runner::request_command(&executable, &cwd, request);
         command
             .args(request.arguments())
             .stdout(Stdio::piped())

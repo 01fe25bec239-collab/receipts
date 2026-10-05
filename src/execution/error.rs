@@ -247,6 +247,26 @@ pub enum ExecutionError {
         /// The counted total and the chunk that could not be added.
         detail: String,
     },
+    /// A child-environment name is on the always-refused list. Names only.
+    ChildEnvNameRefused { name: String },
+    /// A project extra names a base, `PATH`, provider or network variable.
+    ChildEnvNameReserved { name: String },
+    /// A project extra or approved name appears more than once.
+    ChildEnvNameDuplicated { name: String },
+    /// A name is not `[A-Z_][A-Z0-9_]*`. Reported by position, never text.
+    ChildEnvNameInvalid {
+        origin: &'static str,
+        position: usize,
+    },
+    /// An admitted value cannot be passed natively (contains NUL).
+    ChildEnvValueInvalid { name: String },
+    /// The project file is not an absolute, readable, bounded regular file.
+    ProjectEnvFileRejected { reason: &'static str },
+    /// The project file violates the strict line format (line 0: whole file).
+    ProjectEnvFileMalformed { line: usize, reason: &'static str },
+    /// The caller confirmation does not exactly bind file bytes, names or
+    /// network approval.
+    ProjectEnvUnconfirmed { reason: &'static str },
 }
 
 impl fmt::Display for ExecutionError {
@@ -391,6 +411,34 @@ impl fmt::Display for ExecutionError {
                 "counting the bytes drained from {stream} would overflow; refusing to report a \
                  wrapped or saturated total: {detail}"
             ),
+            Self::ChildEnvNameRefused { name } => {
+                write!(f, "child environment name {name} is always refused")
+            }
+            Self::ChildEnvNameReserved { name } => write!(
+                f,
+                "project extra {name} names a base, provider or network variable"
+            ),
+            Self::ChildEnvNameDuplicated { name } => {
+                write!(f, "child environment name {name} appears more than once")
+            }
+            Self::ChildEnvNameInvalid { origin, position } => {
+                write!(f, "invalid child environment name at {origin} {position}")
+            }
+            Self::ChildEnvValueInvalid { name } => {
+                write!(f, "child environment value for {name} contains NUL")
+            }
+            Self::ProjectEnvFileRejected { reason } => {
+                write!(f, "project environment file rejected: {reason}")
+            }
+            Self::ProjectEnvFileMalformed { line, reason } => {
+                write!(
+                    f,
+                    "project environment file line {line} malformed: {reason}"
+                )
+            }
+            Self::ProjectEnvUnconfirmed { reason } => {
+                write!(f, "project environment file not confirmed: {reason}")
+            }
         }
     }
 }

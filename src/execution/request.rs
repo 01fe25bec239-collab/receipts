@@ -3,6 +3,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use crate::execution::env_policy::ChildEnvPolicy;
 use crate::execution::error::ExecutionError;
 
 /// Maximum raw stdin payload, checked before a request can admit it.
@@ -79,6 +80,7 @@ pub struct ProcessRunRequest {
     workspace_root: PathBuf,
     cwd: PathBuf,
     stdin: ProcessStdin,
+    env_policy: Option<ChildEnvPolicy>,
 }
 
 impl ProcessRunRequest {
@@ -118,6 +120,7 @@ impl ProcessRunRequest {
             workspace_root,
             cwd,
             stdin: ProcessStdin::Closed,
+            env_policy: None,
         })
     }
 
@@ -153,5 +156,16 @@ impl ProcessRunRequest {
 
     pub fn stdin(&self) -> &ProcessStdin {
         &self.stdin
+    }
+
+    /// Opt in to one immutable admitted child environment, applied after
+    /// `env_clear`. Without it the child environment stays empty.
+    pub fn with_env_policy(mut self, policy: ChildEnvPolicy) -> Self {
+        self.env_policy = Some(policy);
+        self
+    }
+
+    pub fn env_policy(&self) -> Option<&ChildEnvPolicy> {
+        self.env_policy.as_ref()
     }
 }
