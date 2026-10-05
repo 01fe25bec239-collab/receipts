@@ -322,14 +322,12 @@ fn admit_project_file(
     if !path.is_absolute() {
         return Err(rejected("path is not absolute"));
     }
-    // ponytail: pre-open check keeps a FIFO/device from blocking open; the
-    // post-open check below is the one that binds what was actually read.
-    if !std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
-        return Err(rejected("not an existing regular file"));
-    }
-    let file = std::fs::File::open(path).map_err(|_| rejected("could not be opened"))?;
+    // No pathname precheck: whatever entry is present at open time is opened
+    // nonblocking (a FIFO without a writer cannot stall construction), and
+    // only the opened handle's own metadata decides admission.
+    let file = open_nonblocking(path)?;
     if !file.metadata().is_ok_and(|m| m.is_file()) {
-        return Err(rejected("not an existing regular file"));
+        return Err(rejected("not a regular file"));
     }
     let mut bytes = Vec::new();
     file.take(MAX_PROJECT_ENV_BYTES as u64 + 1)
@@ -356,6 +354,65 @@ fn admit_project_file(
         });
     }
     Ok((extras, network))
+}
+
+/// `O_NONBLOCK`, only for targets whose value was checked against local
+/// authoritative definitions: the macOS SDK `sys/fcntl.h` (`0x00000004`) and
+/// libc 0.2.189 Linux gnu/musl and Android x86/x86_64/arm/aarch64 (`2048`).
+/// This is the same platform set as timed execution and `stdin.rs`.
+#[cfg(all(
+    target_os = "macos",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+const NONBLOCKING_OPEN_FLAG: Option<i32> = Some(0x4);
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "arm",
+        target_arch = "aarch64"
+    )
+))]
+const NONBLOCKING_OPEN_FLAG: Option<i32> = Some(0x800);
+#[cfg(not(any(
+    all(
+        target_os = "macos",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(
+        any(target_os = "linux", target_os = "android"),
+        any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_arch = "arm",
+            target_arch = "aarch64"
+        )
+    )
+)))]
+const NONBLOCKING_OPEN_FLAG: Option<i32> = None;
+
+/// Opens read-only with `O_NONBLOCK` so the open itself never waits for a
+/// FIFO writer. Unsupported targets are refused before any open is attempted.
+fn open_nonblocking(path: &Path) -> Result<std::fs::File, ExecutionError> {
+    let rejected = |reason| ExecutionError::ProjectEnvFileRejected { reason };
+    let Some(flag) = NONBLOCKING_OPEN_FLAG else {
+        return Err(rejected("nonblocking open unsupported on this platform"));
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(flag)
+            .open(path)
+            .map_err(|_| rejected("could not be opened"))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (flag, path);
+        Err(rejected("nonblocking open unsupported on this platform"))
+    }
 }
 
 /// Strict UTF-8 LF format: `NAME=VALUE` lines split at the first `=`, plus

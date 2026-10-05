@@ -504,8 +504,8 @@ fn changed_unconfirmed_or_unadmissible_project_file_refused() {
             PathBuf::from("relative/project.env"),
             "path is not absolute",
         ),
-        (ws.0.clone(), "not an existing regular file"),
-        (ws.0.join("missing.env"), "not an existing regular file"),
+        (ws.0.clone(), "not a regular file"),
+        (ws.0.join("missing.env"), "could not be opened"),
     ] {
         match build_with(&path, &confirm(b"", &[], false)) {
             Err(ExecutionError::ProjectEnvFileRejected { reason: actual }) => {
@@ -529,6 +529,130 @@ fn changed_unconfirmed_or_unadmissible_project_file_refused() {
         ProjectEnvConfirmation::new(oversized, Vec::<String>::new(), false),
         Err(ExecutionError::ProjectEnvUnconfirmed { .. })
     ));
+}
+
+// --- FIFO-safe project-file acquisition ---------------------------------------
+
+const FIFO_PROBE: &str = "execution::env_policy::env_policy_tests::env_policy_fifo_probe_child";
+
+fn make_fifo(path: &Path) {
+    let mkfifo = ["/usr/bin/mkfifo", "/bin/mkfifo"]
+        .into_iter()
+        .map(Path::new)
+        .find(|candidate| candidate.is_file())
+        .expect("mkfifo utility for the test fixture");
+    let status = std::process::Command::new(mkfifo)
+        .arg(path)
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+/// Atomically replaces `target` with another link to `source` (FIFO or file).
+fn replace_with(source: &Path, target: &Path, scratch: &Path) {
+    let _ = fs::remove_file(scratch);
+    fs::hard_link(source, scratch).unwrap();
+    fs::rename(scratch, target).unwrap();
+}
+
+fn assert_not_regular(result: Result<ChildEnvPolicy, ExecutionError>) {
+    match result {
+        Err(ExecutionError::ProjectEnvFileRejected {
+            reason: "not a regular file",
+        }) => {}
+        other => panic!("expected nonregular rejection, got {other:?}"),
+    }
+}
+
+/// Child side of the FIFO regression. Run only through the bounded runner
+/// below; a blocking open here would be killed by that runner's deadline.
+#[test]
+#[ignore]
+fn env_policy_fifo_probe_child() {
+    let dir = PathBuf::from(
+        std::env::args_os()
+            .skip(1)
+            .find(|arg| Path::new(arg).is_absolute())
+            .expect("absolute fixture directory argument"),
+    );
+    let (fifo, regular, target, scratch, link) = (
+        dir.join("fifo"),
+        dir.join("regular"),
+        dir.join("project.env"),
+        dir.join("scratch"),
+        dir.join("link"),
+    );
+    make_fifo(&fifo);
+    fs::write(&regular, b"A=1\n").unwrap();
+    let confirmation = confirm(b"A=1\n", &["A"], false);
+    let attempt = || {
+        ChildEnvPolicy::build(
+            Claude,
+            Subscription,
+            Some((&target, &confirmation)),
+            parent(&[]),
+        )
+    };
+
+    // Stationary FIFO with no writer.
+    replace_with(&fifo, &target, &scratch);
+    assert_not_regular(attempt());
+    // A confirmed regular file replaced by a FIFO before construction.
+    replace_with(&regular, &target, &scratch);
+    assert_entries(&attempt().unwrap(), &[("A", "1")]);
+    replace_with(&fifo, &target, &scratch);
+    assert_not_regular(attempt());
+    // A symlink resolving to the FIFO.
+    std::os::unix::fs::symlink(&fifo, &link).unwrap();
+    assert_not_regular(ChildEnvPolicy::build(
+        Claude,
+        Subscription,
+        Some((&link, &confirmation)),
+        parent(&[]),
+    ));
+
+    // Concurrent substitution: every construction must return promptly with
+    // either the confirmed policy or the typed nonregular rejection.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let swapper = {
+        let stop = stop.clone();
+        let (fifo, regular, target) = (fifo.clone(), regular.clone(), target.clone());
+        let scratch = dir.join("swap-scratch");
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                replace_with(&fifo, &target, &scratch);
+                replace_with(&regular, &target, &scratch);
+            }
+        })
+    };
+    for _ in 0..500 {
+        match attempt() {
+            Ok(policy) => assert_entries(&policy, &[("A", "1")]),
+            other => assert_not_regular(other),
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    swapper.join().unwrap();
+}
+
+#[test]
+fn fifo_project_file_refused_without_blocking() {
+    let ws = Workspace::new();
+    let request = ProcessRunRequest::new(
+        std::env::current_exe().unwrap(),
+        [FIFO_PROBE, "--exact", "--ignored", ws.0.to_str().unwrap()],
+        &ws.0,
+        &ws.0,
+    )
+    .unwrap();
+    // Finite external watchdog with owned process-group kill and verified reap.
+    let watchdog =
+        ProcessTimeoutPolicy::new(Duration::from_secs(60), Duration::from_secs(2)).unwrap();
+    let outcome = run_with_timeout(&request, &watchdog).unwrap();
+    assert!(!outcome.timed_out(), "FIFO admission blocked: {outcome:?}");
+    assert_eq!(outcome.exit_code(), Some(0), "{outcome:?}");
 }
 
 #[test]
