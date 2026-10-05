@@ -40,7 +40,7 @@
 //! handling, no streaming, and no output digests exist at this slice. The
 //! only capability provided is running one resolved-Git command inside one
 //! canonical directory and capturing its exit status plus its stdout/stderr
-//! text.
+//! text, with the exact stdout bytes retained for byte-exact parsers.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -77,9 +77,17 @@ pub(crate) struct GitCapture {
     pub stdout: String,
     /// Lossily decoded stderr.
     pub stderr: String,
+    /// Exact stdout bytes; identity evidence must never pass through the
+    /// lossy text above.
+    raw_stdout: Vec<u8>,
 }
 
 impl GitCapture {
+    /// The exact bytes Git wrote to stdout.
+    pub(crate) fn raw_stdout(&self) -> &[u8] {
+        &self.raw_stdout
+    }
+
     /// Converts an unsuccessful capture into the typed Git-command failure
     /// for `operation`; passes successful captures through unchanged.
     pub(crate) fn require_success(self, operation: &'static str) -> Result<Self, WorkspaceError> {
@@ -245,5 +253,6 @@ pub(crate) fn capture(
         exit_status: output.status.to_string(),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        raw_stdout: output.stdout,
     })
 }
