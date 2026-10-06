@@ -42,12 +42,15 @@
 //!   is refused; a sibling directory whose name merely shares a textual
 //!   prefix with the root is not mistaken for containment. Any failed
 //!   canonicalization fails closed.
-//! * **Empty child environment.** Command construction starts from
-//!   [`Command::env_clear`] and adds nothing back: the child inherits no
+//! * **Empty child environment by default.** Command construction starts
+//!   from [`Command::env_clear`] and adds nothing back: the child inherits no
 //!   parent variable — not `PATH`, `HOME`, credentials, proxies, or any
 //!   other ambient state. Because the executable is an absolute validated
 //!   path, no environment entry is required to locate it, and none is
-//!   required by the spawn mechanism itself on supported platforms.
+//!   required by the spawn mechanism itself on supported platforms. A
+//!   request that explicitly opted in to a [`super::ChildEnvPolicy`] receives
+//!   exactly that policy's immutable construction-time snapshot afterwards;
+//!   no parent variable is read at spawn and no `PATH` lookup occurs.
 //! * **Non-interactive child.** stdin defaults to immediate EOF or delivers
 //!   one admitted immutable byte payload. Uncaptured stdout/stderr remain null.
 //! * **Attempt-owned process group (timed path).** Each timed execution
@@ -307,7 +310,7 @@ pub fn run(request: &ProcessRunRequest) -> Result<ProcessRunOutcome, ExecutionEr
     let executable = validated_executable(request.executable())?;
     let cwd = validated_workspace_cwd(request.workspace_root(), request.cwd())?;
 
-    let mut command = prepared_command(&executable, &cwd);
+    let mut command = request_command(&executable, &cwd, request);
     // Arguments travel verbatim as individual argv values; nothing joins,
     // splits, quotes, or interprets them because no shell exists here.
     command.args(request.arguments());
@@ -411,7 +414,7 @@ pub fn run_with_timeout(
     let executable = validated_executable(request.executable())?;
     let cwd = validated_workspace_cwd(request.workspace_root(), request.cwd())?;
 
-    let mut command = prepared_command(&executable, &cwd);
+    let mut command = request_command(&executable, &cwd, request);
     // Attempt-owned process group: created by the platform exec wrapper
     // inside the child before ordinary execution begins, so every
     // descendant the child spawns inherits membership naturally. Value 0
@@ -539,7 +542,7 @@ pub fn run_with_timeout_and_capture(
     let stdout_retention = frozen_retention(STDOUT)?;
     let stderr_retention = frozen_retention(STDERR)?;
 
-    let mut command = prepared_command(&executable, &cwd);
+    let mut command = request_command(&executable, &cwd, request);
     // Output streams stay separate pipes; stderr is never redirected into stdout.
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
@@ -1851,6 +1854,21 @@ pub(crate) fn prepared_command(executable: &Path, cwd: &Path) -> Command {
     command.stdin(Stdio::null());
     command.stdout(Stdio::null());
     command.stderr(Stdio::null());
+    command
+}
+
+/// [`prepared_command`] plus the request's opted-in [`super::ChildEnvPolicy`],
+/// if any. The policy is an immutable construction-time snapshot; nothing is
+/// read from the parent environment here.
+pub(crate) fn request_command(
+    executable: &Path,
+    cwd: &Path,
+    request: &ProcessRunRequest,
+) -> Command {
+    let mut command = prepared_command(executable, cwd);
+    if let Some(policy) = request.env_policy() {
+        policy.apply(&mut command);
+    }
     command
 }
 

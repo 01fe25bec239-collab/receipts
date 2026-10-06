@@ -18,8 +18,14 @@
 //!   root itself or a descendant of it — symlink escapes, `..` chains past
 //!   the root, and textual-prefix siblings are all refused, failing closed;
 //! * the child inherits nothing from the parent environment: construction
-//!   starts from `env_clear` and the allowlist is intentionally empty,
-//!   because the absolute executable needs no `PATH` to be located;
+//!   starts from `env_clear` and, by default, adds nothing back, because the
+//!   absolute executable needs no `PATH` to be located. A caller may opt in
+//!   with [`ProcessRunRequest::with_env_policy`]: a [`ChildEnvPolicy`] is an
+//!   immutable D1 allowlist snapshot taken at construction (base names,
+//!   absolute-only `PATH`, the caller-selected provider's names, and network
+//!   names or extras only from an exactly confirmed project file). Provider,
+//!   auth mode and confirmation are caller admission, not authenticated
+//!   attestation; Debug and errors show variable names only;
 //! * stdin defaults to null (immediate EOF), or accepts one immutable raw
 //!   [`ProcessStdin`] payload up to [`MAX_STDIN_BYTES`]. Delivery uses private
 //!   nonblocking writes inside the existing monitor; no writer thread or handle
@@ -60,6 +66,7 @@
 //! and process isolation belong to the runtime/host sandbox layer.
 
 mod capture;
+mod env_policy;
 mod error;
 mod live_attempt;
 mod outcome;
@@ -74,6 +81,10 @@ mod unix_signal;
 pub use capture::{
     CapturedProcessRun, CapturedStream, STREAM_CAPTURE_LIMIT_BYTES, STREAM_HEAD_RETENTION_BYTES,
     STREAM_TAIL_RETENTION_BYTES,
+};
+pub use env_policy::{
+    BASE_NAMES, ChildEnvAuthMode, ChildEnvPolicy, ChildEnvProvider, MAX_PROJECT_ENV_BYTES,
+    NETWORK_NAMES, ProjectEnvConfirmation, REFUSED,
 };
 pub use error::ExecutionError;
 pub use outcome::{ProcessRunOutcome, ProcessTermination};
