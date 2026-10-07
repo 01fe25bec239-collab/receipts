@@ -12,3 +12,8 @@ path = "../../src/core/lib.rs"
 receipts-state = { path = "../.." }
 receipts-workspace-execution = { path = "../receipts-workspace-execution" }
 sha2 = "=0.11.0"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+
+[dev-dependencies]
+jsonschema = { version = "=0.58.6", default-features = false }

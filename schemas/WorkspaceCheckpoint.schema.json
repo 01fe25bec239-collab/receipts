@@ -1,0 +1,214 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/WorkspaceCheckpoint.schema.json",
+  "title": "Workspace Checkpoint \u2014 captured before cleanup; partial work is never auto-accepted",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-WORKSPACE-EXECUTION",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "type": "object",
+  "required": [
+    "checkpoint_id",
+    "workspace_id",
+    "head_sha",
+    "captured_at",
+    "kind"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "checkpoint_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "checkpoint"
+    },
+    "workspace_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "workspace"
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "task"
+    },
+    "attempt_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "attempt"
+    },
+    "kind": {
+      "enum": [
+        "PROGRESS",
+        "PRE_TERMINATION",
+        "RECOVERY_CAPTURE"
+      ]
+    },
+    "head_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "base_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "dirty_diff_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ref_type",
+        "target"
+      ],
+      "properties": {
+        "ref_type": {
+          "enum": [
+            "REPO_PATH",
+            "STATE_QUERY",
+            "ARTIFACT_ID",
+            "URL"
+          ]
+        },
+        "target": {
+          "type": "string",
+          "minLength": 1
+        },
+        "digest": {
+          "type": "string"
+        },
+        "section": {
+          "type": "string"
+        }
+      }
+    },
+    "modified_files": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "untracked_files": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "executed_checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "source",
+          "command",
+          "exit_code",
+          "code_sha"
+        ],
+        "properties": {
+          "source": {
+            "enum": [
+              "WORKER_EXECUTION",
+              "BROKER_EXECUTION",
+              "REVIEW_EXECUTION",
+              "GIT_PROVENANCE"
+            ]
+          },
+          "command": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "description": "Explicit argv. Never a shell string."
+          },
+          "exit_code": {
+            "type": "integer"
+          },
+          "code_sha": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$"
+          },
+          "timed_out": {
+            "type": "boolean"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "finished_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "output_ref": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "ref_type",
+              "target"
+            ],
+            "properties": {
+              "ref_type": {
+                "enum": [
+                  "REPO_PATH",
+                  "STATE_QUERY",
+                  "ARTIFACT_ID",
+                  "URL"
+                ]
+              },
+              "target": {
+                "type": "string",
+                "minLength": 1
+              },
+              "digest": {
+                "type": "string"
+              },
+              "section": {
+                "type": "string"
+              }
+            }
+          },
+          "result": {
+            "enum": [
+              "PASS",
+              "FAIL",
+              "ERROR",
+              "SKIPPED",
+              "UNKNOWN"
+            ]
+          }
+        }
+      }
+    },
+    "crash_classification": {
+      "enum": [
+        "RATE_LIMITED",
+        "SESSION_EXHAUSTED",
+        "AUTH_REQUIRED",
+        "PROVIDER_DOWN",
+        "TIMEOUT",
+        "SANDBOX_DENIED",
+        "SAFETY_CHECK_PENDING",
+        "POLICY_BLOCKED",
+        "RUNTIME_CRASH",
+        "INVALID_OUTPUT",
+        "USER_CANCELLED",
+        "UNKNOWN"
+      ]
+    },
+    "recovery_decision": {
+      "enum": [
+        "RESET_TO_LAST_ACCEPTED",
+        "CONTINUE_FROM_CHECKPOINT",
+        "INSPECT_AND_SALVAGE"
+      ]
+    },
+    "recovery_rationale": {
+      "type": "string"
+    },
+    "captured_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

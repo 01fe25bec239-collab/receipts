@@ -1,0 +1,48 @@
+{
+  "graph_id": "G-EVAL",
+  "graph_version": 2,
+  "project_id": "P1",
+  "goal_id": "GOAL-1",
+  "nodes": [
+    {
+      "node_id": "t1",
+      "graph_id": "G-EVAL",
+      "kind": "TASK",
+      "state": "ACCEPTED"
+    },
+    {
+      "node_id": "ev",
+      "graph_id": "G-EVAL",
+      "kind": "GOAL_EVALUATION",
+      "state": "PASSED"
+    },
+    {
+      "node_id": "t2",
+      "graph_id": "G-EVAL",
+      "kind": "TASK",
+      "state": "PLANNED",
+      "created_in_version": 2
+    }
+  ],
+  "edges": [
+    {
+      "edge_id": "e1",
+      "graph_id": "G-EVAL",
+      "from_node": "t1",
+      "to_node": "ev",
+      "edge_class": "PRECEDENCE",
+      "precedence_kind": "REQUIRES_ACCEPTED"
+    },
+    {
+      "edge_id": "e2",
+      "graph_id": "G-EVAL",
+      "from_node": "ev",
+      "to_node": "t2",
+      "edge_class": "PRECEDENCE",
+      "precedence_kind": "REQUIRES_ACCEPTED"
+    }
+  ],
+  "policy_id": "free.single_runtime",
+  "created_at": "2026-08-15T00:00:00Z",
+  "context_epoch": 1
+}

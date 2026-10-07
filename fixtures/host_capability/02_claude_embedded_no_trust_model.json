@@ -1,0 +1,43 @@
+{
+  "host_id": "claude-code",
+  "host_version": "2.1.0",
+  "probed_at": "2026-08-16T04:00:00Z",
+  "plugin_supported": true,
+  "plugin_installed": true,
+  "manifest_path": "plugins/claude/.claude-plugin/plugin.json",
+  "supports_skills": true,
+  "supports_commands": true,
+  "supports_subagents": true,
+  "supports_mcp": false,
+  "hooks_supported": true,
+  "hooks_configured": true,
+  "hook_trust_required": false,
+  "hooks_trusted": null,
+  "hooks_enabled": true,
+  "hooks_allowed_by_admin_policy": true,
+  "hook_events": [
+    "SessionStart",
+    "SessionEnd",
+    "SubagentStart",
+    "SubagentStop",
+    "PostToolUse"
+  ],
+  "blocking_hook_events": [],
+  "hook_coverage_class": "FULL",
+  "required_hook_coverage_satisfied": true,
+  "selected_mode": "EMBEDDED",
+  "inactive_reason": "NONE",
+  "plugin_data_path": "/home/user/.claude/plugins/receipts/data",
+  "sandbox_modes": [
+    "sandbox.enabled"
+  ],
+  "evidence_label": "REVIEWER_SUPPLIED_CURRENT_PRIMARY_SOURCE",
+  "source_claim_id": "C-04",
+  "probe_status": "COMPLETE",
+  "validity_fingerprint": "sha256:fixture-current",
+  "hook_definition_digest": "sha256:fixture-hook",
+  "relevant_config_digest": "sha256:fixture-config",
+  "last_verified_at": "2026-08-16T04:00:00Z",
+  "stale_reason": "NONE",
+  "mode_override": null
+}

@@ -1,0 +1,10 @@
+{
+  "activation_state": "ACTIVATED_KNOWN",
+  "subject_id": "subj-9f2",
+  "first_activated_at": "2026-07-01T00:00:00Z",
+  "last_known_tier_id": "pro",
+  "last_entitlement_seen_at": "2026-08-10T00:00:00Z",
+  "last_observed_server_time": "2026-08-10T00:00:00Z",
+  "logged_out_at": null,
+  "recorded_at": "2026-08-15T00:00:00Z"
+}

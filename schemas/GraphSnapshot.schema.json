@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/GraphSnapshot.schema.json",
+  "title": "Graph Snapshot \u2014 a materialised graph state for display or resume",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-ORCHESTRATION",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "graph_id",
+    "graph_version",
+    "captured_at",
+    "node_states"
+  ],
+  "properties": {
+    "graph_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "graph"
+    },
+    "graph_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "captured_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "resulting_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "node_states": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "node_id",
+          "state"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "node"
+          },
+          "state": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Extensible node kind. Well-known: GOAL, WORKSTREAM, TASK, ATTEMPT, IMPLEMENTATION, REVIEW, REPAIR, DETERMINISTIC_CHECK, ROUTING, INTEGRATION, HUMAN_GATE, GOAL_EVALUATION. NOT an enum \u2014 new kinds must not require a schema change."
+          },
+          "locked": {
+            "type": "boolean"
+          },
+          "code_sha": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$"
+          }
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  }
+}

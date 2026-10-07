@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/GraphNodeResult.schema.json",
+  "title": "Graph Node Result \u2014 evidence produced by one node",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-ORCHESTRATION",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "node_id",
+    "graph_id",
+    "outcome",
+    "produced_at"
+  ],
+  "properties": {
+    "node_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "node"
+    },
+    "graph_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "graph"
+    },
+    "outcome": {
+      "enum": [
+        "PASS",
+        "FAIL",
+        "REJECTED",
+        "BLOCKED",
+        "CANCELLED",
+        "SKIPPED",
+        "HUMAN_REQUIRED"
+      ]
+    },
+    "code_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "attempt_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "attempt"
+    },
+    "evidence_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "command",
+          "exit_code"
+        ],
+        "properties": {
+          "command": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1
+          },
+          "exit_code": {
+            "type": "integer"
+          },
+          "result": {
+            "enum": [
+              "PASS",
+              "FAIL",
+              "ERROR",
+              "SKIPPED",
+              "UNKNOWN"
+            ]
+          },
+          "output_ref": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "review_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "review"
+    },
+    "routing_decision_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "routing decision"
+    },
+    "produced_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

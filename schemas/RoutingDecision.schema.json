@@ -1,0 +1,295 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/RoutingDecision.schema.json",
+  "title": "Routing Decision \u2014 immutable, explainable record of one dispatch choice",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-MODEL-ROUTING",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "type": "object",
+  "required": [
+    "decision_id",
+    "request_id",
+    "outcome",
+    "registry_freshness",
+    "mode"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "decision_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "decision"
+    },
+    "request_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "request"
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "task"
+    },
+    "occurred_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "outcome": {
+      "enum": [
+        "SELECTED",
+        "NO_ELIGIBLE_CANDIDATE",
+        "USER_INPUT_REQUIRED",
+        "BLOCKED"
+      ]
+    },
+    "selected_provider": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque provider identifier. MUST NOT be constrained to an enum; new providers must validate without a schema change."
+    },
+    "selected_model": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque model identifier. MUST NOT be constrained to an enum."
+    },
+    "selected_runtime": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque agent-runtime identifier. MUST NOT be constrained to an enum."
+    },
+    "selection_reason": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "quality_floor_applied": {
+          "enum": [
+            "FRONTIER",
+            "BALANCED",
+            "ECONOMY"
+          ]
+        },
+        "hard_filters_passed": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "score_components": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "expected_implementation_cost": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "expected_rejection_probability": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0,
+              "maximum": 1
+            },
+            "expected_repair_cost": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "expected_review_cost": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "latency_estimate_seconds": {
+              "type": [
+                "number",
+                "null"
+              ]
+            }
+          }
+        },
+        "decisive_factor": {
+          "type": "string"
+        }
+      }
+    },
+    "capability_evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "capability",
+          "confidence"
+        ],
+        "properties": {
+          "capability": {
+            "type": "string"
+          },
+          "value": {},
+          "confidence": {
+            "enum": [
+              "OFFICIAL_VERIFIED",
+              "INDEPENDENT_VERIFIED",
+              "LOCAL_EMPIRICAL",
+              "USER_DECLARED",
+              "UNVERIFIED"
+            ]
+          },
+          "source_ref": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "ref_type",
+              "target"
+            ],
+            "properties": {
+              "ref_type": {
+                "enum": [
+                  "REPO_PATH",
+                  "STATE_QUERY",
+                  "ARTIFACT_ID",
+                  "URL"
+                ]
+              },
+              "target": {
+                "type": "string",
+                "minLength": 1
+              },
+              "digest": {
+                "type": "string"
+              },
+              "section": {
+                "type": "string"
+              }
+            }
+          },
+          "observed_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "sample_size": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "confidence": {
+      "enum": [
+        "HIGH",
+        "MEDIUM",
+        "LOW"
+      ]
+    },
+    "availability_at_decision": {
+      "type": "string"
+    },
+    "estimated_cost_class": {
+      "enum": [
+        "LOW",
+        "MEDIUM",
+        "HIGH",
+        "UNKNOWN"
+      ]
+    },
+    "alternative_candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "provider_id",
+          "model_id",
+          "runtime_id",
+          "rejection_reason"
+        ],
+        "properties": {
+          "provider_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Opaque provider identifier. MUST NOT be constrained to an enum; new providers must validate without a schema change."
+          },
+          "model_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Opaque model identifier. MUST NOT be constrained to an enum."
+          },
+          "runtime_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Opaque agent-runtime identifier. MUST NOT be constrained to an enum."
+          },
+          "score": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "rejection_reason": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "registry_freshness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stale"
+      ],
+      "properties": {
+        "model_list_age_seconds": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "capability_age_seconds": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "calibration_sample_size": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "stale": {
+          "type": "boolean"
+        }
+      }
+    },
+    "mode": {
+      "enum": [
+        "AUTO_CURRENT",
+        "ASK_ON_UNCERTAINTY",
+        "USER_CONTROLLED"
+      ]
+    },
+    "user_involved": {
+      "type": "boolean"
+    },
+    "user_pin_applied": {
+      "type": "boolean"
+    },
+    "fallback_from": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "prior decision id"
+    }
+  }
+}

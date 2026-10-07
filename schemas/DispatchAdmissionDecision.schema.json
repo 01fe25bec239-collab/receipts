@@ -1,0 +1,253 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/DispatchAdmissionDecision.schema.json",
+  "title": "Dispatch Admission Decision \u2014 the single composed gate every provider dispatch must consume",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-ORCHESTRATION",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "description": "Composes the independent axes by REFERENCE and returns one final result naming the exact failing axis. It does not duplicate the underlying records. Every provider dispatch MUST consume one of these.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "decision_id",
+    "node_id",
+    "outcome",
+    "failing_axis",
+    "axis_results",
+    "decided_at"
+  ],
+  "properties": {
+    "decision_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "dispatch admission decision"
+    },
+    "node_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "graph node requesting dispatch"
+    },
+    "graph_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "graph"
+    },
+    "capability_id": {
+      "type": "string",
+      "description": "Product capability the node requires."
+    },
+    "outcome": {
+      "enum": [
+        "ALLOW",
+        "DENY"
+      ]
+    },
+    "failing_axis": {
+      "enum": [
+        "NONE",
+        "ENTITLEMENT",
+        "PROVIDER_AUTH",
+        "PROVIDER_POLICY",
+        "PROVIDER_AVAILABILITY",
+        "SAFETY",
+        "QUALITY_FLOOR"
+      ],
+      "description": "Exactly one axis is named. NONE only when outcome is ALLOW."
+    },
+    "denial_reason": {
+      "enum": [
+        "NONE",
+        "LOCKED_REQUIRES_PRO",
+        "ENTITLEMENT_UNKNOWN",
+        "ENTITLEMENT_EXPIRED",
+        "AUTH_REQUIRED",
+        "PROVIDER_POLICY_DISALLOWED",
+        "PROVIDER_POLICY_UNKNOWN",
+        "PROVIDER_RATE_LIMITED",
+        "PROVIDER_DOWN",
+        "NO_ELIGIBLE_RUNTIME",
+        "SAFETY_CHECK_PENDING",
+        "POLICY_BLOCKED",
+        "HUMAN_REQUIRED",
+        "QUALITY_FLOOR_UNSATISFIED"
+      ],
+      "description": "A licence problem is never reported as a provider problem, and vice versa."
+    },
+    "axis_results": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "entitlement",
+        "provider_auth",
+        "provider_policy",
+        "provider_availability",
+        "safety",
+        "quality_floor"
+      ],
+      "properties": {
+        "entitlement": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "result"
+          ],
+          "properties": {
+            "result": {
+              "enum": [
+                "PASS",
+                "FAIL",
+                "NOT_APPLICABLE"
+              ]
+            },
+            "feature_admission_decision_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "description": "FeatureAdmissionDecision reference"
+            }
+          }
+        },
+        "provider_auth": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "result"
+          ],
+          "properties": {
+            "result": {
+              "enum": [
+                "PASS",
+                "FAIL",
+                "NOT_APPLICABLE"
+              ]
+            },
+            "provider_id": {
+              "type": "string"
+            },
+            "technical_status": {
+              "type": "string"
+            }
+          }
+        },
+        "provider_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "result"
+          ],
+          "properties": {
+            "result": {
+              "enum": [
+                "PASS",
+                "FAIL",
+                "NOT_APPLICABLE"
+              ]
+            },
+            "provider_policy_eligibility_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "description": "ProviderPolicyEligibility reference"
+            },
+            "policy_status": {
+              "enum": [
+                "VERIFIED_ALLOWED",
+                "VERIFIED_DISALLOWED",
+                "NEEDS_REVIEW",
+                "UNKNOWN"
+              ]
+            },
+            "execution_context": {
+              "type": "string"
+            }
+          }
+        },
+        "provider_availability": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "result"
+          ],
+          "properties": {
+            "result": {
+              "enum": [
+                "PASS",
+                "FAIL",
+                "NOT_APPLICABLE"
+              ]
+            },
+            "availability_state_ref": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "description": "AvailabilityState reference"
+            }
+          }
+        },
+        "safety": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "result"
+          ],
+          "properties": {
+            "result": {
+              "enum": [
+                "PASS",
+                "FAIL",
+                "NOT_APPLICABLE"
+              ]
+            },
+            "safety_interruption_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "description": "SafetyInterruption reference"
+            }
+          }
+        },
+        "quality_floor": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "result"
+          ],
+          "properties": {
+            "result": {
+              "enum": [
+                "PASS",
+                "FAIL",
+                "NOT_APPLICABLE"
+              ]
+            },
+            "routing_decision_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "description": "RoutingDecision reference"
+            }
+          }
+        }
+      }
+    },
+    "selected_provider": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "selected_runtime": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "decided_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

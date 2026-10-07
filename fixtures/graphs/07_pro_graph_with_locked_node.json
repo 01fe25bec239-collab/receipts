@@ -1,0 +1,102 @@
+{
+  "graph_id": "G-PRO",
+  "graph_version": 1,
+  "project_id": "P1",
+  "goal_id": "GOAL-1",
+  "nodes": [
+    {
+      "node_id": "g",
+      "graph_id": "G-PRO",
+      "kind": "GOAL",
+      "state": "PLANNED"
+    },
+    {
+      "node_id": "t",
+      "graph_id": "G-PRO",
+      "kind": "TASK",
+      "state": "PLANNED",
+      "required_capabilities": [
+        "graph.core"
+      ]
+    },
+    {
+      "node_id": "route",
+      "graph_id": "G-PRO",
+      "kind": "ROUTING",
+      "state": "PLANNED",
+      "required_capabilities": [
+        "routing.model_intelligence"
+      ]
+    },
+    {
+      "node_id": "a3",
+      "graph_id": "G-PRO",
+      "kind": "IMPLEMENTATION",
+      "state": "PLANNED",
+      "required_capabilities": [
+        "orchestration.multi_runtime"
+      ]
+    },
+    {
+      "node_id": "a4",
+      "graph_id": "G-PRO",
+      "kind": "REVIEW",
+      "state": "LOCKED_REQUIRES_PRO",
+      "required_capabilities": [
+        "review.independent_a4"
+      ],
+      "locked_reason": "Requires review.independent_a4; entitlement is FREE. Visible, never dispatched."
+    },
+    {
+      "node_id": "int",
+      "graph_id": "G-PRO",
+      "kind": "INTEGRATION",
+      "state": "PLANNED"
+    }
+  ],
+  "edges": [
+    {
+      "edge_id": "e1",
+      "graph_id": "G-PRO",
+      "from_node": "g",
+      "to_node": "t",
+      "edge_class": "PRECEDENCE",
+      "precedence_kind": "REQUIRES_ACCEPTED"
+    },
+    {
+      "edge_id": "e2",
+      "graph_id": "G-PRO",
+      "from_node": "t",
+      "to_node": "route",
+      "edge_class": "PRECEDENCE",
+      "precedence_kind": "REQUIRES_ACCEPTED"
+    },
+    {
+      "edge_id": "e3",
+      "graph_id": "G-PRO",
+      "from_node": "route",
+      "to_node": "a3",
+      "edge_class": "PRECEDENCE",
+      "precedence_kind": "REQUIRES_ACCEPTED"
+    },
+    {
+      "edge_id": "e4",
+      "graph_id": "G-PRO",
+      "from_node": "a3",
+      "to_node": "a4",
+      "edge_class": "PRECEDENCE",
+      "precedence_kind": "REQUIRES_ACCEPTED"
+    },
+    {
+      "edge_id": "e5",
+      "graph_id": "G-PRO",
+      "from_node": "a4",
+      "to_node": "int",
+      "edge_class": "PRECEDENCE",
+      "precedence_kind": "REQUIRES_ACCEPTED"
+    }
+  ],
+  "policy_id": "pro.distributed_orchestration",
+  "created_at": "2026-08-15T00:00:00Z",
+  "context_epoch": 1
+}

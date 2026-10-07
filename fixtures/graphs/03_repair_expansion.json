@@ -1,0 +1,110 @@
+{
+  "graph_id": "G-REP",
+  "graph_version": 2,
+  "project_id": "P1",
+  "goal_id": "GOAL-1",
+  "nodes": [
+    {
+      "node_id": "t",
+      "graph_id": "G-REP",
+      "kind": "TASK",
+      "state": "PLANNED"
+    },
+    {
+      "node_id": "i1",
+      "graph_id": "G-REP",
+      "kind": "IMPLEMENTATION",
+      "state": "PLANNED",
+      "attempt_number": 1
+    },
+    {
+      "node_id": "r1",
+      "graph_id": "G-REP",
+      "kind": "REVIEW",
+      "state": "PLANNED",
+      "attempt_number": 1
+    },
+    {
+      "node_id": "i2",
+      "graph_id": "G-REP",
+      "kind": "REPAIR",
+      "state": "PLANNED",
+      "attempt_number": 2,
+      "parent_node_id": "i1"
+    },
+    {
+      "node_id": "r2",
+      "graph_id": "G-REP",
+      "kind": "REVIEW",
+      "state": "PLANNED",
+      "attempt_number": 2
+    },
+    {
+      "node_id": "acc",
+      "graph_id": "G-REP",
+      "kind": "INTEGRATION",
+      "state": "PLANNED"
+    }
+  ],
+  "edges": [
+    {
+      "edge_id": "e1",
+      "graph_id": "G-REP",
+      "from_node": "t",
+      "to_node": "i1",
+      "edge_class": "PRECEDENCE",
+      "precedence_kind": "REQUIRES_ACCEPTED"
+    },
+    {
+      "edge_id": "e2",
+      "graph_id": "G-REP",
+      "from_node": "i1",
+      "to_node": "r1",
+      "edge_class": "PRECEDENCE",
+      "precedence_kind": "REQUIRES_ACCEPTED"
+    },
+    {
+      "edge_id": "e3",
+      "graph_id": "G-REP",
+      "from_node": "i2",
+      "to_node": "r2",
+      "edge_class": "PRECEDENCE",
+      "precedence_kind": "REQUIRES_ACCEPTED"
+    },
+    {
+      "edge_id": "e4",
+      "graph_id": "G-REP",
+      "from_node": "r2",
+      "to_node": "acc",
+      "edge_class": "PRECEDENCE",
+      "precedence_kind": "REQUIRES_ACCEPTED"
+    },
+    {
+      "edge_id": "c1",
+      "graph_id": "G-REP",
+      "from_node": "r1",
+      "to_node": "i2",
+      "edge_class": "CONTROL",
+      "control_kind": "ON_REJECT"
+    },
+    {
+      "edge_id": "c2",
+      "graph_id": "G-REP",
+      "from_node": "r1",
+      "to_node": "acc",
+      "edge_class": "CONTROL",
+      "control_kind": "ON_PASS"
+    },
+    {
+      "edge_id": "c3",
+      "graph_id": "G-REP",
+      "from_node": "i1",
+      "to_node": "i2",
+      "edge_class": "CONTROL",
+      "control_kind": "EXPANDS_INTO"
+    }
+  ],
+  "policy_id": "free.single_runtime",
+  "created_at": "2026-08-15T00:00:00Z",
+  "context_epoch": 1
+}

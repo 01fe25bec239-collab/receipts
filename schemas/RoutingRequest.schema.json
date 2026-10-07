@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/RoutingRequest.schema.json",
+  "title": "Routing Request \u2014 states capabilities, never a remembered model name",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-MODEL-ROUTING",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "type": "object",
+  "required": [
+    "request_id",
+    "role",
+    "task_class",
+    "quality_floor",
+    "required_capabilities"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "request_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "request"
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "task"
+    },
+    "role": {
+      "enum": [
+        "IMPLEMENTER",
+        "REVIEWER",
+        "MANAGER",
+        "EVALUATOR",
+        "RENDERER"
+      ]
+    },
+    "task_class": {
+      "enum": [
+        "FRONTIER_IMPLEMENTATION",
+        "FRONTIER_REVIEW",
+        "FRONTIER_ARCHITECTURE",
+        "SECURITY_CRITICAL_CODE",
+        "BALANCED_REASONING",
+        "ECONOMY_DOCS",
+        "ECONOMY_SUMMARY",
+        "ECONOMY_STATUS",
+        "PRESENTATION_ONLY"
+      ]
+    },
+    "quality_floor": {
+      "enum": [
+        "FRONTIER",
+        "BALANCED",
+        "ECONOMY"
+      ]
+    },
+    "required_capabilities": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1
+    },
+    "preferred_capabilities": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "quality_priority": {
+      "enum": [
+        "HIGHEST",
+        "HIGH",
+        "SECONDARY",
+        "LOW"
+      ]
+    },
+    "cost_priority": {
+      "enum": [
+        "HIGHEST",
+        "HIGH",
+        "SECONDARY",
+        "LOW"
+      ]
+    },
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "distinct_provider_from": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Opaque provider identifier. MUST NOT be constrained to an enum; new providers must validate without a schema change."
+        },
+        "avoid_providers": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Opaque provider identifier. MUST NOT be constrained to an enum; new providers must validate without a schema change."
+          }
+        },
+        "user_pinned_model": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Opaque model identifier. MUST NOT be constrained to an enum."
+        },
+        "user_pinned_provider": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Opaque provider identifier. MUST NOT be constrained to an enum; new providers must validate without a schema change."
+        },
+        "max_cost": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      }
+    },
+    "context_size_hint": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "deadline": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    }
+  }
+}

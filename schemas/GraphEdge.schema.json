@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/GraphEdge.schema.json",
+  "title": "Graph Edge \u2014 precedence or control relation",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-ORCHESTRATION",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "type": "object",
+  "additionalProperties": false,
+  "description": "Precedence edges form the scheduling DAG and MUST be acyclic. Control edges express outcome transitions and are NOT scheduling prerequisites. V1.3.1: edge classes are mutually exclusive \u2014 a PRECEDENCE edge forbids control_kind and a CONTROL edge forbids precedence_kind, enforced by conditional validation.",
+  "required": [
+    "edge_id",
+    "graph_id",
+    "from_node",
+    "to_node",
+    "edge_class"
+  ],
+  "properties": {
+    "edge_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "edge"
+    },
+    "graph_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "graph"
+    },
+    "from_node": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "source node"
+    },
+    "to_node": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "target node"
+    },
+    "edge_class": {
+      "enum": [
+        "PRECEDENCE",
+        "CONTROL"
+      ]
+    },
+    "precedence_kind": {
+      "enum": [
+        "REQUIRES_ACCEPTED",
+        "REQUIRES_INTEGRATED",
+        "REQUIRES_INTERFACE"
+      ]
+    },
+    "control_kind": {
+      "enum": [
+        "ON_PASS",
+        "ON_REJECT",
+        "ON_FAILURE",
+        "ON_BLOCKED",
+        "ESCALATE",
+        "EXPANDS_INTO"
+      ]
+    },
+    "note": {
+      "type": "string"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "edge_class": {
+            "const": "PRECEDENCE"
+          }
+        },
+        "required": [
+          "edge_class"
+        ]
+      },
+      "then": {
+        "required": [
+          "precedence_kind"
+        ],
+        "not": {
+          "required": [
+            "control_kind"
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "edge_class": {
+            "const": "CONTROL"
+          }
+        },
+        "required": [
+          "edge_class"
+        ]
+      },
+      "then": {
+        "required": [
+          "control_kind"
+        ],
+        "not": {
+          "required": [
+            "precedence_kind"
+          ]
+        }
+      }
+    }
+  ]
+}

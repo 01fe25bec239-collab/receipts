@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/ProductEntitlement.schema.json",
+  "title": "Product Entitlement \u2014 signed proof of OUR product capabilities",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-STATE-CONTEXT",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "type": "object",
+  "additionalProperties": false,
+  "description": "Concerns only this product's licensing. Carries no provider credential, no repository content, no prompts, no graph data.",
+  "required": [
+    "subject_id",
+    "tier_id",
+    "capabilities",
+    "issued_at",
+    "expires_at",
+    "entitlement_version",
+    "key_id",
+    "signature"
+  ],
+  "properties": {
+    "subject_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "opaque product account/licence subject"
+    },
+    "tier_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Extensible tier identifier. Well-known: free, pro. NOT an enum \u2014 future tiers must not require a schema change."
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$",
+        "description": "Namespaced capability id, e.g. graph.core or orchestration.multi_runtime. Extensible string, never an enum."
+      },
+      "minItems": 0
+    },
+    "issued_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "offline_grace_until": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "entitlement_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "key_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "signature": {
+      "type": "string",
+      "minLength": 1
+    },
+    "device_binding": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Optional opaque binding. Never a hardware serial in cleartext."
+    }
+  }
+}

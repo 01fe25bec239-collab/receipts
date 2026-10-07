@@ -1,0 +1,357 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/ReviewCapsule.schema.json",
+  "title": "Review Capsule \u2014 everything a fresh RUNTIME-A4 needs to audit one exact commit",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-REVIEW-INTEGRATION",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "type": "object",
+  "required": [
+    "review_id",
+    "task_id",
+    "attempt_id",
+    "baseline_sha",
+    "implementation_sha",
+    "objective",
+    "acceptance_criteria",
+    "diff",
+    "allowed_write_paths",
+    "review_scope",
+    "severity_policy",
+    "reproduction_required",
+    "context_epoch"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "review_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "review id"
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "task"
+    },
+    "attempt_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "attempt"
+    },
+    "baseline_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "implementation_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "objective": {
+      "type": "string",
+      "minLength": 1
+    },
+    "acceptance_criteria": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "description",
+          "kind"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "criterion id"
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1
+          },
+          "kind": {
+            "enum": [
+              "DETERMINISTIC",
+              "SEMANTIC"
+            ]
+          },
+          "check_command": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "rationale": {
+            "type": "string"
+          }
+        }
+      },
+      "minItems": 1
+    },
+    "non_goals": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "architecture_refs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ref_type",
+          "target"
+        ],
+        "properties": {
+          "ref_type": {
+            "enum": [
+              "REPO_PATH",
+              "STATE_QUERY",
+              "ARTIFACT_ID",
+              "URL"
+            ]
+          },
+          "target": {
+            "type": "string",
+            "minLength": 1
+          },
+          "digest": {
+            "type": "string"
+          },
+          "section": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "contract_refs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ref_type",
+          "target"
+        ],
+        "properties": {
+          "ref_type": {
+            "enum": [
+              "REPO_PATH",
+              "STATE_QUERY",
+              "ARTIFACT_ID",
+              "URL"
+            ]
+          },
+          "target": {
+            "type": "string",
+            "minLength": 1
+          },
+          "digest": {
+            "type": "string"
+          },
+          "section": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "diff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ref_type",
+        "target"
+      ],
+      "properties": {
+        "ref_type": {
+          "enum": [
+            "REPO_PATH",
+            "STATE_QUERY",
+            "ARTIFACT_ID",
+            "URL"
+          ]
+        },
+        "target": {
+          "type": "string",
+          "minLength": 1
+        },
+        "digest": {
+          "type": "string"
+        },
+        "section": {
+          "type": "string"
+        }
+      }
+    },
+    "allowed_write_paths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "source",
+          "command",
+          "exit_code",
+          "code_sha"
+        ],
+        "properties": {
+          "source": {
+            "enum": [
+              "WORKER_EXECUTION",
+              "BROKER_EXECUTION",
+              "REVIEW_EXECUTION",
+              "GIT_PROVENANCE"
+            ]
+          },
+          "command": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "description": "Explicit argv. Never a shell string."
+          },
+          "exit_code": {
+            "type": "integer"
+          },
+          "code_sha": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$"
+          },
+          "timed_out": {
+            "type": "boolean"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "finished_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "output_ref": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "ref_type",
+              "target"
+            ],
+            "properties": {
+              "ref_type": {
+                "enum": [
+                  "REPO_PATH",
+                  "STATE_QUERY",
+                  "ARTIFACT_ID",
+                  "URL"
+                ]
+              },
+              "target": {
+                "type": "string",
+                "minLength": 1
+              },
+              "digest": {
+                "type": "string"
+              },
+              "section": {
+                "type": "string"
+              }
+            }
+          },
+          "result": {
+            "enum": [
+              "PASS",
+              "FAIL",
+              "ERROR",
+              "SKIPPED",
+              "UNKNOWN"
+            ]
+          }
+        }
+      }
+    },
+    "security_requirements": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "review_scope": {
+      "enum": [
+        "FULL",
+        "SECURITY",
+        "REGRESSION",
+        "REPAIR_VERIFICATION"
+      ]
+    },
+    "severity_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "blocking_categories"
+      ],
+      "properties": {
+        "blocking_categories": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "nonblocking_categories": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "reproduction_required": {
+      "type": "boolean"
+    },
+    "structured_output_schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ref_type",
+        "target"
+      ],
+      "properties": {
+        "ref_type": {
+          "enum": [
+            "REPO_PATH",
+            "STATE_QUERY",
+            "ARTIFACT_ID",
+            "URL"
+          ]
+        },
+        "target": {
+          "type": "string",
+          "minLength": 1
+        },
+        "digest": {
+          "type": "string"
+        },
+        "section": {
+          "type": "string"
+        }
+      }
+    },
+    "context_epoch": {
+      "type": "integer",
+      "minimum": 0
+    }
+  }
+}

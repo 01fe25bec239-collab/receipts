@@ -1,0 +1,10 @@
+{
+  "decision_id": "fa-1",
+  "capability_id": "review.independent_a4",
+  "outcome": "LOCKED_REQUIRES_PRO",
+  "entitlement_state": "FREE",
+  "activation_state": "NEVER_ACTIVATED",
+  "dispatch_permitted": false,
+  "reason": "Capability requires tier pro; installation is FREE.",
+  "decided_at": "2026-08-15T00:00:00Z"
+}

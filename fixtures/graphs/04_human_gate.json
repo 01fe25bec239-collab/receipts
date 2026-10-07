@@ -1,0 +1,61 @@
+{
+  "graph_id": "G-HUM",
+  "graph_version": 1,
+  "project_id": "P1",
+  "goal_id": "GOAL-1",
+  "nodes": [
+    {
+      "node_id": "t",
+      "graph_id": "G-HUM",
+      "kind": "TASK",
+      "state": "PLANNED"
+    },
+    {
+      "node_id": "sec",
+      "graph_id": "G-HUM",
+      "kind": "REVIEW",
+      "state": "PLANNED"
+    },
+    {
+      "node_id": "h",
+      "graph_id": "G-HUM",
+      "kind": "HUMAN_GATE",
+      "state": "HUMAN_REQUIRED"
+    },
+    {
+      "node_id": "int",
+      "graph_id": "G-HUM",
+      "kind": "INTEGRATION",
+      "state": "PLANNED"
+    }
+  ],
+  "edges": [
+    {
+      "edge_id": "e1",
+      "graph_id": "G-HUM",
+      "from_node": "t",
+      "to_node": "sec",
+      "edge_class": "PRECEDENCE",
+      "precedence_kind": "REQUIRES_ACCEPTED"
+    },
+    {
+      "edge_id": "e2",
+      "graph_id": "G-HUM",
+      "from_node": "sec",
+      "to_node": "h",
+      "edge_class": "PRECEDENCE",
+      "precedence_kind": "REQUIRES_ACCEPTED"
+    },
+    {
+      "edge_id": "e3",
+      "graph_id": "G-HUM",
+      "from_node": "h",
+      "to_node": "int",
+      "edge_class": "PRECEDENCE",
+      "precedence_kind": "REQUIRES_ACCEPTED"
+    }
+  ],
+  "policy_id": "free.single_runtime",
+  "created_at": "2026-08-15T00:00:00Z",
+  "context_epoch": 1
+}

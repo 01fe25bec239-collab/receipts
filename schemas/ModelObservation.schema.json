@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/ModelObservation.schema.json",
+  "title": "Model Observation \u2014 one local calibration datum",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-MODEL-ROUTING",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "type": "object",
+  "required": [
+    "observation_id",
+    "provider_id",
+    "model_id",
+    "runtime_id",
+    "task_class",
+    "outcome",
+    "observed_at"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "observation_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "observation"
+    },
+    "provider_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque provider identifier. MUST NOT be constrained to an enum; new providers must validate without a schema change."
+    },
+    "model_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque model identifier. MUST NOT be constrained to an enum."
+    },
+    "runtime_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque agent-runtime identifier. MUST NOT be constrained to an enum."
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "task"
+    },
+    "task_class": {
+      "type": "string"
+    },
+    "outcome": {
+      "enum": [
+        "ACCEPTED_FIRST_PASS",
+        "ACCEPTED_AFTER_REPAIR",
+        "REJECTED",
+        "TIMEOUT",
+        "RUNTIME_FAILURE",
+        "CANCELLED",
+        "USER_OVERRIDE"
+      ]
+    },
+    "repair_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "cost": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "tokens": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "latency_seconds": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "cost_to_accepted_result": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "difficulty_hint": {
+      "enum": [
+        "LOW",
+        "MEDIUM",
+        "HIGH",
+        "UNKNOWN"
+      ]
+    },
+    "excluded_from_calibration": {
+      "type": "boolean",
+      "description": "True for outcomes caused by spec ambiguity or provider outage."
+    },
+    "observed_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}
