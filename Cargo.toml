@@ -6,6 +6,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.97.1"
 publish = false
+license = "Apache-2.0"
 
 # Product source for this task lives under src/state/** only; the lib target
 # is pointed there so no crate topology is defined for other managers.

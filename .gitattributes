@@ -1,0 +1,2 @@
+# Preserve upstream license bytes, including original line endings/whitespace.
+licenses/third-party/*.txt -text whitespace=-blank-at-eol,-blank-at-eof

@@ -2,6 +2,8 @@
 
 Receipts is designed as a host-neutral control plane for coding work. Its intended flow turns a developer goal into a durable `ExecutionGraph` that tracks work, results, reviews, and the exact code state each result applies to. Claude Code and Codex are the intended first-class hosts.
 
+**Receipts Free and Receipts Pro are both open source under the Apache License, Version 2.0 (`Apache-2.0`).** Both editions' existing source implementations and shared foundations are included. The project is fully open source; Free and Pro describe intended execution modes, not separate source-license terms. See [LICENSE](LICENSE), [licensing scope](LICENSING.md), and [third-party notices](THIRD_PARTY_NOTICES.md).
+
 ## How it is designed to work
 
 The host is where a developer interacts with Receipts. A shared local core owns the graph and state, so the plan does not depend on one chat session or host. The execution policy decides how ready graph nodes are dispatched.
@@ -61,6 +63,8 @@ The repository contains Rust foundations for state, graph contracts, workspace e
 
 Users bring their own permitted model/provider access. Receipts is intended to provide coordination software; it does not sell or proxy model credits.
 
+External AI provider subscriptions, API access, and usage remain subject to the providers' terms and charges. The Apache license covers Receipts software; it does not grant provider access.
+
 ## Repository map
 
 | Path | Contents |
@@ -77,7 +81,14 @@ Users bring their own permitted model/provider access. Receipts is intended to p
 
 ## Development
 
-The repository pins Rust **1.97.1** in `rust-toolchain.toml`. From the repository root, use the same checks as [repository CI](.github/workflows/ci.yml):
+The repository pins Rust **1.97.1** in `rust-toolchain.toml`. Development requires Git, rustup, and a native C compiler for bundled SQLite. Install the pinned toolchain and build the workspace from the repository root:
+
+```sh
+rustup toolchain install 1.97.1 --component rustfmt --component clippy
+cargo build --workspace --locked
+```
+
+Use the same checks as [repository CI](.github/workflows/ci.yml):
 
 ```sh
 cargo fmt --all -- --check
@@ -87,3 +98,13 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ```
 
 There is currently no supported CLI, release package, or deployment procedure to run Receipts as a finished product. The [architecture documents](build-control/orchestrator-architecture/NEW_SYSTEM_ARCHITECTURE.md) describe the target system; they should not be treated as setup instructions.
+
+## Contributing and security
+
+Report ordinary bugs or feature requests through [GitHub issues](https://github.com/01fe25bec239-collab/receipts/issues), and propose changes through pull requests. See [CONTRIBUTING.md](CONTRIBUTING.md) for development and review expectations. Report vulnerabilities privately using the route in [SECURITY.md](SECURITY.md).
+
+## License
+
+Original Receipts code, documentation, and configuration for both Free and Pro are licensed under [Apache 2.0](LICENSE). Third-party dependencies and their generated or compiled artifacts retain their upstream licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+[LICENSING.md](LICENSING.md) records the current source-licensing policy, which supersedes earlier open-core/proprietary-Pro guidance in the preserved architecture documents. The architecture, runtime behavior, and development history remain intact.
