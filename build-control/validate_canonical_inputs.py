@@ -8,21 +8,19 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
-import socket
-import ssl  # Load SSLSocket before socket.socket becomes the offline guard.
 import sys
 from collections import Counter
 
 sys.dont_write_bytecode = True
 
 
-def deny_network(*args, **kwargs):
-    raise RuntimeError("canonical validation is offline")
+def deny_network(event, args):
+    if event.startswith("socket."):
+        raise RuntimeError("canonical validation is offline")
 
 
-socket.socket = deny_network
-socket.create_connection = deny_network
-socket.getaddrinfo = deny_network
+# Keep socket classes intact for SSL imports while denying actual socket operations.
+sys.addaudithook(deny_network)
 
 root = Path(__file__).resolve().parents[1]
 source = root / "build-control/orchestrator-architecture"
