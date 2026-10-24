@@ -9,6 +9,7 @@ import importlib.util
 import json
 from pathlib import Path
 import socket
+import ssl  # Load SSLSocket before socket.socket becomes the offline guard.
 import sys
 from collections import Counter
 
