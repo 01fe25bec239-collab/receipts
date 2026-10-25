@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/ExecutionGraph.schema.json",
+  "title": "Execution Graph \u2014 the authoritative, durable, versioned plan",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-ORCHESTRATION",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "type": "object",
+  "additionalProperties": false,
+  "description": "First-class runtime artifact compiled from a goal or spec. Same graph model in FREE and PRO; only the ExecutionPolicy differs.",
+  "required": [
+    "graph_id",
+    "graph_version",
+    "project_id",
+    "goal_id",
+    "nodes",
+    "edges",
+    "created_at",
+    "policy_id"
+  ],
+  "properties": {
+    "graph_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "stable graph identity across versions"
+    },
+    "graph_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "parent_version": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1
+    },
+    "project_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "project"
+    },
+    "goal_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "goal"
+    },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "$ref": "https://receipts.invalid/orchestrator/schemas/GraphNode.schema.json"
+      },
+      "minItems": 1
+    },
+    "edges": {
+      "type": "array",
+      "items": {
+        "$ref": "https://receipts.invalid/orchestrator/schemas/GraphEdge.schema.json"
+      }
+    },
+    "policy_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "GraphExecutionPolicy in force"
+    },
+    "resulting_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "compiled_from": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Spec refs the compiler read."
+    },
+    "context_epoch": {
+      "type": "integer",
+      "minimum": 0
+    }
+  }
+}

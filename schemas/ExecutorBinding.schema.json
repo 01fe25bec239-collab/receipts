@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/ExecutorBinding.schema.json",
+  "title": "Executor Binding \u2014 temporary association of a durable role to a model/session",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-STATE-CONTEXT",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "type": "object",
+  "required": [
+    "binding_id",
+    "role_id",
+    "provider_id",
+    "model_id",
+    "runtime_id",
+    "bound_at",
+    "lease_expires_at"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "binding_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "binding"
+    },
+    "role_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "role"
+    },
+    "provider_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque provider identifier. MUST NOT be constrained to an enum; new providers must validate without a schema change."
+    },
+    "model_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque model identifier. MUST NOT be constrained to an enum."
+    },
+    "runtime_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque agent-runtime identifier. MUST NOT be constrained to an enum."
+    },
+    "session_ref": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "routing_decision_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "routing decision"
+    },
+    "bound_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "lease_expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "released_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "release_reason": {
+      "enum": [
+        "RATE_LIMITED",
+        "SESSION_EXHAUSTED",
+        "AUTH_REQUIRED",
+        "PROVIDER_DOWN",
+        "CRASH",
+        "HOST_SWITCH",
+        "USER_REQUEST",
+        "COMPLETED",
+        "LEASE_EXPIRED"
+      ]
+    },
+    "rehydration_completed": {
+      "type": "boolean",
+      "description": "MUST be true before a newly bound executor acts."
+    }
+  }
+}

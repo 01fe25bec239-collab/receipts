@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/ProviderPolicyEligibility.schema.json",
+  "title": "Provider Policy Eligibility \u2014 is this authenticated connection PERMITTED for this execution context",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-MODEL-ROUTING",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "type": "object",
+  "additionalProperties": false,
+  "description": "Technical authentication does not imply contractual permission. Routing defaults conservatively and never treats UNKNOWN as allowed.",
+  "required": [
+    "provider_id",
+    "runtime_id",
+    "credential_mode",
+    "technical_status",
+    "policy_status",
+    "verified_at",
+    "evidence_label"
+  ],
+  "properties": {
+    "provider_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Extensible. Never an enum."
+    },
+    "runtime_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Extensible. Never an enum."
+    },
+    "credential_mode": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Extensible. Well-known: HOST_NATIVE, PERSONAL_LOCAL_CLI, USER_API, ENTERPRISE_GATEWAY, CLOUD_PROVIDER."
+    },
+    "technical_status": {
+      "enum": [
+        "CONNECTED",
+        "AUTH_REQUIRED",
+        "EXPIRED",
+        "NOT_CONFIGURED",
+        "UNKNOWN"
+      ]
+    },
+    "policy_status": {
+      "enum": [
+        "VERIFIED_ALLOWED",
+        "VERIFIED_DISALLOWED",
+        "NEEDS_REVIEW",
+        "UNKNOWN"
+      ]
+    },
+    "allowed_execution_contexts": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Extensible. Well-known: HOST_NATIVE_INTERACTIVE, HOST_NATIVE_PLUGIN, LOCAL_EXTERNAL_WORKER, NONINTERACTIVE_CLI, CI_AUTOMATION, TEAM_SERVICE, CLOUD_SERVICE."
+    },
+    "verified_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "evidence_source": {
+      "type": "string",
+      "description": "URL or document reference for the policy determination."
+    },
+    "evidence_label": {
+      "enum": [
+        "VERIFIED_CURRENT_SELF_FETCHED",
+        "REVIEWER_SUPPLIED_CURRENT_PRIMARY_SOURCE",
+        "VERIFIED_HISTORICAL",
+        "INDEPENDENT_VERIFIED",
+        "USER_DECLARED",
+        "DESIGN_DECISION",
+        "ASSUMPTION",
+        "UNVERIFIED",
+        "POLICY_NEEDS_REVIEW"
+      ],
+      "description": "GENERATED from evidence_labels in evidence/SOURCE_CLAIM_REGISTRY.json. Preserves the exact authoritative label; provenance is never collapsed."
+    },
+    "terms_version_or_digest": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "reason": {
+      "type": "string"
+    },
+    "reverification_deadline": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "source_claim_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Exact registry claim id (e.g. C-10). Ties this record to the authoritative source rather than restating it."
+    }
+  },
+  "x-evidence-label-source": "evidence/SOURCE_CLAIM_REGISTRY.json#/evidence_labels"
+}

@@ -1,0 +1,38 @@
+{
+  "decision_id": "da-3",
+  "node_id": "n-a3",
+  "graph_id": "G-PRO",
+  "capability_id": "orchestration.multi_runtime",
+  "outcome": "ALLOW",
+  "failing_axis": "NONE",
+  "denial_reason": "NONE",
+  "axis_results": {
+    "entitlement": {
+      "result": "PASS",
+      "feature_admission_decision_id": "fa-ok"
+    },
+    "provider_auth": {
+      "result": "PASS",
+      "provider_id": "openai",
+      "technical_status": "CONNECTED"
+    },
+    "provider_policy": {
+      "result": "PASS",
+      "provider_policy_eligibility_id": "ppe-3",
+      "policy_status": "VERIFIED_ALLOWED",
+      "execution_context": "PROGRAMMATIC_WORKER"
+    },
+    "provider_availability": {
+      "result": "PASS"
+    },
+    "safety": {
+      "result": "PASS"
+    },
+    "quality_floor": {
+      "result": "PASS"
+    }
+  },
+  "selected_provider": "openai",
+  "selected_runtime": "codex-cli",
+  "decided_at": "2026-08-15T00:00:00Z"
+}

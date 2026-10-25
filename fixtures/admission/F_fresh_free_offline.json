@@ -1,0 +1,10 @@
+{
+  "activation_state": "NEVER_ACTIVATED",
+  "subject_id": null,
+  "first_activated_at": null,
+  "last_known_tier_id": null,
+  "last_entitlement_seen_at": null,
+  "last_observed_server_time": null,
+  "logged_out_at": null,
+  "recorded_at": "2026-08-15T00:00:00Z"
+}

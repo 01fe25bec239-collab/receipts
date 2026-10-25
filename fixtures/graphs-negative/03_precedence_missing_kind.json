@@ -1,0 +1,7 @@
+{
+  "edge_id": "e-bad-3",
+  "graph_id": "G-NEG",
+  "from_node": "a",
+  "to_node": "b",
+  "edge_class": "PRECEDENCE"
+}

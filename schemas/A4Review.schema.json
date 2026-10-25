@@ -1,0 +1,455 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/A4Review.schema.json",
+  "title": "A4 Review \u2014 structured independent verdict bound to an exact implementation SHA",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-REVIEW-INTEGRATION",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "type": "object",
+  "required": [
+    "review_id",
+    "task_id",
+    "reviewed_sha",
+    "verdict",
+    "independence_attested",
+    "blocking_findings",
+    "nonblocking_findings",
+    "dimensions"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "review_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "review"
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "task"
+    },
+    "reviewed_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "reviewer": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Opaque provider identifier. MUST NOT be constrained to an enum; new providers must validate without a schema change."
+        },
+        "model_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Opaque model identifier. MUST NOT be constrained to an enum."
+        },
+        "runtime_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Opaque agent-runtime identifier. MUST NOT be constrained to an enum."
+        },
+        "session_ref": {
+          "type": "string"
+        }
+      }
+    },
+    "reviewed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "independence_attested": {
+      "type": "boolean",
+      "description": "True asserts the reviewer session is not the implementing session. False voids the review."
+    },
+    "verdict": {
+      "enum": [
+        "PASS",
+        "PASS_WITH_NONBLOCKING_FINDINGS",
+        "REJECT"
+      ]
+    },
+    "blocking_findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "finding_id",
+          "severity",
+          "category",
+          "description",
+          "blocking"
+        ],
+        "properties": {
+          "finding_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "finding id"
+          },
+          "severity": {
+            "enum": [
+              "INFO",
+              "LOW",
+              "MEDIUM",
+              "HIGH",
+              "CRITICAL"
+            ]
+          },
+          "category": {
+            "enum": [
+              "ARCHITECTURE_VIOLATION",
+              "CONTRACT_VIOLATION",
+              "SECURITY_BOUNDARY_VIOLATION",
+              "WRITE_SCOPE_VIOLATION",
+              "UNDISCLOSED_CHANGE",
+              "MISSING_REQUIRED_NEGATIVE_TEST",
+              "UNREPRODUCIBLE_EVIDENCE",
+              "OVERSTATED_LABEL",
+              "TEST_WEAKENED_OR_DELETED",
+              "ACCEPTANCE_CRITERION_UNMET",
+              "CORRECTNESS",
+              "ERROR_HANDLING",
+              "REGRESSION_RISK",
+              "STYLE",
+              "NAMING",
+              "MINOR_PERFORMANCE",
+              "DOC_GAP"
+            ]
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1
+          },
+          "blocking": {
+            "type": "boolean"
+          },
+          "path": {
+            "type": "string"
+          },
+          "line": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "evidence_ref": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "ref_type",
+              "target"
+            ],
+            "properties": {
+              "ref_type": {
+                "enum": [
+                  "REPO_PATH",
+                  "STATE_QUERY",
+                  "ARTIFACT_ID",
+                  "URL"
+                ]
+              },
+              "target": {
+                "type": "string",
+                "minLength": 1
+              },
+              "digest": {
+                "type": "string"
+              },
+              "section": {
+                "type": "string"
+              }
+            }
+          },
+          "confidence": {
+            "enum": [
+              "HIGH",
+              "MEDIUM",
+              "LOW"
+            ]
+          },
+          "source": {
+            "enum": [
+              "LLM_REVIEW",
+              "STATIC_ANALYSIS",
+              "DEPENDENCY_SCAN",
+              "TEST",
+              "CONFIG_CHECK"
+            ]
+          }
+        }
+      }
+    },
+    "nonblocking_findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "finding_id",
+          "severity",
+          "category",
+          "description",
+          "blocking"
+        ],
+        "properties": {
+          "finding_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "finding id"
+          },
+          "severity": {
+            "enum": [
+              "INFO",
+              "LOW",
+              "MEDIUM",
+              "HIGH",
+              "CRITICAL"
+            ]
+          },
+          "category": {
+            "enum": [
+              "ARCHITECTURE_VIOLATION",
+              "CONTRACT_VIOLATION",
+              "SECURITY_BOUNDARY_VIOLATION",
+              "WRITE_SCOPE_VIOLATION",
+              "UNDISCLOSED_CHANGE",
+              "MISSING_REQUIRED_NEGATIVE_TEST",
+              "UNREPRODUCIBLE_EVIDENCE",
+              "OVERSTATED_LABEL",
+              "TEST_WEAKENED_OR_DELETED",
+              "ACCEPTANCE_CRITERION_UNMET",
+              "CORRECTNESS",
+              "ERROR_HANDLING",
+              "REGRESSION_RISK",
+              "STYLE",
+              "NAMING",
+              "MINOR_PERFORMANCE",
+              "DOC_GAP"
+            ]
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1
+          },
+          "blocking": {
+            "type": "boolean"
+          },
+          "path": {
+            "type": "string"
+          },
+          "line": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "evidence_ref": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "ref_type",
+              "target"
+            ],
+            "properties": {
+              "ref_type": {
+                "enum": [
+                  "REPO_PATH",
+                  "STATE_QUERY",
+                  "ARTIFACT_ID",
+                  "URL"
+                ]
+              },
+              "target": {
+                "type": "string",
+                "minLength": 1
+              },
+              "digest": {
+                "type": "string"
+              },
+              "section": {
+                "type": "string"
+              }
+            }
+          },
+          "confidence": {
+            "enum": [
+              "HIGH",
+              "MEDIUM",
+              "LOW"
+            ]
+          },
+          "source": {
+            "enum": [
+              "LLM_REVIEW",
+              "STATIC_ANALYSIS",
+              "DEPENDENCY_SCAN",
+              "TEST",
+              "CONFIG_CHECK"
+            ]
+          }
+        }
+      }
+    },
+    "dimensions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "dimension",
+          "assessment"
+        ],
+        "properties": {
+          "dimension": {
+            "enum": [
+              "SCOPE_COMPLIANCE",
+              "CONTRACT_COMPLIANCE",
+              "ARCHITECTURE_COMPLIANCE",
+              "CORRECTNESS",
+              "ERROR_HANDLING",
+              "SECURITY_TRUST_BOUNDARIES",
+              "TEST_ADEQUACY",
+              "NEGATIVE_TESTS",
+              "REGRESSION_RISK",
+              "WRITE_SCOPE",
+              "UNDISCLOSED_CHANGES",
+              "EVIDENCE_ACCURACY"
+            ]
+          },
+          "assessment": {
+            "enum": [
+              "SATISFIED",
+              "NOT_SATISFIED",
+              "NOT_APPLICABLE"
+            ]
+          },
+          "note": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "reproduction": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "performed": {
+          "type": "boolean"
+        },
+        "checks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "source",
+              "command",
+              "exit_code",
+              "code_sha"
+            ],
+            "properties": {
+              "source": {
+                "enum": [
+                  "WORKER_EXECUTION",
+                  "BROKER_EXECUTION",
+                  "REVIEW_EXECUTION",
+                  "GIT_PROVENANCE"
+                ]
+              },
+              "command": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "minItems": 1,
+                "description": "Explicit argv. Never a shell string."
+              },
+              "exit_code": {
+                "type": "integer"
+              },
+              "code_sha": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{40}$"
+              },
+              "timed_out": {
+                "type": "boolean"
+              },
+              "started_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "finished_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "output_ref": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "ref_type",
+                  "target"
+                ],
+                "properties": {
+                  "ref_type": {
+                    "enum": [
+                      "REPO_PATH",
+                      "STATE_QUERY",
+                      "ARTIFACT_ID",
+                      "URL"
+                    ]
+                  },
+                  "target": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "digest": {
+                    "type": "string"
+                  },
+                  "section": {
+                    "type": "string"
+                  }
+                }
+              },
+              "result": {
+                "enum": [
+                  "PASS",
+                  "FAIL",
+                  "ERROR",
+                  "SKIPPED",
+                  "UNKNOWN"
+                ]
+              }
+            }
+          }
+        },
+        "limitation": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "unauthorized_file_changes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "recommended_action": {
+      "enum": [
+        "ACCEPT",
+        "ACCEPT_WITH_FINDINGS_LOGGED",
+        "REPAIR_REQUIRED",
+        "ESCALATE_TO_A1"
+      ]
+    },
+    "rationale": {
+      "type": "string"
+    }
+  }
+}

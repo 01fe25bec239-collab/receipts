@@ -1,0 +1,10 @@
+{
+  "decision_id": "fa-2",
+  "capability_id": "orchestration.multi_runtime",
+  "outcome": "ENTITLEMENT_UNKNOWN",
+  "entitlement_state": "ENTITLEMENT_UNKNOWN",
+  "activation_state": "ACTIVATED_KNOWN",
+  "dispatch_permitted": false,
+  "reason": "Previously activated; entitlement missing and licensing service unreachable. Not inferred as FREE.",
+  "decided_at": "2026-08-15T00:00:00Z"
+}

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/HostCapabilityReport.schema.json",
+  "title": "Host Capability Report",
+  "schema_version": "0.2.0-draft",
+  "x-owner": "BUILD-A2-HOST-INTEGRATION",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["host_id", "probed_at", "probe_status", "validity_fingerprint", "last_verified_at", "stale_reason", "plugin_supported", "plugin_installed", "hooks_supported", "hooks_configured", "hook_trust_required", "hooks_trusted", "hooks_enabled", "hooks_allowed_by_admin_policy", "hook_coverage_class", "required_hook_coverage_satisfied", "selected_mode"],
+  "properties": {
+    "host_id":{"type":"string","minLength":1}, "host_version":{"type":["string","null"]}, "probed_at":{"type":"string","format":"date-time"}, "last_verified_at":{"type":"string","format":"date-time"},
+    "probe_status":{"enum":["COMPLETE","PARTIAL","FAILED"]}, "validity_fingerprint":{"type":["string","null"],"minLength":1}, "hook_definition_digest":{"type":["string","null"]}, "relevant_config_digest":{"type":["string","null"]}, "stale_reason":{"enum":["NONE","VALIDITY_FINGERPRINT_CHANGED","VALIDITY_FINGERPRINT_UNPROVEN","PROBE_FAILED"]},
+    "plugin_supported":{"type":["boolean","null"]}, "plugin_installed":{"type":["boolean","null"]}, "manifest_path":{"type":["string","null"]}, "supports_skills":{"type":["boolean","null"]}, "supports_commands":{"type":["boolean","null"]}, "supports_subagents":{"type":["boolean","null"]}, "supports_mcp":{"type":["boolean","null"]},
+    "hooks_supported":{"type":["boolean","null"]}, "hooks_configured":{"type":["boolean","null"]}, "hook_trust_required":{"type":["boolean","null"]}, "hooks_trusted":{"type":["boolean","null"]}, "hooks_enabled":{"type":["boolean","null"]}, "hooks_allowed_by_admin_policy":{"type":["boolean","null"]},
+    "hook_events":{"type":"array","items":{"type":"string"}}, "blocking_hook_events":{"type":"array","items":{"type":"string"}}, "hook_coverage_class":{"enum":["FULL","PARTIAL","NONE","UNKNOWN"]}, "required_hook_coverage_satisfied":{"type":["boolean","null"]},
+    "selected_mode":{"enum":["EMBEDDED","HYBRID","SUPERVISED"]}, "mode_override":{"type":["object","null"],"additionalProperties":false,"required":["source","reason"],"properties":{"source":{"enum":["USER","ADMIN","DEBUG"]},"reason":{"type":"string","minLength":1}}},
+    "inactive_reason":{"enum":["NONE","PLUGIN_NOT_INSTALLED","HOOKS_UNSUPPORTED","HOOKS_NOT_CONFIGURED","HOOKS_UNTRUSTED","HOOKS_DISABLED","HOOKS_EXCLUDED_BY_ADMIN_POLICY","INSUFFICIENT_COVERAGE","MODE_OVERRIDE","UNKNOWN"]},
+    "plugin_data_path":{"type":["string","null"]}, "sandbox_modes":{"type":"array","items":{"type":"string"}}, "evidence_label":{"enum":["VERIFIED_CURRENT_SELF_FETCHED","REVIEWER_SUPPLIED_CURRENT_PRIMARY_SOURCE","VERIFIED_HISTORICAL","INDEPENDENT_VERIFIED","USER_DECLARED","DESIGN_DECISION","ASSUMPTION","UNVERIFIED","POLICY_NEEDS_REVIEW"]}, "source_claim_id":{"type":["string","null"]}
+  },
+  "allOf": [
+    {"if":{"properties":{"probe_status":{"const":"COMPLETE"},"plugin_installed":{"const":true}},"required":["probe_status","plugin_installed"]},"then":{"properties":{"plugin_supported":{"const":true}},"required":["plugin_supported"]}},
+    {"if":{"properties":{"probe_status":{"const":"COMPLETE"},"hooks_configured":{"const":true}},"required":["probe_status","hooks_configured"]},"then":{"properties":{"hooks_supported":{"const":true}},"required":["hooks_supported"]}},
+    {"if":{"properties":{"probe_status":{"const":"COMPLETE"},"hooks_enabled":{"const":true}},"required":["probe_status","hooks_enabled"]},"then":{"properties":{"hooks_supported":{"const":true}},"required":["hooks_supported"]}},
+    {"if":{"properties":{"probe_status":{"const":"COMPLETE"},"hook_trust_required":{"const":true}},"required":["probe_status","hook_trust_required"]},"then":{"properties":{"hooks_trusted":{"type":"boolean"}},"required":["hooks_trusted"]}}
+  ]
+}

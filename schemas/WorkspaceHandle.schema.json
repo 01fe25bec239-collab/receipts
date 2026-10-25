@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://receipts.invalid/orchestrator/schemas/WorkspaceHandle.schema.json",
+  "title": "Workspace Handle \u2014 an isolated worktree, never a security sandbox",
+  "schema_version": "0.1.0-draft",
+  "x-owner": "BUILD-A2-WORKSPACE-EXECUTION",
+  "x-status": "ARCHITECTURE_CANDIDATE_NOT_FROZEN",
+  "type": "object",
+  "required": [
+    "workspace_id",
+    "branch",
+    "worktree_path",
+    "base_sha",
+    "state"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "workspace_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "workspace"
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "task"
+    },
+    "branch": {
+      "type": "string",
+      "minLength": 1
+    },
+    "worktree_path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "base_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "head_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "state": {
+      "enum": [
+        "PROVISIONED",
+        "ACTIVE",
+        "CHECKPOINTED",
+        "ORPHANED",
+        "RECOVERED",
+        "TORN_DOWN"
+      ]
+    },
+    "isolation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "WORKSPACE_ISOLATION",
+          "description": "Git worktrees are workspace isolation, NOT security isolation."
+        },
+        "sandbox_mode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "network_access": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "remote_publish_policy": {
+      "enum": [
+        "LOCAL_ONLY",
+        "PUSH_ON_ACCEPT",
+        "PUSH_ALWAYS"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

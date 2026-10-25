@@ -1,0 +1,91 @@
+{
+  "graph_id": "G-PAR",
+  "graph_version": 1,
+  "project_id": "P1",
+  "goal_id": "GOAL-1",
+  "nodes": [
+    {
+      "node_id": "g",
+      "graph_id": "G-PAR",
+      "kind": "GOAL",
+      "state": "PLANNED"
+    },
+    {
+      "node_id": "a",
+      "graph_id": "G-PAR",
+      "kind": "TASK",
+      "state": "PLANNED"
+    },
+    {
+      "node_id": "b",
+      "graph_id": "G-PAR",
+      "kind": "TASK",
+      "state": "PLANNED"
+    },
+    {
+      "node_id": "c",
+      "graph_id": "G-PAR",
+      "kind": "TASK",
+      "state": "PLANNED"
+    },
+    {
+      "node_id": "j",
+      "graph_id": "G-PAR",
+      "kind": "INTEGRATION",
+      "state": "PLANNED"
+    }
+  ],
+  "edges": [
+    {
+      "edge_id": "e1",
+      "graph_id": "G-PAR",
+      "from_node": "g",
+      "to_node": "a",
+      "edge_class": "PRECEDENCE",
+      "precedence_kind": "REQUIRES_ACCEPTED"
+    },
+    {
+      "edge_id": "e2",
+      "graph_id": "G-PAR",
+      "from_node": "g",
+      "to_node": "b",
+      "edge_class": "PRECEDENCE",
+      "precedence_kind": "REQUIRES_ACCEPTED"
+    },
+    {
+      "edge_id": "e3",
+      "graph_id": "G-PAR",
+      "from_node": "g",
+      "to_node": "c",
+      "edge_class": "PRECEDENCE",
+      "precedence_kind": "REQUIRES_ACCEPTED"
+    },
+    {
+      "edge_id": "e4",
+      "graph_id": "G-PAR",
+      "from_node": "a",
+      "to_node": "j",
+      "edge_class": "PRECEDENCE",
+      "precedence_kind": "REQUIRES_ACCEPTED"
+    },
+    {
+      "edge_id": "e5",
+      "graph_id": "G-PAR",
+      "from_node": "b",
+      "to_node": "j",
+      "edge_class": "PRECEDENCE",
+      "precedence_kind": "REQUIRES_ACCEPTED"
+    },
+    {
+      "edge_id": "e6",
+      "graph_id": "G-PAR",
+      "from_node": "c",
+      "to_node": "j",
+      "edge_class": "PRECEDENCE",
+      "precedence_kind": "REQUIRES_ACCEPTED"
+    }
+  ],
+  "policy_id": "free.single_runtime",
+  "created_at": "2026-08-15T00:00:00Z",
+  "context_epoch": 1
+}
