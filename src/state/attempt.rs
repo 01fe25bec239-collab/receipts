@@ -351,6 +351,12 @@ fn decode(row: &rusqlite::Row<'_>) -> Result<AttemptRecord, StateError> {
             .map_err(|_| corrupt())?,
         ),
     };
+    if finish
+        .as_ref()
+        .is_some_and(|finish| finish.ended_at.cmp(&start.started_at) == Ordering::Less)
+    {
+        return Err(corrupt());
+    }
     Ok(AttemptRecord { start, finish })
 }
 

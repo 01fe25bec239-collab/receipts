@@ -254,6 +254,96 @@ fn finish_before_start_time_is_refused() {
 }
 
 #[test]
+fn persisted_finish_times_are_validated_by_both_read_apis() {
+    for ended_at in ["2026-10-25T09:59:59.999999999Z", T0, T1] {
+        let db = TempDb::new();
+        let mut repo = SqliteStateRepository::open(&db.0).unwrap();
+        repo.append_attempt_started(start(ID_A, "1")).unwrap();
+        repo.connection()
+            .execute(
+                "INSERT INTO attempt_finished(attempt_id,ended_at) VALUES (?1,?2)",
+                rusqlite::params![ID_A, ended_at],
+            )
+            .unwrap();
+        drop(repo);
+        let repo = SqliteStateRepository::open(&db.0).unwrap();
+        let found = repo.find_attempt(&aid(ID_A));
+        let listed = repo.list_attempts_for_node("project-a", GRAPH, NODE);
+        if ended_at < T0 {
+            assert_eq!(
+                attempt_error(found.unwrap_err()),
+                (Code::CorruptStore, None)
+            );
+            assert_eq!(
+                attempt_error(listed.unwrap_err()),
+                (Code::CorruptStore, None)
+            );
+        } else {
+            let found = found.unwrap().unwrap();
+            assert_eq!(found.ended_at().unwrap().as_str(), ended_at);
+            assert_eq!(listed.unwrap(), vec![found]);
+        }
+        assert_eq!(rows(&repo), (1, 1));
+    }
+}
+
+#[test]
+fn ordinary_open_refuses_missing_or_altered_attempt_immutability_triggers() {
+    use crate::error::{GraphFailureCode, GraphPhase};
+    for table in ["attempt_started", "attempt_finished"] {
+        for operation in ["update", "delete", "replace"] {
+            for altered in [false, true] {
+                let db = TempDb::new();
+                let mut repo = SqliteStateRepository::open(&db.0).unwrap();
+                repo.append_attempt_started(start(ID_A, "1")).unwrap();
+                repo.append_attempt_finished(finish(ID_A)).unwrap();
+                let before = list(&repo);
+                let trigger = format!("{table}_no_{operation}");
+                repo.connection()
+                    .execute_batch(&format!("DROP TRIGGER {trigger}"))
+                    .unwrap();
+                if altered {
+                    repo.connection()
+                        .execute_batch(&format!(
+                            "CREATE TRIGGER {trigger} BEFORE INSERT ON {table} BEGIN SELECT 1; END;"
+                        ))
+                        .unwrap();
+                }
+                drop(repo);
+                assert!(matches!(
+                    SqliteStateRepository::open(&db.0).unwrap_err(),
+                    StateError::GraphPersistence {
+                        phase: GraphPhase::Read,
+                        code: GraphFailureCode::CorruptStore,
+                        ..
+                    }
+                ));
+                // The failed ordinary open must not repair or rewrite the store.
+                let repo = SqliteStateRepository::open_with_migrations(
+                    &db.0,
+                    crate::migrations::registered(),
+                )
+                .unwrap();
+                assert_eq!(rows(&repo), (1, 1));
+                assert_eq!(repo.schema_version().unwrap(), 14);
+                repo.connection()
+                    .execute_batch(&format!("DROP TRIGGER IF EXISTS {trigger}"))
+                    .unwrap();
+                let original = crate::migrations::v0014_execution_records::SQL
+                    .split(";\n")
+                    .find(|sql| {
+                        sql.trim_start()
+                            .starts_with(&format!("CREATE TRIGGER {trigger} "))
+                    })
+                    .unwrap();
+                repo.connection().execute_batch(original).unwrap();
+                assert_eq!(list(&repo), before);
+            }
+        }
+    }
+}
+
+#[test]
 fn attempt_rows_cannot_be_updated_or_deleted_sql_trigger() {
     let db = TempDb::new();
     let mut repo = SqliteStateRepository::open(&db.0).unwrap();
@@ -261,27 +351,38 @@ fn attempt_rows_cannot_be_updated_or_deleted_sql_trigger() {
     repo.append_attempt_finished(finish(ID_A)).unwrap();
     let before = list(&repo);
     let sha = "c".repeat(40);
-    let statements = [
-        "UPDATE attempt_started SET workspace_id='x'".to_string(),
-        "DELETE FROM attempt_started".to_string(),
-        "UPDATE attempt_finished SET end_sha=NULL".to_string(),
-        "DELETE FROM attempt_finished".to_string(),
-        format!(
-            "INSERT OR REPLACE INTO attempt_started(attempt_id,project_id,graph_id,node_id,attempt_number,role,runtime_ref,workspace_id,start_sha,started_at) VALUES ('{ID_A}','p','g','n','1','RUNTIME_A4','r','w','{sha}','{T0}')"
-        ),
-        format!(
-            "INSERT OR REPLACE INTO attempt_started(attempt_id,project_id,graph_id,node_id,attempt_number,role,runtime_ref,workspace_id,start_sha,started_at) VALUES ('{ID_B}','project-a','{GRAPH}','{NODE}','1','RUNTIME_A4','r','w','{sha}','{T0}')"
-        ),
-        format!(
-            "INSERT OR REPLACE INTO attempt_finished(attempt_id,ended_at) VALUES ('{ID_A}','{T1}')"
-        ),
-    ];
-    for statement in &statements {
-        assert!(
-            repo.connection().execute(statement, []).is_err(),
-            "{statement}"
-        );
+    let assert_trigger = |error: rusqlite::Error| {
+        let rusqlite::Error::SqliteFailure(code, message) = error else {
+            panic!("expected a trigger constraint, got {error:?}");
+        };
+        assert_eq!(code.code, rusqlite::ErrorCode::ConstraintViolation);
+        assert_eq!(code.extended_code, rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER);
+        assert_eq!(message.as_deref(), Some("attempt rows are append-only"));
+        assert_eq!(rows(&repo), (1, 1));
+        assert_eq!(list(&repo), before);
+    };
+    for statement in [
+        "UPDATE attempt_started SET workspace_id='x'",
+        "DELETE FROM attempt_started",
+        "UPDATE attempt_finished SET end_sha=NULL",
+        "DELETE FROM attempt_finished",
+    ] {
+        assert_trigger(repo.connection().execute(statement, []).unwrap_err());
     }
+    for (id, project, graph, node) in [(ID_A, "p", "g", "n"), (ID_B, "project-a", GRAPH, NODE)] {
+        assert_trigger(repo.connection().execute(
+            "INSERT OR REPLACE INTO attempt_started(attempt_id,project_id,graph_id,node_id,attempt_number,role,runtime_ref,workspace_id,start_sha,started_at) VALUES (?1,?2,?3,?4,'1','RUNTIME_A4','r','w',?5,?6)",
+            rusqlite::params![id, project, graph, node, sha, T0],
+        ).unwrap_err());
+    }
+    assert_trigger(
+        repo.connection()
+            .execute(
+                "INSERT OR REPLACE INTO attempt_finished(attempt_id,ended_at) VALUES (?1,?2)",
+                rusqlite::params![ID_A, T1],
+            )
+            .unwrap_err(),
+    );
     assert_eq!(rows(&repo), (1, 1));
     assert_eq!(list(&repo), before);
 }

@@ -64,7 +64,9 @@ impl SqliteStateRepository {
     /// PRAGMA is applied and verified; any failure is returned as an
     /// explicit error.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StateError> {
-        Self::open_with_migrations(path, migrations::registered())
+        let repo = Self::open_with_migrations(path, migrations::registered())?;
+        graph_repository::verify_current(repo.connection(), GraphPhase::Read)?;
+        Ok(repo)
     }
 
     /// Explicitly upgrades an exact v11, v12 or v13 State database to v14.
