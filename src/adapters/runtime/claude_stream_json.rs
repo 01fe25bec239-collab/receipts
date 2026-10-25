@@ -1,4 +1,4 @@
-//! Open Claude stdout records, with no provider success or failure taxonomy.
+//! Open Claude stdout records and conservative provider-result interpretation.
 use std::{error::Error, fmt};
 
 use receipts_workspace_execution::execution::CapturedStream;
@@ -79,4 +79,181 @@ pub(crate) fn protocol(
         });
     }
     Ok(ClaudeStreamJson { records })
+}
+
+/// Provider evidence only; never process completion or Receipts acceptance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeProviderResult {
+    Success,
+    Error,
+    Unknown,
+}
+
+/// Only documented result subtypes are interpreted. Other fields remain raw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeResultSubtype {
+    Success,
+    ErrorDuringExecution,
+    ErrorMaxTurns,
+    ErrorMaxBudgetUsd,
+    ErrorMaxStructuredOutputRetries,
+    Unknown,
+}
+
+/// Main-loop token counts, not whole-tree usage, cost or quota.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeResultUsage {
+    Unknown,
+    Known {
+        input_tokens: u64,
+        output_tokens: u64,
+    },
+}
+
+/// Payload-free refusal to interpret; raw protocol records remain available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeResultError {
+    MissingResult,
+    MultipleResults,
+    InvalidResult,
+    InvalidUsage,
+}
+impl fmt::Display for ClaudeResultError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Claude result unavailable: {self:?}")
+    }
+}
+impl Error for ClaudeResultError {}
+
+/// Borrowed interpretation. Payload access is explicit; Debug is omitted.
+/// Session ID is opaque data and grants no resume, identity or consent authority.
+pub struct ClaudeResult<'a> {
+    record: &'a Value,
+    subtype: ClaudeResultSubtype,
+    is_error: bool,
+    usage: ClaudeResultUsage,
+}
+impl ClaudeResult<'_> {
+    pub fn subtype(&self) -> ClaudeResultSubtype {
+        self.subtype
+    }
+    pub fn is_error(&self) -> bool {
+        self.is_error
+    }
+    pub fn provider_result(&self) -> ClaudeProviderResult {
+        match self.subtype {
+            ClaudeResultSubtype::Unknown => ClaudeProviderResult::Unknown,
+            ClaudeResultSubtype::Success if !self.is_error => ClaudeProviderResult::Success,
+            _ => ClaudeProviderResult::Error,
+        }
+    }
+    pub fn usage(&self) -> ClaudeResultUsage {
+        self.usage
+    }
+    pub fn session_id(&self) -> Option<&str> {
+        self.record.get("session_id").and_then(Value::as_str)
+    }
+    /// Final text or API error text on the success subtype; never error diagnosis.
+    pub fn text(&self) -> Option<&str> {
+        (self.subtype == ClaudeResultSubtype::Success)
+            .then(|| self.record.get("result").and_then(Value::as_str))
+            .flatten()
+    }
+    /// Provider error strings, accessed as data without a FailureClass mapping.
+    pub fn errors(&self) -> Option<&[Value]> {
+        self.record
+            .get("errors")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+    }
+}
+
+impl ClaudeStreamJson<'_> {
+    /// Interpret exactly one result in the entire validated observation. Live
+    /// snapshots can contain a result before process completion. Trailing events
+    /// are allowed, but any second result (including unknown subtypes) is refused.
+    ///
+    /// Sources: <https://code.claude.com/docs/en/agent-sdk/typescript#sdkresultmessage>,
+    /// <https://code.claude.com/docs/en/agent-sdk/agent-loop#handle-the-result>.
+    /// The published @anthropic-ai/claude-agent-sdk 0.3.301 sdk.d.ts documents
+    /// subtype success + is_error true as API error text, not provider success.
+    pub fn result(&self) -> Result<ClaudeResult<'_>, ClaudeResultError> {
+        let mut results = self.records.iter().filter(|r| r.value["type"] == "result");
+        let record = &results
+            .next()
+            .ok_or(ClaudeResultError::MissingResult)?
+            .value;
+        if results.next().is_some() {
+            return Err(ClaudeResultError::MultipleResults);
+        }
+        let invalid = ClaudeResultError::InvalidResult;
+        let subtype = match record
+            .get("subtype")
+            .and_then(Value::as_str)
+            .ok_or(invalid)?
+        {
+            "success" => ClaudeResultSubtype::Success,
+            "error_during_execution" => ClaudeResultSubtype::ErrorDuringExecution,
+            "error_max_turns" => ClaudeResultSubtype::ErrorMaxTurns,
+            "error_max_budget_usd" => ClaudeResultSubtype::ErrorMaxBudgetUsd,
+            "error_max_structured_output_retries" => {
+                ClaudeResultSubtype::ErrorMaxStructuredOutputRetries
+            }
+            _ => ClaudeResultSubtype::Unknown,
+        };
+        let is_error = record
+            .get("is_error")
+            .and_then(Value::as_bool)
+            .ok_or(invalid)?;
+        if record.get("session_id").is_some_and(|v| !v.is_string()) {
+            return Err(invalid);
+        }
+        match subtype {
+            ClaudeResultSubtype::Success => {
+                if !record.get("result").is_some_and(Value::is_string)
+                    || record.get("errors").is_some()
+                {
+                    return Err(invalid);
+                }
+            }
+            ClaudeResultSubtype::Unknown => {}
+            _ => {
+                if !record
+                    .get("errors")
+                    .and_then(Value::as_array)
+                    .is_some_and(|errors| errors.iter().all(Value::is_string))
+                    || record.get("result").is_some()
+                {
+                    return Err(invalid);
+                }
+            }
+        }
+        let usage = match record.get("usage") {
+            None | Some(Value::Null) => ClaudeResultUsage::Unknown,
+            Some(Value::Object(usage)) => {
+                for key in ["input_tokens", "output_tokens"] {
+                    if usage.get(key).is_some_and(|v| v.as_u64().is_none()) {
+                        return Err(ClaudeResultError::InvalidUsage);
+                    }
+                }
+                match (
+                    usage.get("input_tokens").and_then(Value::as_u64),
+                    usage.get("output_tokens").and_then(Value::as_u64),
+                ) {
+                    (Some(input_tokens), Some(output_tokens)) => ClaudeResultUsage::Known {
+                        input_tokens,
+                        output_tokens,
+                    },
+                    _ => ClaudeResultUsage::Unknown,
+                }
+            }
+            _ => return Err(ClaudeResultError::InvalidUsage),
+        };
+        Ok(ClaudeResult {
+            record,
+            subtype,
+            is_error,
+            usage,
+        })
+    }
 }
