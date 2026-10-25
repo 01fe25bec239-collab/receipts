@@ -87,15 +87,15 @@ pub(crate) fn legacy_error(phase: Phase, error: StateError) -> StateError {
     failure(phase, code, None)
 }
 
-fn id(value: &str) -> bool {
+pub(crate) fn id(value: &str) -> bool {
     let n = value.chars().count();
     (1..=200).contains(&n)
 }
-fn positive(value: &str) -> bool {
+pub(crate) fn positive(value: &str) -> bool {
     let b = value.as_bytes();
     b.first().is_some_and(|x| (b'1'..=b'9').contains(x)) && b[1..].iter().all(u8::is_ascii_digit)
 }
-fn hex(value: &str, length: usize) -> bool {
+pub(crate) fn hex(value: &str, length: usize) -> bool {
     value.len() == length
         && value
             .bytes()
@@ -811,6 +811,16 @@ pub(crate) fn verify_ledger(
     Ok(())
 }
 
+/// Verifies the exact current (v14) ledger and schema.
+pub(crate) fn verify_current(conn: &Connection, phase: Phase) -> Result<(), StateError> {
+    verify_ledger(conn, 14, phase)?;
+    verify_schema(conn, phase, true)?;
+    if !crate::attempt::schema_matches(conn).map_err(|e| schema_error(phase, e))? {
+        return Err(failure(phase, Code::CorruptStore, None));
+    }
+    Ok(())
+}
+
 pub(crate) fn verify_schema(
     conn: &Connection,
     phase: Phase,
@@ -947,8 +957,7 @@ impl SqliteStateRepository {
         conn.execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| sqlite_error(Phase::Write, e))?;
         let outcome = (|| {
-            verify_ledger(conn, 13, Phase::Write)?;
-            verify_schema(conn, Phase::Write, true)?;
+            verify_current(conn, Phase::Write)?;
             let exists: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM graphs WHERE project_id=?1 AND graph_id=?2",
@@ -1067,11 +1076,10 @@ impl ReadOnlyGraphReader {
         if head.is_some_and(|version| version < 0) {
             return Err(corrupt());
         }
-        if head != Some(13) {
+        if head != Some(14) {
             return Err(failure(Phase::Read, Code::UnsupportedSchema, None));
         }
-        verify_ledger(&self.conn, 13, Phase::Read)?;
-        verify_schema(&self.conn, Phase::Read, true)
+        verify_current(&self.conn, Phase::Read)
     }
     pub fn read_current_v1(
         &self,
@@ -1090,8 +1098,7 @@ impl ReadOnlyGraphReader {
             .map_err(|e| sqlite_error(Phase::Read, e))?;
         let outcome = (|| {
             // Verify before the pointer query while the same snapshot remains active.
-            verify_ledger(&tx, 13, Phase::Read)?;
-            verify_schema(&tx, Phase::Read, true)?;
+            verify_current(&tx, Phase::Read)?;
             read_projection(&tx, project_id, graph_id)
         })();
         match outcome {
@@ -1414,17 +1421,34 @@ pub(crate) fn configure_graph_writer(conn: &Connection) -> Result<(), StateError
 }
 
 pub(crate) fn migrate_graph_store(conn: &Connection) -> Result<(), StateError> {
-    conn.execute_batch("BEGIN IMMEDIATE")
-        .map_err(|e| sqlite_error(Phase::Migration, e))?;
-    let outcome = (|| {
+    migrate_step(conn, |conn| {
         verify_ledger(conn, 12, Phase::Migration)?;
         verify_schema(conn, Phase::Migration, false)?;
         conn.execute_batch(migrations::v0013_graph_repository::SQL)
             .map_err(|e| sqlite_error(Phase::Migration, e))?;
         verify_ledger(conn, 13, Phase::Migration)?;
         verify_schema(conn, Phase::Migration, true)
-    })();
-    match outcome {
+    })
+}
+
+/// Explicit v13 to v14 maintenance; graph DDL and data are verified, not rewritten.
+pub(crate) fn migrate_attempt_store(conn: &Connection) -> Result<(), StateError> {
+    migrate_step(conn, |conn| {
+        verify_ledger(conn, 13, Phase::Migration)?;
+        verify_schema(conn, Phase::Migration, true)?;
+        conn.execute_batch(migrations::v0014_execution_records::SQL)
+            .map_err(|e| sqlite_error(Phase::Migration, e))?;
+        verify_current(conn, Phase::Migration)
+    })
+}
+
+fn migrate_step(
+    conn: &Connection,
+    work: impl FnOnce(&Connection) -> Result<(), StateError>,
+) -> Result<(), StateError> {
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|e| sqlite_error(Phase::Migration, e))?;
+    match work(conn) {
         Ok(()) => match conn.execute_batch("COMMIT") {
             Ok(()) => Ok(()),
             Err(e) => {
