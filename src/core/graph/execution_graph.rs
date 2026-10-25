@@ -30,8 +30,12 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::edge::{EdgeClass, GraphEdge};
 use crate::error::GraphError;
+use crate::goal::GoalEvaluationContextEpoch;
 use crate::node::GraphNode;
 use crate::node_state::GraphNodeState;
+use crate::orchestration::OrchestrationDateTimeV1;
+use crate::records::{GraphRecordError, validate_hex};
+use crate::version::GraphVersionV1;
 
 /// Adjacency view of the precedence subgraph: source node -> ordered set of
 /// `(target node, edge id)`. Sorted structures keep traversal order a pure
@@ -383,4 +387,170 @@ fn find_precedence_path(
         }
     }
     None
+}
+
+/// Why an envelope could not be bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionGraphEnvelopeError {
+    /// An envelope field failed its identifier or digest constraint.
+    Record(GraphRecordError),
+    /// The authoritative envelope graph must contain at least one node.
+    EmptyGraph,
+}
+
+impl std::fmt::Display for ExecutionGraphEnvelopeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Record(error) => error.fmt(f),
+            Self::EmptyGraph => f.write_str("envelope graph must contain at least one node"),
+        }
+    }
+}
+
+impl std::error::Error for ExecutionGraphEnvelopeError {}
+
+impl From<GraphError> for ExecutionGraphEnvelopeError {
+    fn from(error: GraphError) -> Self {
+        Self::Record(error.into())
+    }
+}
+
+/// Caller-supplied envelope metadata, validated only by
+/// [`ExecutionGraphEnvelope::bind`]. Nothing is defaulted or inferred.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionGraphEnvelopeFields {
+    project_id: String,
+    goal_id: String,
+    graph_version: GraphVersionV1,
+    created_at: OrchestrationDateTimeV1,
+    policy_id: String,
+    /// `None` absent, `Some(None)` explicit null, `Some(Some(v))` value.
+    parent_version: Option<Option<GraphVersionV1>>,
+    resulting_digest: Option<String>,
+    compiled_from: Option<Vec<String>>,
+    context_epoch: Option<GoalEvaluationContextEpoch>,
+}
+
+impl ExecutionGraphEnvelopeFields {
+    /// The required schema fields; all optional fields start absent.
+    pub fn new(
+        project_id: impl Into<String>,
+        goal_id: impl Into<String>,
+        graph_version: GraphVersionV1,
+        created_at: OrchestrationDateTimeV1,
+        policy_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            project_id: project_id.into(),
+            goal_id: goal_id.into(),
+            graph_version,
+            created_at,
+            policy_id: policy_id.into(),
+            parent_version: None,
+            resulting_digest: None,
+            compiled_from: None,
+            context_epoch: None,
+        }
+    }
+
+    /// Supplies `parent_version` as a value. No adjacency to `graph_version`
+    /// is checked.
+    pub fn with_parent_version(mut self, parent_version: GraphVersionV1) -> Self {
+        self.parent_version = Some(Some(parent_version));
+        self
+    }
+
+    /// Supplies `parent_version` as explicit null, distinct from absence.
+    pub fn with_null_parent_version(mut self) -> Self {
+        self.parent_version = Some(None);
+        self
+    }
+
+    /// Supplied digest evidence (64 lowercase hex). It is recorded, never
+    /// recomputed or verified against the graph, and authenticates neither the
+    /// outer metadata nor any write authority.
+    pub fn with_resulting_digest(mut self, resulting_digest: impl Into<String>) -> Self {
+        self.resulting_digest = Some(resulting_digest.into());
+        self
+    }
+
+    /// Spec refs exactly as supplied: any strings, order and duplicates kept.
+    pub fn with_compiled_from(mut self, compiled_from: Vec<String>) -> Self {
+        self.compiled_from = Some(compiled_from);
+        self
+    }
+
+    /// Supplies `context_epoch` (non-negative, any magnitude); no epoch authority is implied.
+    pub fn with_context_epoch(mut self, context_epoch: GoalEvaluationContextEpoch) -> Self {
+        self.context_epoch = Some(context_epoch);
+        self
+    }
+}
+
+/// An explicitly bound, validated, immutable in-memory `ExecutionGraph`
+/// envelope. It exists only after [`ExecutionGraphEnvelope::bind`] succeeds
+/// and grants no mutation, persistence, digest, policy-lookup or write
+/// authority. Not a wire encoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionGraphEnvelope {
+    graph: ExecutionGraph,
+    fields: ExecutionGraphEnvelopeFields,
+}
+
+impl ExecutionGraphEnvelope {
+    /// Validates `fields` against a non-empty `graph` and returns the envelope
+    /// over a copy of it. The input graph is never modified; any failure
+    /// returns no envelope.
+    pub fn bind(
+        graph: &ExecutionGraph,
+        fields: ExecutionGraphEnvelopeFields,
+    ) -> Result<Self, ExecutionGraphEnvelopeError> {
+        if graph.node_count() == 0 {
+            return Err(ExecutionGraphEnvelopeError::EmptyGraph);
+        }
+        GraphError::validate_identifier("project_id", &fields.project_id)?;
+        GraphError::validate_identifier("goal_id", &fields.goal_id)?;
+        GraphError::validate_identifier("policy_id", &fields.policy_id)?;
+        validate_hex("resulting_digest", fields.resulting_digest.as_deref(), 64)
+            .map_err(ExecutionGraphEnvelopeError::Record)?;
+        Ok(Self {
+            graph: graph.clone(),
+            fields,
+        })
+    }
+
+    pub fn graph(&self) -> &ExecutionGraph {
+        &self.graph
+    }
+    pub fn graph_id(&self) -> &str {
+        self.graph.graph_id()
+    }
+    pub fn graph_version(&self) -> &GraphVersionV1 {
+        &self.fields.graph_version
+    }
+    pub fn project_id(&self) -> &str {
+        &self.fields.project_id
+    }
+    pub fn goal_id(&self) -> &str {
+        &self.fields.goal_id
+    }
+    pub fn created_at(&self) -> &OrchestrationDateTimeV1 {
+        &self.fields.created_at
+    }
+    pub fn policy_id(&self) -> &str {
+        &self.fields.policy_id
+    }
+    /// `None` absent, `Some(None)` explicit null, `Some(Some(v))` value.
+    pub fn parent_version(&self) -> Option<Option<&GraphVersionV1>> {
+        self.fields.parent_version.as_ref().map(Option::as_ref)
+    }
+    pub fn resulting_digest(&self) -> Option<&str> {
+        self.fields.resulting_digest.as_deref()
+    }
+    pub fn compiled_from(&self) -> Option<&[String]> {
+        self.fields.compiled_from.as_deref()
+    }
+    pub fn context_epoch(&self) -> Option<&GoalEvaluationContextEpoch> {
+        self.fields.context_epoch.as_ref()
+    }
 }

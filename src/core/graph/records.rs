@@ -38,7 +38,7 @@ impl From<GraphError> for GraphRecordError {
     }
 }
 
-fn validate_hex(
+pub(crate) fn validate_hex(
     field: &'static str,
     value: Option<&str>,
     length: usize,

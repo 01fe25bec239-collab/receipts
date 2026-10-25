@@ -73,6 +73,8 @@ mod capability_name_tests;
 #[cfg(test)]
 mod content_digest_tests;
 #[cfg(test)]
+mod execution_graph_envelope_tests;
+#[cfg(test)]
 mod execution_graph_tests;
 #[cfg(test)]
 mod graph_mutation_actor_policy_tests;
@@ -108,7 +110,10 @@ pub use accepted_integration_transition::{
 pub use content_digest::{GraphContentDigestError, graph_content_digest_v1};
 pub use edge::{ControlKind, EdgeClass, GraphEdge, GraphEdgeRelation, PrecedenceKind};
 pub use error::{GraphError, MAX_IDENTIFIER_LENGTH};
-pub use execution_graph::ExecutionGraph;
+pub use execution_graph::{
+    ExecutionGraph, ExecutionGraphEnvelope, ExecutionGraphEnvelopeError,
+    ExecutionGraphEnvelopeFields,
+};
 pub use graph_mutation_actor_policy::{
     GraphMutationActorAuthorizationError, validate_graph_mutation_actor,
 };
