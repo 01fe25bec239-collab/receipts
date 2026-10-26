@@ -1330,3 +1330,76 @@ fn shared_jsonl_retains_codex_shape_error_priority_and_framing_contract() {
         }
     );
 }
+
+#[test]
+fn typed_provider_result_stays_separate_from_exit_status_and_stderr() {
+    let success = b"{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"synthetic\"}\n";
+    let error = b"{\"type\":\"result\",\"subtype\":\"error_max_turns\",\"is_error\":true,\"errors\":[\"synthetic\"]}\n";
+    for (stdout, code, expected) in [
+        (&success[..], 7, ClaudeProviderResult::Success),
+        (&error[..], 0, ClaudeProviderResult::Error),
+    ] {
+        let result = complete(stdout, MARKER.as_bytes(), code);
+        assert_eq!(result.process().outcome().success(), code == 0);
+        assert_eq!(
+            result
+                .protocol()
+                .unwrap()
+                .result()
+                .unwrap()
+                .provider_result(),
+            expected
+        );
+    }
+    let mut damaged = success.to_vec();
+    damaged.extend_from_slice(b"{bad}\n");
+    assert_eq!(
+        complete(&damaged, success, 0).protocol().err(),
+        Some(ClaudeStreamJsonError::InvalidJson { line: 2 })
+    );
+    let mut truncated = success.to_vec();
+    truncated.extend_from_slice(&vec![
+        b' ';
+        usize::try_from(STREAM_CAPTURE_LIMIT_BYTES).unwrap()
+    ]);
+    assert_eq!(
+        complete(&truncated, success, 0).protocol().err(),
+        Some(ClaudeStreamJsonError::StdoutTruncated)
+    );
+}
+
+#[test]
+fn typed_result_in_live_snapshot_does_not_establish_process_completion() {
+    let ws = Workspace::new();
+    ws.write("stdout", "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"synthetic\"}\n");
+    ws.write("suffix", "{bad}\n");
+    let request = ws.request(
+        "fixture",
+        ClaudePermissionMode::Plan,
+        Duration::from_secs(10),
+    );
+    let start = Instant::now();
+    let attempt = start_claude_live_attempt(&request).unwrap();
+    ws.ready(start, &attempt, false);
+    live(&attempt, || {
+        let snapshot = attempt.snapshot_output().unwrap();
+        assert_eq!(
+            snapshot
+                .protocol()
+                .unwrap()
+                .result()
+                .unwrap()
+                .provider_result(),
+            ClaudeProviderResult::Success
+        );
+        assert_eq!(attempt.terminal_cause(), None);
+    });
+    ws.write("release", "1");
+    let outcome = attempt.wait_collect().unwrap();
+    assert!(outcome.process().success());
+    assert_eq!(
+        outcome.protocol().err(),
+        Some(ClaudeStreamJsonError::InvalidJson { line: 2 })
+    );
+    ws.prove_empty(false);
+}

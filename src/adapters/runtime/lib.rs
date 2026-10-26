@@ -9,6 +9,8 @@ mod claude_probe_execution_tests;
 #[cfg(test)]
 mod claude_probe_tests;
 mod claude_stream_json;
+#[cfg(test)]
+mod claude_stream_json_tests;
 mod codex_auth_status;
 mod codex_failure_classification;
 mod codex_jsonl;
@@ -57,7 +59,10 @@ pub use claude_execution::{
     classify_claude_task_execution_error, classify_claude_task_execution_result,
     execute_claude_task_once, observe_claude_auth_status, start_claude_live_attempt,
 };
-pub use claude_stream_json::{ClaudeStreamJson, ClaudeStreamJsonError, ClaudeStreamJsonRecord};
+pub use claude_stream_json::{
+    ClaudeProviderResult, ClaudeResult, ClaudeResultError, ClaudeResultSubtype, ClaudeResultUsage,
+    ClaudeStreamJson, ClaudeStreamJsonError, ClaudeStreamJsonRecord,
+};
 
 pub use adapter::RuntimeAdapter;
 pub use attempt::{AttemptHandle, AttemptId, AttemptIdError, AttemptResult};
