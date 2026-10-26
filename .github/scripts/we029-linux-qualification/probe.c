@@ -412,7 +412,7 @@ int main(int argc, char **argv) {
         REQUIRE(handle_ok);
     }
     int pipefd[2]; REQUIRE(pipe2(pipefd, O_CLOEXEC | O_NONBLOCK) == 0);
-    struct clone_args args = {.flags = CLONE_INTO_CGROUP, .exit_signal = SIGCHLD, .cgroup = (uint64_t)cg};
+    struct clone_args args = {.flags = CLONE_INTO_CGROUP, .exit_signal = SIGCHLD, .cgroup = (__u64)cg};
     pid_t child = (pid_t)syscall(SYS_clone3, &args, sizeof(args));
     REQUIRE(child >= 0);
     if (!child) {

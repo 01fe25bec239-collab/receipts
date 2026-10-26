@@ -20,6 +20,7 @@ import time
 BASELINE = "1811205f30f6993a373528f6cce67c489c19c6db"
 BRANCH = "build/workspace-execution-a3-029-linux-qualification"
 REPO = "01fe25bec239-collab/receipts"
+QUALIFICATION_PR = 185
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 WORKFLOW = ".github/workflows/we029-linux-qualification.yml"
@@ -129,6 +130,23 @@ def verify_source(rec):
     return head, paths
 
 
+def admit_event(event, env):
+    require(env.get("GITHUB_EVENT_NAME") == "pull_request", "wrong event")
+    require(event["action"] in ("opened", "reopened") and env.get("GITHUB_RUN_ATTEMPT") == "1",
+            "requires opened/reopened attempt1")
+    pr = event["pull_request"]
+    require(event["number"] == QUALIFICATION_PR and pr["number"] == QUALIFICATION_PR, "requires PR185")
+    require(env.get("GITHUB_REPOSITORY") == REPO and pr["head"]["repo"]["full_name"] == REPO and
+            pr["base"]["repo"]["full_name"] == REPO, "foreign repository")
+    require(pr["head"]["ref"] == BRANCH and pr["base"]["ref"] == "main", "wrong qualification branch")
+    require(re.fullmatch(r"[0-9a-f]{40}", env.get("QUALIFICATION_HEAD", "")) and
+            pr["head"]["sha"] == env.get("QUALIFICATION_HEAD"), "event/head mismatch")
+    require(re.fullmatch(r"[1-9][0-9]*", env.get("GITHUB_RUN_ID", "")), "missing or invalid run ID")
+    return {"event_name": env["GITHUB_EVENT_NAME"], "event_action": event["action"],
+            "repository": env["GITHUB_REPOSITORY"], "pr_number": pr["number"],
+            "run_id": env["GITHUB_RUN_ID"], "run_attempt": env["GITHUB_RUN_ATTEMPT"]}
+
+
 def prepare(out):
     require(platform.system() == "Linux" and platform.machine() == "x86_64", "requires Linux x86_64")
     require(os.geteuid() != 0, "compile/provenance must run unprivileged")
@@ -140,20 +158,16 @@ def prepare(out):
     rec = Recorder(out)
     # Verify event, not just an attacker-controlled shell variable.
     event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
-    require(os.environ.get("GITHUB_EVENT_NAME") == "pull_request", "wrong event")
-    require(event["action"] == "opened" and os.environ.get("GITHUB_RUN_ATTEMPT") == "1", "one initial run only")
-    pr = event["pull_request"]
-    require(os.environ.get("GITHUB_REPOSITORY") == REPO and pr["head"]["repo"]["full_name"] == REPO,
-            "foreign repository")
-    require(pr["head"]["ref"] == BRANCH and pr["base"]["ref"] == "main", "wrong qualification branch")
-    require(pr["head"]["sha"] == os.environ.get("QUALIFICATION_HEAD"), "event/head mismatch")
+    event_identity = admit_event(event, os.environ)
+    dump(out / "provenance.json", {"checkout_sha": "UNVERIFIED", "qualification_baseline": BASELINE,
+                                  **event_identity})
     head, paths = verify_source(rec)
     sources = [WORKFLOW] + sorted(str(p.relative_to(ROOT)) for p in HERE.iterdir() if p.is_file())
     provenance = {"checkout_sha": head, "harness_sha": head, "qualification_baseline": BASELINE,
                   "parent": git(rec, ROOT, "rev-parse", "HEAD^").decode().strip(),
                   "tree": git(rec, ROOT, "rev-parse", "HEAD^{tree}").decode().strip(),
                   "changed_paths": paths, "source_sha256": {p: sha(ROOT / p) for p in sources},
-                  "run_id": os.environ.get("GITHUB_RUN_ID"), "run_attempt": "1",
+                  **event_identity,
                   "ImageOS": os.environ.get("ImageOS"), "ImageVersion": os.environ.get("ImageVersion"),
                   "platform": platform.uname()._asdict(), "scope": "synthetic qualification only"}
     require(provenance["ImageOS"] and provenance["ImageVersion"], "missing actual image identity")
@@ -399,6 +413,42 @@ def self_check():
     require(allowed(WORKFLOW) and allowed(PREFIX + "probe.c"), "allowlist positive")
     require(not any(allowed(p) for p in ("src/lib.rs", ".github/workflows/ci.yml", PREFIX + "../bad")),
             "allowlist negative")
+    import copy
+    event = {"action": "opened", "number": 185, "pull_request": {
+        "number": 185, "head": {"repo": {"full_name": REPO}, "ref": BRANCH, "sha": "a" * 40},
+        "base": {"repo": {"full_name": REPO}, "ref": "main"}}}
+    env = {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_REPOSITORY": REPO,
+           "GITHUB_RUN_ATTEMPT": "1", "GITHUB_RUN_ID": "12345", "QUALIFICATION_HEAD": "a" * 40}
+    for action in ("opened", "reopened"):
+        event["action"] = action
+        identity = admit_event(event, env)
+        require(identity["event_action"] == action and identity["pr_number"] == 185 and
+                identity["run_id"] == "12345" and identity["run_attempt"] == "1", "event receipt mismatch")
+    refusals = [
+        ("event", ("action",), "synchronize"), ("event", ("action",), "closed"),
+        ("event", ("number",), 186), ("event", ("pull_request", "number"), 186),
+        ("event", ("pull_request", "head", "repo", "full_name"), "foreign/repo"),
+        ("event", ("pull_request", "base", "repo", "full_name"), "foreign/repo"),
+        ("event", ("pull_request", "head", "ref"), "other-branch"),
+        ("event", ("pull_request", "base", "ref"), "other-target"),
+        ("event", ("pull_request", "head", "sha"), "b" * 40),
+        ("env", ("GITHUB_EVENT_NAME",), "workflow_dispatch"),
+        ("env", ("GITHUB_RUN_ATTEMPT",), "2"), ("env", ("GITHUB_REPOSITORY",), "foreign/repo"),
+        ("env", ("QUALIFICATION_HEAD",), "bad-head"), ("env", ("GITHUB_RUN_ID",), ""),
+    ]
+    for target, keys, value in refusals:
+        candidate, candidate_env = copy.deepcopy(event), env.copy()
+        mapping = candidate if target == "event" else candidate_env
+        for key in keys[:-1]:
+            mapping = mapping[key]
+        mapping[keys[-1]] = value
+        try:
+            admit_event(candidate, candidate_env)
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError(f"event gate admitted {target}:{keys}={value}")
+    print(f"Event gate: 2 admissions, {len(refusals)} refusals passed")
     with tempfile.TemporaryDirectory(prefix="we029-static-") as tmp:
         out = Path(tmp)
         (out / "raw.jsonl").touch()

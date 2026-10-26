@@ -2,7 +2,7 @@ name: WE029 Linux qualification (synthetic only)
 
 on:
   pull_request:
-    types: [opened]
+    types: [opened, reopened]
     paths:
       - .github/workflows/we029-linux-qualification.yml
       - .github/scripts/we029-linux-qualification/**
@@ -14,7 +14,10 @@ jobs:
   qualification:
     if: >-
       github.repository == '01fe25bec239-collab/receipts' &&
+      github.event.number == 185 && github.event.pull_request.number == 185 &&
+      (github.event.action == 'opened' || github.event.action == 'reopened') &&
       github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.base.repo.full_name == github.repository &&
       github.event.pull_request.head.ref == 'build/workspace-execution-a3-029-linux-qualification' &&
       github.event.pull_request.base.ref == 'main' && github.run_attempt == 1
     runs-on: ubuntu-24.04

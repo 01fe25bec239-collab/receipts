@@ -4,12 +4,16 @@ Qualification source only. Original WE029 product implementation and MR020 stay
 stopped. This does not install a launcher, implement mediation, establish product
 lifecycle compatibility, or grant an assurance PASS. New privileged source needs
 independent static review before publication. A2 inspects the exact commit; USER
-starts fresh A4 static review; only after static PASS may A2 publish the diagnostic
-PR for one initial hosted run. A3 must not push, open a PR or dispatch it.
+starts fresh A4 static review; only after static PASS may A2 update existing PR185
+for one authorized corrected hosted run. A3 must not push, open a PR or dispatch it.
 
-The workflow admits only an initial `pull_request: opened` event, run attempt 1,
-from this repository's qualification branch into `main`. Synchronization and manual
-reruns do not run qualification. It uses standard `ubuntu-24.04` x64 with a ten
+The workflow and recorder admit only `pull_request: opened` or `reopened`, run
+attempt 1, for existing PR185 from this repository's qualification branch into
+this repository's `main`. Synchronization and manual reruns do not run
+qualification. This stateless gate does not prevent repeated reopen events;
+A2's execution ledger controls the one authorized corrected run, after exact-SHA
+static review and acceptance, using exactly one close/reopen of PR185. No second
+PR or unrestricted retry is authorized. It uses standard `ubuntu-24.04` x64 with a ten
 minute job bound. Preparation verifies the event, exact head, baseline ancestry,
 clean checkout, regular source modes and every changed path against the two-path
 allowlist. `ci.yml` is preserved. Checkout credentials are not persisted. The only
@@ -46,7 +50,9 @@ No proxy repository or branch switch is used.
 | controller | Same confined controller UID/capabilities reads worker0600 without chmod, while a real visible outside sentinel and proc-root/retained-directory-FD routes are denied. A real outside file handle must first open/read under host privileged control and then under the same controller UID/capabilities before confinement. Its confined open must return the explicit seccomp EPERM. Unsupported handles refuse the case. The same confined controller then stages/commits the actual edit/delete/private payload and observes the checkpoint SHA/status/diff. An independent fixed host observer checks SHA, parent, branch, clean status, exact change set, private bytes and unchanged repository inodes. |
 
 All cases use `clone3(CLONE_INTO_CGROUP)` and verify the child's exact cgroup before
-identity setup. There is no fork-then-migrate launch. Bounding capabilities are
+identity setup. The validated nonnegative cgroup FD is converted directly to the
+Linux field type `__u64`, preserving its value and all strict compiler checks.
+There is no fork-then-migrate launch. Bounding capabilities are
 dropped while privileged, followed by supplementary group removal, setresgid/uid,
 explicit capability sets and verification. The runtime capability range must
 match the compile-time range; unknown new capabilities refuse setup. NNP is set
@@ -105,11 +111,14 @@ hashes, argv, cwd, exits and timeout flags. Probe receipts are read only after t
 receipts bracket complete unmodified Git stdout; stderr remains the original raw
 probe stderr stream. This is synthetic evidence, not the product's evidence ABI.
 `results.json` names each completed/refused case; cases after a refusal are NOT RUN.
-The image OS/version, kernel/architecture, filesystem, tool versions, exact
+The actual event action, repository, PR number, run ID and attempt are recorded
+in `provenance.json`, including compilation failures after admission. The image
+OS/version, kernel/architecture, filesystem, tool versions, exact
 checkout/harness SHA, source/binary hashes and cleanup receipts bind the evidence.
 
 Local static preparation: `python3 .github/scripts/we029-linux-qualification/run.py
-self-check` verifies allowlist rejection, NUL preservation, failed-command receipts,
+self-check` verifies opened/reopened admission, wrong-PR/repository/branch/head/event/attempt
+refusal and accurate event receipts, allowlist rejection, NUL preservation, failed-command receipts,
 timeout cleanup, output-limit/unknown-cleanup refusal and evidence sealing without Linux setup. Linux execution is
 NOT RUN until the separately authorized hosted run. Do not run Rust suites or
 scanners for untouched product files.
