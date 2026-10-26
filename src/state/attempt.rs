@@ -14,7 +14,9 @@ use std::fmt;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::canonical_timestamp::CanonicalTimestampV1;
-use crate::error::{AttemptFailureCode as Code, AttemptField as Field, StateError};
+use crate::error::{
+    AttemptFailureCode as Code, AttemptField as Field, GraphFailureCode, StateError,
+};
 use crate::graph_repository::{self, hex, id, positive};
 use crate::migrations::v0014_execution_records;
 use crate::repository::SqliteStateRepository;
@@ -27,6 +29,16 @@ fn invalid(field: Field) -> StateError {
 }
 fn corrupt() -> StateError {
     failure(Code::CorruptStore, None)
+}
+
+fn verification_error(error: StateError) -> StateError {
+    match error {
+        StateError::GraphPersistence {
+            code: GraphFailureCode::StoreBusy,
+            ..
+        } => failure(Code::StoreBusy, None),
+        _ => corrupt(),
+    }
 }
 
 fn sqlite_error(error: rusqlite::Error) -> StateError {
@@ -291,12 +303,12 @@ pub(crate) fn schema_matches(conn: &Connection) -> Result<bool, rusqlite::Error>
 
 fn verify_store(conn: &Connection) -> Result<(), StateError> {
     let head = graph_repository::schema_head(conn, crate::error::GraphPhase::Read)
-        .map_err(|_| corrupt())?;
+        .map_err(verification_error)?;
     if head != Some(14) {
         return Err(failure(Code::UnsupportedSchema, None));
     }
     graph_repository::verify_ledger(conn, 14, crate::error::GraphPhase::Read)
-        .map_err(|_| corrupt())?;
+        .map_err(verification_error)?;
     if !schema_matches(conn).map_err(sqlite_error)? {
         return Err(corrupt());
     }

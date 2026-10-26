@@ -101,6 +101,24 @@ fn attempt_error(error: StateError) -> (Code, Option<Field>) {
     (code, field)
 }
 
+fn attempt_row_image(repo: &SqliteStateRepository) -> Vec<Vec<rusqlite::types::Value>> {
+    let mut image = Vec::new();
+    for table in ["attempt_started", "attempt_finished"] {
+        let mut statement = repo
+            .connection()
+            .prepare(&format!("SELECT * FROM {table} ORDER BY attempt_id"))
+            .unwrap();
+        let columns = statement.column_count();
+        let rows = statement
+            .query_map([], |row| {
+                (0..columns).map(|column| row.get(column)).collect()
+            })
+            .unwrap();
+        image.extend(rows.map(Result::unwrap));
+    }
+    image
+}
+
 #[test]
 fn start_finish_find_list_survive_reopen() {
     let db = TempDb::new();
@@ -580,6 +598,10 @@ fn malformed_inputs_are_refused_without_echoing_them() {
 fn tampered_store_fails_closed_without_writing() {
     for (tamper, expected) in [
         (
+            "UPDATE state_schema_version SET migration_name='tampered' WHERE version=14",
+            Code::CorruptStore,
+        ),
+        (
             "DROP TRIGGER attempt_finished_no_delete",
             Code::CorruptStore,
         ),
@@ -595,6 +617,7 @@ fn tampered_store_fails_closed_without_writing() {
         let db = TempDb::new();
         let mut repo = SqliteStateRepository::open(&db.0).unwrap();
         repo.append_attempt_started(start(ID_A, "1")).unwrap();
+        let before = attempt_row_image(&repo);
         repo.connection().execute_batch(tamper).unwrap();
         for result in [
             repo.append_attempt_started(start(ID_B, "2")),
@@ -606,8 +629,68 @@ fn tampered_store_fails_closed_without_writing() {
             attempt_error(repo.find_attempt(&aid(ID_A)).unwrap_err()).0,
             expected
         );
+        assert_eq!(
+            attempt_error(
+                repo.list_attempts_for_node("project-a", GRAPH, NODE)
+                    .unwrap_err()
+            ),
+            (expected, None)
+        );
         assert_eq!(rows(&repo), (1, 0));
+        assert_eq!(attempt_row_image(&repo), before);
     }
+}
+
+#[test]
+fn busy_verification_preserves_both_reads_and_recovers_after_rollback() {
+    use crate::error::{GraphFailureCode, GraphPhase};
+    use std::time::Duration;
+
+    let db = TempDb::new();
+    let mut repo = SqliteStateRepository::open(&db.0).unwrap();
+    repo.append_attempt_started(start(ID_A, "1")).unwrap();
+    repo.append_attempt_finished(finish(ID_A)).unwrap();
+    let expected_rows = attempt_row_image(&repo);
+    let expected_found = repo.find_attempt(&aid(ID_A)).unwrap();
+    let expected_list = list(&repo);
+
+    // Rollback-journal EXCLUSIVE locks block deferred readers, unlike WAL writers.
+    assert!(repo.connection().is_autocommit());
+    let mode: String = repo
+        .connection()
+        .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "delete");
+    repo.connection().busy_timeout(Duration::ZERO).unwrap();
+    let blocker = rusqlite::Connection::open(&db.0).unwrap();
+    blocker.busy_timeout(Duration::ZERO).unwrap();
+    blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+    for error in [
+        crate::graph_repository::schema_head(repo.connection(), GraphPhase::Read).unwrap_err(),
+        crate::graph_repository::verify_ledger(repo.connection(), 14, GraphPhase::Read)
+            .unwrap_err(),
+    ] {
+        assert!(matches!(
+            error,
+            StateError::GraphPersistence {
+                code: GraphFailureCode::StoreBusy,
+                ..
+            }
+        ));
+    }
+    let errors = [
+        attempt_error(repo.find_attempt(&aid(ID_A)).unwrap_err()),
+        attempt_error(
+            repo.list_attempts_for_node("project-a", GRAPH, NODE)
+                .unwrap_err(),
+        ),
+    ];
+    blocker.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(attempt_row_image(&repo), expected_rows);
+    assert_eq!(repo.find_attempt(&aid(ID_A)).unwrap(), expected_found);
+    assert_eq!(list(&repo), expected_list);
+    assert_eq!(errors, [(Code::StoreBusy, None); 2]);
 }
 
 #[test]
