@@ -1,5 +1,5 @@
 //! Open Claude stdout records and conservative provider-result interpretation.
-use std::{error::Error, fmt};
+use std::{collections::BTreeSet, error::Error, fmt};
 
 use receipts_workspace_execution::execution::CapturedStream;
 use serde_json::Value;
@@ -125,6 +125,37 @@ impl fmt::Display for ClaudeResultError {
 }
 impl Error for ClaudeResultError {}
 
+// Value has already erased duplicate members. Walk validated raw JSON, letting
+// serde_json decode strings so escaped equivalent keys compare identically.
+fn require_unique_keys(raw: &[u8]) -> Result<(), ClaudeResultError> {
+    let invalid = ClaudeResultError::InvalidResult;
+    let mut objects = Vec::<BTreeSet<String>>::new();
+    let mut index = 0;
+    while index < raw.len() {
+        match raw[index] {
+            b'{' => objects.push(BTreeSet::new()),
+            b'}' => {
+                objects.pop().ok_or(invalid)?;
+            }
+            b'"' => {
+                let mut strings =
+                    serde_json::Deserializer::from_slice(&raw[index..]).into_iter::<String>();
+                let string = strings.next().ok_or(invalid)?.map_err(|_| invalid)?;
+                index += strings.byte_offset();
+                if raw[index..].iter().find(|b| !b.is_ascii_whitespace()) == Some(&b':')
+                    && !objects.last_mut().ok_or(invalid)?.insert(string)
+                {
+                    return Err(invalid);
+                }
+                continue;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
 /// Borrowed interpretation. Payload access is explicit; Debug is omitted.
 /// Session ID is opaque data and grants no resume, identity or consent authority.
 pub struct ClaudeResult<'a> {
@@ -172,12 +203,19 @@ impl ClaudeStreamJson<'_> {
     /// Interpret exactly one result in the entire validated observation. Live
     /// snapshots can contain a result before process completion. Trailing events
     /// are allowed, but any second result (including unknown subtypes) is refused.
+    /// Duplicate object keys anywhere in the observation refuse interpretation;
+    /// raw records and their existing Value projections remain available.
     ///
     /// Sources: <https://code.claude.com/docs/en/agent-sdk/typescript#sdkresultmessage>,
     /// <https://code.claude.com/docs/en/agent-sdk/agent-loop#handle-the-result>.
     /// The published @anthropic-ai/claude-agent-sdk 0.3.301 sdk.d.ts documents
     /// subtype success + is_error true as API error text, not provider success.
     pub fn result(&self) -> Result<ClaudeResult<'_>, ClaudeResultError> {
+        // Check every observation before selection: a duplicate type can hide
+        // an error result in an otherwise successful stream.
+        for record in &self.records {
+            require_unique_keys(record.raw)?;
+        }
         let mut results = self.records.iter().filter(|r| r.value["type"] == "result");
         let record = &results
             .next()

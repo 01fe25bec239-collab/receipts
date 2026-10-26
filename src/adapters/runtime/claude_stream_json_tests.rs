@@ -228,6 +228,100 @@ fn invalid_usage_does_not_fabricate_counts_or_provider_success() {
 }
 
 #[test]
+fn duplicate_raw_members_refuse_semantics_without_changing_protocol_evidence() {
+    const SUCCESS: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"ok"}"#;
+    for ambiguous in [
+        r#"{"type":"result","subtype":"success","is_error":true,"is_error":false,"result":"ok"}"#,
+        r#"{"type":"result","subtype":"success","is_error":false,"is_error":true,"result":"ok"}"#,
+        r#"{"type":"result","subtype":"error_max_turns","subtype":"success","is_error":false,"result":"ok"}"#,
+        r#"{"type":"result","subtype":"success","subtype":"error_max_turns","is_error":false,"result":"ok"}"#,
+        r#"{"type":"result","subtype":"success","is_error":true,"is_\u0065rror":false,"result":"ok"}"#,
+        r#"{"type":"result","subtype":"success","is_\u0065rror":false,"is_error":true,"result":"ok"}"#,
+        r#"{"type":"result","subtype":"error_max_turns","is_error":true,"errors":["refused"],"type":"system"}"#,
+        r#"{"type":"system","subtype":"error_max_turns","is_error":true,"errors":["refused"],"type":"result"}"#,
+        r#"{"type":"result","subtype":"error_max_turns","is_error":true,"errors":["refused"],"ty\u0070e":"system"}"#,
+        r#"{"ty\u0070e":"system","subtype":"error_max_turns","is_error":true,"errors":["refused"],"type":"result"}"#,
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","usage":{"input_tokens":1,"input_tokens":2,"output_tokens":3}}"#,
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","usage":{"input_tokens":2,"input_tokens":1,"output_tokens":3}}"#,
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","usage":{"input_tokens":1,"output_tokens":2,"output_\u0074okens":3}}"#,
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","usage":{"input_tokens":1,"output_\u0074okens":3,"output_tokens":2}}"#,
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","usage":null,"usage":{"input_tokens":1,"output_tokens":2}}"#,
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","usage":{"input_tokens":1,"output_tokens":2},"usage":null}"#,
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"first","result":"second"}"#,
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","is_error":false}"#,
+        r#"{"type":"future","payload":[{"nested":1,"nested":2}]}"#,
+    ] {
+        for observation in [
+            ambiguous.to_owned(),
+            format!("{ambiguous}\n{SUCCESS}\n"),
+            format!("{SUCCESS}\n{ambiguous}\n"),
+        ] {
+            let input = Some(observation.as_bytes().to_vec());
+            let protocol = protocol(&input).unwrap();
+            assert_eq!(
+                protocol.result().err(),
+                Some(ClaudeResultError::InvalidResult)
+            );
+            assert_eq!(
+                protocol
+                    .records()
+                    .iter()
+                    .flat_map(|r| r.raw_record().iter().copied())
+                    .collect::<Vec<_>>(),
+                observation.as_bytes()
+            );
+            for record in protocol.records() {
+                assert_eq!(
+                    record.value(),
+                    &serde_json::from_slice::<Value>(record.raw_record()).unwrap()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn unique_escaped_keys_and_key_looking_strings_keep_their_meaning() {
+    let unknown = r#"{"type":"future","payload":[{"same":1},{"same":2}],"text":"\"type\":\"result\",{}[]:\\"}"#;
+    for (result, expected) in [
+        (
+            r#"{"type":"result","subtype":"success","is_\u0065rror":false,"result":"\"is_error\":true,\"is_error\":false; \\ \u0022 {}[]:","usage":{"input_tokens":1,"output_tokens":2},"future":{"input_tokens":3}}"#,
+            ClaudeProviderResult::Success,
+        ),
+        (
+            r#"{"type":"result","subtype":"error_max_turns","is_error":true,"errors":["\"subtype\":\"success\"","\\\" {}[]:"]}"#,
+            ClaudeProviderResult::Error,
+        ),
+        (
+            r#"{"type":"result","subtype":"future","is_error":false}"#,
+            ClaudeProviderResult::Unknown,
+        ),
+    ] {
+        let input = Some(format!("{unknown}\n{result}\n{unknown}").into_bytes());
+        let protocol = protocol(&input).unwrap();
+        assert_eq!(protocol.result().unwrap().provider_result(), expected);
+        assert_eq!(protocol.records().len(), 3);
+        assert_eq!(
+            protocol.records()[0].raw_record(),
+            format!("{unknown}\n").as_bytes()
+        );
+        assert_eq!(protocol.records()[2].raw_record(), unknown.as_bytes());
+        assert_eq!(protocol.records()[0].value(), protocol.records()[2].value());
+    }
+}
+
+#[test]
+fn duplicate_key_refusal_diagnostics_do_not_expose_keys_or_values() {
+    const SECRET: &str = "sensitive-provider-session-prompt-marker";
+    let input = Some(format!(r#"{{"type":"result","subtype":"success","is_error":false,"result":"{SECRET}","{SECRET}":1,"{SECRET}":2}}"#).into_bytes());
+    let protocol = protocol(&input).unwrap();
+    let error = protocol.result().err().unwrap();
+    assert_eq!(error, ClaudeResultError::InvalidResult);
+    assert!(!format!("{error:?} {error}").contains(SECRET));
+    assert!(error.source().is_none());
+}
+
+#[test]
 fn protocol_damage_including_after_success_prevents_any_interpretation() {
     for (damage, expected) in [
         (
