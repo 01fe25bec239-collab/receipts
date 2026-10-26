@@ -19,9 +19,6 @@ use crate::graph_repository::{self, hex, id, positive};
 use crate::migrations::v0014_execution_records;
 use crate::repository::SqliteStateRepository;
 
-const MAX_REF: usize = 200;
-const MAX_FAILURE_CLASS: usize = 64;
-
 fn failure(code: Code, field: Option<Field>) -> StateError {
     StateError::AttemptPersistence { code, field }
 }
@@ -52,11 +49,6 @@ fn sqlite_error(error: rusqlite::Error) -> StateError {
         _ => Code::StorageFailure,
     };
     failure(code, None)
-}
-
-/// Printable ASCII without spaces: a reference token cannot carry prose.
-fn token(value: &str, max: usize) -> bool {
-    (1..=max).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_graphic())
 }
 
 fn timestamp(value: &str, field: Field) -> Result<CanonicalTimestampV1, StateError> {
@@ -131,6 +123,7 @@ pub struct AttemptStart {
 impl AttemptStart {
     /// `attempt_number` is a positive decimal of any length; `start_sha` is a
     /// lowercase 40-hex Git SHA; `started_at` is a canonical UTC timestamp.
+    /// `runtime_ref` is opaque and preserved exactly; it grants no admission or authority.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         attempt_id: AttemptId,
@@ -148,7 +141,6 @@ impl AttemptStart {
         checked(id(graph_id), Field::GraphId)?;
         checked(id(node_id), Field::NodeId)?;
         checked(positive(attempt_number), Field::AttemptNumber)?;
-        checked(token(runtime_ref, MAX_REF), Field::RuntimeRef)?;
         checked(id(workspace_id), Field::WorkspaceId)?;
         checked(hex(start_sha, 40), Field::StartSha)?;
         Ok(Self {
@@ -181,8 +173,8 @@ pub struct AttemptFinish {
     failure_class: Option<String>,
 }
 impl AttemptFinish {
-    /// `outcome_ref` is an opaque reference token and `failure_class` a short
-    /// class label; neither may hold output or error text.
+    /// Optional strings are opaque and preserved exactly, including empty values.
+    /// Callers must supply references/classes rather than raw output or error text.
     pub fn new(
         attempt_id: AttemptId,
         ended_at: &str,
@@ -192,12 +184,6 @@ impl AttemptFinish {
     ) -> Result<Self, StateError> {
         if let Some(sha) = end_sha {
             checked(hex(sha, 40), Field::EndSha)?;
-        }
-        if let Some(reference) = outcome_ref {
-            checked(token(reference, MAX_REF), Field::OutcomeRef)?;
-        }
-        if let Some(class) = failure_class {
-            checked(token(class, MAX_FAILURE_CLASS), Field::FailureClass)?;
         }
         Ok(Self {
             attempt_id,
@@ -384,14 +370,13 @@ fn write<T>(
 }
 
 impl SqliteStateRepository {
-    /// Appends the immutable start row of an attempt. A repeated `attempt_id`,
-    /// or a second attempt with the same node and `attempt_number`, is refused.
+    /// Appends the immutable start row of an attempt. A repeated `attempt_id` is refused.
     pub fn append_attempt_started(&mut self, start: AttemptStart) -> Result<(), StateError> {
         write(self.connection(), |conn| {
             let duplicate: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM attempt_started WHERE attempt_id=?1 OR (project_id=?2 AND graph_id=?3 AND node_id=?4 AND attempt_number=?5)",
-                    params![start.attempt_id.as_str(), start.project_id, start.graph_id, start.node_id, start.attempt_number],
+                    "SELECT COUNT(*) FROM attempt_started WHERE attempt_id=?1",
+                    [start.attempt_id.as_str()],
                     |r| r.get(0),
                 )
                 .map_err(sqlite_error)?;
@@ -472,7 +457,7 @@ impl SqliteStateRepository {
         })
     }
 
-    /// Lists the attempts of one node in attempt-number order.
+    /// Lists one node's attempts by numeric attempt number, then attempt identity.
     pub fn list_attempts_for_node(
         &self,
         project_id: &str,

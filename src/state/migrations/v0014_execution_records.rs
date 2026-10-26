@@ -23,8 +23,7 @@ CREATE TABLE attempt_started (
     workspace_id ANY NOT NULL CHECK (typeof(workspace_id)='text'),
     start_sha ANY NOT NULL CHECK (typeof(start_sha)='text' AND instr(start_sha,char(0))=0 AND length(CAST(start_sha AS BLOB))=40 AND start_sha NOT GLOB '*[^0-9a-f]*'),
     started_at ANY NOT NULL CHECK (typeof(started_at)='text' AND length(CAST(started_at AS BLOB))=30),
-    PRIMARY KEY (attempt_id),
-    UNIQUE (project_id, graph_id, node_id, attempt_number)
+    PRIMARY KEY (attempt_id)
 ) STRICT;
 CREATE TABLE attempt_finished (
     attempt_id ANY NOT NULL COLLATE BINARY CHECK (typeof(attempt_id)='text'),
@@ -37,7 +36,7 @@ CREATE TABLE attempt_finished (
 ) STRICT;
 CREATE TRIGGER attempt_started_no_update BEFORE UPDATE ON attempt_started BEGIN SELECT RAISE(ABORT, 'attempt rows are append-only'); END;
 CREATE TRIGGER attempt_started_no_delete BEFORE DELETE ON attempt_started BEGIN SELECT RAISE(ABORT, 'attempt rows are append-only'); END;
-CREATE TRIGGER attempt_started_no_replace BEFORE INSERT ON attempt_started WHEN EXISTS (SELECT 1 FROM attempt_started WHERE attempt_id=NEW.attempt_id OR (project_id=NEW.project_id AND graph_id=NEW.graph_id AND node_id=NEW.node_id AND attempt_number=NEW.attempt_number)) BEGIN SELECT RAISE(ABORT, 'attempt rows are append-only'); END;
+CREATE TRIGGER attempt_started_no_replace BEFORE INSERT ON attempt_started WHEN EXISTS (SELECT 1 FROM attempt_started WHERE attempt_id=NEW.attempt_id) BEGIN SELECT RAISE(ABORT, 'attempt rows are append-only'); END;
 CREATE TRIGGER attempt_finished_no_update BEFORE UPDATE ON attempt_finished BEGIN SELECT RAISE(ABORT, 'attempt rows are append-only'); END;
 CREATE TRIGGER attempt_finished_no_delete BEFORE DELETE ON attempt_finished BEGIN SELECT RAISE(ABORT, 'attempt rows are append-only'); END;
 CREATE TRIGGER attempt_finished_no_replace BEFORE INSERT ON attempt_finished WHEN EXISTS (SELECT 1 FROM attempt_finished WHERE attempt_id=NEW.attempt_id) BEGIN SELECT RAISE(ABORT, 'attempt rows are append-only'); END;

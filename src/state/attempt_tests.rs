@@ -148,6 +148,110 @@ fn start_finish_find_list_survive_reopen() {
 }
 
 #[test]
+fn opaque_strings_round_trip_exactly_and_preserve_optional_absence() {
+    for value in [
+        "".to_owned(),
+        "two words".into(),
+        "运行 😀".into(),
+        "a\0b".into(),
+        "r".repeat(10001),
+    ] {
+        let db = TempDb::new();
+        let mut repo = SqliteStateRepository::open(&db.0).unwrap();
+        let started = AttemptStart::new(
+            aid(ID_A),
+            "project-a",
+            GRAPH,
+            NODE,
+            "1",
+            AttemptRole::RuntimeA3,
+            &value,
+            "workspace-1",
+            &"a".repeat(40),
+            T0,
+        )
+        .unwrap();
+        let finished = AttemptFinish::new(aid(ID_A), T1, None, Some(&value), Some(&value)).unwrap();
+        repo.append_attempt_started(started).unwrap();
+        repo.append_attempt_finished(finished.clone()).unwrap();
+        repo.append_attempt_started(start(ID_B, "1")).unwrap();
+        repo.append_attempt_finished(AttemptFinish::new(aid(ID_B), T1, None, None, None).unwrap())
+            .unwrap();
+        let before = list(&repo);
+        drop(repo);
+
+        let mut repo = SqliteStateRepository::open(&db.0).unwrap();
+        let found = repo.find_attempt(&aid(ID_A)).unwrap().unwrap();
+        assert_eq!(found.runtime_ref(), value);
+        assert_eq!(found.outcome_ref(), Some(value.as_str()));
+        assert_eq!(found.failure_class(), Some(value.as_str()));
+        let absent = repo.find_attempt(&aid(ID_B)).unwrap().unwrap();
+        assert_eq!(absent.outcome_ref(), None);
+        assert_eq!(absent.failure_class(), None);
+        assert_eq!(list(&repo), before);
+        assert_eq!(list(&repo), vec![found, absent]);
+        assert_eq!(format!("{finished:?}"), "AttemptFinish");
+        assert_eq!(
+            attempt_error(repo.append_attempt_finished(finished).unwrap_err()),
+            (Code::DuplicateFinish, None)
+        );
+        for (outcome, class) in [(None, Some(value.as_str())), (Some(value.as_str()), None)] {
+            let conflict = AttemptFinish::new(aid(ID_A), T1, None, outcome, class).unwrap();
+            assert_eq!(
+                attempt_error(repo.append_attempt_finished(conflict).unwrap_err()),
+                (Code::ConflictingFinish, None)
+            );
+        }
+        assert_eq!(list(&repo), before);
+        assert_eq!(rows(&repo), (2, 2));
+    }
+}
+
+#[test]
+fn shared_ordinals_across_and_within_roles_sort_by_attempt_id() {
+    let db = TempDb::new();
+    let mut repo = SqliteStateRepository::open(&db.0).unwrap();
+    for (id, role) in [
+        (ID_C, AttemptRole::RuntimeA3),
+        (ID_B, AttemptRole::RuntimeA4),
+        (ID_A, AttemptRole::RuntimeA3),
+    ] {
+        let started = AttemptStart::new(
+            aid(id),
+            "project-a",
+            GRAPH,
+            NODE,
+            "10",
+            role,
+            "runtime",
+            "workspace-1",
+            &"a".repeat(40),
+            T0,
+        )
+        .unwrap();
+        repo.append_attempt_started(started).unwrap();
+    }
+    drop(repo);
+    let repo = SqliteStateRepository::open(&db.0).unwrap();
+    let listed = list(&repo);
+    assert_eq!(
+        listed
+            .iter()
+            .map(|a| a.attempt_id().as_str())
+            .collect::<Vec<_>>(),
+        [ID_A, ID_B, ID_C]
+    );
+    for record in listed {
+        assert_eq!(record.attempt_number(), "10");
+        assert_eq!(
+            repo.find_attempt(record.attempt_id()).unwrap(),
+            Some(record)
+        );
+    }
+    assert_eq!(rows(&repo), (3, 0));
+}
+
+#[test]
 fn attempts_are_isolated_by_project_graph_and_node() {
     let db = TempDb::new();
     let mut repo = SqliteStateRepository::open(&db.0).unwrap();
@@ -196,8 +300,8 @@ fn duplicate_start_is_refused_and_preserves_prior_rows() {
     repo.append_attempt_started(start(ID_A, "1")).unwrap();
     repo.append_attempt_finished(finish(ID_A)).unwrap();
     let before = list(&repo);
-    // Same attempt id, and same node + attempt number under a new id.
-    for duplicate in [start(ID_A, "2"), start(ID_B, "1")] {
+    // Repeated identity is refused even when its ordinal changes.
+    for duplicate in [start(ID_A, "1"), start(ID_A, "2")] {
         assert_eq!(
             attempt_error(repo.append_attempt_started(duplicate).unwrap_err()),
             (Code::DuplicateStart, None)
@@ -362,17 +466,17 @@ fn attempt_rows_cannot_be_updated_or_deleted_sql_trigger() {
         assert_eq!(list(&repo), before);
     };
     for statement in [
-        "UPDATE attempt_started SET workspace_id='x'",
-        "DELETE FROM attempt_started",
-        "UPDATE attempt_finished SET end_sha=NULL",
-        "DELETE FROM attempt_finished",
+        "UPDATE attempt_started SET workspace_id='x' WHERE attempt_id=?1",
+        "DELETE FROM attempt_started WHERE attempt_id=?1",
+        "UPDATE attempt_finished SET end_sha=NULL WHERE attempt_id=?1",
+        "DELETE FROM attempt_finished WHERE attempt_id=?1",
     ] {
-        assert_trigger(repo.connection().execute(statement, []).unwrap_err());
+        assert_trigger(repo.connection().execute(statement, [ID_A]).unwrap_err());
     }
-    for (id, project, graph, node) in [(ID_A, "p", "g", "n"), (ID_B, "project-a", GRAPH, NODE)] {
+    for (project, graph, node) in [("p", "g", "n"), ("project-a", GRAPH, NODE)] {
         assert_trigger(repo.connection().execute(
             "INSERT OR REPLACE INTO attempt_started(attempt_id,project_id,graph_id,node_id,attempt_number,role,runtime_ref,workspace_id,start_sha,started_at) VALUES (?1,?2,?3,?4,'1','RUNTIME_A4','r','w',?5,?6)",
-            rusqlite::params![id, project, graph, node, sha, T0],
+            rusqlite::params![ID_A, project, graph, node, sha, T0],
         ).unwrap_err());
     }
     assert_trigger(
@@ -414,8 +518,10 @@ fn malformed_inputs_are_refused_without_echoing_them() {
         (start(ID_A, "p", "0", "r", &sha, T0), Field::AttemptNumber),
         (start(ID_A, "p", "01", "r", &sha, T0), Field::AttemptNumber),
         (start(ID_A, "p", "1x", "r", &sha, T0), Field::AttemptNumber),
-        (start(ID_A, "p", "1", sentinel, &sha, T0), Field::RuntimeRef),
-        (start(ID_A, "p", "1", "", &sha, T0), Field::RuntimeRef),
+        (
+            start(ID_A, sentinel, "0", sentinel, &sha, T0),
+            Field::AttemptNumber,
+        ),
         (
             start(ID_A, "p", "1", "r", &sha.to_uppercase(), T0),
             Field::StartSha,
@@ -456,27 +562,16 @@ fn malformed_inputs_are_refused_without_echoing_them() {
     }
     let finish_cases = [
         AttemptFinish::new(aid(ID_A), T1, Some("abc"), None, None),
-        AttemptFinish::new(aid(ID_A), T1, None, Some("two words"), None),
-        AttemptFinish::new(aid(ID_A), T1, None, Some(&"r".repeat(201)), None),
-        AttemptFinish::new(aid(ID_A), T1, None, None, Some(sentinel)),
-        AttemptFinish::new(aid(ID_A), T1, None, None, Some(&"C".repeat(65))),
         AttemptFinish::new(aid(ID_A), "bad", None, None, None),
     ];
-    let fields = [
-        Field::EndSha,
-        Field::OutcomeRef,
-        Field::OutcomeRef,
-        Field::FailureClass,
-        Field::FailureClass,
-        Field::EndedAt,
-    ];
+    let fields = [Field::EndSha, Field::EndedAt];
     for (result, field) in finish_cases.into_iter().zip(fields) {
         assert_eq!(
             attempt_error(result.unwrap_err()),
             (Code::InvalidShape, Some(field))
         );
     }
-    let record_debug = format!("{:?}", start(ID_A, "p", "1", "r", &sha, T0).unwrap());
+    let record_debug = format!("{:?}", start(ID_A, "p", "1", sentinel, &sha, T0).unwrap());
     assert_eq!(record_debug, "AttemptStart");
     assert_eq!(format!("{:?}", aid(ID_A)), "AttemptId");
 }
