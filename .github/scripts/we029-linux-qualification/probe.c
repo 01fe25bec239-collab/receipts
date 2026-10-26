@@ -391,7 +391,11 @@ int main(int argc, char **argv) {
     union { uint64_t alignment; unsigned char storage[256]; } h;
     memset(&h, 0, sizeof(h));
     struct file_handle *handle = (struct file_handle *)&h;
-    handle->handle_bytes = sizeof(h) - sizeof(*handle);
+    enum { HANDLE_CAPACITY = MAX_HANDLE_SZ };
+    _Static_assert(HANDLE_CAPACITY > 0 && HANDLE_CAPACITY <= MAX_HANDLE_SZ, "legal handle capacity");
+    _Static_assert(sizeof(h) >= sizeof(*handle) + HANDLE_CAPACITY, "handle header and payload fit storage");
+    _Static_assert(_Alignof(__typeof__(h)) >= _Alignof(struct file_handle), "handle storage alignment");
+    handle->handle_bytes = HANDLE_CAPACITY;
     int mount_id, handle_ok = 0;
     if (!strcmp(argv[1], "controller")) {
         int r = name_to_handle_at(AT_FDCWD, victim, handle, &mount_id, 0);
