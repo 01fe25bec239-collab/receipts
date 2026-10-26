@@ -146,6 +146,76 @@ impl GraphField {
     }
 }
 
+/// Closed attempt-record failure reason. Never carries caller input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptFailureCode {
+    InvalidShape,
+    DuplicateStart,
+    UnknownAttempt,
+    DuplicateFinish,
+    ConflictingFinish,
+    StoreBusy,
+    StoreUnavailable,
+    UnsupportedSchema,
+    CorruptStore,
+    StorageFailure,
+}
+impl AttemptFailureCode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::InvalidShape => "INVALID_SHAPE",
+            Self::DuplicateStart => "DUPLICATE_START",
+            Self::UnknownAttempt => "UNKNOWN_ATTEMPT",
+            Self::DuplicateFinish => "DUPLICATE_FINISH",
+            Self::ConflictingFinish => "CONFLICTING_FINISH",
+            Self::StoreBusy => "STORE_BUSY",
+            Self::StoreUnavailable => "STORE_UNAVAILABLE",
+            Self::UnsupportedSchema => "UNSUPPORTED_SCHEMA",
+            Self::CorruptStore => "CORRUPT_STORE",
+            Self::StorageFailure => "STORAGE_FAILURE",
+        }
+    }
+}
+
+/// Attempt field named by a closed diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptField {
+    AttemptId,
+    ProjectId,
+    GraphId,
+    NodeId,
+    AttemptNumber,
+    Role,
+    RuntimeRef,
+    WorkspaceId,
+    StartSha,
+    EndSha,
+    StartedAt,
+    EndedAt,
+    OutcomeRef,
+    FailureClass,
+}
+impl AttemptField {
+    fn label(self) -> &'static str {
+        match self {
+            Self::AttemptId => "attempt_id",
+            Self::ProjectId => "project_id",
+            Self::GraphId => "graph_id",
+            Self::NodeId => "node_id",
+            Self::AttemptNumber => "attempt_number",
+            Self::Role => "role",
+            Self::RuntimeRef => "runtime_ref",
+            Self::WorkspaceId => "workspace_id",
+            Self::StartSha => "start_sha",
+            Self::EndSha => "end_sha",
+            Self::StartedAt => "started_at",
+            Self::EndedAt => "ended_at",
+            Self::OutcomeRef => "outcome_ref",
+            Self::FailureClass => "failure_class",
+        }
+    }
+}
+
 /// Errors produced by the State repository foundation.
 ///
 /// Every failure mode of opening, configuring, migrating, or transacting
@@ -159,6 +229,11 @@ pub enum StateError {
         phase: GraphPhase,
         code: GraphFailureCode,
         field: Option<GraphField>,
+    },
+    /// Closed, content-free attempt-record diagnostic.
+    AttemptPersistence {
+        code: AttemptFailureCode,
+        field: Option<AttemptField>,
     },
     /// A value was not canonical non-negative decimal State epoch text.
     InvalidStateEpochValue { value: String },
@@ -601,6 +676,13 @@ impl fmt::Display for StateError {
         match self {
             StateError::GraphPersistence { phase, code, field } => {
                 write!(f, "graph persistence {} {}", phase.label(), code.label())?;
+                if let Some(field) = field {
+                    write!(f, " {}", field.label())?;
+                }
+                Ok(())
+            }
+            StateError::AttemptPersistence { code, field } => {
+                write!(f, "attempt persistence {}", code.label())?;
                 if let Some(field) = field {
                     write!(f, " {}", field.label())?;
                 }

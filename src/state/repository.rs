@@ -64,10 +64,12 @@ impl SqliteStateRepository {
     /// PRAGMA is applied and verified; any failure is returned as an
     /// explicit error.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StateError> {
-        Self::open_with_migrations(path, migrations::registered())
+        let repo = Self::open_with_migrations(path, migrations::registered())?;
+        graph_repository::verify_current(repo.connection(), GraphPhase::Read)?;
+        Ok(repo)
     }
 
-    /// Explicitly upgrades an exact v11 or v12 State database to v13.
+    /// Explicitly upgrades an exact v11, v12 or v13 State database to v14.
     pub fn migrate_existing_to_current(path: impl AsRef<Path>) -> Result<u32, StateError> {
         let mut conn =
             Connection::open_with_flags(path.as_ref(), OpenFlags::SQLITE_OPEN_READ_WRITE)
@@ -85,16 +87,21 @@ impl SqliteStateRepository {
             Some(11) => {
                 migrations::v0012_context_epoch_unbounded::apply_graph(&mut conn)?;
                 graph_repository::migrate_graph_store(&conn)?;
-                Ok(13)
+                graph_repository::migrate_attempt_store(&conn)?;
+                Ok(14)
             }
             Some(12) => {
                 graph_repository::migrate_graph_store(&conn)?;
-                Ok(13)
+                graph_repository::migrate_attempt_store(&conn)?;
+                Ok(14)
             }
             Some(13) => {
-                graph_repository::verify_ledger(&conn, 13, GraphPhase::Migration)?;
-                graph_repository::verify_schema(&conn, GraphPhase::Migration, true)?;
-                Ok(13)
+                graph_repository::migrate_attempt_store(&conn)?;
+                Ok(14)
+            }
+            Some(14) => {
+                graph_repository::verify_current(&conn, GraphPhase::Migration)?;
+                Ok(14)
             }
             _ => Err(StateError::GraphPersistence {
                 phase: GraphPhase::Migration,
@@ -120,7 +127,7 @@ impl SqliteStateRepository {
         let repo = Self { conn };
         match repo.read_schema_version()? {
             found if found == supported => {
-                if supported == 13 {
+                if supported >= 13 {
                     verify_exact_ledger(repo.connection(), chain)?;
                 }
                 Ok(repo)

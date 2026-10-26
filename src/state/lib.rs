@@ -15,6 +15,7 @@
 //! orchestrator core). This foundation provides no worker-, host-, adapter-,
 //! or model-facing mutation path.
 
+pub mod attempt;
 pub mod canonical_timestamp;
 pub mod context_epoch;
 pub mod context_manifest;
@@ -32,6 +33,9 @@ pub mod startup_recovery;
 pub mod trusted_time;
 
 mod migrations;
+
+#[cfg(test)]
+mod attempt_tests;
 
 #[cfg(test)]
 mod context_epoch_advance_tests;
@@ -90,6 +94,7 @@ mod trusted_time_watermark_tests;
 #[cfg(test)]
 mod tests;
 
+pub use attempt::{AttemptFinish, AttemptId, AttemptRecord, AttemptRole, AttemptStart};
 pub use canonical_timestamp::CanonicalTimestampV1;
 pub use context_epoch::{
     ChangedSource, ChangedSourceRefType, ChangedSources, ContextEpoch, ContextEpochTrigger,
@@ -108,7 +113,9 @@ pub use context_rehydration::{
     context_rehydration_event_payload, context_source_digest_v1,
 };
 pub use epoch_value::StateEpochValueV1;
-pub use error::{GraphFailureCode, GraphField, GraphPhase, StateError};
+pub use error::{
+    AttemptFailureCode, AttemptField, GraphFailureCode, GraphField, GraphPhase, StateError,
+};
 pub use event::{
     ActorKind, EventActor, EventEnvelope, EventPayloadReference, EventSubject, EventType,
     SubjectKind,

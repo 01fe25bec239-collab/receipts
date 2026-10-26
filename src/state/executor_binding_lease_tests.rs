@@ -177,8 +177,8 @@ fn t01_schema_version_remains_11() {
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
     assert_eq!(
         repo.schema_version().expect("version read"),
-        13,
-        "the supported schema version must be 13 before any renewal"
+        14,
+        "the supported schema version must be 14 before any renewal"
     );
     repo.create_logical_role(minimal_role("role-ver-001", LogicalRoleType::RuntimeA1))
         .expect("role create");
@@ -188,12 +188,12 @@ fn t01_schema_version_remains_11() {
         .expect("renew");
     assert_eq!(
         repo.schema_version().expect("version read"),
-        13,
+        14,
         "a lease renewal must not change the schema version"
     );
     drop(repo);
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("reopen");
-    assert_eq!(repo.schema_version().expect("version read"), 13);
+    assert_eq!(repo.schema_version().expect("version read"), 14);
 }
 
 // T02 — lease renewal itself introduces no migration beyond the authorized
@@ -205,13 +205,13 @@ fn t02_no_migration_introduced_by_lease_renewal() {
     let registered = migrations::registered();
     assert_eq!(
         registered.len(),
-        13,
-        "exactly thirteen registered migrations may exist"
+        14,
+        "exactly fourteen registered migrations may exist"
     );
     assert_eq!(
         registered.last().expect("chain is non-empty").version,
-        13,
-        "the registered chain must end at version 13"
+        14,
+        "the registered chain must end at version 14"
     );
     let tmp = TempDir::new("ebl-t02");
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
@@ -223,7 +223,7 @@ fn t02_no_migration_introduced_by_lease_renewal() {
         .expect("renew");
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        13,
+        14,
         "no extra migration metadata row may appear"
     );
 }
