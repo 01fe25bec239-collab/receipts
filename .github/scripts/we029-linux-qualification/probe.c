@@ -19,6 +19,7 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -157,6 +158,7 @@ static void verify_identity(int controller) {
  * Namespace, mount and FD-stealing APIs are unnecessary for this fixed fixture.
  */
 #define BLOCK(n) BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_##n, 0, 1), BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM)
+#define NEW_NAMESPACES (CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWTIME)
 static void syscall_policy(void) {
     struct sock_filter f[] = {
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
@@ -170,10 +172,61 @@ static void syscall_policy(void) {
         BLOCK(process_vm_readv), BLOCK(process_vm_writev), BLOCK(pidfd_getfd),
         BLOCK(open_tree), BLOCK(move_mount), BLOCK(fsopen), BLOCK(fsmount),
         BLOCK(mount_setattr),
+        /* BPF cannot inspect clone3's pointed-to flags; ENOSYS permits libc's clone fallback. */
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_clone3, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_clone, 0, 3),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0])),
+        BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, NEW_NAMESPACES, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)
     };
     struct sock_fprog p = {.len = sizeof(f) / sizeof(f[0]), .filter = f};
     REQUIRE(syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &p) == 0);
+}
+static void process_creation(void) {
+    const unsigned long flags[] = {CLONE_NEWNS, CLONE_NEWCGROUP, CLONE_NEWUTS,
+        CLONE_NEWIPC, CLONE_NEWUSER, CLONE_NEWPID, CLONE_NEWNET, CLONE_NEWTIME};
+    for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); ++i) {
+        errno = 0;
+        long r = syscall(SYS_clone, flags[i] | (unsigned long)SIGCHLD, NULL, NULL, NULL, 0UL);
+        if (!r) _exit(73);
+        printf("NAMESPACE clone flags=%lx result=%ld errno=%d\n", flags[i], r, errno);
+        REQUIRE(r == -1 && errno == EPERM);
+        struct clone_args args = {.flags = flags[i], .exit_signal = SIGCHLD};
+        errno = 0;
+        r = syscall(SYS_clone3, &args, sizeof(args));
+        if (!r) _exit(73);
+        printf("NAMESPACE clone3 flags=%lx result=%ld errno=%d\n", flags[i], r, errno);
+        REQUIRE(r == -1 && errno == ENOSYS);
+    }
+    struct clone_args args = {.exit_signal = SIGCHLD};
+    errno = 0;
+    REQUIRE(syscall(SYS_clone3, &args, sizeof(args)) == -1 && errno == ENOSYS);
+    pid_t p = (pid_t)syscall(SYS_clone, (unsigned long)SIGCHLD, NULL, NULL, NULL, 0UL);
+    REQUIRE(p >= 0);
+    if (!p) _exit(0);
+    REQUIRE(wait_bounded(p) == 0);
+    printf("POSITIVE ordinary-clone=ok clone3-fallback=ENOSYS\n");
+}
+static void null_access(const char *stage) {
+    struct stat st;
+    REQUIRE(lstat("/dev/null", &st) == 0);
+    printf("NULL stage=%s mode=%o uid=%u gid=%u major=%u minor=%u character=%d\n",
+           stage, (unsigned int)(st.st_mode & 07777), st.st_uid, st.st_gid,
+           major(st.st_rdev), minor(st.st_rdev), S_ISCHR(st.st_mode));
+    REQUIRE(S_ISCHR(st.st_mode) && (st.st_mode & 07777) == 0666 &&
+            st.st_uid == 0 && st.st_gid == 0 && major(st.st_rdev) == 1 && minor(st.st_rdev) == 3);
+    const int modes[] = {O_RDONLY, O_WRONLY, O_RDWR};
+    for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); ++i) {
+        errno = 0;
+        int fd = open("/dev/null", modes[i] | O_CLOEXEC);
+        printf("NULL_OPEN stage=%s access=%d fd=%d errno=%d\n", stage, modes[i], fd, errno);
+        REQUIRE(fd >= 0);
+        if (modes[i] != O_WRONLY) { char b; REQUIRE(read(fd, &b, 1) == 0); }
+        if (modes[i] != O_RDONLY) REQUIRE(write(fd, "x", 1) == 1);
+        REQUIRE(close(fd) == 0);
+    }
 }
 static void landlock_rule(int rules, const char *path, uint64_t access) {
     int fd = open(path, O_PATH | O_CLOEXEC);
@@ -198,6 +251,7 @@ static void confine_controller(void) {
     REQUIRE(syscall(SYS_landlock_restrict_self, rules, 0) == 0);
     REQUIRE(close(rules) == 0);
     syscall_policy();
+    process_creation();
 }
 static void mount_view(const char *root) {
     REQUIRE(unshare(CLONE_NEWNS) == 0);
@@ -264,6 +318,7 @@ static void worker(const char *cg_name, int inherited) {
     verify_identity(0);
     closed_fd(inherited);
     syscall_policy();
+    process_creation();
     denied("proc-root-metadata", open("/proc/self/root/scope/.git/config", O_WRONLY));
     exec_identity(0);
     char b[4096];
@@ -316,8 +371,10 @@ static void controller(int inherited, int mount_fd, int namespace_fd, struct fil
     REQUIRE(read(control, outside, sizeof(outside)) == 18 && !strcmp(outside, "outside-synthetic\n"));
     REQUIRE(close(control) == 0);
     printf("POSITIVE controller-same-cap-handle-read-before-confinement bytes=18\n");
+    null_access("controller-before-confinement");
     /* The outside mount FD is deliberately retained solely for adversarial probes. */
     confine_controller();
+    null_access("controller-after-confinement");
     exec_identity(1);
     char b[128];
     struct stat st;
@@ -431,7 +488,10 @@ int main(int argc, char **argv) {
             controller(inherited, mount_fd, namespace_fd, handle, handle_ok);
         } else if (!strcmp(argv[1], "preflight")) {
             REQUIRE(close(mount_fd) == 0 && close(namespace_fd) == 0 && close(pipefd[1]) == 0);
-            identity(1); verify_identity(1); confine_controller();
+            identity(1); verify_identity(1);
+            null_access("preflight-before-confinement");
+            confine_controller();
+            null_access("preflight-after-confinement");
             git("rev-parse", "--show-toplevel", NULL);
             git("symbolic-ref", "--short", "HEAD");
             git("rev-parse", "--verify", "HEAD^{commit}");

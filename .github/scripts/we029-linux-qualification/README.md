@@ -4,16 +4,17 @@ Qualification source only. Original WE029 product implementation and MR020 stay
 stopped. This does not install a launcher, implement mediation, establish product
 lifecycle compatibility, or grant an assurance PASS. New privileged source needs
 independent static review before publication. A2 inspects the exact commit; USER
-starts fresh A4 static review; only after static PASS may A2 update existing PR185
-for one authorized corrected hosted run. A3 must not push, open a PR or dispatch it.
+starts fresh A4 static review; A2 then accepts readiness before any A1 handoff.
+The previous corrected execution allowance is consumed. This source repair grants
+no push, PR mutation, hosted run or privileged local execution to A3.
 
 The workflow and recorder admit only `pull_request: opened` or `reopened`, run
 attempt 1, for existing PR185 from this repository's qualification branch into
 this repository's `main`. Synchronization and manual reruns do not run
 qualification. This stateless gate does not prevent repeated reopen events;
-A2's execution ledger controls the one authorized corrected run, after exact-SHA
-static review and acceptance, using exactly one close/reopen of PR185. No second
-PR or unrestricted retry is authorized. It uses standard `ubuntu-24.04` x64 with a ten
+A2's execution ledger and separate execution authority must control any later run
+after exact-SHA review and acceptance. No second PR or unrestricted retry is
+authorized. It uses standard `ubuntu-24.04` x64 with a ten
 minute job bound. Preparation verifies the event, exact head, baseline ancestry,
 clean checkout, regular source modes and every changed path against the two-path
 allowlist. `ci.yml` is preserved. Checkout credentials are not persisted. The only
@@ -69,6 +70,15 @@ made private before setup. No host service sockets or writable host mounts are
 provided. Deliberately retained directory and real host mount-namespace FDs are used solely for the controller
 bypass tests and closed before Git runs; all other privileged FDs are closed.
 
+Device setup records the inherited umask and created/final type, mode, owner and
+device numbers. It explicitly sets root ownership and mode0666, verifies character
+device1:3, and records the containing mount's options. Tool/library directories
+also receive explicit search permissions. With the actual controller identity,
+read, write and read/write opens plus EOF/write behavior are checked before and
+after confinement. No capability or Landlock grant is broadened. The historical
+run40410425492 EACCES had no final-mode or mount receipt; umask remains a candidate
+cause, not a demonstrated explanation of that failure.
+
 The controller additionally requires Landlock ABI >=3. Its filesystem rules
 handle all ABI3 rights (through TRUNCATE), allowing the repository tree, read/exec
 of fixed tool/library trees, and read/write of `/dev/null`. The outside sentinel
@@ -85,6 +95,13 @@ kill the process. The following calls return EPERM:
 - `mount`, `umount2`, `pivot_root`, `chroot`, `open_tree`, `move_mount`, `fsopen`,
   `fsmount`, `mount_setattr`;
 - `ptrace`, `process_vm_readv`, `process_vm_writev`, `pidfd_getfd`.
+
+Legacy `clone` namespace flags return EPERM. All filtered `clone3` calls return
+ENOSYS because BPF cannot inspect their pointed-to flags; libc can fall back to
+ordinary `clone`. Both controller and worker probe every namespace bit, the
+clone3 fallback result and ordinary clone/wait. Existing fork/exec, Git and
+double-fork lifecycle checks remain required. The privileged supervisor's initial
+`clone3(CLONE_INTO_CGROUP)` runs before the filter is installed.
 
 Other syscalls remain available to this fixed fixture. This is an explicit small
 candidate policy, not a general sandbox claim. It is installed before any fork;
@@ -117,7 +134,10 @@ OS/version, kernel/architecture, filesystem, tool versions, exact
 checkout/harness SHA, source/binary hashes and cleanup receipts bind the evidence.
 
 Local static preparation: `python3 .github/scripts/we029-linux-qualification/run.py
-self-check` verifies opened/reopened admission, wrong-PR/repository/branch/head/event/attempt
+self-check` verifies vanished `/proc` entries, malformed live identities, reserved
+UID/GID conflicts and unexpected-error propagation. Safe FIFO permission checks
+under umasks022/077/777 mock device creation/identity and root chown; these do not
+execute Linux device or confinement setup. It also verifies opened/reopened admission, wrong-PR/repository/branch/head/event/attempt
 refusal and accurate event receipts, allowlist rejection, NUL preservation, failed-command receipts,
 timeout cleanup, output-limit/unknown-cleanup refusal and evidence sealing without Linux setup. Linux execution is
 NOT RUN until the separately authorized hosted run. Do not run Rust suites or

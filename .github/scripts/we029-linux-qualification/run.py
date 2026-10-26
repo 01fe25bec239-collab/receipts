@@ -187,7 +187,9 @@ def prepare(out):
 
 def copy_tool(rec, root, source, destination):
     dest = root / destination.lstrip("/")
-    dest.parent.mkdir(parents=True, exist_ok=True)
+    for parent in reversed(dest.relative_to(root).parents[:-1]):
+        (root / parent).mkdir(exist_ok=True)
+        (root / parent).chmod(0o755)
     shutil.copyfile(source, dest)
     dest.chmod(0o755)
     deps = rec.run(["/usr/bin/ldd", str(source)]).decode()
@@ -195,17 +197,41 @@ def copy_tool(rec, root, source, destination):
     for lib in re.findall(r"(?:=>\s+)?(/[^\s()]+)", deps):
         require(lib.startswith(("/lib/", "/lib64/", "/usr/lib/")), "unexpected dependency location")
         target = root / lib.lstrip("/")
-        target.parent.mkdir(parents=True, exist_ok=True)
+        for parent in reversed(target.relative_to(root).parents[:-1]):
+            (root / parent).mkdir(exist_ok=True)
+            (root / parent).chmod(0o755)
         shutil.copyfile(lib, target)
         target.chmod(0o755)
 
 
-def fixture(rec, out, root):
+def create_null(path, receipt):
+    """Create and verify the sole fixture device, independent of inherited umask."""
+    mask = os.umask(0o777)
+    os.umask(mask)
+    receipt["umask"] = oct(mask)
+    os.mknod(path, stat.S_IFCHR | 0o666, os.makedev(1, 3))
+    for stage in ("created", "final"):
+        if stage == "final":
+            os.chown(path, 0, 0)
+            path.chmod(0o666)
+        s = path.lstat()
+        receipt[stage] = {"mode": oct(stat.S_IMODE(s.st_mode)), "uid": s.st_uid, "gid": s.st_gid,
+                          "character": stat.S_ISCHR(s.st_mode),
+                          "major": os.major(s.st_rdev), "minor": os.minor(s.st_rdev)}
+        require(stat.S_ISCHR(s.st_mode) and s.st_rdev == os.makedev(1, 3), "wrong null device")
+    require(stat.S_IMODE(s.st_mode) == 0o666 and s.st_uid == 0 and s.st_gid == 0,
+            "wrong null device permissions/owner")
+
+
+def fixture(rec, out, root, report):
     root.chmod(0o755)
     for directory in ("scope", "proc", "cgroups", "tool", "lib", "lib64", "dev"):
         (root / directory).mkdir(mode=0o755)
+        (root / directory).chmod(0o755)
     # A regular synthetic /dev/null would be wrong; this fixed device is the only device.
-    os.mknod(root / "dev/null", stat.S_IFCHR | 0o666, os.makedev(1, 3))
+    report["null_device"] = {}
+    create_null(root / "dev/null", report["null_device"])
+    rec.run(["/usr/bin/findmnt", "-n", "-T", str(root / "dev/null"), "-o", "TARGET,FSTYPE,OPTIONS"])
     (root / "outside").write_text("outside-synthetic\n")
     (root / "outside").chmod(0o600)
     copy_tool(rec, root, Path("/usr/bin/git"), "/tool/git")
@@ -276,6 +302,25 @@ def cleanup_cgroup(path, results):
     raise RuntimeError("UNKNOWN CLEANUP: retained cgroup and fixture; stop")
 
 
+def check_process_identity(entry):
+    """Ignore vanished processes; refuse malformed live status or reserved IDs."""
+    try:
+        status = (entry / "status").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return
+    fields = re.findall(r"^(Uid|Gid):[ \t]*(.*)$", status, re.M)
+    ids = dict(fields)
+    if len(fields) != 2 or set(ids) != {"Uid", "Gid"} or not all(
+            re.fullmatch(r"[0-9]+(?:[ \t]+[0-9]+){3}[ \t]*", value) for value in ids.values()):
+        try:
+            entry.stat()
+        except (FileNotFoundError, ProcessLookupError):
+            return
+        raise RuntimeError("malformed live process identity")
+    require(not ({C, W} & {int(value) for row in ids.values() for value in row.split()}),
+            "active fixture identity conflict")
+
+
 def hosted(out):
     require(platform.system() == "Linux" and platform.machine() == "x86_64" and os.geteuid() == 0,
             "hosted Linux x64 administrator setup only")
@@ -294,13 +339,7 @@ def hosted(out):
     # Existing numeric owners could create a collision even without passwd entries.
     for entry in Path("/proc").iterdir():
         if entry.name.isdigit():
-            try:
-                status = (entry / "status").read_text()
-            except FileNotFoundError:
-                continue
-            for field in ("Uid", "Gid"):
-                ids = re.search(rf"^{field}:\s+(.*)$", status, re.M)
-                require(ids and not ({C, W} & set(map(int, ids[1].split()))), "active fixture identity conflict")
+            check_process_identity(entry)
     libc = ctypes.CDLL(None, use_errno=True)
     require(libc.prctl(36, 1, 0, 0, 0) == 0, "cannot become owned-child subreaper")
     rec = Recorder(out)
@@ -325,7 +364,7 @@ def hosted(out):
     try:
         rec.run(["/usr/bin/findmnt", "-n", "-o", "FSTYPE,OPTIONS", "/sys/fs/cgroup"])
         root = Path(tempfile.mkdtemp(prefix="we029-", dir="/tmp"))
-        initial = fixture(rec, out, root)
+        initial = fixture(rec, out, root, report)
         report["fixture"] = str(root)
         report["initial_sha"] = initial
         repository_identity = [(root / "scope").stat().st_ino, (root / "scope/.git").stat().st_ino]
@@ -410,6 +449,92 @@ def seal(out):
 
 
 def self_check():
+    from types import SimpleNamespace
+    from unittest import mock
+    with tempfile.TemporaryDirectory(prefix="we029-setup-check-") as tmp:
+        entry = Path(tmp) / "123"
+        entry.mkdir()
+        status = entry / "status"
+        good = "Uid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\n"
+        status.write_text(good)
+        check_process_identity(entry)
+        for error in (FileNotFoundError(), ProcessLookupError()):
+            with mock.patch.object(Path, "read_text", side_effect=error):
+                check_process_identity(entry)
+        for malformed in ("", "Uid:\nGid:\n", "Uid:\t1 1 1 1\n", good.replace("1000", "bad", 1),
+                          good + "Uid:\t1 1 1 1\n", good.replace("1000\t1000\t1000\t1000", "1 1 1")):
+            status.write_text(malformed)
+            for error in (FileNotFoundError(), ProcessLookupError()):
+                with mock.patch.object(Path, "stat", side_effect=error):
+                    check_process_identity(entry)
+            try:
+                check_process_identity(entry)
+            except RuntimeError as exc:
+                require(str(exc) == "malformed live process identity", "wrong live-status refusal")
+            else:
+                raise RuntimeError("malformed live status accepted")
+        for uid in (C, W):
+            for field in ("Uid", "Gid"):
+                status.write_text(good.replace(field + ":\t1000", field + ":\t" + str(uid)))
+                try:
+                    check_process_identity(entry)
+                except RuntimeError as exc:
+                    require(str(exc) == "active fixture identity conflict", "wrong conflict refusal")
+                else:
+                    raise RuntimeError("live identity conflict accepted")
+        for operation in ("read_text", "stat"):
+            status.write_text("")
+            with mock.patch.object(Path, operation, side_effect=PermissionError("unexpected")):
+                try:
+                    check_process_identity(entry)
+                except PermissionError:
+                    pass
+                else:
+                    raise RuntimeError("unexpected proc error swallowed")
+        # Safe FIFO exercises real umask/chmod; only device creation/identity and root chown are mocked.
+        real_lstat = Path.lstat
+        def device_stat(path):
+            s = real_lstat(path)
+            return SimpleNamespace(st_mode=stat.S_IFCHR | stat.S_IMODE(s.st_mode), st_uid=0,
+                                   st_gid=0, st_rdev=os.makedev(1, 3))
+        for mask in (0o022, 0o077, 0o777):
+            path = Path(tmp) / ("null-" + str(mask))
+            receipt = {}
+            previous = os.umask(mask)
+            try:
+                with mock.patch.object(os, "mknod", side_effect=lambda p, m, d: os.mkfifo(p, stat.S_IMODE(m))) as node, \
+                     mock.patch.object(os, "chown") as owner, \
+                     mock.patch.object(Path, "lstat", autospec=True, side_effect=device_stat):
+                    create_null(path, receipt)
+                    node.assert_called_once_with(path, stat.S_IFCHR | 0o666, os.makedev(1, 3))
+                    owner.assert_called_once_with(path, 0, 0)
+                require(receipt["created"]["mode"] == oct(0o666 & ~mask) and
+                        receipt["final"]["mode"] == "0o666" and stat.S_IMODE(path.stat().st_mode) == 0o666,
+                        "null mode depends on umask")
+                require(os.umask(mask) == mask, "fixture changed inherited umask")
+                tool_root = Path(tmp) / ("tools-" + str(mask))
+                tool_root.mkdir()
+                tool_root.chmod(0o755)
+                source = Path(tmp) / "source"
+                source.write_bytes(b"synthetic")
+                source.chmod(0o600)
+                rec = mock.Mock()
+                rec.run.return_value = b""
+                copy_tool(rec, tool_root, source, "/lib/test/tool")
+                require(all(stat.S_IMODE(p.stat().st_mode) == 0o755 for p in (
+                    tool_root / "lib", tool_root / "lib/test", tool_root / "lib/test/tool")),
+                    "tool access depends on umask")
+            finally:
+                os.umask(previous)
+        with mock.patch.object(os, "mknod"), mock.patch.object(Path, "lstat", return_value=SimpleNamespace(
+                st_mode=stat.S_IFREG | 0o666, st_uid=0, st_gid=0, st_rdev=0)):
+            try:
+                create_null(Path(tmp) / "wrong-device", {})
+            except RuntimeError:
+                pass
+            else:
+                raise RuntimeError("regular-file null accepted")
+    print("Proc disappearance/live-conflict checks and mocked-device restrictive-umask checks passed")
     require(allowed(WORKFLOW) and allowed(PREFIX + "probe.c"), "allowlist positive")
     require(not any(allowed(p) for p in ("src/lib.rs", ".github/workflows/ci.yml", PREFIX + "../bad")),
             "allowlist negative")
