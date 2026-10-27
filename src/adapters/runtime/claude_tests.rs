@@ -1105,12 +1105,11 @@ fn fixture_evidence_checks_reject_missing_late_wrong_or_live_evidence() {
     let (leafless, retained) = (ws.identities(true), ws.gone(false));
     let uncaused = ws.stopped(&attempt, Cause::Cancelled);
     assert_eq!(attempt.cancel(), Acceptance::CancelAccepted);
-    let result = attempt.wait_collect().unwrap();
+    let result = attempt.wait_collect();
     assert!(leafless.is_err(), "{leafless:?}");
     assert!(retained.is_err(), "{retained:?}");
     assert!(uncaused.is_err(), "{uncaused:?}");
-    assert_eq!(result.process().terminal_cause(), Cause::Cancelled);
-    assert!(forced_timeout(Ok(&result)).is_err());
+    helper_cancellation_collection(result.as_ref());
     // Absence alone is not the expected winning cause.
     assert!(ws.stopped(&attempt, Cause::TimedOut).is_err());
     ws.stopped(&attempt, Cause::Cancelled).unwrap();
@@ -1120,6 +1119,37 @@ fn fixture_evidence_checks_reject_missing_late_wrong_or_live_evidence() {
         detail: MARKER.into(),
     });
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| safe(&leaked))).is_err());
+}
+
+fn helper_cancellation_collection(result: Result<&ClaudeLiveOutcome, &LiveProcessAttemptError>) {
+    match result {
+        Ok(result) => {
+            assert_eq!(result.process().terminal_cause(), Cause::Cancelled);
+            assert!(forced_timeout(Ok(result)).is_err());
+        }
+        Err(error) => {
+            assert!(
+                unverified_stderr_eof(error),
+                "{:?}",
+                RawFailure::from(error)
+            );
+            let raw = RawFailure::from(error);
+            assert_eq!(raw.classify_failure(), FailureClass::Unknown);
+            safe(error);
+            safe(&raw);
+            assert!(forced_timeout(Err(error)).is_err());
+        }
+    }
+}
+
+#[test]
+fn helper_cancellation_collection_accepts_incomplete_without_outcome_evidence() {
+    // Constructed carrier exercises the row's collection check, not reader fault injection.
+    let error = LiveProcessAttemptError::Execution(ExecutionError::CaptureReaderFailed {
+        stream: "stderr",
+        detail: "live reader EOF verification exceeded two seconds".into(),
+    });
+    helper_cancellation_collection(Err(&error));
 }
 
 #[test]
@@ -1173,6 +1203,13 @@ fn collection_contract_permits_only_typed_unverified_stderr_eof_never_orphan_evi
         LiveProcessAttemptError::AlreadyCollectedOrCollecting,
     ]) {
         assert!(!unverified_stderr_eof(&error), "{error:?}");
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                helper_cancellation_collection(Err(&error));
+            }))
+            .is_err(),
+            "{error:?}"
+        );
     }
 }
 
