@@ -1128,7 +1128,11 @@ fn helper_cancellation_collection(result: Result<&ClaudeLiveOutcome, &LiveProces
             assert!(forced_timeout(Ok(result)).is_err());
         }
         Err(error) => {
-            assert!(unverified_stderr_eof(error), "{:?}", RawFailure::from(error));
+            assert!(
+                unverified_stderr_eof(error),
+                "{:?}",
+                RawFailure::from(error)
+            );
             let raw = RawFailure::from(error);
             assert_eq!(raw.classify_failure(), FailureClass::Unknown);
             safe(error);
