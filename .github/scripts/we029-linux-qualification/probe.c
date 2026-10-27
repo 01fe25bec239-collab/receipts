@@ -443,7 +443,8 @@ int main(int argc, char **argv) {
     REQUIRE(inherited >= 0);
     int namespace_fd = open("/proc/self/ns/mnt", O_RDONLY | O_CLOEXEC);
     REQUIRE(namespace_fd >= 0);
-    int mount_fd = open(argv[2], O_PATH | O_DIRECTORY | O_CLOEXEC);
+    /* open_by_handle_at's fdget rejects O_PATH descriptors, even when live. */
+    int mount_fd = open(argv[2], O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     REQUIRE(mount_fd >= 0);
     union { uint64_t alignment; unsigned char storage[256]; } h;
     memset(&h, 0, sizeof(h));
