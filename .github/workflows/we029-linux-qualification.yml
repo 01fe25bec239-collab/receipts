@@ -1,0 +1,66 @@
+name: WE029 Linux qualification (synthetic only)
+
+on:
+  pull_request:
+    types: [opened, reopened]
+    paths:
+      - .github/workflows/we029-linux-qualification.yml
+      - .github/scripts/we029-linux-qualification/**
+
+permissions:
+  contents: read
+
+jobs:
+  qualification:
+    if: >-
+      github.repository == '01fe25bec239-collab/receipts' &&
+      github.event.number == 185 && github.event.pull_request.number == 185 &&
+      (github.event.action == 'opened' || github.event.action == 'reopened') &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.base.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'build/workspace-execution-a3-029-linux-qualification' &&
+      github.event.pull_request.base.ref == 'main' && github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      QUALIFICATION_HEAD: ${{ github.event.pull_request.head.sha }}
+      QUALIFICATION_BASELINE: 1811205f30f6993a373528f6cce67c489c19c6db
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout exact PR head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.QUALIFICATION_HEAD }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Verify scope, record provenance and compile
+        run: |
+          export QUALIFICATION_OUT="$RUNNER_TEMP/we029-evidence"
+          python3 .github/scripts/we029-linux-qualification/run.py prepare
+      - name: Disposable VM qualification
+        run: |
+          export QUALIFICATION_OUT="$RUNNER_TEMP/we029-evidence"
+          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+            QUALIFICATION_OUT="$QUALIFICATION_OUT" QUALIFICATION_HEAD="$QUALIFICATION_HEAD" \
+            QUALIFICATION_BASELINE="$QUALIFICATION_BASELINE" \
+            ImageOS="$ImageOS" ImageVersion="$ImageVersion" \
+            python3 .github/scripts/we029-linux-qualification/run.py hosted
+      - name: Seal explicit evidence, including failures
+        if: always()
+        run: |
+          export QUALIFICATION_OUT="$RUNNER_TEMP/we029-evidence"
+          python3 .github/scripts/we029-linux-qualification/run.py seal
+      - name: Upload synthetic evidence only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: we029-linux-synthetic-${{ github.run_id }}
+          retention-days: 3
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/we029-evidence/provenance.json
+            ${{ runner.temp }}/we029-evidence/results.json
+            ${{ runner.temp }}/we029-evidence/raw.jsonl
+            ${{ runner.temp }}/we029-evidence/SHA256SUMS
