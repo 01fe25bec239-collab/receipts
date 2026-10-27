@@ -28,6 +28,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use crate::content_digest::{GraphContentDigestError, graph_content_digest_v1};
 use crate::edge::{EdgeClass, GraphEdge};
 use crate::error::GraphError;
 use crate::goal::GoalEvaluationContextEpoch;
@@ -415,6 +416,41 @@ impl From<GraphError> for ExecutionGraphEnvelopeError {
     }
 }
 
+/// Why a typed append returned no new envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphAppendError {
+    EmptyBatch,
+    ParentVersionMismatch,
+    CreatedInVersionMismatch { node_id: String },
+    Graph(GraphError),
+    Digest(GraphContentDigestError),
+    ExpectedDigestMismatch,
+}
+
+impl std::fmt::Display for GraphAppendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyBatch => f.write_str("graph append requires at least one node or edge"),
+            Self::ParentVersionMismatch => {
+                f.write_str("append parent does not match current version")
+            }
+            Self::CreatedInVersionMismatch { node_id } => {
+                write!(
+                    f,
+                    "node {node_id:?} created_in_version does not match successor"
+                )
+            }
+            Self::Graph(error) => error.fmt(f),
+            Self::Digest(error) => error.fmt(f),
+            Self::ExpectedDigestMismatch => {
+                f.write_str("append digest does not match expected digest")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GraphAppendError {}
+
 /// Caller-supplied envelope metadata, validated only by
 /// [`ExecutionGraphEnvelope::bind`]. Nothing is defaulted or inferred.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -498,6 +534,62 @@ pub struct ExecutionGraphEnvelope {
 }
 
 impl ExecutionGraphEnvelope {
+    /// Appends a nonempty typed batch atomically, staging nodes before edges.
+    /// Returns a new envelope with the exact successor, old version as parent,
+    /// supplied time and computed v1 child digest. Other metadata and child
+    /// values are preserved; a supplied node `created_in_version` must match
+    /// the successor. Neither this physical value nor its digest grants live
+    /// write, execution or acceptance authority. No input is changed on failure.
+    ///
+    /// Invalid edge class/kind combinations cannot reach this typed boundary:
+    /// ```compile_fail
+    /// use receipts_orchestration::{GraphEdgeRelation, PrecedenceKind};
+    /// let invalid = GraphEdgeRelation::Control(PrecedenceKind::RequiresAccepted);
+    /// ```
+    pub fn append(
+        &self,
+        expected_parent: &GraphVersionV1,
+        mutation_time: OrchestrationDateTimeV1,
+        nodes: &[GraphNode],
+        edges: &[GraphEdge],
+        expected_digest: Option<&str>,
+    ) -> Result<Self, GraphAppendError> {
+        if expected_parent != self.graph_version() {
+            return Err(GraphAppendError::ParentVersionMismatch);
+        }
+        if nodes.is_empty() && edges.is_empty() {
+            return Err(GraphAppendError::EmptyBatch);
+        }
+        let successor = self.graph_version().successor();
+        let mut candidate = self.clone();
+        for node in nodes {
+            if node.created_in_version().is_some_and(|v| v != &successor) {
+                return Err(GraphAppendError::CreatedInVersionMismatch {
+                    node_id: node.node_id().to_owned(),
+                });
+            }
+            candidate
+                .graph
+                .add_node(node.clone())
+                .map_err(GraphAppendError::Graph)?;
+        }
+        for edge in edges {
+            candidate
+                .graph
+                .add_edge(edge.clone())
+                .map_err(GraphAppendError::Graph)?;
+        }
+        let digest = graph_content_digest_v1(&candidate.graph).map_err(GraphAppendError::Digest)?;
+        if expected_digest.is_some_and(|expected| expected != digest) {
+            return Err(GraphAppendError::ExpectedDigestMismatch);
+        }
+        candidate.fields.graph_version = successor;
+        candidate.fields.parent_version = Some(Some(self.graph_version().clone()));
+        candidate.fields.created_at = mutation_time;
+        candidate.fields.resulting_digest = Some(digest);
+        Ok(candidate)
+    }
+
     /// Validates `fields` against a non-empty `graph` and returns the envelope
     /// over a copy of it. The input graph is never modified; any failure
     /// returns no envelope.
