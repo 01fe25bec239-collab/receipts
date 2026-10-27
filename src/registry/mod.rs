@@ -3,6 +3,8 @@
 //! &Registry. No mutable collections or record references are exposed.
 mod capability;
 pub use capability::*;
+mod resolver;
+pub use resolver::*;
 
 use crate::EvidenceConfidence;
 use crate::intelligence::{
@@ -516,5 +518,7 @@ impl ModelIntelligenceService {
     }
 }
 
+#[cfg(test)]
+mod resolver_tests;
 #[cfg(test)]
 mod tests;
