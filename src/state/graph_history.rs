@@ -213,6 +213,7 @@ fn mutations(
     if !id(project) || !id(graph_id) {
         return Err(invalid());
     }
+    validate_partition(conn, project, graph_id)?;
     let mut stmt=conn.prepare("SELECT mutation_id,parent_version,resulting_version,mutation_json FROM graph_mutations WHERE project_id=?1 AND graph_id=?2 ORDER BY mutation_id COLLATE BINARY").map_err(|e|graph::sqlite_error(Phase::Read,e))?;
     let mut rows = stmt
         .query(params![project, graph_id])

@@ -633,3 +633,61 @@ fn empty_result_lists_validate_partition_for_both_readers() {
     drop(repo);
     cleanup(path);
 }
+
+#[test]
+fn empty_mutation_lists_validate_partition_for_both_readers() {
+    let path = db();
+    let mut repo = SqliteStateRepository::open(&path).unwrap();
+    repo.create_initial_graph_v1(&Clock, content("p", None))
+        .unwrap();
+    let reader = ReadOnlyGraphReader::open_existing(&path).unwrap();
+    assert!(repo.list_graph_mutations_v1("p", "g").unwrap().is_empty());
+    assert!(reader.list_graph_mutations_v1("p", "g").unwrap().is_empty());
+    assert!(
+        repo.list_graph_mutations_v1("absent", "g")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        reader
+            .list_graph_mutations_v1("absent", "g")
+            .unwrap()
+            .is_empty()
+    );
+    corrupt_graph(
+        repo.connection(),
+        "DELETE FROM graph_snapshot_seals WHERE project_id='p' AND graph_id='g' AND graph_version='1'",
+    );
+    let repository_result = repo.list_graph_mutations_v1("p", "g");
+    let reader_result = reader.list_graph_mutations_v1("p", "g");
+    assert!(matches!(
+        reader.read_current_v1("p", "g"),
+        Err(StateError::GraphPersistence {
+            code: Code::CorruptStore,
+            ..
+        })
+    ));
+    assert!(
+        matches!(
+            repository_result,
+            Err(StateError::GraphPersistence {
+                code: Code::CorruptStore,
+                ..
+            })
+        ),
+        "repository mutation list bypassed corruption: {repository_result:?}"
+    );
+    assert!(
+        matches!(
+            reader_result,
+            Err(StateError::GraphPersistence {
+                code: Code::CorruptStore,
+                ..
+            })
+        ),
+        "read-only mutation list bypassed corruption: {reader_result:?}"
+    );
+    drop(reader);
+    drop(repo);
+    cleanup(path);
+}
