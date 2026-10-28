@@ -58,6 +58,7 @@ pub mod date_time;
 pub mod error;
 pub mod git;
 pub mod handle;
+pub mod handle_wire;
 pub mod provision;
 pub mod recovery_preparation;
 pub mod remote_publish_policy;
@@ -85,6 +86,8 @@ mod checkpoint_reference_tests;
 mod checkpoint_vocabulary_tests;
 #[cfg(test)]
 mod date_time_tests;
+#[cfg(test)]
+mod handle_wire_tests;
 #[cfg(test)]
 mod provision_tests;
 #[cfg(test)]
@@ -119,6 +122,9 @@ pub use checkpoint_vocabulary::{
 pub use date_time::{WorkspaceDateTimeError, WorkspaceDateTimeV1};
 pub use error::WorkspaceError;
 pub use handle::{CommitSha, WorkspaceHandle, WorkspaceIsolation, WorkspaceState};
+pub use handle_wire::{
+    WorkspaceHandleExportError, WorkspaceHandleWire, WorkspaceHandleWireIsolation,
+};
 pub use provision::{WorkspaceProvisionRequest, validate_branch_name};
 pub use recovery_preparation::{
     WorkspaceRecoveryPreparation, WorkspaceRecoveryPreparationError,
