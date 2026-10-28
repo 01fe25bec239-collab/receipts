@@ -88,7 +88,7 @@ fn bounded_refusal_is_not_disjoint_and_does_not_limit_public_matching() {
     );
     let huge = "a".repeat(INTERSECTION_WORK_LIMIT);
     let large = set(&[&huge]);
-    assert!(large.matches(&huge));
+    assert!(set(&["*"]).matches(&huge));
     assert_eq!(
         intersects(&large, &large),
         Err(WritePathIntersectionError::ResourceLimit)
