@@ -3,6 +3,8 @@
 //! &Registry. No mutable collections or record references are exposed.
 mod capability;
 pub use capability::*;
+mod seed_loader;
+pub use seed_loader::*;
 mod resolver;
 pub use resolver::*;
 
@@ -522,3 +524,6 @@ impl ModelIntelligenceService {
 mod resolver_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod seed_loader_tests;
