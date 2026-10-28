@@ -1,5 +1,8 @@
 use super::*;
 use crate::test_support::{TempDir, TestRepo, git};
+use crate::write_path_pattern::{
+    WritePathPattern as Pattern, match_component, validate_write_path as validate_structure,
+};
 use std::ffi::OsStr;
 
 fn strings(values: &[&str]) -> Vec<String> {
@@ -719,5 +722,94 @@ fn write_scope_raw_bound_precedes_utf8_nul_and_deduplication() {
             result,
             Err(WriteScopeVerificationError::Evidence { .. })
         ));
+    }
+}
+
+#[test]
+fn public_engine_and_verifier_agree_on_scope_and_all_forbidden_evidence() {
+    use crate::{WritePathPattern, WritePathSet};
+    let repo = TestRepo::new("scope-public-parity");
+    let base = repo.head_sha();
+    for path in [
+        "src/foo",
+        "src/nested/foo",
+        "src/猫🦀.rs",
+        "?[]{}!*",
+        "outside",
+        ".env",
+    ] {
+        repo.commit_file(path, "content");
+    }
+    let allowed = strings(&["src/**/foo", "src/猫*.rs", "?bad"]);
+    // Invalid policy entries cannot be skipped, even if another pattern matches.
+    let bad = crate::WritePathPattern::parse(&allowed[2]).unwrap_err();
+    assert!(matches!(
+        verify_write_scope(repo.path(), &base, &repo.head_sha(), &allowed, &[]),
+        Err(WriteScopeVerificationError::InvalidPattern { set: WriteScopePatternSet::Allowed, index: 2, reason, .. }) if reason == bad
+    ));
+    let allowed = strings(&["src/**/foo", "src/猫*.rs", ".env"]);
+    let forbidden = strings(&["**/foo", "src/*", "**/foo"]);
+    let parse = |patterns: &[String]| {
+        WritePathSet::new(
+            patterns
+                .iter()
+                .map(|p| WritePathPattern::parse(p).unwrap())
+                .collect(),
+        )
+    };
+    let allowed_set = parse(&allowed);
+    let forbidden_set = parse(&forbidden);
+    let result =
+        verify_write_scope(repo.path(), &base, &repo.head_sha(), &allowed, &forbidden).unwrap();
+    let expected: Vec<_> = result
+        .changed_paths()
+        .iter()
+        .filter(|p| !allowed_set.matches(p))
+        .cloned()
+        .collect();
+    assert_eq!(result.unauthorized_paths(), expected);
+    let mut expected_forbidden = Vec::new();
+    for path in result.changed_paths() {
+        assert_eq!(
+            forbidden_set.matches(path),
+            result.forbidden_matches().iter().any(|m| m.path() == path)
+        );
+        for pattern in &forbidden {
+            if WritePathPattern::parse(pattern).unwrap().matches(path) {
+                expected_forbidden.push((path.as_str(), pattern.as_str()));
+            }
+        }
+    }
+    expected_forbidden.sort();
+    expected_forbidden.dedup();
+    let actual: Vec<_> = result
+        .forbidden_matches()
+        .iter()
+        .map(|m| (m.path(), m.pattern()))
+        .collect();
+    assert_eq!(actual, expected_forbidden);
+}
+
+#[test]
+fn malformed_policy_keeps_sha_allowed_forbidden_and_collection_error_order() {
+    let absent = Path::new("/nonexistent-write-scope-policy-order");
+    let sha = "0000000000000000000000000000000000000000";
+    let bad = strings(&["**", "!bad?"]);
+    let good = strings(&["**/**"]);
+    assert!(matches!(
+        verify_write_scope(absent, "HEAD", "HEAD", &bad, &bad),
+        Err(WriteScopeVerificationError::InvalidBaselineSha)
+    ));
+    assert!(matches!(
+        verify_write_scope(absent, sha, "HEAD", &bad, &bad),
+        Err(WriteScopeVerificationError::InvalidCandidateSha)
+    ));
+    for (allowed, forbidden, expected) in [
+        (&bad, &bad, WriteScopePatternSet::Allowed),
+        (&good, &bad, WriteScopePatternSet::Forbidden),
+    ] {
+        assert!(
+            matches!(verify_write_scope(absent, sha, sha, allowed, forbidden), Err(WriteScopeVerificationError::InvalidPattern {set, index: 1, pattern, reason: "leading negation is unsupported"}) if set == expected && pattern == "!bad?")
+        );
     }
 }

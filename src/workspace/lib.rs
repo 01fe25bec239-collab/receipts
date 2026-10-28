@@ -62,6 +62,7 @@ pub mod provision;
 pub mod recovery_preparation;
 pub mod remote_publish_policy;
 pub mod teardown;
+pub mod write_path_pattern;
 pub mod write_scope;
 
 /// Argv-only local process-runner foundation owned by the execution layer.
@@ -133,4 +134,8 @@ pub use write_scope::{
 pub use attempt_finalization::{
     WorkspaceAttemptFinalizationError, WorkspaceAttemptFinalizationEvidence,
     WorkspaceAttemptFinalizationRequest, finalize_workspace_attempt,
+};
+
+pub use write_path_pattern::{
+    WritePathIntersectionError, WritePathPattern, WritePathSet, intersects, validate_write_path,
 };
