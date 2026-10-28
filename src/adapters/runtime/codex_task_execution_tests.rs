@@ -68,13 +68,17 @@ fn read_only_uses_exact_argv() {
     let request = test_request(CodexTaskSandboxMode::ReadOnly, "smoke");
     let seen: RefCell<Vec<OsString>> = RefCell::new(Vec::new());
     let result = execute_with_runner(&request, |process_request, _| {
+        assert_eq!(
+            process_request.stdin(),
+            &ProcessStdin::bytes(request.prompt().as_bytes()).unwrap()
+        );
         *seen.borrow_mut() = process_request.arguments().to_vec();
         Ok(completed_snapshot(b"out", b"err", Some(0)))
     })
     .expect("read-only smoke task must succeed");
     assert_eq!(
         recorded_args(&seen.borrow()),
-        vec!["exec", "--json", "--sandbox", "read-only", "--", "smoke"]
+        vec!["exec", "--json", "--sandbox", "read-only", "--", "-"]
     );
     assert_eq!(result.exit_code(), 0);
 }
@@ -84,6 +88,10 @@ fn workspace_write_uses_exact_sandbox_value() {
     let request = test_request(CodexTaskSandboxMode::WorkspaceWrite, "smoke");
     let seen: RefCell<Vec<OsString>> = RefCell::new(Vec::new());
     execute_with_runner(&request, |process_request, _| {
+        assert_eq!(
+            process_request.stdin(),
+            &ProcessStdin::bytes(request.prompt().as_bytes()).unwrap()
+        );
         *seen.borrow_mut() = process_request.arguments().to_vec();
         Ok(completed_snapshot(b"out", b"err", Some(0)))
     })
@@ -93,7 +101,7 @@ fn workspace_write_uses_exact_sandbox_value() {
     assert_eq!(&args[..3], ["exec", "--json", "--sandbox"]);
     assert_eq!(args[3], "workspace-write");
     assert_eq!(args[4], "--");
-    assert_eq!(args[5], "smoke");
+    assert_eq!(args[5], "-");
 }
 
 // Exhaustive with no wildcard: adding a third public sandbox variant breaks
@@ -149,6 +157,10 @@ fn whitespace_only_prompt_is_accepted_exactly() {
     let request = test_request(CodexTaskSandboxMode::ReadOnly, "   ");
     let seen: RefCell<Vec<OsString>> = RefCell::new(Vec::new());
     execute_with_runner(&request, |process_request, _| {
+        assert_eq!(
+            process_request.stdin(),
+            &ProcessStdin::bytes(request.prompt().as_bytes()).unwrap()
+        );
         *seen.borrow_mut() = process_request.arguments().to_vec();
         Ok(completed_snapshot(b"out", b"err", Some(0)))
     })
@@ -156,7 +168,7 @@ fn whitespace_only_prompt_is_accepted_exactly() {
     let args = seen.borrow();
     assert_eq!(args.len(), 6);
     assert_eq!(args[4], OsString::from("--"));
-    assert_eq!(args[5], OsString::from("   "));
+    assert_eq!(args[5], OsString::from("-"));
 }
 
 #[test]
@@ -165,6 +177,10 @@ fn prompt_is_preserved_byte_for_byte() {
     let request = test_request(CodexTaskSandboxMode::ReadOnly, prompt);
     let seen: RefCell<Vec<OsString>> = RefCell::new(Vec::new());
     execute_with_runner(&request, |process_request, _| {
+        assert_eq!(
+            process_request.stdin(),
+            &ProcessStdin::bytes(request.prompt().as_bytes()).unwrap()
+        );
         *seen.borrow_mut() = process_request.arguments().to_vec();
         Ok(completed_snapshot(b"out", b"err", Some(0)))
     })
@@ -174,10 +190,10 @@ fn prompt_is_preserved_byte_for_byte() {
     assert_eq!(args[4], OsString::from("--"));
     assert_eq!(
         args[5],
-        OsString::from(prompt),
+        OsString::from("-"),
         "leading/trailing spaces, newline, tab, unicode, and flag-looking text must survive untouched"
     );
-    assert_eq!(args[5].as_encoded_bytes(), prompt.as_bytes());
+    assert_eq!(args[5].as_encoded_bytes(), b"-");
 }
 
 /// Admitted prompts that must reach the child as one verbatim argv element
@@ -213,23 +229,20 @@ fn option_and_rich_prompts_stay_one_verbatim_element_after_terminator() {
             let request = test_request(mode, prompt);
             let expected = ProcessRunRequest::new(
                 "/tmp/fake-codex-bin",
-                [
-                    "exec",
-                    "--json",
-                    "--sandbox",
-                    mode.cli_value(),
-                    "--",
-                    prompt,
-                ],
+                ["exec", "--json", "--sandbox", mode.cli_value(), "--", "-"],
                 "/tmp",
                 "/tmp",
             )
-            .expect("expected request is valid");
+            .expect("expected request is valid")
+            .with_stdin(ProcessStdin::bytes(prompt.as_bytes()).unwrap());
             let calls: RefCell<u32> = RefCell::new(0);
             let result = execute_with_runner(&request, |process_request, _| {
                 *calls.borrow_mut() += 1;
                 assert_eq!(process_request, &expected, "prompt {prompt:?}");
-                assert_eq!(process_request.stdin(), &ProcessStdin::Closed);
+                assert_eq!(
+                    process_request.stdin(),
+                    &ProcessStdin::bytes(prompt.as_bytes()).unwrap()
+                );
                 Ok(completed_snapshot(b"out", b"err", Some(0)))
             })
             .expect("admitted prompt must reach the runner");
@@ -240,27 +253,19 @@ fn option_and_rich_prompts_stay_one_verbatim_element_after_terminator() {
 }
 
 #[test]
-fn prompt_beyond_one_mib_stays_byte_exact_without_a_new_cap() {
-    // Larger than Workspace's stdin bound: argv transport must not inherit it.
-    let prompt = format!("-{}\n\u{2713}", "a".repeat(MAX_STDIN_BYTES + 1));
-    for mode in [
+fn prompt_over_limit_is_refused_without_launch() {
+    let request = test_request(
         CodexTaskSandboxMode::ReadOnly,
-        CodexTaskSandboxMode::WorkspaceWrite,
-    ] {
-        let request = test_request(mode, &prompt);
-        let seen: RefCell<Vec<OsString>> = RefCell::new(Vec::new());
-        execute_with_runner(&request, |process_request, _| {
-            assert_eq!(process_request.stdin(), &ProcessStdin::Closed);
-            *seen.borrow_mut() = process_request.arguments().to_vec();
-            Ok(completed_snapshot(b"out", b"err", Some(0)))
-        })
-        .expect("oversized prompt is not refused before launch");
-        let args = seen.borrow();
-        assert_eq!(args.len(), 6);
-        assert_eq!(args[3], mode.cli_value());
-        assert_eq!(args[4], "--");
-        assert!(args[5].as_encoded_bytes() == prompt.as_bytes());
-    }
+        &"x".repeat(MAX_STDIN_BYTES + 1),
+    );
+    let error =
+        execute_with_runner(&request, |_, _| panic!("oversized prompt launched")).unwrap_err();
+    assert!(matches!(
+        error,
+        CodexTaskExecutionError::WorkspaceExecution {
+            source: ExecutionError::StdinPayloadTooLarge { .. }
+        }
+    ));
 }
 
 #[test]

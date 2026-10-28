@@ -43,9 +43,12 @@ fn main() {
     assert_eq!(&args[1..4], &["exec", "--json", "--sandbox"]);
     assert_eq!(args[4].as_bytes(), fs::read("mode").unwrap());
     assert_eq!(args[5], "--");
-    assert_eq!(args[6].as_bytes(), fs::read("prompt").unwrap());
+    assert_eq!(args[6], "-");
+    let mut input = Vec::new();
+    std::io::stdin().read_to_end(&mut input).unwrap();
+    assert_eq!(input, fs::read("prompt").unwrap());
     assert!(std::env::vars_os().next().is_none());
-    assert_eq!(std::io::stdin().read(&mut [0]).unwrap(), 0);
+
     if Path::new("spawn-descendant").exists() {
         let _child = std::process::Command::new(std::env::current_exe().unwrap()).arg("descendant").spawn().unwrap();
         until(|| Path::new("descendant-ready").exists());
@@ -458,7 +461,11 @@ fn drop_before_collect_cleans_parent_and_descendant_via_workspace() {
 #[test]
 fn exact_shared_request_modes_prompts_and_validation_reach_real_boundary() {
     for mode in [Sandbox::ReadOnly, Sandbox::WorkspaceWrite] {
-        for &prompt in crate::codex_task_execution_tests::BOUNDARY_PROMPTS {
+        let boundary = "x".repeat(receipts_workspace_execution::execution::MAX_STDIN_BYTES);
+        for &prompt in crate::codex_task_execution_tests::BOUNDARY_PROMPTS
+            .iter()
+            .chain(std::iter::once(&boundary.as_str()))
+        {
             let ws = Workspace::new();
             ws.write("prompt", prompt);
             ws.write("mode", mode.cli_value());
@@ -764,4 +771,33 @@ fn codex_live_start_and_collection_error_types_remain_distinct() {
         start,
         CodexLiveStartError::Workspace(LiveProcessStartError::ControllerFailed)
     ));
+}
+
+#[test]
+fn oversized_stdin_refuses_both_paths_before_launch() {
+    let ws = Workspace::new();
+    let request = CodexTaskExecutionRequest::new(
+        helper(),
+        &ws.0,
+        &ws.0,
+        *ws.request(Duration::from_secs(10)).timeout_policy(),
+        Sandbox::ReadOnly,
+        "x".repeat(receipts_workspace_execution::execution::MAX_STDIN_BYTES + 1),
+    );
+    assert!(matches!(
+        crate::execute_codex_task_once(&request),
+        Err(CodexTaskExecutionError::WorkspaceExecution {
+            source: receipts_workspace_execution::execution::ExecutionError::StdinPayloadTooLarge { .. }
+        })
+    ));
+    assert!(matches!(
+        start_codex_live_attempt(&request),
+        Err(CodexLiveStartError::Request(
+            CodexTaskExecutionError::WorkspaceExecution {
+                source:
+                    receipts_workspace_execution::execution::ExecutionError::StdinPayloadTooLarge { .. }
+            }
+        ))
+    ));
+    assert!(!ws.0.join("pid").exists());
 }
