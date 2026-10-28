@@ -318,6 +318,7 @@ fn list_results(
     if !id(project) || !id(graph_id) || !positive(version) || !id(node) {
         return Err(invalid());
     }
+    crate::graph_history::validate_partition(conn, project, graph_id)?;
     let mut stmt=conn.prepare("SELECT result_ref FROM graph_node_results WHERE project_id=?1 AND graph_id=?2 AND graph_version=?3 AND node_id=?4 ORDER BY result_ref COLLATE BINARY").map_err(|e|graph::sqlite_error(Phase::Read,e))?;
     let refs = stmt
         .query_map(params![project, graph_id, version, node], |r| {
