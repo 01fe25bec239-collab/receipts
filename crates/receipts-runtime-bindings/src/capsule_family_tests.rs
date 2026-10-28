@@ -24,3 +24,15 @@ fn exactly_three_branches_expose_canonical_owner_types() {
         }
     };
 }
+
+#[test]
+fn exported_capsules_are_the_canonical_constructor_types() {
+    let _: fn(crate::TaskCapsule) -> RuntimeCapsuleFamily = RuntimeCapsuleFamily::Task;
+    let _: fn(crate::RepairCapsule) -> RuntimeCapsuleFamily = RuntimeCapsuleFamily::Repair;
+    let _: fn(crate::ReviewCapsuleNonTemporalCore) -> RuntimeCapsuleFamily =
+        RuntimeCapsuleFamily::Review;
+    let _: fn(crate::Criterion) -> receipts_orchestration::capsules::Criterion = |value| value;
+    let _: fn(
+        crate::ReviewCapsuleCriterion,
+    ) -> receipts_review_integration::ReviewCapsuleCriterion = |value| value;
+}

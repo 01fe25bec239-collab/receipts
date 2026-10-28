@@ -1,3 +1,11 @@
+mod attempt_types;
+mod claude_adapter;
+mod policy;
+pub use attempt_types::{ClaudeAttemptEvent, ClaudeEventError, ClaudeEventStream};
+pub use claude_adapter::{
+    CancelReason, ClaudeAdapter, ClaudeAttemptHandle, ClaudeAttemptResult, RuntimeObservation,
+};
+pub use policy::RuntimeExecutionPolicy;
 mod adapter;
 mod attempt;
 mod auth_status;
@@ -105,3 +113,6 @@ pub use claude_probe_execution::{
     ClaudeProbeExecutionError, classify_claude_probe_execution_error,
     execute_claude_capability_probe,
 };
+
+#[cfg(all(test, unix))]
+mod claude_adapter_tests;

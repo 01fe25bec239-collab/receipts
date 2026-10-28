@@ -20,10 +20,10 @@
 use crate::claude_stream_json::{contiguous_stdout, protocol};
 use crate::{ClaudeStreamJson, ClaudeStreamJsonError, FailureClass, RuntimeAuthStatus};
 use receipts_workspace_execution::execution::{
-    CapturedProcessRun, ExecutionError, LiveProcessAttempt, LiveProcessAttemptError,
-    LiveProcessCancelAcceptance, LiveProcessOutcome, LiveProcessOutput, LiveProcessStartError,
-    LiveProcessTerminalCause, ProcessRunRequest, ProcessStdin, ProcessTermination,
-    ProcessTimeoutPolicy, run_with_timeout, run_with_timeout_and_capture,
+    CapturedProcessRun, ChildEnvPolicy, ExecutionError, LiveProcessAttempt,
+    LiveProcessAttemptError, LiveProcessCancelAcceptance, LiveProcessOutcome, LiveProcessOutput,
+    LiveProcessStartError, LiveProcessTerminalCause, ProcessRunRequest, ProcessStdin,
+    ProcessTermination, ProcessTimeoutPolicy, run_with_timeout, run_with_timeout_and_capture,
     start_live_process_attempt,
 };
 use std::{error::Error, fmt, mem::discriminant, path::PathBuf};
@@ -57,6 +57,7 @@ pub struct ClaudeTaskExecutionRequest {
     timeout_policy: ProcessTimeoutPolicy,
     permission_mode: ClaudePermissionMode,
     prompt: String,
+    env_policy: Option<ChildEnvPolicy>,
 }
 impl ClaudeTaskExecutionRequest {
     pub fn new(
@@ -74,7 +75,13 @@ impl ClaudeTaskExecutionRequest {
             timeout_policy,
             permission_mode,
             prompt: prompt.into(),
+            env_policy: None,
         }
+    }
+    /// Explicit opt-in; omission preserves Workspace's empty environment.
+    pub fn with_env_policy(mut self, policy: ChildEnvPolicy) -> Self {
+        self.env_policy = Some(policy);
+        self
     }
     pub fn timeout_policy(&self) -> &ProcessTimeoutPolicy {
         &self.timeout_policy
@@ -121,7 +128,7 @@ pub(crate) fn build_claude_task_request(
     .into_bytes();
     encoded.push(b'\n');
     let stdin = ProcessStdin::bytes(encoded)?;
-    Ok(ProcessRunRequest::new(
+    let process = ProcessRunRequest::new(
         &request.executable,
         [
             "--print",
@@ -137,7 +144,11 @@ pub(crate) fn build_claude_task_request(
         &request.workspace_root,
         &request.cwd,
     )?
-    .with_stdin(stdin))
+    .with_stdin(stdin);
+    Ok(match &request.env_policy {
+        Some(policy) => process.with_env_policy(policy.clone()),
+        None => process,
+    })
 }
 
 /// Bounded process truth and separately available protocol. Even a timed-out,

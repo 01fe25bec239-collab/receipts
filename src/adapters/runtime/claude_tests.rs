@@ -1440,3 +1440,28 @@ fn typed_result_in_live_snapshot_does_not_establish_process_completion() {
     );
     ws.prove_empty(false);
 }
+
+#[test]
+fn explicit_child_environment_reaches_workspace_request() {
+    use receipts_workspace_execution::execution::{
+        ChildEnvAuthMode, ChildEnvPolicy, ChildEnvProvider,
+    };
+    let ws = Workspace::new();
+    let request = ws.request(
+        "private prompt",
+        ClaudePermissionMode::Plan,
+        Duration::from_secs(5),
+    );
+    assert!(
+        build_claude_task_request(&request)
+            .unwrap()
+            .env_policy()
+            .is_none()
+    );
+    let env =
+        ChildEnvPolicy::new(ChildEnvProvider::Claude, ChildEnvAuthMode::Subscription).unwrap();
+    let expected = env.clone();
+    let process = build_claude_task_request(&request.with_env_policy(env)).unwrap();
+    assert_eq!(process.env_policy(), Some(&expected));
+    assert_eq!(process.arguments()[7], "plan");
+}
