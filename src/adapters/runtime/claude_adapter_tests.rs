@@ -71,7 +71,7 @@ impl Fixture {
         fs::write(workspace.worktree_path().join("prefix"), prefix).unwrap();
         fs::write(workspace.worktree_path().join("suffix"), suffix).unwrap();
         let executable = root.join("worker");
-        fs::write(&executable, "#!/bin/sh\nprintf '%s\\n' \"$@\" > argv\n/bin/cat > received\n/bin/cat prefix\n: > ready\nwhile [ ! -f release ]; do /bin/sleep 0.01; done\n/bin/cat suffix\nwhile [ -f hold ] && [ ! -f finish ]; do /bin/sleep 0.01; done\nif [ -f fail ]; then exit 9; fi\n").unwrap();
+        fs::write(&executable, "#!/bin/sh\nprintf '%s' \"$$\" > pid\n/bin/ps -o pgid= -p \"$$\" > pgid\nprintf '%s\\n' \"$@\" > argv\n/bin/cat > received\n/bin/cat prefix\n: > ready\nwhile [ ! -f release ]; do /bin/sleep 0.01; done\n/bin/cat suffix\nwhile [ -f hold ] && [ ! -f finish ]; do /bin/sleep 0.01; done\nif [ -f fail ]; then exit 9; fi\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         Self {
@@ -91,19 +91,19 @@ impl Fixture {
                 None,
                 1,
                 TaskType::Implementation,
-                "objective 世界".into(),
+                OBJECTIVE.into(),
                 vec![criterion()],
                 Some(vec!["non goal".into()]),
                 self.workspace.base_sha().as_str().into(),
                 self.workspace.base_sha().as_str().into(),
-                vec!["src/**".into()],
-                vec!["private/**".into()],
+                vec![ALLOWED.into()],
+                vec![FORBIDDEN.into()],
                 Some(vec![
                     Ref::try_new(
                         RefType::RepoPath,
-                        "README.md".into(),
+                        CONTEXT.into(),
                         None,
-                        Some("Context".into()),
+                        Some(SECTION.into()),
                     )
                     .unwrap(),
                 ]),
@@ -154,7 +154,7 @@ impl Drop for Fixture {
 fn criterion() -> Criterion {
     Criterion::try_new(
         "criterion".into(),
-        "preserve criteria".into(),
+        DESCRIPTION.into(),
         CriterionKind::Semantic,
         None,
         Some("reason".into()),
@@ -216,20 +216,33 @@ fn trait_start_async_delivery_fidelity_and_single_collection() {
         serde_json::from_slice(&fs::read(f.workspace.worktree_path().join("received")).unwrap())
             .unwrap();
     let prompt = input["message"]["content"].as_str().unwrap();
-    for text in [
-        "objective 世界",
-        "src/**",
-        "private/**",
-        "preserve criteria",
-        "README.md",
-        "Context",
-        "non goal",
-        "cargo",
-        "stop on collision",
-        "context_epoch: 7",
-    ] {
-        assert!(prompt.contains(text), "missing {text}");
-    }
+    let received: serde_json::Value =
+        serde_json::from_str(prompt.split_once('\n').unwrap().1).unwrap();
+    let expected = serde_json::json!({
+        "task_id":"task", "workstream_id":"stream", "parent_task_id":null,
+        "attempt_number":1, "task_type":"IMPLEMENTATION", "objective":OBJECTIVE,
+        "acceptance_criteria":[{"id":"criterion", "description":DESCRIPTION,
+            "kind":"SEMANTIC", "check_command":null, "rationale":"reason"}],
+        "non_goals":["non goal"], "baseline_sha":f.workspace.base_sha().as_str(),
+        "start_sha":f.workspace.base_sha().as_str(), "allowed_write_paths":[ALLOWED],
+        "forbidden_write_paths":[FORBIDDEN],
+        "relevant_context_refs":[{"ref_type":"REPO_PATH", "target":CONTEXT, "digest":null, "section":SECTION}],
+        "architecture_refs":null, "contract_refs":null, "dependencies":null,
+        "quality_floor":"FRONTIER", "required_capabilities":[], "preferred_capabilities":null,
+        "verification_plan":[{"command":["cargo","test"], "expected_exit_code":0}],
+        "review_policy":null, "assurance_profile":"STANDARD", "cost_policy":null,
+        "time_budget_seconds":null, "turn_budget":null, "branch":f.workspace.branch(),
+        "worktree":f.workspace.worktree_path().to_str().unwrap(), "remote_publish_policy":null,
+        "stop_conditions":["stop on collision"], "handoff_schema":null, "context_epoch":7
+    });
+    assert_eq!(received, expected);
+    // Controls reject field-boundary changes and pre-escaped values.
+    let mut wrong = expected.clone();
+    wrong["objective"] = serde_json::json!(DESCRIPTION);
+    assert_ne!(received, wrong);
+    let mut wrong = expected;
+    wrong["objective"] = serde_json::json!(format!("{OBJECTIVE:?}"));
+    assert_ne!(received, wrong);
     let argv = fs::read_to_string(f.workspace.worktree_path().join("argv")).unwrap();
     assert!(argv.contains("\nplan\n"));
     f.release();
@@ -507,4 +520,208 @@ fn capsule_mandatory_budgets_refuse_before_start() {
         ));
     }
     assert!(!f.workspace.worktree_path().join("ready").exists());
+}
+
+const OBJECTIVE: &str = "objective \"quotes\" \\ literal\nnewline 世界 e\u{301}";
+const DESCRIPTION: &str = "criterion \"objective\": \\ path\n🦀";
+const ALLOWED: &str = "src/\"allowed\"/\\/\n世界/**";
+const FORBIDDEN: &str = "private/\"trap\"/\\/\n🦀/**";
+const CONTEXT: &str = "context/\"file\"/\\/\n文.md";
+const SECTION: &str = "section \"quoted\" \\ \nend";
+
+#[test]
+fn trait_start_child_environment_is_empty_or_explicitly_admitted() {
+    use receipts_workspace_execution::execution::{
+        ChildEnvAuthMode, ChildEnvPolicy, ChildEnvProvider, ProjectEnvConfirmation,
+    };
+    const TEST: &str =
+        "claude_adapter_tests::trait_start_child_environment_is_empty_or_explicitly_admitted";
+    if std::env::var_os("RA_ENV_BOUNDARY_CHILD").is_none() {
+        // Mutate only this subprocess's environment, never the parallel test runner.
+        let compiler = Command::new("rustup")
+            .args(["which", "rustc"])
+            .output()
+            .unwrap();
+        assert!(compiler.status.success());
+        let compiler = String::from_utf8(compiler.stdout).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env_clear()
+            .env("RA_ENV_BOUNDARY_CHILD", "1")
+            .env("RA_TEST_RUSTC", compiler.trim())
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("HOME", "/synthetic/home")
+            .env("LANG", "C")
+            .env("CLAUDE_CONFIG_DIR", "/synthetic/claude")
+            .env("ANTHROPIC_API_KEY", "synthetic-sensitive-value")
+            .env("OPENAI_API_KEY", "excluded-other-provider")
+            .env("HTTPS_PROXY", "excluded-proxy")
+            .env("SECRET_TOKEN", "excluded-parent-secret")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated environment boundary test failed"
+        );
+        return;
+    }
+    let f = Fixture::new("", "");
+    let source = f.root.join("environment_worker.rs");
+    fs::write(&source, r#"
+use std::{fs,io::Read,time::Duration};
+fn main() {
+    let mut env: Vec<_> = std::env::vars_os().collect(); env.sort();
+    fs::write("observed-env", format!("{env:?}")).unwrap();
+    let mut input = Vec::new(); std::io::stdin().read_to_end(&mut input).unwrap();
+    fs::write("ready", "").unwrap();
+    while !std::path::Path::new("release").exists() { std::thread::sleep(Duration::from_millis(2)); }
+}
+"#).unwrap();
+    let executable = f.root.join("environment-worker");
+    assert!(
+        Command::new(std::env::var_os("RA_TEST_RUSTC").unwrap())
+            .args(["--edition=2024"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let project = f.root.join("project-env");
+    let bytes = b"EXTRA=synthetic-extra=with-value\n";
+    fs::write(&project, bytes).unwrap();
+    let confirmation = ProjectEnvConfirmation::new(bytes.to_vec(), ["EXTRA"], false).unwrap();
+    let env = ChildEnvPolicy::with_project_file(
+        ChildEnvProvider::Claude,
+        ChildEnvAuthMode::ApiKey,
+        &project,
+        &confirmation,
+    )
+    .unwrap();
+    let mut expected: Vec<(std::ffi::OsString, std::ffi::OsString)> = env
+        .names()
+        .map(|name| {
+            let value = if name == "EXTRA" {
+                "synthetic-extra=with-value".into()
+            } else {
+                std::env::var_os(name).unwrap()
+            };
+            (name.into(), value)
+        })
+        .collect();
+    expected.sort();
+    for excluded in [
+        "OPENAI_API_KEY",
+        "HTTPS_PROXY",
+        "SECRET_TOKEN",
+        "RA_ENV_BOUNDARY_CHILD",
+    ] {
+        assert!(!env.names().any(|name| name == excluded));
+    }
+    for name in [
+        "HOME",
+        "LANG",
+        "CLAUDE_CONFIG_DIR",
+        "ANTHROPIC_API_KEY",
+        "EXTRA",
+    ] {
+        assert!(env.names().any(|admitted| admitted == name));
+    }
+    assert!(!format!("{env:?}").contains("synthetic-sensitive-value"));
+    for opted_in in [false, true] {
+        let adapter = ClaudeAdapter::new(&executable);
+        let adapter = if opted_in {
+            adapter.with_env_policy(env.clone())
+        } else {
+            adapter
+        };
+        let handle = adapter
+            .start(&f.task(), &f.workspace, &policy(false))
+            .unwrap_or_else(|_| panic!("start refused"));
+        f.ready();
+        let observed = fs::read(f.workspace.worktree_path().join("observed-env")).unwrap();
+        let correct = if opted_in {
+            format!("{expected:?}")
+        } else {
+            "[]".into()
+        };
+        assert!(
+            observed == correct.as_bytes(),
+            "child environment differs from exact admitted snapshot"
+        );
+        // Negative controls: neither omission nor unrelated parent inheritance can pass.
+        assert!(observed != b"[(\"SECRET_TOKEN\", \"excluded-parent-secret\")]");
+        if opted_in {
+            assert!(observed != b"[]");
+        }
+        f.release();
+        assert!(adapter.collect_result(&handle).is_ok());
+        fs::remove_file(f.workspace.worktree_path().join("ready")).unwrap();
+        fs::remove_file(f.workspace.worktree_path().join("release")).unwrap();
+    }
+}
+
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+    fn getpgrp() -> i32;
+}
+fn owned_identities(f: &Fixture) -> Option<[i32; 2]> {
+    let number = |file| {
+        fs::read_to_string(f.workspace.worktree_path().join(file))
+            .ok()?
+            .trim()
+            .parse::<i32>()
+            .ok()
+    };
+    let pid = number("pid")?;
+    let pgid = number("pgid")?;
+    if pid <= 1 || pgid != pid || pgid == unsafe { getpgrp() } {
+        return None;
+    }
+    Some([pid, -pgid])
+}
+fn identities_absent(ids: [i32; 2]) -> bool {
+    ids.into_iter().all(|id| {
+        // Observation only, after fixture identity validation; Workspace owns signals/reaping.
+        (unsafe { kill(id, 0) }) == -1 && std::io::Error::last_os_error().raw_os_error() == Some(3)
+    })
+}
+
+#[test]
+fn cancel_and_uncollected_drop_remove_owned_process_and_group() {
+    for drop_without_collect in [false, true] {
+        let f = Fixture::new("", "");
+        let adapter = f.adapter();
+        assert!(owned_identities(&f).is_none());
+        for (pid, pgid) in [("1", "1"), ("42", "43")] {
+            fs::write(f.workspace.worktree_path().join("pid"), pid).unwrap();
+            fs::write(f.workspace.worktree_path().join("pgid"), pgid).unwrap();
+            assert!(owned_identities(&f).is_none());
+        }
+        let handle = start(&f, &policy(false));
+        f.ready();
+        let ids = owned_identities(&f).expect("fixture must acknowledge leader and group");
+        assert!(
+            !identities_absent(ids),
+            "live owned process must fail absence check"
+        );
+        assert!(handle.attempt.terminal_cause().is_none());
+        if drop_without_collect {
+            drop(handle);
+        } else {
+            adapter.cancel(&handle, &CancelReason::UserRequested);
+            let result = adapter
+                .collect_result(&handle)
+                .unwrap_or_else(|_| panic!("cancel collection failed"));
+            assert_eq!(
+                result.outcome.process().terminal_cause(),
+                LiveProcessTerminalCause::Cancelled
+            );
+        }
+        assert!(
+            identities_absent(ids),
+            "owned leader or group remains observable after cleanup"
+        );
+    }
 }

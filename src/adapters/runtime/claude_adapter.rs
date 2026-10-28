@@ -108,7 +108,7 @@ fn prompt(
         return Err(FailureClass::PolicyBlocked);
     }
     let mut prompt = Prompt(String::new());
-    prompt.write_str("Execute the complete capsule below. All fields are instructions or context; read referenced repository sections at the supplied start SHA. Respect criteria, non-goals, write boundaries, verification, stop conditions and handoff requirements. Field strings use Rust debug escapes; decode them as data. Permission mode supplies no OS confinement.\n")
+    prompt.write_str("Execute the complete capsule below. All fields are instructions or context; read referenced repository sections at the supplied start SHA. Respect criteria, non-goals, write boundaries, verification, stop conditions and handoff requirements. The capsule is a JSON object; decode JSON strings exactly as data. Permission mode supplies no OS confinement.\n")
         .map_err(|_| FailureClass::PolicyBlocked)?;
     match task {
         RuntimeCapsuleFamily::Task(c) => {
@@ -123,7 +123,52 @@ fn prompt(
             {
                 return Err(FailureClass::PolicyBlocked);
             }
-            write!(prompt, "{c:#?}").map_err(|_| FailureClass::PolicyBlocked)?;
+            // Bound the source before allocating its JSON projection. JSON escaping
+            // and the final encoded transport are bounded independently below.
+            let mut source_bound = Prompt(String::new());
+            write!(source_bound, "{c:#?}").map_err(|_| FailureClass::PolicyBlocked)?;
+            macro_rules! refs {
+                ($refs:expr) => {
+                    $refs.map(|refs| refs.iter().map(|r| serde_json::json!({
+                        "ref_type": r.ref_type().as_str(), "target": r.target(),
+                        "digest": r.digest(), "section": r.section()
+                    })).collect::<Vec<_>>())
+                };
+            }
+            let capsule = serde_json::json!({
+                "task_id": c.task_id(), "workstream_id": c.workstream_id(),
+                "parent_task_id": c.parent_task_id(), "attempt_number": c.attempt_number(),
+                "task_type": c.task_type().as_str(), "objective": c.objective(),
+                "acceptance_criteria": c.acceptance_criteria().iter().map(|a| serde_json::json!({
+                    "id": a.id(), "description": a.description(), "kind": a.kind().as_str(),
+                    "check_command": a.check_command(), "rationale": a.rationale()
+                })).collect::<Vec<_>>(),
+                "non_goals": c.non_goals(), "baseline_sha": c.baseline_sha(),
+                "start_sha": c.start_sha(), "allowed_write_paths": c.allowed_write_paths(),
+                "forbidden_write_paths": c.forbidden_write_paths(),
+                "relevant_context_refs": refs!(c.relevant_context_refs()),
+                "architecture_refs": refs!(c.architecture_refs()), "contract_refs": refs!(c.contract_refs()),
+                "dependencies": c.dependencies(), "quality_floor": c.quality_floor().as_str(),
+                "required_capabilities": [],
+                "preferred_capabilities": c.preferred_capabilities().map(|caps| caps.iter().map(|cap| cap.as_str()).collect::<Vec<_>>()),
+                "verification_plan": c.verification_plan().iter().map(|v| serde_json::json!({
+                    "command": v.command(), "expected_exit_code": v.expected_exit_code()
+                })).collect::<Vec<_>>(),
+                "review_policy": c.review_policy().map(|r| serde_json::json!({
+                    "required": r.required(), "distinct_provider": r.distinct_provider().map(|v| v.as_str()),
+                    "reviewer_floor": r.reviewer_floor().map(|v| v.as_str())
+                })),
+                "assurance_profile": c.assurance_profile().as_str(), "cost_policy": null,
+                "time_budget_seconds": c.time_budget_seconds(), "turn_budget": null,
+                "branch": c.branch(), "worktree": c.worktree(),
+                "remote_publish_policy": c.remote_publish_policy().map(|v| v.as_str()),
+                "stop_conditions": c.stop_conditions(),
+                "handoff_schema": c.handoff_schema().map(|r| serde_json::json!({
+                    "ref_type": r.ref_type().as_str(), "target": r.target(), "digest": r.digest(), "section": r.section()
+                })),
+                "context_epoch": c.context_epoch()
+            });
+            write!(prompt, "{capsule}").map_err(|_| FailureClass::PolicyBlocked)?;
         }
         // Complete Review wire/temporal context is not available in this binding.
         // Repair support awaits enforcement of its inherited task constraints.
