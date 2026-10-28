@@ -69,7 +69,7 @@ impl SqliteStateRepository {
         Ok(repo)
     }
 
-    /// Explicitly upgrades an exact v11–v14 State database to v15.
+    /// Explicitly upgrades an exact v11–v15 State database to v16.
     pub fn migrate_existing_to_current(path: impl AsRef<Path>) -> Result<u32, StateError> {
         let mut conn =
             Connection::open_with_flags(path.as_ref(), OpenFlags::SQLITE_OPEN_READ_WRITE)
@@ -95,9 +95,10 @@ impl SqliteStateRepository {
             }
             Some(13) => graph_repository::migrate_attempt_store(&conn)?,
             Some(14) => graph_repository::verify_v14(&conn, GraphPhase::Migration)?,
-            Some(15) => {
+            Some(15) => graph_repository::verify_v15(&conn, GraphPhase::Migration)?,
+            Some(16) => {
                 graph_repository::verify_current(&conn, GraphPhase::Migration)?;
-                return Ok(15);
+                return Ok(16);
             }
             _ => {
                 return Err(StateError::GraphPersistence {
@@ -107,8 +108,16 @@ impl SqliteStateRepository {
                 });
             }
         }
-        graph_repository::migrate_history_store(&conn)?;
-        Ok(15)
+        if found != Some(15) {
+            graph_repository::migrate_history_store(&conn)?;
+        }
+        graph_repository::migrate_step(&conn, |conn| {
+            graph_repository::verify_v15(conn, GraphPhase::Migration)?;
+            conn.execute_batch(migrations::v0016_checkpoint_refs::SQL)
+                .map_err(|e| graph_repository::sqlite_error(GraphPhase::Migration, e))?;
+            graph_repository::verify_current(conn, GraphPhase::Migration)
+        })?;
+        Ok(16)
     }
 
     /// Version-reconciliation core of [`Self::open`], parameterized by the

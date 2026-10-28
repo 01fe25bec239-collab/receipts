@@ -150,3 +150,12 @@ pub use graph_node_result::{PersistedNodeResultV1, StateGraphNodeResultV1};
 pub use graph_repository::StateGraphSnapshotV1;
 #[cfg(test)]
 mod graph_history_tests;
+
+pub mod checkpoint_ref;
+pub mod output_ref;
+pub use checkpoint_ref::CheckpointRecord;
+pub use output_ref::OutputRef;
+#[cfg(test)]
+mod checkpoint_ref_tests;
+#[cfg(test)]
+mod output_ref_tests;

@@ -191,20 +191,20 @@ fn t01_fresh_database_bootstraps_to_schema_version_7() {
     let registered = migrations::registered();
     assert_eq!(
         registered.len(),
-        15,
-        "exactly fifteen registered migrations may exist"
+        16,
+        "exactly sixteen registered migrations may exist"
     );
     assert_eq!(
         registered.last().expect("chain is non-empty").version,
-        15,
-        "the registered chain must end at version 15"
+        16,
+        "the registered chain must end at version 16"
     );
     let tmp = TempDir::new("ce-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 15);
+    assert_eq!(repo.schema_version().expect("version read"), 16);
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        15,
+        16,
         "one metadata row per applied migration"
     );
 }
@@ -215,10 +215,10 @@ fn t02_version_7_database_reopens_idempotently() {
     let tmp = TempDir::new("ce-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 15);
+        assert_eq!(repo.schema_version().expect("version read"), 16);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            15,
+            16,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -241,7 +241,7 @@ fn t03_ordinary_open_of_version_6_fails_closed() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 6,
-                supported: 15
+                supported: 16
             }
         ),
         "unexpected error: {error}"
@@ -343,6 +343,8 @@ fn t04_migration_v7_creates_exactly_the_authorized_schema() {
         "graph_node_capabilities",
         "graph_node_results",
         "graph_snapshot_seals",
+        "output_refs",
+        "workspace_checkpoints",
         "graph_compiled_sources",
         "attempt_started",
         "attempt_finished",
@@ -2000,10 +2002,10 @@ fn changed_sources_v10_to_v11_legacy_is_uncaptured_and_four_field_reads_survive(
     drop(repo);
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).expect("v11 -> v13"),
-        15
+        16
     );
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("v13 reopen");
-    assert_eq!(repo.schema_version().expect("version"), 15);
+    assert_eq!(repo.schema_version().expect("version"), 16);
     assert_eq!(
         repo.count_table_rows("context_epoch_changed_source")
             .expect("children"),

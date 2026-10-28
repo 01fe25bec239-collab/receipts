@@ -1037,7 +1037,7 @@ impl ReadOnlyGraphReader {
         if head.is_some_and(|version| version < 0) {
             return Err(corrupt());
         }
-        if head != Some(15) {
+        if head != Some(16) {
             return Err(failure(Phase::Read, Code::UnsupportedSchema, None));
         }
         verify_current(&self.conn, Phase::Read)
@@ -1503,12 +1503,24 @@ pub(crate) fn seal_snapshot(
     Ok(())
 }
 
-/// Current stores require the exact v15 ledger and every immutable-history trigger.
-pub(crate) fn verify_current(conn: &Connection, phase: Phase) -> Result<(), StateError> {
+/// Exact v15 postcondition, also required before applying migration 16.
+pub(crate) fn verify_v15(conn: &Connection, phase: Phase) -> Result<(), StateError> {
     verify_ledger(conn, 15, phase)?;
     verify_schema(conn, phase, true)?;
     if !crate::attempt::schema_matches(conn).map_err(|e| schema_error(phase, e))?
         || !crate::graph_history::schema_matches(conn).map_err(|e| schema_error(phase, e))?
+    {
+        return Err(failure(phase, Code::CorruptStore, None));
+    }
+    Ok(())
+}
+/// Current stores retain all earlier checks and verify the new immutable definitions.
+pub(crate) fn verify_current(conn: &Connection, phase: Phase) -> Result<(), StateError> {
+    verify_ledger(conn, 16, phase)?;
+    verify_schema(conn, phase, true)?;
+    if !crate::attempt::schema_matches(conn).map_err(|e| schema_error(phase, e))?
+        || !crate::graph_history::schema_matches(conn).map_err(|e| schema_error(phase, e))?
+        || !crate::output_ref::schema_matches(conn).map_err(|e| schema_error(phase, e))?
     {
         return Err(failure(phase, Code::CorruptStore, None));
     }
@@ -1519,7 +1531,7 @@ pub(crate) fn migrate_history_store(conn: &Connection) -> Result<(), StateError>
         verify_v14(conn, Phase::Migration)?;
         conn.execute_batch(migrations::v0015_graph_history::SQL)
             .map_err(|e| sqlite_error(Phase::Migration, e))?;
-        verify_current(conn, Phase::Migration)
+        verify_v15(conn, Phase::Migration)
     })
 }
 /// A successor snapshot, using the existing checked content/provenance carrier.

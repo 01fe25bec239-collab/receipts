@@ -218,6 +218,7 @@ pub(crate) fn corrupt_graph(conn: &rusqlite::Connection, sql: &str) {
     }
 }
 pub(crate) fn remove_v15(conn: &rusqlite::Connection) {
+    crate::checkpoint_ref_tests::remove_v16(conn);
     let names:Vec<String>=conn.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name GLOB 'graph*_immutable_*'").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
     for n in names {
         conn.execute_batch(&format!("DROP TRIGGER {n}")).unwrap();
@@ -285,7 +286,7 @@ fn late_children_and_all_history_mutation_matrix() {
             assert!(SqliteStateRepository::open(&path).is_err());
             assert_eq!(
                 SqliteStateRepository::migrate_existing_to_current(&path).unwrap(),
-                15
+                16
             );
             repo = SqliteStateRepository::open(&path).unwrap();
             let legacy: i64 = repo
@@ -483,7 +484,7 @@ fn migration_preserves_attempts_and_failure_leaves_exact_v14() {
     drop(conn);
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(&path).unwrap(),
-        15
+        16
     );
     let repo = SqliteStateRepository::open(&path).unwrap();
     assert!(repo.find_attempt(&aid).unwrap().is_some());
