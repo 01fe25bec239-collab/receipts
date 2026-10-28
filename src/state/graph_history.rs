@@ -287,10 +287,6 @@ impl SqliteStateRepository {
             if existing {
                 return Err(graph::failure(Phase::Write, Code::AlreadyExists, None));
             }
-            let moved=conn.execute("UPDATE graphs SET current_version=?1 WHERE project_id=?2 AND graph_id=?3 AND current_version=?4",params![snapshot.graph_version(),content.project_id(),content.graph_id(),snapshot.parent_version()]).map_err(|e|graph::sqlite_error(Phase::Write,e))?;
-            if moved != 1 {
-                return Err(graph::failure(Phase::Write, Code::ParentConflict, None));
-            }
             for node in content.nodes() {
                 if let Some(reference) = node.result_ref() {
                     let result = crate::graph_node_result::read_result(
@@ -304,6 +300,10 @@ impl SqliteStateRepository {
                         return Err(graph::failure(Phase::Write, Code::IdentityMismatch, None));
                     }
                 }
+            }
+            let moved=conn.execute("UPDATE graphs SET current_version=?1 WHERE project_id=?2 AND graph_id=?3 AND current_version=?4",params![snapshot.graph_version(),content.project_id(),content.graph_id(),snapshot.parent_version()]).map_err(|e|graph::sqlite_error(Phase::Write,e))?;
+            if moved != 1 {
+                return Err(graph::failure(Phase::Write, Code::ParentConflict, None));
             }
             graph::accept_graph_sample(conn, content.project_id(), &sample, &time)?;
             graph::insert_snapshot(conn, content, snapshot.graph_version(), &sample)?;
@@ -370,6 +370,35 @@ pub(crate) fn validate_partition(
     graph_id: &str,
 ) -> Result<(), StateError> {
     let map = |e| graph::sqlite_error(Phase::Read, e);
+    // Reuse the leaf decoder, which does not call this partition boundary.
+    let current: Option<String> = conn
+        .query_row(
+            "SELECT current_version FROM graphs WHERE project_id=?1 AND graph_id=?2",
+            params![project, graph_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(map)?;
+    let mut versions = conn
+        .prepare("SELECT graph_version FROM graph_versions WHERE project_id=?1 AND graph_id=?2")
+        .map_err(map)?;
+    let members = versions
+        .query_map(params![project, graph_id], |r| r.get::<_, String>(0))
+        .map_err(map)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map)?;
+    match current {
+        Some(current) => {
+            if !positive(&current) || !members.contains(&current) {
+                return Err(graph::corrupt());
+            }
+            for version in &members {
+                graph::read_version_projection(conn, project, graph_id, &current, version)?;
+            }
+        }
+        None if !members.is_empty() => return Err(graph::corrupt()),
+        None => {}
+    }
     let broken:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM graph_versions v LEFT JOIN graph_snapshot_seals s USING(project_id,graph_id,graph_version) WHERE v.project_id=?1 AND v.graph_id=?2 AND s.graph_version IS NULL) OR EXISTS(SELECT 1 FROM graph_snapshot_seals s LEFT JOIN graph_versions v USING(project_id,graph_id,graph_version) WHERE s.project_id=?1 AND s.graph_id=?2 AND v.graph_version IS NULL)",params![project,graph_id],|r|r.get(0)).map_err(map)?;
     if broken {
         return Err(graph::corrupt());

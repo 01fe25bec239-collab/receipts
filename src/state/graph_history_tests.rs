@@ -691,3 +691,109 @@ fn empty_mutation_lists_validate_partition_for_both_readers() {
     drop(repo);
     cleanup(path);
 }
+
+#[test]
+fn malformed_graph_content_is_refused_by_connected_lists_and_reads() {
+    for historical in [false, true] {
+        for field in ["goal", "node", "edge", "capabilities", "sources"] {
+            let path = db();
+            let mut repo = SqliteStateRepository::open(&path).unwrap();
+            repo.create_initial_graph_v1(&Clock, content("p", None))
+                .unwrap();
+            repo.create_initial_graph_v1(&Clock, content("isolated", None))
+                .unwrap();
+            if historical {
+                repo.append_node_result_v1("p", "1", "r", result()).unwrap();
+                repo.append_graph_mutation_v1(
+                    &Clock,
+                    mutation("1", "2"),
+                    StateGraphSnapshotV1::new("2".into(), "1".into(), content("p", Some("r")))
+                        .unwrap(),
+                )
+                .unwrap();
+            }
+            let reader = ReadOnlyGraphReader::open_existing(&path).unwrap();
+            assert_eq!(
+                repo.list_graph_mutations_v1("p", "g").unwrap().len(),
+                usize::from(historical)
+            );
+            assert_eq!(
+                reader.list_graph_mutations_v1("p", "g").unwrap().len(),
+                usize::from(historical)
+            );
+            assert!(
+                repo.list_node_results_v1("p", "g", "1", "absent")
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                reader
+                    .list_node_results_v1("p", "g", "1", "absent")
+                    .unwrap()
+                    .is_empty()
+            );
+            let sql = match field {
+                "goal" => {
+                    "UPDATE graph_versions SET goal_id='' WHERE project_id='p' AND graph_version='1'"
+                }
+                "node" => {
+                    "UPDATE graph_nodes SET kind='' WHERE project_id='p' AND graph_version='1'"
+                }
+                "edge" => {
+                    "UPDATE graph_edges SET control_kind='invalid' WHERE project_id='p' AND graph_version='1'"
+                }
+                "capabilities" => {
+                    "UPDATE graph_node_capabilities SET ordinal=3 WHERE project_id='p' AND graph_version='1'"
+                }
+                _ => {
+                    "UPDATE graph_compiled_sources SET ordinal=3 WHERE project_id='p' AND graph_version='1'"
+                }
+            };
+            corrupt_graph(repo.connection(), sql);
+            let corrupt = |error: StateError| {
+                assert!(
+                    matches!(
+                        error,
+                        StateError::GraphPersistence {
+                            code: Code::CorruptStore,
+                            ..
+                        }
+                    ),
+                    "{error:?}"
+                )
+            };
+            corrupt(reader.read_current_v1("p", "g").unwrap_err());
+            let lists = [
+                repo.list_graph_mutations_v1("p", "g").map(|_| ()),
+                reader.list_graph_mutations_v1("p", "g").map(|_| ()),
+                repo.list_node_results_v1("p", "g", "1", "absent")
+                    .map(|_| ()),
+                reader
+                    .list_node_results_v1("p", "g", "1", "absent")
+                    .map(|_| ()),
+            ];
+            for list in lists {
+                corrupt(list.unwrap_err());
+            }
+            corrupt(repo.load_graph_version_v1("p", "g", "1").unwrap_err());
+            corrupt(reader.load_graph_version_v1("p", "g", "1").unwrap_err());
+            corrupt(repo.find_node_result_v1("p", "g", "absent").unwrap_err());
+            corrupt(reader.find_node_result_v1("p", "g", "absent").unwrap_err());
+            assert!(
+                repo.list_graph_mutations_v1("isolated", "g")
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                reader
+                    .list_node_results_v1("isolated", "g", "1", "n")
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(reader.read_current_v1("isolated", "g").unwrap().is_some());
+            drop(reader);
+            drop(repo);
+            cleanup(path);
+        }
+    }
+}
