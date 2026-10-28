@@ -210,16 +210,16 @@ fn direct_exec(repo: &mut SqliteStateRepository, sql: &str, params: &[&dyn ToSql
 #[test]
 fn t01_schema_remains_version_8() {
     let (tmp, mut repo) = opened_repo("cea-t01");
-    assert_eq!(repo.schema_version().expect("version read"), 14);
+    assert_eq!(repo.schema_version().expect("version read"), 15);
     advance(&mut repo, "project-1", ContextEpochTrigger::A1Init).expect("advance");
     assert_eq!(
         repo.schema_version().expect("version read"),
-        14,
+        15,
         "advancement must not change the schema version"
     );
     drop(repo);
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("reopen");
-    assert_eq!(repo.schema_version().expect("version read"), 14);
+    assert_eq!(repo.schema_version().expect("version read"), 15);
 }
 
 // T02 — migration v11 is the exact registered chain head.
@@ -228,13 +228,13 @@ fn t02_migration_v8_registered() {
     let registered = migrations::registered();
     assert_eq!(
         registered.len(),
-        14,
-        "exactly fourteen registered migrations may exist"
+        15,
+        "exactly fifteen registered migrations may exist"
     );
     let versions: Vec<u32> = registered.iter().map(|m| m.version).collect();
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     );
 }
 
@@ -1257,7 +1257,10 @@ fn t64_no_new_schema_object() {
         "graph_versions",
         "graph_nodes",
         "graph_edges",
+        "graph_mutations",
         "graph_node_capabilities",
+        "graph_node_results",
+        "graph_snapshot_seals",
         "graph_compiled_sources",
         "attempt_started",
         "attempt_finished",

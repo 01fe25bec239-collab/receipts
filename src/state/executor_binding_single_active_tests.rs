@@ -142,10 +142,10 @@ fn named_binding_indexes(repo: &SqliteStateRepository) -> Vec<(String, String)> 
 fn t01_fresh_database_bootstraps_through_schema_7() {
     let tmp = TempDir::new("sab-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 14);
+    assert_eq!(repo.schema_version().expect("version read"), 15);
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        14,
+        15,
         "one metadata row per applied migration"
     );
     // The guard index is part of the fresh bootstrap.
@@ -165,10 +165,10 @@ fn t02_schema_version_7_reopens() {
     let tmp = TempDir::new("sab-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 14);
+        assert_eq!(repo.schema_version().expect("version read"), 15);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            14,
+            15,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -187,7 +187,7 @@ fn t03_ordinary_open_of_version_4_fails_closed() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 4,
-                supported: 14
+                supported: 15
             }
         ),
         "unexpected error: {error}"
@@ -679,7 +679,7 @@ fn t18_lease_expired_release_permits_rebind() {
     );
 }
 
-// CREATE-BYPASS-14 — pre-existing LEASE_EXPIRED rows stay fully readable
+// CREATE-BYPASS-15 — pre-existing LEASE_EXPIRED rows stay fully readable
 // and non-blocking. Readability is not writability: such a row is set up
 // below the typed boundary, because the public create path no longer
 // manufactures new LEASE_EXPIRED state and no read path was removed.

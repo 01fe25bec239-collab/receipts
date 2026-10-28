@@ -15,13 +15,13 @@ use crate::migrations;
 use crate::repository::SqliteStateRepository;
 use crate::trusted_time::{self, TrustedClockV1, TrustedTimeSampleV1};
 
-fn failure(phase: Phase, code: Code, field: Option<Field>) -> StateError {
+pub(crate) fn failure(phase: Phase, code: Code, field: Option<Field>) -> StateError {
     StateError::GraphPersistence { phase, code, field }
 }
 fn invalid(field: Field) -> StateError {
     failure(Phase::Input, Code::InvalidShape, Some(field))
 }
-fn corrupt() -> StateError {
+pub(crate) fn corrupt() -> StateError {
     failure(Phase::Read, Code::CorruptStore, None)
 }
 
@@ -123,7 +123,7 @@ fn provenance(value: &str, prefix: &str) -> bool {
             .all(|x| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(x))
 }
 
-fn accept_graph_sample(
+pub(crate) fn accept_graph_sample(
     conn: &Connection,
     project_id: &str,
     sample: &TrustedTimeSampleV1,
@@ -812,7 +812,7 @@ pub(crate) fn verify_ledger(
 }
 
 /// Verifies the exact current (v14) ledger and schema.
-pub(crate) fn verify_current(conn: &Connection, phase: Phase) -> Result<(), StateError> {
+pub(crate) fn verify_v14(conn: &Connection, phase: Phase) -> Result<(), StateError> {
     verify_ledger(conn, 14, phase)?;
     verify_schema(conn, phase, true)?;
     if !crate::attempt::schema_matches(conn).map_err(|e| schema_error(phase, e))? {
@@ -974,47 +974,8 @@ impl SqliteStateRepository {
                 params![request.project_id, request.graph_id],
             )
             .map_err(|e| sqlite_error(Phase::Write, e))?;
-            conn.execute("INSERT INTO graph_versions(project_id,graph_id,graph_version,parent_version_present,parent_version,goal_id,policy_id,created_at,compiled_from_present,context_epoch,resulting_digest,clock_source_id,clock_contract_version,compiler_id,source_ref,creation_reason) VALUES (?1,?2,'1',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
-                params![request.project_id, request.graph_id, i64::from(request.parent_version.is_some()), request.parent_version.as_ref().and_then(|x| x.as_deref()),
-                    request.goal_id, request.policy_id, sample.canonical_utc_timestamp, i64::from(request.compiled_from.is_some()),
-                    request.context_epoch.as_ref().map(StateEpochValueV1::as_str), request.resulting_digest, sample.clock_source_id,
-                    sample.clock_contract_version, request.genesis_provenance.compiler_id.as_str(), request.genesis_provenance.source_ref.as_str(),
-                    request.genesis_provenance.creation_reason.as_str()]).map_err(|e| sqlite_error(Phase::Write, e))?;
-            if let Some(sources) = &request.compiled_from {
-                for (index, source) in sources.iter().enumerate() {
-                    let ordinal = i64::try_from(index).map_err(|_| {
-                        failure(Phase::Input, Code::InvalidShape, Some(Field::CompiledFrom))
-                    })?;
-                    conn.execute("INSERT INTO graph_compiled_sources(project_id,graph_id,graph_version,ordinal,source) VALUES (?1,?2,'1',?3,?4)",
-                        params![request.project_id, request.graph_id, ordinal, source]).map_err(|e| sqlite_error(Phase::Write, e))?;
-                }
-            }
-            for node in &request.nodes {
-                conn.execute("INSERT INTO graph_nodes(project_id,graph_id,graph_version,node_id,kind,state,title,parent_node_id,attempt_number,required_capabilities_present,task_capsule_ref,workstream_id,code_sha,workspace_id,result_ref,locked_reason_present,locked_reason,created_in_version) VALUES (?1,?2,'1',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
-                    params![request.project_id, request.graph_id, node.node_id, node.kind, node.state, node.title, node.parent_node_id,
-                        node.attempt_number, i64::from(node.required_capabilities.is_some()), node.task_capsule_ref, node.workstream_id,
-                        node.code_sha, node.workspace_id, node.result_ref, i64::from(node.locked_reason.is_some()),
-                        node.locked_reason.as_ref().and_then(|x| x.as_deref()), node.created_in_version]).map_err(|e| sqlite_error(Phase::Write, e))?;
-                if let Some(capabilities) = &node.required_capabilities {
-                    for (index, capability) in capabilities.iter().enumerate() {
-                        let ordinal = i64::try_from(index).map_err(|_| {
-                            failure(
-                                Phase::Input,
-                                Code::InvalidShape,
-                                Some(Field::RequiredCapabilities),
-                            )
-                        })?;
-                        conn.execute("INSERT INTO graph_node_capabilities(project_id,graph_id,graph_version,node_id,ordinal,capability) VALUES (?1,?2,'1',?3,?4,?5)",
-                            params![request.project_id, request.graph_id, node.node_id, ordinal, capability]).map_err(|e| sqlite_error(Phase::Write, e))?;
-                    }
-                }
-            }
-            for edge in &request.edges {
-                conn.execute("INSERT INTO graph_edges(project_id,graph_id,graph_version,edge_id,from_node,to_node,edge_class,precedence_kind,control_kind,note) VALUES (?1,?2,'1',?3,?4,?5,?6,?7,?8,?9)",
-                    params![request.project_id, request.graph_id, edge.edge_id, edge.from_node, edge.to_node,
-                        edge.relation.edge_class(), edge.relation.precedence_kind(), edge.relation.control_kind(), edge.note])
-                    .map_err(|e| sqlite_error(Phase::Write, e))?;
-            }
+            insert_snapshot(conn, &request, "1", &sample)?;
+            seal_snapshot(conn, &request, "1")?;
             Ok(())
         })();
         match outcome {
@@ -1038,7 +999,7 @@ impl SqliteStateRepository {
 
 /// Existing-file, read-only graph projection. The caller authorizes path and project.
 pub struct ReadOnlyGraphReader {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 impl fmt::Debug for ReadOnlyGraphReader {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1076,7 +1037,7 @@ impl ReadOnlyGraphReader {
         if head.is_some_and(|version| version < 0) {
             return Err(corrupt());
         }
-        if head != Some(14) {
+        if head != Some(15) {
             return Err(failure(Phase::Read, Code::UnsupportedSchema, None));
         }
         verify_current(&self.conn, Phase::Read)
@@ -1144,11 +1105,12 @@ fn ordered_list(
     Ok(list)
 }
 
-fn read_projection(
+pub(crate) fn read_projection(
     conn: &Connection,
     project_id: &str,
     graph_id: &str,
 ) -> Result<Option<PersistedCurrentGraphV1>, StateError> {
+    crate::graph_history::validate_partition(conn, project_id, graph_id)?;
     let current: Option<String> = conn
         .query_row(
             "SELECT current_version FROM graphs WHERE project_id=?1 AND graph_id=?2",
@@ -1184,7 +1146,7 @@ fn read_projection(
     current_projection.ok_or_else(corrupt).map(Some)
 }
 
-fn read_version_projection(
+pub(crate) fn read_version_projection(
     conn: &Connection,
     project_id: &str,
     graph_id: &str,
@@ -1438,11 +1400,11 @@ pub(crate) fn migrate_attempt_store(conn: &Connection) -> Result<(), StateError>
         verify_schema(conn, Phase::Migration, true)?;
         conn.execute_batch(migrations::v0014_execution_records::SQL)
             .map_err(|e| sqlite_error(Phase::Migration, e))?;
-        verify_current(conn, Phase::Migration)
+        verify_v14(conn, Phase::Migration)
     })
 }
 
-fn migrate_step(
+pub(crate) fn migrate_step(
     conn: &Connection,
     work: impl FnOnce(&Connection) -> Result<(), StateError>,
 ) -> Result<(), StateError> {
@@ -1481,4 +1443,143 @@ pub(crate) fn schema_head(conn: &Connection, phase: Phase) -> Result<Option<i64>
         r.get(0)
     })
     .map_err(|e| schema_error(phase, e))
+}
+
+pub(crate) fn insert_snapshot(
+    conn: &Connection,
+    request: &StateGraphGenesisV1,
+    version: &str,
+    sample: &TrustedTimeSampleV1,
+) -> Result<(), StateError> {
+    conn.execute("INSERT INTO graph_versions(project_id,graph_id,graph_version,parent_version_present,parent_version,goal_id,policy_id,created_at,compiled_from_present,context_epoch,resulting_digest,clock_source_id,clock_contract_version,compiler_id,source_ref,creation_reason) VALUES (?1,?2,?16,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)", params![request.project_id, request.graph_id, i64::from(request.parent_version.is_some()), request.parent_version.as_ref().and_then(|x| x.as_deref()),
+                    request.goal_id, request.policy_id, sample.canonical_utc_timestamp, i64::from(request.compiled_from.is_some()),
+                    request.context_epoch.as_ref().map(StateEpochValueV1::as_str), request.resulting_digest, sample.clock_source_id,
+                    sample.clock_contract_version, request.genesis_provenance.compiler_id.as_str(), request.genesis_provenance.source_ref.as_str(),
+                    request.genesis_provenance.creation_reason.as_str(), version]).map_err(|e| sqlite_error(Phase::Write, e))?;
+    if let Some(sources) = &request.compiled_from {
+        for (index, source) in sources.iter().enumerate() {
+            let ordinal = i64::try_from(index).map_err(|_| {
+                failure(Phase::Input, Code::InvalidShape, Some(Field::CompiledFrom))
+            })?;
+            conn.execute("INSERT INTO graph_compiled_sources(project_id,graph_id,graph_version,ordinal,source) VALUES (?1,?2,?5,?3,?4)", params![request.project_id, request.graph_id, ordinal, source, version]).map_err(|e| sqlite_error(Phase::Write, e))?;
+        }
+    }
+    for node in &request.nodes {
+        conn.execute("INSERT INTO graph_nodes(project_id,graph_id,graph_version,node_id,kind,state,title,parent_node_id,attempt_number,required_capabilities_present,task_capsule_ref,workstream_id,code_sha,workspace_id,result_ref,locked_reason_present,locked_reason,created_in_version) VALUES (?1,?2,?18,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)", params![request.project_id, request.graph_id, node.node_id, node.kind, node.state, node.title, node.parent_node_id,
+                        node.attempt_number, i64::from(node.required_capabilities.is_some()), node.task_capsule_ref, node.workstream_id,
+                        node.code_sha, node.workspace_id, node.result_ref, i64::from(node.locked_reason.is_some()),
+                        node.locked_reason.as_ref().and_then(|x| x.as_deref()), node.created_in_version, version]).map_err(|e| sqlite_error(Phase::Write, e))?;
+        if let Some(capabilities) = &node.required_capabilities {
+            for (index, capability) in capabilities.iter().enumerate() {
+                let ordinal = i64::try_from(index).map_err(|_| {
+                    failure(
+                        Phase::Input,
+                        Code::InvalidShape,
+                        Some(Field::RequiredCapabilities),
+                    )
+                })?;
+                conn.execute("INSERT INTO graph_node_capabilities(project_id,graph_id,graph_version,node_id,ordinal,capability) VALUES (?1,?2,?6,?3,?4,?5)", params![request.project_id, request.graph_id, node.node_id, ordinal, capability, version]).map_err(|e| sqlite_error(Phase::Write, e))?;
+            }
+        }
+    }
+    for edge in &request.edges {
+        conn.execute("INSERT INTO graph_edges(project_id,graph_id,graph_version,edge_id,from_node,to_node,edge_class,precedence_kind,control_kind,note) VALUES (?1,?2,?10,?3,?4,?5,?6,?7,?8,?9)", params![request.project_id, request.graph_id, edge.edge_id, edge.from_node, edge.to_node,
+                        edge.relation.edge_class(), edge.relation.precedence_kind(), edge.relation.control_kind(), edge.note, version])
+                    .map_err(|e| sqlite_error(Phase::Write, e))?;
+    }
+
+    Ok(())
+}
+pub(crate) fn seal_snapshot(
+    conn: &Connection,
+    request: &StateGraphGenesisV1,
+    version: &str,
+) -> Result<(), StateError> {
+    conn.execute(
+        "INSERT INTO graph_snapshot_seals(project_id,graph_id,graph_version) VALUES (?1,?2,?3)",
+        params![request.project_id, request.graph_id, version],
+    )
+    .map_err(|e| sqlite_error(Phase::Write, e))?;
+    Ok(())
+}
+
+/// Current stores require the exact v15 ledger and every immutable-history trigger.
+pub(crate) fn verify_current(conn: &Connection, phase: Phase) -> Result<(), StateError> {
+    verify_ledger(conn, 15, phase)?;
+    verify_schema(conn, phase, true)?;
+    if !crate::attempt::schema_matches(conn).map_err(|e| schema_error(phase, e))?
+        || !crate::graph_history::schema_matches(conn).map_err(|e| schema_error(phase, e))?
+    {
+        return Err(failure(phase, Code::CorruptStore, None));
+    }
+    Ok(())
+}
+pub(crate) fn migrate_history_store(conn: &Connection) -> Result<(), StateError> {
+    migrate_step(conn, |conn| {
+        verify_v14(conn, Phase::Migration)?;
+        conn.execute_batch(migrations::v0015_graph_history::SQL)
+            .map_err(|e| sqlite_error(Phase::Migration, e))?;
+        verify_current(conn, Phase::Migration)
+    })
+}
+/// A successor snapshot, using the existing checked content/provenance carrier.
+/// Parent/version association is supplied explicitly; no successor is computed here.
+#[derive(Clone)]
+pub struct StateGraphSnapshotV1 {
+    pub(crate) version: String,
+    pub(crate) content: StateGraphGenesisV1,
+}
+impl StateGraphSnapshotV1 {
+    pub fn new(
+        version: String,
+        parent: String,
+        mut content: StateGraphGenesisV1,
+    ) -> Result<Self, StateError> {
+        content.validate()?;
+        if !positive(&version) || version == "1" || !positive(&parent) || version == parent {
+            return Err(invalid(Field::ParentVersion));
+        }
+        content.parent_version = Some(Some(parent));
+        Ok(Self { version, content })
+    }
+    pub fn graph_version(&self) -> &str {
+        &self.version
+    }
+    pub fn parent_version(&self) -> &str {
+        self.content
+            .parent_version
+            .as_ref()
+            .and_then(|x| x.as_deref())
+            .expect("checked snapshot parent")
+    }
+}
+impl fmt::Debug for StateGraphSnapshotV1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("StateGraphSnapshotV1")
+    }
+}
+
+pub(crate) fn write_transaction<T>(
+    conn: &Connection,
+    work: impl FnOnce(&Connection) -> Result<T, StateError>,
+) -> Result<T, StateError> {
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|e| sqlite_error(Phase::Write, e))?;
+    let result = verify_current(conn, Phase::Write).and_then(|()| work(conn));
+    match result {
+        Ok(value) => match conn.execute_batch("COMMIT") {
+            Ok(()) => Ok(value),
+            Err(e) => {
+                let mapped = sqlite_error(Phase::Write, e);
+                conn.execute_batch("ROLLBACK")
+                    .map_err(|_| failure(Phase::Write, Code::RollbackFailure, None))?;
+                Err(mapped)
+            }
+        },
+        Err(e) => {
+            conn.execute_batch("ROLLBACK")
+                .map_err(|_| failure(Phase::Write, Code::RollbackFailure, None))?;
+            Err(e)
+        }
+    }
 }

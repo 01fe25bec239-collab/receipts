@@ -26,7 +26,14 @@ pub mod error;
 pub mod event;
 pub mod executor_binding;
 pub mod executor_binding_lease_expiry;
+pub mod graph_history;
+pub mod graph_node_result;
+#[cfg(test)]
+mod graph_node_result_tests;
 pub mod graph_repository;
+mod json_integer;
+#[cfg(test)]
+mod json_integer_tests;
 pub mod logical_role;
 pub mod repository;
 pub mod startup_recovery;
@@ -137,3 +144,9 @@ pub use startup_recovery::{
     StartupRecoveryClassification, StartupRecoverySnapshot, classify_startup_recovery,
 };
 pub use trusted_time::{TrustedClockV1, TrustedTimeSampleV1, TrustedTimeWatermarkV1};
+
+pub use graph_history::StateGraphMutationV1;
+pub use graph_node_result::{PersistedNodeResultV1, StateGraphNodeResultV1};
+pub use graph_repository::StateGraphSnapshotV1;
+#[cfg(test)]
+mod graph_history_tests;
