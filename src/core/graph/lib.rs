@@ -87,6 +87,8 @@ mod graph_mutation_target_graph_policy_tests;
 #[cfg(test)]
 mod graph_mutation_vocabulary_tests;
 #[cfg(test)]
+mod mutation_apply_tests;
+#[cfg(test)]
 mod node_result_vocabulary_tests;
 #[cfg(test)]
 mod node_state_tests;
@@ -112,7 +114,7 @@ pub use edge::{ControlKind, EdgeClass, GraphEdge, GraphEdgeRelation, PrecedenceK
 pub use error::{GraphError, MAX_IDENTIFIER_LENGTH};
 pub use execution_graph::{
     ExecutionGraph, ExecutionGraphEnvelope, ExecutionGraphEnvelopeError,
-    ExecutionGraphEnvelopeFields,
+    ExecutionGraphEnvelopeFields, GraphAppendError,
 };
 pub use graph_mutation_actor_policy::{
     GraphMutationActorAuthorizationError, validate_graph_mutation_actor,

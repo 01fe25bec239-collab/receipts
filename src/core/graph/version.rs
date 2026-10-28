@@ -1,8 +1,9 @@
 //! Graph-owned physical binding: BUILD-A1-ADR-ORCHESTRATION-GRAPH-VERSION-PHYSICAL-V1-001.
 
 /// A canonical positive integer with no numeric or digit-count ceiling.
-/// The authoritative value is lexical: no conversion, normalization, ordering,
-/// or arithmetic is performed.
+/// The authoritative value is lexical: no numeric conversion, normalization,
+/// or ordering is performed. The append boundary computes its successor
+/// directly from these decimal digits.
 ///
 /// Raw construction cannot bypass validation:
 /// ```compile_fail
@@ -43,5 +44,18 @@ impl GraphVersionV1 {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub(crate) fn successor(&self) -> Self {
+        let mut digits = self.0.as_bytes().to_vec();
+        for digit in digits.iter_mut().rev() {
+            if *digit != b'9' {
+                *digit += 1;
+                return Self(String::from_utf8(digits).expect("decimal digits remain ASCII"));
+            }
+            *digit = b'0';
+        }
+        digits.insert(0, b'1');
+        Self(String::from_utf8(digits).expect("decimal digits remain ASCII"))
     }
 }
