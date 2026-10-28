@@ -72,7 +72,7 @@ impl<'a> ClaudeEventStream<'a> {
             worker,
         }
     }
-    pub fn next(&mut self) -> impl Future<Output = Option<ClaudeAttemptEvent>> + '_ {
+    pub fn next_event(&mut self) -> impl Future<Output = Option<ClaudeAttemptEvent>> + '_ {
         poll_fn(|cx| Pin::new(&mut *self).poll_next(cx))
     }
     fn unavailable(&mut self, error: ClaudeEventError) -> Poll<Option<ClaudeAttemptEvent>> {

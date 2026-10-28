@@ -202,7 +202,7 @@ fn trait_start_async_delivery_fidelity_and_single_collection() {
     f.ready();
     let mut stream = adapter.stream_events(&handle);
     let first = {
-        let mut next = pin!(stream.next());
+        let mut next = pin!(stream.next_event());
         let waker = Waker::from(Arc::new(Notify(std::thread::current())));
         let mut cx = Context::from_waker(&waker);
         match next.as_mut().poll(&mut cx) {
@@ -241,10 +241,10 @@ fn trait_start_async_delivery_fidelity_and_single_collection() {
     assert_eq!(result.failure(), None);
     assert!(adapter.collect_result(&handle).is_err());
     assert!(matches!(
-        block_on(stream.next()),
+        block_on(stream.next_event()),
         Some(ClaudeAttemptEvent::Record(_))
     ));
-    assert!(block_on(stream.next()).is_none());
+    assert!(block_on(stream.next_event()).is_none());
     assert_eq!(adapter.authenticate_status(), RuntimeAuthStatus::Unknown);
     assert!(matches!(
         adapter.capabilities(),
@@ -270,7 +270,7 @@ fn partial_records_wait_without_duplicates_and_final_incomplete_is_error() {
     }
     f.release();
     assert!(matches!(
-        block_on(stream.next()),
+        block_on(stream.next_event()),
         Some(ClaudeAttemptEvent::Record(_))
     ));
     assert!(handle.attempt.terminal_cause().is_none());
@@ -281,12 +281,12 @@ fn partial_records_wait_without_duplicates_and_final_incomplete_is_error() {
     assert_eq!(result.provider_result(), ClaudeProviderResult::Unknown);
 
     assert!(matches!(
-        block_on(stream.next()),
+        block_on(stream.next_event()),
         Some(ClaudeAttemptEvent::Unavailable(ClaudeEventError::Protocol(
             _
         )))
     ));
-    assert!(block_on(stream.next()).is_none());
+    assert!(block_on(stream.next_event()).is_none());
 }
 
 #[test]
@@ -297,7 +297,7 @@ fn truncation_is_never_a_complete_stream() {
     f.ready();
     let mut stream = adapter.stream_events(&handle);
     assert!(matches!(
-        block_on(stream.next()),
+        block_on(stream.next_event()),
         Some(ClaudeAttemptEvent::Unavailable(ClaudeEventError::Protocol(
             ClaudeStreamJsonError::StdoutTruncated
         )))
