@@ -732,6 +732,17 @@ fn malformed_graph_content_is_refused_by_connected_lists_and_reads() {
                     .unwrap()
                     .is_empty()
             );
+            assert_eq!(
+                repo.list_node_results_v1("p", "g", "1", "n").unwrap().len(),
+                usize::from(historical)
+            );
+            assert_eq!(
+                reader
+                    .list_node_results_v1("p", "g", "1", "n")
+                    .unwrap()
+                    .len(),
+                usize::from(historical)
+            );
             let sql = match field {
                 "goal" => {
                     "UPDATE graph_versions SET goal_id='' WHERE project_id='p' AND graph_version='1'"
@@ -772,6 +783,8 @@ fn malformed_graph_content_is_refused_by_connected_lists_and_reads() {
                     .list_node_results_v1("p", "g", "1", "absent")
                     .map(|_| ()),
             ];
+            corrupt(repo.list_node_results_v1("p", "g", "1", "n").unwrap_err());
+            corrupt(reader.list_node_results_v1("p", "g", "1", "n").unwrap_err());
             for list in lists {
                 corrupt(list.unwrap_err());
             }
@@ -796,4 +809,76 @@ fn malformed_graph_content_is_refused_by_connected_lists_and_reads() {
             cleanup(path);
         }
     }
+}
+
+#[test]
+fn public_lists_validate_partition_once_independent_of_row_count() {
+    use crate::graph_history::take_partition_validation_count as take_count;
+    let mut observations = Vec::new();
+    for count in [0usize, 8, 16] {
+        let path = db();
+        let mut repo = SqliteStateRepository::open(&path).unwrap();
+        repo.create_initial_graph_v1(&Clock, content("p", None))
+            .unwrap();
+        for index in 0..count {
+            repo.append_node_result_v1("p", "1", &format!("r{index:04}"), result())
+                .unwrap();
+            let parent = (index + 1).to_string();
+            let version = (index + 2).to_string();
+            repo.append_graph_mutation_v1(
+                &Clock,
+                mutation(&parent, &version),
+                StateGraphSnapshotV1::new(version, parent, content("p", None)).unwrap(),
+            )
+            .unwrap();
+        }
+        let reader = ReadOnlyGraphReader::open_existing(&path).unwrap();
+        take_count();
+        let start = std::time::Instant::now();
+        let rows = repo.list_graph_mutations_v1("p", "g").unwrap();
+        assert_eq!(rows.len(), count);
+        observations.push(("repository mutations", count, take_count(), start.elapsed()));
+        let start = std::time::Instant::now();
+        let rows = reader.list_graph_mutations_v1("p", "g").unwrap();
+        assert_eq!(rows.len(), count);
+        observations.push(("read-only mutations", count, take_count(), start.elapsed()));
+        let start = std::time::Instant::now();
+        let rows = repo.list_node_results_v1("p", "g", "1", "n").unwrap();
+        assert_eq!(rows.len(), count);
+        observations.push(("repository results", count, take_count(), start.elapsed()));
+        let start = std::time::Instant::now();
+        let rows = reader.list_node_results_v1("p", "g", "1", "n").unwrap();
+        assert_eq!(rows.len(), count);
+        observations.push(("read-only results", count, take_count(), start.elapsed()));
+        assert!(
+            repo.find_node_result_v1("p", "g", "absent")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(take_count(), 1, "standalone lookup retains full validation");
+        assert!(
+            reader
+                .load_graph_version_v1("p", "g", "1")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            take_count(),
+            1,
+            "standalone historical lookup retains validation"
+        );
+        drop(reader);
+        drop(repo);
+        cleanup(path);
+    }
+    for (surface, rows, validations, elapsed) in &observations {
+        eprintln!(
+            "surface={surface:?} rows={rows} full_validations={validations} elapsed_us={} context=debug_public_api_same_thread_one_node_one_edge_per_version",
+            elapsed.as_micros()
+        );
+    }
+    assert!(
+        observations.iter().all(|(_, _, count, _)| *count == 1),
+        "full validation must be independent of row count: {observations:?}"
+    );
 }

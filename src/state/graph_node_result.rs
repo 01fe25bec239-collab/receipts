@@ -280,6 +280,16 @@ pub(crate) fn read_result(
         return Err(invalid());
     }
     crate::graph_history::validate_partition(conn, project, graph_id)?;
+    read_result_validated(conn, project, graph_id, reference)
+}
+
+// Only callers that validated this partition in the same transaction may use this leaf.
+fn read_result_validated(
+    conn: &Connection,
+    project: &str,
+    graph_id: &str,
+    reference: &str,
+) -> Result<Option<PersistedNodeResultV1>, StateError> {
     let row:Option<(String,String,String)>=conn.query_row("SELECT graph_version,node_id,result_json FROM graph_node_results WHERE project_id=?1 AND graph_id=?2 AND result_ref=?3",params![project,graph_id,reference],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|e|graph::sqlite_error(Phase::Read,e))?;
     let Some((version, node, raw)) = row else {
         return Ok(None);
@@ -329,7 +339,7 @@ fn list_results(
         .map_err(|e| graph::sqlite_error(Phase::Read, e))?;
     refs.into_iter()
         .map(|reference| {
-            read_result(conn, project, graph_id, &reference)?.ok_or_else(graph::corrupt)
+            read_result_validated(conn, project, graph_id, &reference)?.ok_or_else(graph::corrupt)
         })
         .collect()
 }

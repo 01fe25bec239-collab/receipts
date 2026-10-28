@@ -188,6 +188,16 @@ fn version_projection(
         return Err(invalid());
     }
     validate_partition(conn, project, graph_id)?;
+    version_projection_validated(conn, project, graph_id, version)
+}
+
+// Only callers that validated this partition in the same transaction may use this leaf.
+fn version_projection_validated(
+    conn: &Connection,
+    project: &str,
+    graph_id: &str,
+    version: &str,
+) -> Result<Option<PersistedCurrentGraphV1>, StateError> {
     let current: Option<String> = conn
         .query_row(
             "SELECT current_version FROM graphs WHERE project_id=?1 AND graph_id=?2",
@@ -235,8 +245,8 @@ fn mutations(
             row.get(2)
                 .map_err(|e| graph::sqlite_error(Phase::Read, e))?,
         );
-        let snapshot =
-            version_projection(conn, project, graph_id, &version)?.ok_or_else(graph::corrupt)?;
+        let snapshot = version_projection_validated(conn, project, graph_id, &version)?
+            .ok_or_else(graph::corrupt)?;
         if mutation.graph_id() != graph_id
             || mutation.mutation_id() != mid
             || mutation.parent_version() != parent
@@ -245,7 +255,7 @@ fn mutations(
             || mutation
                 .resulting_digest()
                 .is_some_and(|d| d != snapshot.resulting_digest())
-            || version_projection(conn, project, graph_id, &parent)?.is_none()
+            || version_projection_validated(conn, project, graph_id, &parent)?.is_none()
         {
             return Err(graph::corrupt());
         }
@@ -363,12 +373,23 @@ impl ReadOnlyGraphReader {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static PARTITION_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+pub(crate) fn take_partition_validation_count() -> usize {
+    PARTITION_VALIDATIONS.with(|count| count.replace(0))
+}
+
 /// Validates immutable associations inside the caller's coherent read snapshot.
 pub(crate) fn validate_partition(
     conn: &Connection,
     project: &str,
     graph_id: &str,
 ) -> Result<(), StateError> {
+    #[cfg(test)]
+    PARTITION_VALIDATIONS.with(|count| count.set(count.get() + 1));
     let map = |e| graph::sqlite_error(Phase::Read, e);
     // Reuse the leaf decoder, which does not call this partition boundary.
     let current: Option<String> = conn
