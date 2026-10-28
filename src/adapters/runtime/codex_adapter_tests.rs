@@ -84,6 +84,15 @@ impl Fixture {
         self.task_with_budgets(None, None)
     }
     fn task_with_budgets(&self, time: Option<i64>, turns: Option<i64>) -> RuntimeCapsuleFamily {
+        self.task_with_requirements(time, turns, vec![], None)
+    }
+    fn task_with_requirements(
+        &self,
+        time: Option<i64>,
+        turns: Option<i64>,
+        capabilities: Vec<CapabilityName>,
+        cost: Option<CostPolicy>,
+    ) -> RuntimeCapsuleFamily {
         RuntimeCapsuleFamily::Task(
             TaskCapsule::try_new(
                 "task".into(),
@@ -111,7 +120,7 @@ impl Fixture {
                 None,
                 None,
                 QualityFloor::Frontier,
-                vec![],
+                capabilities,
                 None,
                 vec![
                     VerificationPlanEntryV1::try_new(vec!["cargo".into(), "test".into()], 0)
@@ -119,7 +128,7 @@ impl Fixture {
                 ],
                 None,
                 AssuranceProfileSelector::Standard,
-                None,
+                cost,
                 time,
                 turns,
                 self.workspace.branch().into(),
@@ -791,4 +800,46 @@ fn contradictory_terminal_events_are_explicitly_unavailable() {
         ))
     ));
     assert!(block_on(stream.next_event()).is_none());
+}
+
+#[test]
+fn canonical_required_capability_refuses_before_launch() {
+    let f = Fixture::new("", "");
+    let task = f.task_with_requirements(
+        None,
+        None,
+        vec![CapabilityName::new("synthetic.required").unwrap()],
+        None,
+    );
+    assert!(matches!(
+        f.adapter().start(&task, &f.workspace, &policy(false)),
+        Err(FailureClass::PolicyBlocked)
+    ));
+    for file in ["pid", "argv", "received", "ready"] {
+        assert!(
+            !f.workspace.worktree_path().join(file).exists(),
+            "child launched: {file}"
+        );
+    }
+}
+
+#[test]
+fn canonical_cost_policy_refuses_before_launch() {
+    let f = Fixture::new("", "");
+    let task = f.task_with_requirements(
+        None,
+        None,
+        vec![],
+        Some(CostPolicy::try_new(Some(Some(1.0)), None).unwrap()),
+    );
+    assert!(matches!(
+        f.adapter().start(&task, &f.workspace, &policy(false)),
+        Err(FailureClass::PolicyBlocked)
+    ));
+    for file in ["pid", "argv", "received", "ready"] {
+        assert!(
+            !f.workspace.worktree_path().join(file).exists(),
+            "child launched: {file}"
+        );
+    }
 }
