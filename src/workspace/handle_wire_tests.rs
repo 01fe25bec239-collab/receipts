@@ -341,6 +341,7 @@ fn handle_wire_v1_timestamps_preserve_lexical_grammar_and_calendar() {
 }
 
 #[test]
+#[ignore = "independent oracle: explicitly set WORKSPACE_SCHEMA_PYTHON to a Python with jsonschema and run with --ignored --nocapture"]
 fn handle_wire_structural_schema_conformance_with_documented_oracle_limits() {
     let mut samples: Vec<_> = cases()
         .into_iter()
@@ -363,12 +364,17 @@ fn handle_wire_structural_schema_conformance_with_documented_oracle_limits() {
         roundtrip(&v);
         samples.push(json!([v, true]));
     }
+    samples.extend(actual_export_samples());
     structural_schema(samples);
 }
 
 fn structural_schema(samples: Vec<Value>) {
     use std::io::Write;
     use std::process::{Command, Stdio};
+    println!(
+        "SCHEMA_SAMPLES={}",
+        serde_json::to_string(&samples).unwrap()
+    );
     let input = json!({"schema": serde_json::from_str::<Value>(include_str!("../../schemas/WorkspaceHandle.schema.json")).unwrap(), "samples": samples});
     let script = r#"
 import sys, json, importlib.metadata
@@ -385,7 +391,9 @@ for time in ['0000-01-01T00:00:00Z', '1990-12-31T23:59:60Z', '2026-09-08T12:00:6
     print('FormatChecker compatibility', time, f.is_valid(value))
 print('SHA final-LF dialect divergence retained; Rust exact ASCII tests are decisive')
 "#;
-    let mut child = Command::new("/opt/anaconda3/bin/python")
+    let python = std::env::var_os("WORKSPACE_SCHEMA_PYTHON")
+        .expect("independent oracle requires WORKSPACE_SCHEMA_PYTHON and installed jsonschema");
+    let mut child = Command::new(python)
         .args(["-c", script])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -458,6 +466,10 @@ fn assert_export(handle: &WorkspaceHandle) -> WorkspaceHandleWire {
 
 #[test]
 fn handle_wire_exports_real_provisioned_and_verified_torn_down_evidence() {
+    assert_eq!(actual_export_samples().len(), 10);
+}
+
+fn actual_export_samples() -> Vec<Value> {
     let repo = TestRepo::new_nested("wire-export", "repo");
     let mut samples = Vec::new();
     for (index, time) in [
@@ -505,7 +517,7 @@ fn handle_wire_exports_real_provisioned_and_verified_torn_down_evidence() {
         assert!(!torn.worktree_path().exists());
         assert!(branch_exists(&repo, torn.branch()));
     }
-    structural_schema(samples);
+    samples
 }
 
 #[test]
