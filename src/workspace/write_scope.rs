@@ -4,6 +4,8 @@
 
 use std::path::Path;
 
+use crate::write_path_pattern::{WritePathPattern, WritePathSet, validate_write_path};
+
 use crate::checkpoint_evidence_capture::{RawStream, observe};
 use crate::{
     CommitSha, WorkspaceCheckpointEvidenceCaptureError, WorkspaceCheckpointGitObservation,
@@ -199,7 +201,7 @@ pub fn verify_write_scope(
     let mut unauthorized_paths = Vec::new();
     let mut forbidden_matches = Vec::new();
     for path in &changed_paths {
-        for (pattern, parsed) in forbidden_write_paths.iter().zip(&forbidden) {
+        for (pattern, parsed) in forbidden_write_paths.iter().zip(forbidden.patterns()) {
             if parsed.matches(path) {
                 forbidden_matches.push(ForbiddenWriteMatch {
                     path: path.clone(),
@@ -207,7 +209,7 @@ pub fn verify_write_scope(
                 });
             }
         }
-        if !allowed.iter().any(|pattern| pattern.matches(path)) {
+        if !allowed.matches(path) {
             unauthorized_paths.push(path.clone());
         }
     }
@@ -275,24 +277,6 @@ fn verify_commit(
     })
 }
 
-fn validate_structure(value: &str) -> Result<(), &'static str> {
-    if value.is_empty() {
-        return Err("empty path");
-    }
-    if value.contains('\\') {
-        return Err("backslash is forbidden");
-    }
-    for component in value.split('/') {
-        if component.is_empty() {
-            return Err("empty component");
-        }
-        if component == "." || component == ".." {
-            return Err("dot component");
-        }
-    }
-    Ok(())
-}
-
 fn complete(
     raw: RawStream,
     operation: WriteScopeGitOperation,
@@ -323,7 +307,7 @@ fn parse_paths(raw: RawStream) -> Result<Vec<String>, WriteScopeVerificationErro
         let path = std::str::from_utf8(record).map_err(|_| E::InvalidUtf8Candidate {
             bytes: record.to_vec(),
         })?;
-        validate_structure(path).map_err(|reason| E::MalformedCandidatePath {
+        validate_write_path(path).map_err(|reason| E::MalformedCandidatePath {
             path: path.to_owned(),
             reason,
         })?;
@@ -334,102 +318,25 @@ fn parse_paths(raw: RawStream) -> Result<Vec<String>, WriteScopeVerificationErro
     Ok(paths)
 }
 
-struct Pattern {
-    components: Vec<Component>,
-}
-enum Component {
-    GlobStar,
-    Normal(Vec<char>),
-}
-
 fn parse_policy(
     patterns: &[String],
     set: WriteScopePatternSet,
-) -> Result<Vec<Pattern>, WriteScopeVerificationError> {
+) -> Result<WritePathSet, WriteScopeVerificationError> {
     patterns
         .iter()
         .enumerate()
         .map(|(index, pattern)| {
-            Pattern::parse(pattern).map_err(|reason| WriteScopeVerificationError::InvalidPattern {
-                set,
-                index,
-                pattern: pattern.clone(),
-                reason,
+            WritePathPattern::parse(pattern).map_err(|reason| {
+                WriteScopeVerificationError::InvalidPattern {
+                    set,
+                    index,
+                    pattern: pattern.clone(),
+                    reason,
+                }
             })
         })
-        .collect()
-}
-
-impl Pattern {
-    fn parse(pattern: &str) -> Result<Self, &'static str> {
-        validate_structure(pattern)?;
-        if pattern.starts_with('!') {
-            return Err("leading negation is unsupported");
-        }
-        if pattern.contains(['?', '[', ']', '{', '}']) {
-            return Err("unsupported pattern syntax");
-        }
-        let mut components = Vec::new();
-        for component in pattern.split('/') {
-            components.push(if component == "**" {
-                Component::GlobStar
-            } else {
-                if component.contains("**") {
-                    return Err("globstar must occupy a complete component");
-                }
-                Component::Normal(component.chars().collect())
-            });
-        }
-        Ok(Self { components })
-    }
-
-    fn matches(&self, path: &str) -> bool {
-        let parts: Vec<&str> = path.split('/').collect();
-        // Each row represents one pattern prefix against every path prefix.
-        // O(pattern components * path components), plus normal-component DP.
-        let mut row = vec![false; parts.len() + 1];
-        row[0] = true;
-        for component in &self.components {
-            let mut next = vec![false; row.len()];
-            match component {
-                Component::GlobStar => {
-                    next[0] = row[0];
-                    for j in 1..row.len() {
-                        next[j] = row[j] || next[j - 1];
-                    }
-                }
-                Component::Normal(tokens) => {
-                    for j in 1..row.len() {
-                        next[j] = row[j - 1] && match_component(tokens, parts[j - 1]);
-                    }
-                }
-            }
-            row = next;
-        }
-        row[parts.len()]
-    }
-}
-
-fn match_component(tokens: &[char], value: &str) -> bool {
-    let scalars: Vec<char> = value.chars().collect();
-    // O(pattern scalars * candidate scalars) time, O(candidate scalars) space.
-    let mut row = vec![false; scalars.len() + 1];
-    row[0] = true;
-    for token in tokens {
-        let mut next = vec![false; row.len()];
-        if *token == '*' {
-            next[0] = row[0];
-        }
-        for j in 1..row.len() {
-            next[j] = if *token == '*' {
-                row[j] || next[j - 1]
-            } else {
-                row[j - 1] && *token == scalars[j - 1]
-            };
-        }
-        row = next;
-    }
-    row[scalars.len()]
+        .collect::<Result<Vec<_>, _>>()
+        .map(WritePathSet::new)
 }
 
 #[cfg(test)]
