@@ -1,12 +1,30 @@
 //! Schema-shaped checkpoint metadata; nested references are opaque evidence.
 use crate::error::{GraphFailureCode as Code, GraphPhase as Phase, StateError};
-use crate::graph_node_result::{date_time, invalid, present};
+use crate::graph_node_result::{RawObject, date_time, invalid, present};
 use crate::graph_repository::{self as graph, hex, id};
 use crate::repository::SqliteStateRepository;
 use rusqlite::{OptionalExtension, params};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::value::RawValue;
 use std::fmt;
+
+// Derived structs also accept sequences; check object shape before typed decoding.
+fn object<'de, D: Deserializer<'de>, T: de::DeserializeOwned>(d: D) -> Result<T, D::Error> {
+    let raw = RawObject::deserialize(d)?;
+    T::deserialize(&*raw.0).map_err(|_| de::Error::custom("invalid object"))
+}
+fn present_object<'de, D: Deserializer<'de>, T: de::DeserializeOwned>(
+    d: D,
+) -> Result<Option<T>, D::Error> {
+    object(d).map(Some)
+}
+fn present_checks<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<Check>>, D::Error> {
+    let raw = Vec::<RawObject>::deserialize(d)?;
+    raw.iter()
+        .map(|raw| Check::deserialize(&*raw.0).map_err(|_| de::Error::custom("invalid check")))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -61,7 +79,7 @@ struct Check {
     finished_at: Option<String>,
     #[serde(
         default,
-        deserialize_with = "present",
+        deserialize_with = "present_object",
         skip_serializing_if = "Option::is_none"
     )]
     output_ref: Option<Reference>,
@@ -118,7 +136,7 @@ struct Wire {
     base_sha: Option<String>,
     #[serde(
         default,
-        deserialize_with = "present",
+        deserialize_with = "present_object",
         skip_serializing_if = "Option::is_none"
     )]
     dirty_diff_ref: Option<Reference>,
@@ -136,7 +154,7 @@ struct Wire {
     untracked_files: Option<Vec<String>>,
     #[serde(
         default,
-        deserialize_with = "present",
+        deserialize_with = "present_checks",
         skip_serializing_if = "Option::is_none"
     )]
     executed_checks: Option<Vec<Check>>,
@@ -171,7 +189,9 @@ impl fmt::Debug for CheckpointRecord {
 }
 impl CheckpointRecord {
     pub fn parse_json(project_id: &str, text: &str) -> Result<Self, StateError> {
-        let wire: Wire = serde_json::from_str(text).map_err(|_| invalid())?;
+        let mut deserializer = serde_json::Deserializer::from_str(text);
+        let wire: Wire = object(&mut deserializer).map_err(|_| invalid())?;
+        deserializer.end().map_err(|_| invalid())?;
         if !id(project_id)
             || !id(&wire.checkpoint_id)
             || !id(&wire.workspace_id)

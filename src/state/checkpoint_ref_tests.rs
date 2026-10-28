@@ -379,3 +379,96 @@ fn new_table_definition_tampering_refuses_even_absent_reads_and_appends() {
         assert!(SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).is_err());
     }
 }
+
+fn positional_checkpoints() -> Vec<String> {
+    let sha = "a".repeat(40);
+    let root = format!(r#"["c","w","{sha}","2000-01-01T00:00:00Z","PROGRESS"]"#);
+    let minimal = format!(
+        r#"{{"checkpoint_id":"c","workspace_id":"w","head_sha":"{sha}","captured_at":"2000-01-01T00:00:00Z","kind":"PROGRESS"}}"#
+    );
+    let check = format!(
+        r#"{{"source":"BROKER_EXECUTION","command":["cmd"],"exit_code":0,"code_sha":"{sha}","output_ref":["URL","SECRET"]}}"#
+    );
+    vec![
+        root,
+        minimal.replace(
+            "\"kind\":",
+            "\"dirty_diff_ref\":[\"URL\",\"SECRET\"],\"kind\":",
+        ),
+        minimal.replace(
+            "\"kind\":",
+            &format!(r#""executed_checks":[["BROKER_EXECUTION",["cmd"],0,"{sha}"]],"kind":"#),
+        ),
+        minimal.replace(
+            "\"kind\":",
+            &format!(r#""executed_checks":[{check}],"kind":"#),
+        ),
+    ]
+}
+
+#[test]
+fn checkpoint_every_schema_object_boundary_refuses_positional_arrays() {
+    for (boundary, raw) in positional_checkpoints().iter().enumerate() {
+        let error = CheckpointRecord::parse_json("p", raw)
+            .expect_err(&format!("object boundary {boundary} accepted an array"));
+        assert!(!format!("{error} {error:?}").contains("SECRET"));
+    }
+    // Neighboring arrays are valid; numeric tokens and optional opaque digests survive.
+    let raw = full("-184467440737095516170000000000001e1000001");
+    let value = CheckpointRecord::parse_json("p", &raw).unwrap();
+    let encoded = value.to_json().unwrap();
+    assert_eq!(
+        CheckpointRecord::parse_json("p", &encoded)
+            .unwrap()
+            .to_json()
+            .unwrap(),
+        encoded
+    );
+    assert!(encoded.contains("-184467440737095516170000000000001e1000001"));
+    assert!(encoded.contains(r#""digest":"opaque\u0000digest""#));
+    assert!(encoded.contains(r#""digest":"""#));
+}
+
+#[test]
+fn stored_positional_checkpoint_objects_fail_closed_on_every_decode_path() {
+    for raw in positional_checkpoints() {
+        let tmp = TempDir::new("checkpoint-positional-corrupt");
+        let mut repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
+        repo.append_checkpoint(checkpoint("p", "\"c\"", "2000-01-01T00:00:00Z"))
+            .unwrap();
+        let ddl: String = repo
+            .connection()
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name='workspace_checkpoints_no_update'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        repo.connection()
+            .execute_batch("DROP TRIGGER workspace_checkpoints_no_update")
+            .unwrap();
+        repo.connection()
+            .execute(
+                "UPDATE workspace_checkpoints SET checkpoint_json=?1",
+                [&raw],
+            )
+            .unwrap();
+        repo.connection().execute_batch(&ddl).unwrap();
+        drop(repo);
+        let repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
+        for error in [
+            repo.find_checkpoint("p", "c").unwrap_err(),
+            repo.list_checkpoints("p", "w").unwrap_err(),
+            repo.latest_checkpoint("p", "w").unwrap_err(),
+        ] {
+            assert!(matches!(
+                error,
+                StateError::GraphPersistence {
+                    code: Code::CorruptStore,
+                    ..
+                }
+            ));
+            assert!(!format!("{error} {error:?}").contains("SECRET"));
+        }
+    }
+}
