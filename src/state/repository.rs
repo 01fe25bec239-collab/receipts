@@ -69,7 +69,7 @@ impl SqliteStateRepository {
         Ok(repo)
     }
 
-    /// Explicitly upgrades an exact v11, v12 or v13 State database to v14.
+    /// Explicitly upgrades an exact v11–v14 State database to v15.
     pub fn migrate_existing_to_current(path: impl AsRef<Path>) -> Result<u32, StateError> {
         let mut conn =
             Connection::open_with_flags(path.as_ref(), OpenFlags::SQLITE_OPEN_READ_WRITE)
@@ -88,27 +88,27 @@ impl SqliteStateRepository {
                 migrations::v0012_context_epoch_unbounded::apply_graph(&mut conn)?;
                 graph_repository::migrate_graph_store(&conn)?;
                 graph_repository::migrate_attempt_store(&conn)?;
-                Ok(14)
             }
             Some(12) => {
                 graph_repository::migrate_graph_store(&conn)?;
                 graph_repository::migrate_attempt_store(&conn)?;
-                Ok(14)
             }
-            Some(13) => {
-                graph_repository::migrate_attempt_store(&conn)?;
-                Ok(14)
-            }
-            Some(14) => {
+            Some(13) => graph_repository::migrate_attempt_store(&conn)?,
+            Some(14) => graph_repository::verify_v14(&conn, GraphPhase::Migration)?,
+            Some(15) => {
                 graph_repository::verify_current(&conn, GraphPhase::Migration)?;
-                Ok(14)
+                return Ok(15);
             }
-            _ => Err(StateError::GraphPersistence {
-                phase: GraphPhase::Migration,
-                code: GraphFailureCode::UnsupportedSchema,
-                field: None,
-            }),
+            _ => {
+                return Err(StateError::GraphPersistence {
+                    phase: GraphPhase::Migration,
+                    code: GraphFailureCode::UnsupportedSchema,
+                    field: None,
+                });
+            }
         }
+        graph_repository::migrate_history_store(&conn)?;
+        Ok(15)
     }
 
     /// Version-reconciliation core of [`Self::open`], parameterized by the

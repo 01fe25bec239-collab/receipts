@@ -152,11 +152,11 @@ fn explicit_migration_and_missing_store() {
     drop(repo);
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
-        14
+        15
     );
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
-        14
+        15
     );
     assert!(
         ReadOnlyGraphReader::open_existing(&db.0)
@@ -291,7 +291,7 @@ fn malformed_rows_and_list_gaps_are_corruption() {
                 .execute_batch("PRAGMA foreign_keys=OFF")
                 .unwrap();
         }
-        repo.connection().execute_batch(sql).unwrap();
+        crate::graph_history_tests::corrupt_graph(repo.connection(), sql);
         drop(repo);
         let error = match ReadOnlyGraphReader::open_existing(&db.0) {
             Ok(reader) => reader.read_current_v1("p", "g").unwrap_err(),
@@ -416,7 +416,7 @@ fn v11_graph_maintenance_preserves_typed_busy_and_durable_state() {
         drop(blocker);
         assert_eq!(
             SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
-            14
+            15
         );
     }
 }
@@ -628,9 +628,9 @@ fn stale_v11_graph_step_refuses_valid_advanced_store_without_rebuild() {
             );
             assert_eq!(
                 SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
-                14
+                15
             );
-            assert_eq!(migration_ledger(&db.0).len(), 14);
+            assert_eq!(migration_ledger(&db.0).len(), 15);
             drop(SqliteStateRepository::open(&db.0).unwrap());
         }
     }
@@ -721,7 +721,7 @@ fn simultaneous_public_v11_maintenance_keeps_one_exact_ledger() {
     barrier.wait();
     for result in handles.into_iter().map(|handle| handle.join().unwrap()) {
         match result {
-            Ok(14) => (),
+            Ok(15) => (),
             Err(StateError::GraphPersistence {
                 phase: Phase::Migration,
                 code: Code::StoreBusy | Code::UnsupportedSchema | Code::CorruptStore,
@@ -732,7 +732,7 @@ fn simultaneous_public_v11_maintenance_keeps_one_exact_ledger() {
     }
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
-        14
+        15
     );
     let expected: Vec<_> = crate::migrations::registered()
         .iter()
@@ -783,7 +783,7 @@ fn graph_v11_commit_busy_rolls_back_and_restores_foreign_keys() {
     reader.execute_batch("ROLLBACK").unwrap();
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
-        14
+        15
     );
 }
 
@@ -1148,7 +1148,10 @@ fn numeric_storage_is_not_decoded_as_decimal_text() {
         .unwrap();
     assert_eq!(storage, "text");
     assert_eq!(decimal, format!("1{}", "0".repeat(10000)));
-    repo.connection().execute_batch("PRAGMA ignore_check_constraints=ON; UPDATE graph_nodes SET attempt_number=1 WHERE node_id='n2';").unwrap();
+    crate::graph_history_tests::corrupt_graph(
+        repo.connection(),
+        "PRAGMA ignore_check_constraints=ON; UPDATE graph_nodes SET attempt_number=1 WHERE node_id='n2';",
+    );
     drop(repo);
     let error = ReadOnlyGraphReader::open_existing(&db.0)
         .unwrap()
@@ -1426,6 +1429,8 @@ fn insert_valid_noncurrent_version(conn: &rusqlite::Connection, project: &str, g
         )
         .unwrap();
     }
+    // Models an already persisted v14 historical version admitted by migration.
+    conn.execute("INSERT INTO graph_snapshot_seals(legacy,project_id,graph_id,graph_version) VALUES (1,?1,?2,'2')",rusqlite::params![project,graph]).unwrap();
 }
 
 #[test]
@@ -1472,7 +1477,7 @@ fn complete_partition_validation_includes_noncurrent_versions() {
         drop(reader);
         let conn = rusqlite::Connection::open(&db.0).unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
-        conn.execute_batch(sql).unwrap();
+        crate::graph_history_tests::corrupt_graph(&conn, sql);
         drop(conn);
         let reader = ReadOnlyGraphReader::open_existing(&db.0).unwrap();
         let error = reader.read_current_v1("p", "g").unwrap_err();
@@ -1625,7 +1630,7 @@ fn invalid_stored_text_decoding_is_read_corruption() {
         if noncurrent {
             insert_valid_noncurrent_version(repo.connection(), "p", "g");
         }
-        repo.connection().execute_batch(update).unwrap();
+        crate::graph_history_tests::corrupt_graph(repo.connection(), update);
         let stored_value: (String, String) = repo
             .connection()
             .query_row(stored, [], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -1779,7 +1784,7 @@ fn utf8_preserves_noncharacters_in_graph_identity_and_metadata() {
 #[test]
 fn utf16_graph_boundaries_refuse_without_mutating_store() {
     for encoding in ["UTF-16le", "UTF-16be"] {
-        for version in [11, 12, 13, 14] {
+        for version in [11, 12, 13, 14, 15] {
             let db = persisted_encoding_db(encoding);
             let mut repo = SqliteStateRepository::open_with_migrations(
                 &db.0,
@@ -1791,7 +1796,7 @@ fn utf16_graph_boundaries_refuse_without_mutating_store() {
                 .query_row("PRAGMA encoding", [], |row| row.get(0))
                 .unwrap();
             assert!(actual.eq_ignore_ascii_case(encoding));
-            if version == 14 {
+            if version == 15 {
                 let before: i64 = repo
                     .connection()
                     .query_row("SELECT COUNT(*) FROM trusted_time_watermark", [], |row| {
@@ -1817,7 +1822,7 @@ fn utf16_graph_boundaries_refuse_without_mutating_store() {
             drop(repo);
             let before_mode = journal_mode(&db.0);
             let before_bytes = std::fs::read(&db.0).unwrap();
-            if version == 14 {
+            if version == 15 {
                 assert_unsupported_encoding(
                     ReadOnlyGraphReader::open_existing(&db.0).unwrap_err(),
                     Phase::Read,
