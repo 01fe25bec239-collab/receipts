@@ -52,6 +52,7 @@ pub mod checkpoint_capture_core;
 pub mod checkpoint_evidence_capture;
 pub mod checkpoint_evidence_vocabulary;
 pub mod checkpoint_executed_check;
+pub mod checkpoint_json;
 pub mod checkpoint_reference;
 pub mod checkpoint_vocabulary;
 pub mod date_time;
@@ -80,6 +81,8 @@ mod checkpoint_capture_core_tests;
 mod checkpoint_evidence_vocabulary_tests;
 #[cfg(test)]
 mod checkpoint_executed_check_tests;
+#[cfg(test)]
+mod checkpoint_json_tests;
 #[cfg(test)]
 mod checkpoint_reference_tests;
 #[cfg(test)]
@@ -115,6 +118,7 @@ pub use checkpoint_evidence_vocabulary::{
 pub use checkpoint_executed_check::{
     WorkspaceCheckpointExecutedCheckCore, WorkspaceCheckpointExecutedCheckCoreError,
 };
+pub use checkpoint_json::{WorkspaceCheckpointJsonExportError, workspace_checkpoint_to_json};
 pub use checkpoint_reference::{WorkspaceCheckpointRef, WorkspaceCheckpointRefError};
 pub use checkpoint_vocabulary::{
     WorkspaceCheckpointCrashClassification, WorkspaceCheckpointKind, WorkspaceRecoveryDecision,
