@@ -116,3 +116,10 @@ pub use claude_probe_execution::{
 
 #[cfg(all(test, unix))]
 mod claude_adapter_tests;
+
+mod codex_adapter;
+pub use attempt_types::{CodexAttemptEvent, CodexEventError, CodexEventStream};
+pub use codex_adapter::{CodexAdapter, CodexAttemptHandle, CodexAttemptResult};
+
+#[cfg(all(test, unix))]
+mod codex_adapter_tests;

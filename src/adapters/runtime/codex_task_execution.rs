@@ -1,62 +1,9 @@
-//! One bounded `codex exec` worker-task execution primitive.
-//!
-//! This is the first real Codex worker-task execution primitive. It runs
-//! exactly one official Codex child through the Workspace-owned process
-//! runner:
-//!
-//! ```text
-//! <absolute codex path> exec --json --sandbox <read-only|workspace-write> -- <PROMPT>
-//! ```
-//!
-//! Frozen properties of this slice:
-//!
-//! * **Workspace-owned process boundary.** Execution goes through
-//!   [`run_with_timeout_and_capture`](receipts_workspace_execution::execution::run_with_timeout_and_capture)
-//!   only. There is no direct child spawning here, no command-string
-//!   assembly, and no environment handling: the Workspace runner remains
-//!   authoritative for absolute-executable validation, working-directory
-//!   containment, the empty inherited environment, timeouts, termination,
-//!   and bounded capture.
-//! * **Prompt is argv data after `--`.** The caller-supplied prompt travels
-//!   as exactly one argv element, verbatim, immediately after the `--`
-//!   option terminator; stdin stays closed for every prompt. It is never
-//!   trimmed, normalized, split, encoded, interpolated, or interpreted here,
-//!   and no size limit is added. Only the true empty string is rejected;
-//!   whitespace-only prompts are valid and preserved exactly. The process
-//!   timeout, working directory, executable and empty environment come from
-//!   the Workspace request, never from the prompt.
-//! * **Argv bytes, not vendor semantics.** This module guarantees the argv
-//!   bytes only. Pinned Darwin arm64 Codex 0.158.0 and 0.159.2 were observed,
-//!   in both sandbox modes, to stop option/config parsing at `--`; other
-//!   versions and platforms are unverified. A prompt of exactly `-` remains
-//!   that CLI's stdin sentinel, so with closed stdin it is refused rather
-//!   than delivered literally. OS argv limits surface as typed launch
-//!   failures.
-//! * **Exactly two sandbox modes.** [`CodexTaskSandboxMode`] exposes
-//!   [`CodexTaskSandboxMode::ReadOnly`] and
-//!   [`CodexTaskSandboxMode::WorkspaceWrite`] only. The provider's unsafe
-//!   unrestricted sandbox mode is deliberately unrepresentable: no enum
-//!   variant maps to it, no string-based escape hatch exists, and no silent
-//!   fallback to another mode ever happens.
-//! * **Raw output bytes.** Standard output and standard error are preserved
-//!   as exact raw bytes (head followed by tail) with no decoding and no
-//!   inserted separators. No JSONL event parsing, no final-message
-//!   extraction, and no semantic success inference happen here.
-//! * **Fail-closed capture.** A timed-out run, a truncated stream, or a
-//!   completed run without a numeric exit status never yields a result.
-//!   An ordinary completed non-zero exit is normal process truth and is
-//!   preserved in the result; later binding slices decide its semantics.
-//!
-//! Deliberately excluded here (later binding slices): `RuntimeAdapter`
-//! implementation, failure-class mapping, attempt events, result
-//! collection, cancellation, resume, model discovery, model routing, and
-//! credential handling of any kind.
-
+//! Bounded Codex execution through Workspace; exact prompt bytes use stdin after `-- -`.
 use std::{error::Error, ffi::OsString, fmt, path::Path, path::PathBuf};
 
 use receipts_workspace_execution::execution::{
-    CapturedProcessRun, ExecutionError, ProcessRunRequest, ProcessTermination,
-    ProcessTimeoutPolicy, run_with_timeout_and_capture,
+    CapturedProcessRun, ChildEnvPolicy, ExecutionError, ProcessRunRequest, ProcessStdin,
+    ProcessTermination, ProcessTimeoutPolicy, run_with_timeout_and_capture,
 };
 
 /// The narrow Runtime-owned sandbox vocabulary for one Codex task.
@@ -95,6 +42,7 @@ pub struct CodexTaskExecutionRequest {
     timeout_policy: ProcessTimeoutPolicy,
     sandbox_mode: CodexTaskSandboxMode,
     prompt: String,
+    env: Option<ChildEnvPolicy>,
 }
 
 impl CodexTaskExecutionRequest {
@@ -118,7 +66,14 @@ impl CodexTaskExecutionRequest {
             timeout_policy,
             sandbox_mode,
             prompt: prompt.into(),
+            env: None,
         }
+    }
+
+    /// Forward an already admitted immutable environment; absent means empty.
+    pub fn with_env_policy(mut self, env: ChildEnvPolicy) -> Self {
+        self.env = Some(env);
+        self
     }
 
     /// The caller-supplied absolute path of the official Codex executable.
@@ -391,22 +346,26 @@ pub(crate) fn build_codex_task_request(
         return Err(CodexTaskExecutionError::EmptyPrompt);
     }
 
-    // The prompt becomes exactly one argv element, verbatim, after the `--`
-    // option terminator: no shell, no splitting, no interpolation, no other
-    // added flags. Stdin keeps the request default, Closed, even for `-`.
+    let stdin = ProcessStdin::bytes(request.prompt().as_bytes())
+        .map_err(|source| CodexTaskExecutionError::WorkspaceExecution { source })?;
     let argv: Vec<OsString> = vec![
         OsString::from("exec"),
         OsString::from("--json"),
         OsString::from("--sandbox"),
         OsString::from(request.sandbox_mode().cli_value()),
         OsString::from("--"),
-        OsString::from(request.prompt()),
+        OsString::from("-"),
     ];
-    ProcessRunRequest::new(
+    let process = ProcessRunRequest::new(
         request.absolute_codex_path(),
         argv,
         request.workspace_root(),
         request.cwd(),
     )
-    .map_err(|source| CodexTaskExecutionError::WorkspaceExecution { source })
+    .map_err(|source| CodexTaskExecutionError::WorkspaceExecution { source })?
+    .with_stdin(stdin);
+    Ok(match &request.env {
+        Some(env) => process.with_env_policy(env.clone()),
+        None => process,
+    })
 }
