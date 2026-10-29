@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "providers": [
+    {
+      "provider_id": " synthetic-provider ☃ ",
+      "observation": {
+        "confidence": "UNVERIFIED",
+        "source_ref": {
+          "ref_type": "ARTIFACT_ID",
+          "target": "synthetic-test-only/☃",
+          "digest": "",
+          "section": " synthetic section "
+        },
+        "observed_at": "2026-09-01t00:00:00.000z"
+      }
+    }
+  ],
+  "models": [
+    {
+      "provider_id": " synthetic-provider ☃ ",
+      "model_id": "synthetic-model/α",
+      "observation": {
+        "confidence": "UNVERIFIED",
+        "source_ref": {
+          "ref_type": "ARTIFACT_ID",
+          "target": "synthetic-test-only/☃",
+          "digest": "",
+          "section": " synthetic section "
+        },
+        "observed_at": "2026-09-01t00:00:00.000z"
+      }
+    }
+  ],
+  "runtimes": [
+    {
+      "provider_id": " synthetic-provider ☃ ",
+      "runtime_id": "synthetic-runtime",
+      "observation": {
+        "confidence": "UNVERIFIED",
+        "source_ref": {
+          "ref_type": "ARTIFACT_ID",
+          "target": "synthetic-test-only/☃",
+          "digest": "",
+          "section": " synthetic section "
+        },
+        "observed_at": "2026-09-01t00:00:00.000z"
+      }
+    }
+  ],
+  "associations": [
+    {
+      "provider_id": " synthetic-provider ☃ ",
+      "model_id": "synthetic-model/α",
+      "runtime_id": "synthetic-runtime",
+      "observation": {
+        "confidence": "UNVERIFIED",
+        "source_ref": {
+          "ref_type": "ARTIFACT_ID",
+          "target": "synthetic-test-only/☃",
+          "digest": "",
+          "section": " synthetic section "
+        },
+        "observed_at": "2026-09-01t00:00:00.000z"
+      }
+    }
+  ],
+  "capabilities": [
+    {
+      "subject": {
+        "kind": "MODEL_RUNTIME_PAIR",
+        "provider_id": " synthetic-provider ☃ ",
+        "model_id": "synthetic-model/α",
+        "runtime_id": "synthetic-runtime"
+      },
+      "capability": "synthetic-capability",
+      "value": true,
+      "sample_size": 18446744073709551615,
+      "observation": {
+        "confidence": "UNVERIFIED",
+        "source_ref": {
+          "ref_type": "ARTIFACT_ID",
+          "target": "synthetic-test-only/☃",
+          "digest": "",
+          "section": " synthetic section "
+        },
+        "observed_at": "2026-09-01t00:00:00.000z"
+      }
+    }
+  ]
+}
