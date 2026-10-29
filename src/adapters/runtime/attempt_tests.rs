@@ -1,8 +1,9 @@
 use std::{any::TypeId, error::Error};
 
 use crate::{
-    AttemptId, ClaudeCapabilityEvidence, ClaudeCapabilityProbeReport, CodexCapabilityEvidence,
-    CodexCapabilityProbeReport, RuntimeCapabilities,
+    AttemptId, CapabilityStatus, ClaudeCapabilityEvidence, ClaudeCapabilityProbeReport,
+    CodexCapabilityEvidence, CodexCapabilityProbeReport, ExtensionCapabilityReport,
+    RuntimeCapabilities,
 };
 
 const SECRET: &str = "sk-test-NOT-A-REAL-CREDENTIAL-A3-012";
@@ -76,6 +77,13 @@ fn capabilities_carrier_preserves_both_reports_and_whole_report_unknown() {
         RuntimeCapabilities::Claude(report) => assert_eq!(report, claude),
         _ => panic!("Claude report changed variant"),
     }
+    // The generic extension is neither a legacy report nor whole-report Unknown.
+    let extension = ExtensionCapabilityReport::new("ext", [("a", CapabilityStatus::Unknown)]);
+    let extension = RuntimeCapabilities::Extension(extension.unwrap());
+    assert_ne!(extension, RuntimeCapabilities::Unknown);
+    assert_ne!(extension, RuntimeCapabilities::Codex(codex.clone()));
+    assert_ne!(extension, RuntimeCapabilities::Claude(claude.clone()));
+
     assert_ne!(
         RuntimeCapabilities::Unknown,
         RuntimeCapabilities::Codex(codex)
@@ -89,6 +97,7 @@ fn capabilities_carrier_preserves_both_reports_and_whole_report_unknown() {
     let _: fn(RuntimeCapabilities) = |capabilities| match capabilities {
         RuntimeCapabilities::Codex(_) => {}
         RuntimeCapabilities::Claude(_) => {}
+        RuntimeCapabilities::Extension(_) => {}
         RuntimeCapabilities::Unknown => {}
     };
 }
