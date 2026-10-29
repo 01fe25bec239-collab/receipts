@@ -56,6 +56,10 @@ mod codex_task_execution_tests;
 mod conformance_tests;
 #[cfg(test)]
 mod raw_failure_tests;
+#[cfg(test)]
+mod runtime_capabilities_tests;
+#[cfg(test)]
+mod third_adapter_capabilities_tests;
 
 #[cfg(all(test, unix))]
 mod claude_tests;
@@ -103,7 +107,10 @@ pub use codex_task_execution::{
     CodexTaskOutputChannel, CodexTaskSandboxMode, execute_codex_task_once,
 };
 pub use failure::FailureClass;
-pub use runtime_capabilities::RuntimeCapabilities;
+pub use runtime_capabilities::{
+    CapabilityStatus, ExtensionCapabilityReport, ExtensionCapabilityReportError,
+    RuntimeCapabilities,
+};
 
 pub use claude_probe::{
     ClaudeCapability, ClaudeCapabilityEvidence, ClaudeCapabilityProbeReport, ClaudeProbeChannel,
