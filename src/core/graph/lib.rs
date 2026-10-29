@@ -38,6 +38,7 @@
 pub mod accepted_integration_transition;
 pub mod content_digest;
 pub mod edge;
+mod edge_wire;
 pub mod error;
 pub mod execution_graph;
 pub mod graph_mutation_actor_policy;
@@ -72,6 +73,8 @@ mod accepted_integration_transition_tests;
 mod capability_name_tests;
 #[cfg(test)]
 mod content_digest_tests;
+#[cfg(test)]
+mod edge_wire_tests;
 #[cfg(test)]
 mod execution_graph_envelope_tests;
 #[cfg(test)]
