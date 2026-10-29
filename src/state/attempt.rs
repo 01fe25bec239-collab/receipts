@@ -304,10 +304,10 @@ pub(crate) fn schema_matches(conn: &Connection) -> Result<bool, rusqlite::Error>
 fn verify_store(conn: &Connection) -> Result<(), StateError> {
     let head = graph_repository::schema_head(conn, crate::error::GraphPhase::Read)
         .map_err(verification_error)?;
-    if head != Some(15) {
+    if head != Some(16) {
         return Err(failure(Code::UnsupportedSchema, None));
     }
-    graph_repository::verify_ledger(conn, 15, crate::error::GraphPhase::Read)
+    graph_repository::verify_ledger(conn, 16, crate::error::GraphPhase::Read)
         .map_err(verification_error)?;
     if !schema_matches(conn).map_err(sqlite_error)? {
         return Err(corrupt());

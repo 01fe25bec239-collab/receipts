@@ -730,10 +730,10 @@ fn t29_schema_version_remains_exactly_7() {
             .last()
             .expect("registered chain is non-empty")
             .version,
-        15,
-        "the registered chain itself must end at version 15"
+        16,
+        "the registered chain itself must end at version 16"
     );
-    assert_eq!(repo.schema_version().expect("version read"), 15);
+    assert_eq!(repo.schema_version().expect("version read"), 16);
     repo.create_logical_role(minimal_role("role-ver-001", LogicalRoleType::RuntimeA1))
         .expect("role create");
     repo.create_executor_binding(minimal_binding("binding-ver-001", "role-ver-001"))
@@ -742,17 +742,17 @@ fn t29_schema_version_remains_exactly_7() {
         .expect("release");
     assert_eq!(
         repo.schema_version().expect("version read"),
-        15,
+        16,
         "a release must not change the schema version"
     );
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        15,
+        16,
         "no extra migration metadata row may appear"
     );
     drop(repo);
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("reopen");
-    assert_eq!(repo.schema_version().expect("version read"), 15);
+    assert_eq!(repo.schema_version().expect("version read"), 16);
 }
 
 // T30 — a release introduces no new schema objects: after releases the

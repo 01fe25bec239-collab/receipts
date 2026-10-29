@@ -20,6 +20,7 @@ pub(crate) mod v0012_context_epoch_unbounded;
 pub(crate) mod v0013_graph_repository;
 pub(crate) mod v0014_execution_records;
 pub(crate) mod v0015_graph_history;
+pub(crate) mod v0016_checkpoint_refs;
 
 use crate::error::StateError;
 
@@ -52,6 +53,7 @@ static REGISTERED: &[Migration] = &[
     v0013_graph_repository::MIGRATION,
     v0014_execution_records::MIGRATION,
     v0015_graph_history::MIGRATION,
+    v0016_checkpoint_refs::MIGRATION,
 ];
 
 /// The registered migration chain in application order.

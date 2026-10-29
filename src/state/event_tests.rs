@@ -174,7 +174,7 @@ fn check_values(sql: &str, column: &str) -> Vec<String> {
 fn t01_fresh_database_bootstraps_to_schema_version_7() {
     let tmp = TempDir::new("ev-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 15);
+    assert_eq!(repo.schema_version().expect("version read"), 16);
     assert!(
         repo.table_exists("event").expect("table check"),
         "event must exist after migration 4"
@@ -182,7 +182,7 @@ fn t01_fresh_database_bootstraps_to_schema_version_7() {
     // Exactly one metadata row per applied migration.
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        15
+        16
     );
 }
 
@@ -192,10 +192,10 @@ fn t02_version_7_database_reopens() {
     let tmp = TempDir::new("ev-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 15);
+        assert_eq!(repo.schema_version().expect("version read"), 16);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            15,
+            16,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -218,7 +218,7 @@ fn t03_ordinary_open_of_version_3_database_fails() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 3,
-                supported: 15
+                supported: 16
             }
         ),
         "unexpected error: {error}"
@@ -1029,6 +1029,8 @@ fn t47_migration4_creates_only_event_schema() {
         "graph_node_capabilities",
         "graph_node_results",
         "graph_snapshot_seals",
+        "output_refs",
+        "workspace_checkpoints",
         "graph_compiled_sources",
         "attempt_started",
         "attempt_finished",
