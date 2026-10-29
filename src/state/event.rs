@@ -37,7 +37,8 @@
 //! contract timestamp string stored as provided: State never reads the wall
 //! clock, parses, or compares it.
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::types::Value;
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use crate::epoch_value::StateEpochValueV1;
 use crate::error::StateError;
@@ -485,7 +486,90 @@ pub struct EventEnvelope {
     pub epoch: StateEpochValueV1,
 }
 
+/// A read-only selection of persisted events inside one project.
+///
+/// `project_id` is mandatory and is applied before `limit`, so another
+/// project's events can never be returned or consume the limit. IDs are
+/// opaque non-empty strings compared byte-for-byte; no project registration
+/// is consulted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventQuery {
+    /// Owning project to read. Must be non-empty.
+    pub project_id: String,
+    /// When present, only events with exactly this subject kind **and** id.
+    pub subject: Option<EventSubject>,
+    /// `None` selects every event type; `Some(empty)` selects nothing;
+    /// duplicates never duplicate events.
+    pub event_types: Option<Vec<EventType>>,
+    /// Maximum number of events to return; `0` returns none.
+    pub limit: u32,
+}
+
 impl SqliteStateRepository {
+    /// Lists persisted events matching `query`, ordered by `event_id` in
+    /// ascending byte order, from one SQLite read snapshot.
+    ///
+    /// The order is an identity order only: it makes the result
+    /// deterministic and says nothing about when events occurred, because
+    /// `occurred_at` is an opaque string that State never parses or compares.
+    /// This query offers no time range. A stored row that fails contract
+    /// decoding fails the whole call; nothing partial is returned. The read
+    /// writes nothing.
+    pub fn list_events(&self, query: &EventQuery) -> Result<Vec<EventEnvelope>, StateError> {
+        ensure_non_empty("project_id", &query.project_id)?;
+        if let Some(subject) = &query.subject {
+            ensure_non_empty("subject.id", &subject.id)?;
+        }
+        // Deduplicated, in contract order.
+        let types = query.event_types.as_ref().map(|requested| {
+            EventType::ALL
+                .into_iter()
+                .filter(|candidate| requested.contains(candidate))
+                .collect::<Vec<_>>()
+        });
+        if query.limit == 0 || types.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(Vec::new());
+        }
+
+        // Only fixed fragments and `?` placeholders are composed; every
+        // caller value is bound as a parameter.
+        let mut sql = String::from(LIST_EVENTS_SQL);
+        let mut args: Vec<Value> = vec![query.project_id.clone().into()];
+        if let Some(subject) = &query.subject {
+            sql.push_str(" AND subject_kind = ? AND subject_id = ?");
+            args.push(subject.kind.as_str().to_owned().into());
+            args.push(subject.id.clone().into());
+        }
+        if let Some(types) = &types {
+            sql.push_str(" AND event_type IN (");
+            sql.push_str(&vec!["?"; types.len()].join(", "));
+            sql.push(')');
+            args.extend(types.iter().map(|t| Value::from(t.as_str().to_owned())));
+        }
+        sql.push_str(" ORDER BY event_id COLLATE BINARY ASC LIMIT ?");
+        args.push(Value::Integer(i64::from(query.limit)));
+
+        let tx = self
+            .connection()
+            .unchecked_transaction()
+            .map_err(internal_query_failure)?;
+        let events = {
+            let mut statement = tx.prepare(&sql).map_err(internal_query_failure)?;
+            statement
+                .query_map(params_from_iter(args), extract_event_row)
+                .map_err(internal_query_failure)?
+                .map(|row| {
+                    row.map_err(internal_query_failure)
+                        .and_then(EventRow::into_event_envelope)
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        // Read-only snapshot: commit merely ends it. On the error paths the
+        // transaction rolls back on drop, with nothing written to undo.
+        tx.commit().map_err(internal_query_failure)?;
+        Ok(events)
+    }
+
     /// Durably appends one immutable EventEnvelope to the event log.
     ///
     /// Append is the only write operation offered for events. The required
@@ -577,6 +661,25 @@ const SELECT_EVENT_SQL: &str = "SELECT
     epoch
 FROM event
 WHERE event_id = ?1";
+
+/// Fixed head of the list query; `list_events` appends only `?` placeholders
+/// and fixed clauses to it.
+const LIST_EVENTS_SQL: &str = "SELECT
+    event_id,
+    project_id,
+    goal_id,
+    event_type,
+    actor_kind,
+    actor_id,
+    subject_kind,
+    subject_id,
+    occurred_at,
+    payload_reference,
+    payload_digest,
+    correlation_id,
+    epoch
+FROM event
+WHERE project_id = ?";
 
 /// Inserts the immutable event row using bound parameters.
 ///
