@@ -63,6 +63,9 @@ mod context_manifest_tests;
 mod context_rehydration_tests;
 
 #[cfg(test)]
+mod event_query_tests;
+
+#[cfg(test)]
 mod event_tests;
 
 #[cfg(test)]
@@ -124,8 +127,8 @@ pub use error::{
     AttemptFailureCode, AttemptField, GraphFailureCode, GraphField, GraphPhase, StateError,
 };
 pub use event::{
-    ActorKind, EventActor, EventEnvelope, EventPayloadReference, EventSubject, EventType,
-    SubjectKind,
+    ActorKind, EventActor, EventEnvelope, EventPayloadReference, EventQuery, EventSubject,
+    EventType, SubjectKind,
 };
 pub use executor_binding::{ExecutorBinding, ReleaseReason};
 pub use executor_binding_lease_expiry::{
