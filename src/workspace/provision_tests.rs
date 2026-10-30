@@ -173,7 +173,10 @@ fn t06_handle_is_provisioned_with_expected_fields() {
     assert_eq!(handle.workspace_id(), "ws-handle");
     assert_eq!(handle.task_id(), Some("task-001"));
     assert_eq!(handle.branch(), "task/handle");
-    assert_eq!(handle.worktree_path(), repo.path().join("the worktree"));
+    assert_eq!(
+        handle.worktree_path(),
+        std::fs::canonicalize(repo.path().join("the worktree")).unwrap()
+    );
     assert_eq!(handle.base_sha().as_str(), base_sha);
     assert_eq!(
         handle.head_sha().map(CommitSha::as_str),
@@ -206,7 +209,10 @@ fn created_at_opt_in_preserves_canonical_value_and_identity() {
     assert_eq!(handle.workspace_id(), request.workspace_id());
     assert_eq!(handle.task_id(), request.task_id());
     assert_eq!(handle.branch(), request.branch());
-    assert_eq!(handle.worktree_path(), request.worktree_path());
+    assert_eq!(
+        handle.worktree_path(),
+        std::fs::canonicalize(request.worktree_path()).unwrap()
+    );
     assert_eq!(handle.base_sha(), request.base_sha());
     assert_eq!(handle.head_sha(), Some(request.base_sha()));
     assert_eq!(handle.isolation(), WorkspaceIsolation::WorkspaceIsolation);
@@ -241,15 +247,9 @@ fn t07_duplicate_branch_git_failure_is_surfaced() {
     );
     let error = second
         .provision()
-        .expect_err("creating an existing branch must fail at the Git level");
+        .expect_err("an existing branch must be refused by preflight");
     assert!(
-        matches!(
-            error,
-            WorkspaceError::GitCommandFailed {
-                operation: "create branch",
-                ..
-            }
-        ),
+        matches!(&error, WorkspaceError::BranchAlreadyExists { branch } if branch == "task/shared"),
         "unexpected error: {error:?}"
     );
     assert!(
@@ -289,9 +289,9 @@ fn t08_git_failure_cannot_produce_a_workspace_handle() {
         ),
         "unexpected error: {error:?}"
     );
-    // The branch may already exist as a partial artifact of the failed
-    // flow, but no handle could have been constructed from it.
-    assert!(branch_exists(&repo, "task/blocked"));
+    // M6/R10: the real `worktree add` failure ran owned rollback, so the
+    // branch this attempt created is gone and a retry can reuse the name.
+    assert!(!branch_exists(&repo, "task/blocked"));
     assert!(
         !repo.path().join("blocker").join("nested worktree").exists(),
         "no handle-producing worktree may exist"
@@ -316,7 +316,7 @@ fn t09_worktree_path_with_spaces_is_argv_safe() {
     let handle = request.provision().expect("provisioning must succeed");
     assert_eq!(
         handle.worktree_path(),
-        repo.path().join("task worktree with spaces")
+        std::fs::canonicalize(repo.path().join("task worktree with spaces")).unwrap()
     );
     assert_eq!(worktree_head(&repo, "task worktree with spaces"), base_sha);
     assert_eq!(
@@ -523,9 +523,8 @@ fn t13_provisioning_through_path_indirection_targets_canonical_repository() {
     assert!(!repo.path().join("unreachable worktree").exists());
 }
 
-// T14 — after worktree creation, HEAD/status verification operates from the
-// canonicalized created-worktree path, while the frozen handle contract
-// still reports the validated absolute path that was requested.
+// T14 — HEAD/status verification operates from the canonical worktree path,
+// and the handle stores that canonical path (N2), not the requested alias.
 #[test]
 fn t14_worktree_verification_operates_from_canonical_worktree_path() {
     let repo = TestRepo::new("wt-t14");
@@ -553,8 +552,8 @@ fn t14_worktree_verification_operates_from_canonical_worktree_path() {
 
     assert_eq!(
         handle.worktree_path(),
-        requested,
-        "frozen handle semantics carry the validated requested path"
+        std::fs::canonicalize(repo.path().join("direct-parent/the worktree")).unwrap(),
+        "the handle stores the canonical worktree path"
     );
     assert_eq!(
         stdout_trimmed(&git(
@@ -751,10 +750,14 @@ fn t19_production_git_execution_is_absolute_canonical_and_allowlisted() {
         .get_args()
         .map(|argument| argument.to_os_string())
         .collect();
+    let mut expected: Vec<OsString> = crate::git::HARDENED_CONFIG
+        .iter()
+        .map(OsString::from)
+        .collect();
+    expected.extend([OsString::from("status"), OsString::from("--porcelain")]);
     assert_eq!(
-        argv,
-        vec![OsString::from("status"), OsString::from("--porcelain")],
-        "arguments must travel as distinct verbatim argv entries"
+        argv, expected,
+        "hardened config precedes the verbatim argv entries"
     );
 
     let child_environment: Vec<(String, String)> = command
@@ -769,9 +772,12 @@ fn t19_production_git_execution_is_absolute_canonical_and_allowlisted() {
         .collect();
     assert_eq!(
         child_environment.len(),
-        2,
+        crate::git::HARDENED_ENV.len(),
         "only the documented allowlist may be present: {child_environment:?}"
     );
+    for (key, value) in crate::git::HARDENED_ENV {
+        assert!(child_environment.contains(&(key.to_string(), value.to_string())));
+    }
     assert!(child_environment.contains(&("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string())));
     assert!(
         child_environment.contains(&("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string()))
@@ -792,7 +798,7 @@ fn t19_production_git_execution_is_absolute_canonical_and_allowlisted() {
         "GIT_SSH",
         "GIT_SSH_COMMAND",
         "GIT_ASKPASS",
-        "GIT_TERMINAL_PROMPT",
+        "GIT_EXTERNAL_DIFF",
     ];
     for key in FORBIDDEN_KEYS {
         assert!(
@@ -826,4 +832,170 @@ fn t21_subprocess_cwd_boundary_fails_closed_on_unresolvable_paths() {
             "unexpected error: {error:?}"
         );
     }
+}
+
+fn with_fault<T>(fault: crate::provision::ProvisionFault, run: impl FnOnce() -> T) -> T {
+    crate::provision::PROVISION_FAULT.set(Some(fault));
+    let result = run();
+    crate::provision::PROVISION_FAULT.set(None);
+    result
+}
+
+#[test]
+fn failed_worktree_add_leaves_no_branch_and_retry_same_name_succeeds() {
+    use crate::provision::ProvisionFault::{Branch, Worktree};
+    let repo = TestRepo::new("wt-rollback");
+    let base_sha = repo.head_sha();
+    for fault in [Branch, Worktree] {
+        let request = valid_request(&repo, "ws-retry", "task/retry", "retry", &base_sha);
+        let error = with_fault(fault, || request.provision()).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                WorkspaceError::GitCommandFailed {
+                    operation: "injected provisioning fault",
+                    ..
+                }
+            ),
+            "{fault:?}: complete rollback returns the original cause, got {error:?}"
+        );
+        assert!(!branch_exists(&repo, "task/retry"), "{fault:?}");
+        assert!(!repo.path().join("retry").exists(), "{fault:?}");
+        assert!(
+            !crate::test_support::worktree_registered(&repo, &repo.path().join("retry")),
+            "{fault:?}"
+        );
+    }
+    let handle = valid_request(&repo, "ws-retry", "task/retry", "retry", &base_sha)
+        .provision()
+        .expect("retry with the same identity must succeed after complete rollback");
+    assert_eq!(handle.state(), WorkspaceState::Provisioned);
+}
+
+#[test]
+fn rollback_retains_worker_data_and_reports_incomplete() {
+    let repo = TestRepo::new("wt-rollback-dirty");
+    let base_sha = repo.head_sha();
+    let request = valid_request(&repo, "ws-dirty", "task/dirty", "dirty", &base_sha);
+    let error = with_fault(crate::provision::ProvisionFault::DirtyWorktree, || {
+        request.provision()
+    })
+    .unwrap_err();
+    let WorkspaceError::ProvisionRollbackIncomplete { cause, detail } = error else {
+        panic!("unknown cleanup must not look like a clean rollback: {error:?}");
+    };
+    assert!(matches!(*cause, WorkspaceError::GitCommandFailed { .. }));
+    assert!(detail.contains("worktree retained") && detail.contains("branch retained"));
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("dirty/worker-data")).unwrap(),
+        "keep"
+    );
+    assert!(branch_exists(&repo, "task/dirty"));
+}
+
+#[test]
+fn rollback_never_removes_a_preexisting_target_directory() {
+    let repo = TestRepo::new("wt-rollback-preexisting");
+    let base_sha = repo.head_sha();
+    std::fs::create_dir(repo.path().join("existing")).unwrap();
+    let request = valid_request(&repo, "ws-pre", "task/pre", "existing", &base_sha);
+    let error = with_fault(crate::provision::ProvisionFault::Worktree, || {
+        request.provision()
+    })
+    .unwrap_err();
+    assert!(
+        matches!(&error, WorkspaceError::ProvisionRollbackIncomplete { detail, .. } if detail.contains("preexisting")),
+        "{error:?}"
+    );
+    assert!(repo.path().join("existing").is_dir());
+}
+
+#[test]
+fn identifiers_are_capped_at_200_unicode_characters() {
+    let repo = TestRepo::new("wt-ids");
+    let base_sha = repo.head_sha();
+    let ok = "é".repeat(200);
+    assert!(
+        ok.len() > 256,
+        "multibyte characters exceed the old byte cap"
+    );
+    WorkspaceProvisionRequest::new(
+        repo.path(),
+        &ok,
+        Some(&ok),
+        "task/ids",
+        repo.path().join("ids"),
+        &base_sha,
+    )
+    .expect("200 characters are admitted");
+    let long = "a".repeat(201);
+    let error = WorkspaceProvisionRequest::new(
+        repo.path(),
+        &long,
+        None,
+        "task/ids",
+        repo.path().join("ids"),
+        &base_sha,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, WorkspaceError::InvalidWorkspaceId { .. }),
+        "{error:?}"
+    );
+    let error = WorkspaceProvisionRequest::new(
+        repo.path(),
+        "ws",
+        Some(&long),
+        "task/ids",
+        repo.path().join("ids"),
+        &base_sha,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, WorkspaceError::InvalidTaskId { .. }),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn symlinked_tmp_path_provisions_and_finalizes_canonically() {
+    let repo = TestRepo::new("wt-symlinked-tmp");
+    let alias = repo.root.path().join("tmp-alias");
+    unix_symlink(repo.path(), &alias);
+    let request = WorkspaceProvisionRequest::new(
+        &alias,
+        "ws-alias",
+        None,
+        "task/alias",
+        alias.join("wt"),
+        &repo.head_sha(),
+    )
+    .unwrap();
+    let handle = request.provision().unwrap();
+    let canonical = std::fs::canonicalize(repo.path().join("wt")).unwrap();
+    assert_eq!(handle.worktree_path(), canonical);
+    let torn = crate::WorkspaceTeardownRequest::new(&alias)
+        .teardown(&handle)
+        .expect("canonical paths finalize through the alias");
+    assert_eq!(torn.state(), WorkspaceState::TornDown);
+    assert!(branch_exists(&repo, "task/alias"));
+}
+
+#[test]
+fn registered_target_is_refused_by_preflight() {
+    let repo = TestRepo::new("wt-registered");
+    let base_sha = repo.head_sha();
+    valid_request(&repo, "ws-a", "task/a", "taken", &base_sha)
+        .provision()
+        .unwrap();
+    // The checkout directory vanishes but Git still registers it (prunable).
+    std::fs::remove_dir_all(repo.path().join("taken")).unwrap();
+    let error = valid_request(&repo, "ws-b", "task/b", "taken", &base_sha)
+        .provision()
+        .unwrap_err();
+    assert!(
+        matches!(error, WorkspaceError::InvalidWorktreePath { .. }),
+        "{error:?}"
+    );
+    assert!(!branch_exists(&repo, "task/b"));
 }

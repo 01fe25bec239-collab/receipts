@@ -14,7 +14,8 @@
 //! The successful flow is strictly ordered:
 //!
 //! 1. validate the supplied [`WorkspaceHandle`](crate::handle::WorkspaceHandle)
-//!    state (only `PROVISIONED` is supported by this slice);
+//!    state may legally become `TORN_DOWN` (`PROVISIONED`, `CHECKPOINTED` or
+//!    `RECOVERED`; never `ACTIVE`, `ORPHANED` or `TORN_DOWN`);
 //! 2. canonicalize the repository root;
 //! 3. canonicalize the existing worktree checkout path;
 //! 4. prove the worktree is registered to exactly this repository, exactly
@@ -94,7 +95,7 @@ impl WorkspaceTeardownRequest {
         // implemented. Any other state — including TORN_DOWN, for which
         // teardown is deliberately not idempotent — is rejected instead of
         // inventing future lifecycle semantics.
-        if handle.state() != WorkspaceState::Provisioned {
+        if !handle.state().may_transition_to(WorkspaceState::TornDown) {
             return Err(WorkspaceError::TeardownUnsupportedState {
                 state: handle.state().as_str(),
             });
@@ -119,7 +120,7 @@ impl WorkspaceTeardownRequest {
         evidence: &WorkspaceAttemptFinalizationEvidence,
     ) -> Result<WorkspaceHandle, WorkspaceError> {
         let handle = evidence.handle();
-        if handle.state() != WorkspaceState::Provisioned {
+        if !handle.state().may_transition_to(WorkspaceState::TornDown) {
             return Err(WorkspaceError::TeardownUnsupportedState {
                 state: handle.state().as_str(),
             });
@@ -229,6 +230,10 @@ impl WorkspaceTeardownRequest {
             });
         }
 
+        // Filters can run programs during status; refuse them (and includes)
+        // before any content-comparing Git operation.
+        git::refuse_untrusted_repository_config(root, "inspect repository configuration")?;
+
         // Step 7: immediately before removal the worktree must be clean
         // per Git porcelain status, inspected from its canonical path. Any
         // output — tracked modifications, staged modifications, untracked
@@ -323,10 +328,7 @@ impl WorkspaceTeardownRequest {
         // Every verification succeeded; only now may the TORN_DOWN handle
         // exist. Identity fields are preserved verbatim and the verified
         // head is the exact commit observed immediately before removal.
-        Ok(WorkspaceHandle::torn_down(
-            handle,
-            CommitSha::parse(observed).expect("head shape was validated above"),
-        ))
+        handle.transitioned(WorkspaceState::TornDown, Some(observed_head))
     }
 }
 
@@ -347,7 +349,7 @@ pub(crate) struct RegisteredWorktree {
 /// Runs `git worktree list --porcelain -z` from the canonical repository
 /// root and parses its complete raw stdout. Unparseable output becomes the
 /// caller's typed error, carrying only constant detail.
-fn list_registered_worktrees(
+pub(crate) fn list_registered_worktrees(
     root: &Path,
     operation: &'static str,
     malformed: fn(String) -> WorkspaceError,
@@ -460,7 +462,7 @@ fn native_path(bytes: &[u8]) -> Result<PathBuf, &'static str> {
 /// checkout physically lives. A record whose reported path cannot be
 /// canonicalized falls back to exact path comparison, so a matching
 /// registration is never missed just because its checkout is mid-removal.
-fn record_matches(record: &RegisteredWorktree, canonical: &Path) -> bool {
+pub(crate) fn record_matches(record: &RegisteredWorktree, canonical: &Path) -> bool {
     match std::fs::canonicalize(&record.path) {
         Ok(resolved) => resolved == canonical,
         Err(_) => record.path == canonical,

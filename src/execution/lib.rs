@@ -109,6 +109,12 @@ pub use live_attempt::{
     LiveProcessOutput, LiveProcessStartError, LiveProcessTerminalCause, start_live_process_attempt,
 };
 
+#[cfg(target_os = "linux")]
+pub(crate) use live_attempt::AttemptContainment;
+pub(crate) use live_attempt::{
+    LaunchCustomization, start_customized_attempt as live_attempt_start_customized,
+};
+
 #[cfg(all(test, unix))]
 mod live_attempt_tests;
 

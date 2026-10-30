@@ -40,13 +40,10 @@ impl CommitSha {
     }
 }
 
-/// Frozen WorkspaceHandle state vocabulary.
-///
-/// This slice creates `PROVISIONED` handles and performs exactly one
-/// lifecycle transition out of them: `PROVISIONED` → `TORN_DOWN` after a
-/// fully verified worktree teardown. Every other transition belongs to
-/// later milestones outside this crate's current scope. No new values may
-/// ever be invented.
+/// Frozen WorkspaceHandle state vocabulary with one checked transition oracle
+/// ([`WorkspaceState::may_transition_to`]). Operational transitions require
+/// observed evidence (see [`crate::lifecycle`]); a state value alone, or a
+/// decoded wire record, never moves a handle. No new values may be invented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WorkspaceState {
@@ -66,6 +63,39 @@ pub enum WorkspaceState {
 }
 
 impl WorkspaceState {
+    /// All six frozen states.
+    pub const ALL: [Self; 6] = [
+        Self::Provisioned,
+        Self::Active,
+        Self::Checkpointed,
+        Self::Orphaned,
+        Self::Recovered,
+        Self::TornDown,
+    ];
+
+    /// The complete legal transition relation (no self-transitions):
+    ///
+    /// * `PROVISIONED`/`CHECKPOINTED`/`RECOVERED` → `ACTIVE`: an attempt start
+    ///   was observed;
+    /// * `ACTIVE` → `CHECKPOINTED`: a checkpoint capture succeeded;
+    /// * `PROVISIONED`/`ACTIVE`/`CHECKPOINTED` → `ORPHANED`: lifecycle
+    ///   evidence shows the owning attempt's cleanup is unknown;
+    /// * `ORPHANED` → `RECOVERED`: recovery evidence (recovery execution is a
+    ///   later wave; no public producer exists yet);
+    /// * `PROVISIONED`/`CHECKPOINTED`/`RECOVERED` → `TORN_DOWN`: verified
+    ///   non-force teardown. `TORN_DOWN` is terminal.
+    pub const fn may_transition_to(self, to: Self) -> bool {
+        use WorkspaceState::*;
+        matches!(
+            (self, to),
+            (Provisioned | Checkpointed | Recovered, Active)
+                | (Active, Checkpointed)
+                | (Provisioned | Active | Checkpointed, Orphaned)
+                | (Orphaned, Recovered)
+                | (Provisioned | Checkpointed | Recovered, TornDown)
+        )
+    }
+
     /// The frozen storage/contract representation required by the contract.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -150,27 +180,26 @@ impl WorkspaceHandle {
         }
     }
 
-    /// Derives the handle for a successfully completed teardown.
-    ///
-    /// This is the only transition this slice performs: `PROVISIONED` →
-    /// `TORN_DOWN`. Every immutable identity field (`workspace_id`,
-    /// `task_id`, `branch`, `worktree_path`, `base_sha`, `isolation`) is
-    /// preserved verbatim, and the verified head becomes the exact commit
-    /// observed and verified immediately before removal — never a
-    /// fabricated value.
-    pub(crate) fn torn_down(prior: &Self, verified_head: CommitSha) -> Self {
-        Self {
-            workspace_id: prior.workspace_id.clone(),
-            branch: prior.branch.clone(),
-            worktree_path: prior.worktree_path.clone(),
-            head_sha: Some(verified_head),
-            base_sha: prior.base_sha.clone(),
-            state: WorkspaceState::TornDown,
-            isolation: prior.isolation,
-            task_id: prior.task_id.clone(),
-            remote_publish_policy: prior.remote_publish_policy,
-            created_at: prior.created_at.clone(),
+    /// The only state-changing constructor: applies one checked transition,
+    /// preserving every identity field. `head` replaces the verified head
+    /// only when supplied as observed evidence by the caller.
+    pub(crate) fn transitioned(
+        &self,
+        to: WorkspaceState,
+        head: Option<CommitSha>,
+    ) -> Result<Self, WorkspaceError> {
+        if !self.state.may_transition_to(to) {
+            return Err(WorkspaceError::IllegalStateTransition {
+                from: self.state.as_str(),
+                to: to.as_str(),
+            });
         }
+        let mut next = self.clone();
+        next.state = to;
+        if let Some(head) = head {
+            next.head_sha = Some(head);
+        }
+        Ok(next)
     }
 
     /// The durable workspace identity supplied by the caller.
@@ -198,15 +227,14 @@ impl WorkspaceHandle {
         &self.base_sha
     }
 
-    /// The verified worktree head; equals `base_sha` after provisioning
-    /// and the exact commit observed immediately before teardown after a
-    /// successful teardown.
+    /// The verified worktree head: `base_sha` after provisioning, the
+    /// captured head after a checkpoint, and the exact commit observed
+    /// immediately before removal after teardown.
     pub fn head_sha(&self) -> Option<&CommitSha> {
         self.head_sha.as_ref()
     }
 
-    /// The frozen lifecycle state: `PROVISIONED` after provisioning,
-    /// `TORN_DOWN` after a fully verified teardown.
+    /// The current checked lifecycle state.
     pub fn state(&self) -> WorkspaceState {
         self.state
     }

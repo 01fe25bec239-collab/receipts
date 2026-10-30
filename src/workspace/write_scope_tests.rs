@@ -306,7 +306,22 @@ fn git_filenames_preserve_unicode_spaces_tabs_newlines_and_pattern_characters() 
     let mut expected = strings(&names);
     expected.sort();
     assert_eq!(result.changed_paths(), expected);
-    assert_eq!(result.verification(), WriteScopeVerificationStatus::Pass);
+    // Path identities are exact either way; R9 only adds the case verdict.
+    match result.case_alias() {
+        crate::WriteScopeCaseAliasCheck::CaseSensitiveFilesystem => {
+            assert_eq!(result.verification(), WriteScopeVerificationStatus::Pass);
+        }
+        crate::WriteScopeCaseAliasCheck::Aliases {
+            collisions,
+            unestablished,
+            ..
+        } => {
+            assert!(collisions.is_empty());
+            assert_eq!(unestablished, &["nested/猫🦀".to_string()]);
+            assert_eq!(result.verification(), WriteScopeVerificationStatus::Fail);
+        }
+        other => panic!("non-ASCII change cannot be established: {other:?}"),
+    }
 }
 
 #[cfg(unix)]
@@ -811,5 +826,118 @@ fn malformed_policy_keeps_sha_allowed_forbidden_and_collection_error_order() {
         assert!(
             matches!(verify_write_scope(absent, sha, sha, allowed, forbidden), Err(WriteScopeVerificationError::InvalidPattern {set, index: 1, pattern, reason: "leading negation is unsupported"}) if set == expected && pattern == "!bad?")
         );
+    }
+}
+
+#[test]
+fn tracked_ignored_file_changes_are_in_scope_and_ignored_untracked_are_not() {
+    let repo = TestRepo::new("scope-r9-ignored");
+    repo.commit_file("build/out.txt", "v1");
+    repo.commit_file(".gitignore", "build/\n");
+    let base = repo.head_sha();
+    // A tracked file under an ignored directory changes in the candidate.
+    std::fs::write(repo.path().join("build/out.txt"), "v2").unwrap();
+    git(repo.path(), &["add", "-f", "build/out.txt"]);
+    git(repo.path(), &["commit", "-m", "tracked ignored change"]);
+    // Ignored untracked content exists in the worktree but is never committed.
+    std::fs::write(repo.path().join("build/untracked.bin"), "x").unwrap();
+    let result = verify(&repo, &base, &repo.head_sha(), &["src/**"], &[]).unwrap();
+    assert_eq!(result.changed_paths(), strings(&["build/out.txt"]));
+    assert_eq!(result.unauthorized_paths(), strings(&["build/out.txt"]));
+    assert_eq!(result.verification(), WriteScopeVerificationStatus::Fail);
+}
+
+#[test]
+fn case_insensitive_fs_collision_detected() {
+    use crate::write_scope_case::{FilesystemCaseSensitivity as F, analyze};
+    use crate::{WritePathPattern, WritePathSet};
+    let set = |patterns: &[&str]| {
+        WritePathSet::new(
+            patterns
+                .iter()
+                .map(|p| WritePathPattern::parse(p).unwrap())
+                .collect(),
+        )
+    };
+    let allowed = set(&["src/**"]);
+    let forbidden = set(&["secrets/**"]);
+    let tracked: std::collections::BTreeSet<String> =
+        strings(&["secrets/key", "src/a.rs"]).into_iter().collect();
+    let changed = strings(&["Secrets/key"]);
+    for fs in [F::Insensitive, F::Unknown] {
+        let crate::WriteScopeCaseAliasCheck::Aliases { collisions, .. } =
+            analyze(fs, &changed, &tracked, &allowed, &forbidden)
+        else {
+            panic!("alias must be reported on {fs:?}");
+        };
+        assert_eq!(collisions.len(), 1);
+        assert_eq!(collisions[0].alias(), "secrets/key");
+        assert!(collisions[0].alias_forbidden());
+        assert!(!collisions[0].alias_allowed());
+    }
+    assert_eq!(
+        analyze(F::Sensitive, &changed, &tracked, &allowed, &forbidden),
+        crate::WriteScopeCaseAliasCheck::CaseSensitiveFilesystem
+    );
+    // Two changed spellings of one path collide with each other.
+    let both = strings(&["src/A.rs", "src/a.rs"]);
+    assert!(
+        !analyze(
+            F::Insensitive,
+            &both,
+            &Default::default(),
+            &allowed,
+            &forbidden
+        )
+        .passes()
+    );
+    // Disjoint ASCII spellings produce no alias.
+    assert!(
+        analyze(
+            F::Insensitive,
+            &strings(&["src/b.rs"]),
+            &tracked,
+            &allowed,
+            &forbidden
+        )
+        .passes()
+    );
+}
+
+#[test]
+fn real_case_alias_commit_fails_on_probed_insensitive_filesystem() {
+    let repo = TestRepo::new("scope-r9-case");
+    repo.commit_file("secrets/key", "secret");
+    let base = repo.head_sha();
+    // Commit an alias spelling through the index, independent of the FS.
+    let blob =
+        crate::test_support::stdout_trimmed(&git(repo.path(), &["hash-object", "-w", "--stdin"]));
+    let entry = format!("100644,{blob},Secrets/key");
+    git(
+        repo.path(),
+        &["update-index", "--add", "--cacheinfo", &entry],
+    );
+    git(repo.path(), &["commit", "-m", "alias"]);
+    let result = verify(
+        &repo,
+        &base,
+        &repo.head_sha(),
+        &["Secrets/**"],
+        &["secrets/**"],
+    )
+    .unwrap();
+    assert_eq!(result.changed_paths(), strings(&["Secrets/key"]));
+    assert!(
+        result.forbidden_matches().is_empty(),
+        "grammar stays case-sensitive"
+    );
+    match crate::probe_case_sensitivity(repo.path()) {
+        crate::FilesystemCaseSensitivity::Sensitive => {
+            assert_eq!(result.verification(), WriteScopeVerificationStatus::Pass)
+        }
+        _ => {
+            assert_eq!(result.verification(), WriteScopeVerificationStatus::Fail);
+            assert!(!result.case_alias().passes());
+        }
     }
 }

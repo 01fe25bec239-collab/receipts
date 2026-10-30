@@ -1,9 +1,8 @@
 //! Read-only local Git checkpoint evidence with optional temporal composition.
 
 use std::ffi::OsStr;
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
 /// Complete raw Git evidence limit, independent of process stdin policy.
 pub(crate) const GIT_EVIDENCE_LIMIT_BYTES: u64 = 1_048_576;
@@ -113,6 +112,10 @@ pub enum WorkspaceCheckpointEvidenceCaptureError {
     StreamReaderPanicked {
         observation: WorkspaceCheckpointGitObservation,
     },
+    /// The bounded Git observation exceeded its deadline and was terminated.
+    GitTimedOut {
+        observation: WorkspaceCheckpointGitObservation,
+    },
     Core(WorkspaceCheckpointCaptureCoreError),
 }
 
@@ -141,7 +144,6 @@ impl std::error::Error for WorkspaceCheckpointEvidenceCaptureError {}
 
 use WorkspaceCheckpointEvidenceCaptureError as E;
 use WorkspaceCheckpointGitObservation as Observation;
-use WorkspaceCheckpointGitStream as Stream;
 
 /// Observes a fixed set of local Git queries, then constructs the existing core.
 /// References and completed checks are moved unchanged, never resolved or run.
@@ -260,37 +262,14 @@ impl RawStream {
         }
     }
 
-    fn new(observation: Observation) -> Result<Self, E> {
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(GIT_EVIDENCE_LIMIT_BYTES as usize)
-            .map_err(|source| E::StreamAllocation {
-                observation,
-                source,
-            })?;
-        Ok(Self {
+    /// Admits one stream from the bounded runner. Anything beyond the Git
+    /// evidence limit, or runner-truncated, is marked and never parsed.
+    pub(crate) fn from_bounded(bytes: Vec<u8>, total_bytes: u64, truncated: bool) -> Self {
+        Self {
+            truncated: truncated || total_bytes > GIT_EVIDENCE_LIMIT_BYTES,
             bytes,
-            total_bytes: 0,
-            truncated: false,
-        })
-    }
-
-    fn push(&mut self, chunk: &[u8], observation: Observation, stream: Stream) -> Result<(), E> {
-        self.total_bytes =
-            self.total_bytes
-                .checked_add(chunk.len() as u64)
-                .ok_or(E::StreamCountOverflow {
-                    observation,
-                    stream,
-                    counted: self.total_bytes,
-                    chunk: chunk.len(),
-                })?;
-        let take = chunk
-            .len()
-            .min(GIT_EVIDENCE_LIMIT_BYTES as usize - self.bytes.len());
-        self.bytes.extend_from_slice(&chunk[..take]);
-        self.truncated = self.total_bytes > GIT_EVIDENCE_LIMIT_BYTES;
-        Ok(())
+            total_bytes,
+        }
     }
 
     pub(crate) fn require_complete(self, observation: Observation) -> Result<Vec<u8>, E> {
@@ -311,29 +290,6 @@ impl RawStream {
     }
 }
 
-fn drain(
-    mut reader: impl Read,
-    mut retained: RawStream,
-    observation: Observation,
-    stream: Stream,
-) -> Result<RawStream, E> {
-    let mut buffer = [0; 8192];
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => return Ok(retained),
-            Ok(count) => retained.push(&buffer[..count], observation, stream)?,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(source) => {
-                return Err(E::StreamRead {
-                    observation,
-                    stream,
-                    source,
-                });
-            }
-        }
-    }
-}
-
 pub(crate) fn observe(
     root: &Path,
     observation: Observation,
@@ -347,82 +303,47 @@ pub(crate) fn observe(
         // config permits a particular transport. Never fetch during observation.
         "--no-lazy-fetch",
         "-c",
-        "core.fsmonitor=false",
-        "-c",
-        "core.untrackedCache=false",
-        "-c",
         "status.relativePaths=false",
-        "-c",
-        "protocol.allow=never",
     ]
     .iter()
     .chain(args)
     .map(OsStr::new)
     .collect();
-    let command =
-        git::prepared_command(root, "capture checkpoint evidence", &args).map_err(|source| {
-            E::GitPreparation {
-                observation,
-                source,
-            }
-        })?;
-    collect_git(command, observation)
+    // The shared hardened boundary adds hook/fsmonitor/transport overrides,
+    // the fixed environment, the deadline and bounded capture.
+    collect(
+        git::run(root, "capture checkpoint evidence", &args),
+        observation,
+    )
 }
 
-fn collect_git(
-    mut command: std::process::Command,
+/// Maps one bounded Git run into admitted raw evidence or a typed failure.
+pub(crate) fn collect(
+    run: Result<git::GitRun, WorkspaceError>,
     observation: Observation,
 ) -> Result<RawStream, E> {
-    let stdout_retention = RawStream::new(observation)?;
-    let stderr_retention = RawStream::new(observation)?;
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|source| E::GitIo {
+    let run = run.map_err(|source| match source {
+        WorkspaceError::GitTimedOut { .. } => E::GitTimedOut { observation },
+        source => E::GitPreparation {
             observation,
-            stage: "spawn",
             source,
-        })?;
-    let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
-    let stderr_reader = match std::thread::Builder::new()
-        .spawn(move || drain(stderr, stderr_retention, observation, Stream::Stderr))
-    {
-        Ok(reader) => reader,
-        Err(source) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(E::GitIo {
-                observation,
-                stage: "start stderr reader",
-                source,
-            });
-        }
-    };
-    // Both pipes are drained concurrently. A failed drain drops its pipe; still
-    // join the other reader and reap Git before propagating any failure.
-    let stdout = drain(stdout, stdout_retention, observation, Stream::Stdout);
-    let stderr = stderr_reader.join();
-    let status = child.wait();
-    let stdout = stdout?;
-    let stderr = stderr.map_err(|_| E::StreamReaderPanicked { observation })??;
-    let status = status.map_err(|source| E::GitIo {
-        observation,
-        stage: "wait",
-        source,
+        },
     })?;
-    if !status.success() {
+    if !run.success {
+        let stderr = RawStream::from_bounded(run.stderr, run.stderr_total, run.stderr_truncated);
         return Err(E::GitCommandFailed {
             observation,
-            status: status.code(),
+            status: run.code,
             stderr: stderr.bytes,
             stderr_total_bytes: stderr.total_bytes,
             stderr_truncated: stderr.truncated,
         });
     }
-    Ok(stdout)
+    Ok(RawStream::from_bounded(
+        run.stdout,
+        run.stdout_total,
+        run.stdout_truncated,
+    ))
 }
 
 pub(crate) fn parse_head(raw: RawStream) -> Result<CommitSha, E> {

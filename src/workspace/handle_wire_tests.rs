@@ -532,11 +532,36 @@ fn handle_wire_export_domain_refusals_do_not_mutate_operational_handles() {
         .unwrap();
     for (index, field) in ["workspace_id", "task_id"].into_iter().enumerate() {
         let long = "x".repeat(201);
-        let handle = provision(
-            &repo,
-            if field == "workspace_id" { &long } else { "w" },
-            Some(if field == "task_id" { &long } else { "t" }),
-            &format!("long-{index}"),
+        let (workspace, task) = if field == "workspace_id" {
+            (long.as_str(), "t")
+        } else {
+            ("w", long.as_str())
+        };
+        // New provisioning enforces the 200-character cap (R5)...
+        assert!(
+            WorkspaceProvisionRequest::new(
+                repo.path(),
+                workspace,
+                Some(task),
+                &format!("long-{index}"),
+                repo.root.path().join(format!("long-{index}")),
+                &repo.head_sha(),
+            )
+            .is_err()
+        );
+        // ...while a previously observed over-cap handle is never rewritten:
+        // export still refuses it explicitly and leaves it unchanged.
+        let handle = WorkspaceHandle::provisioned(
+            workspace.to_owned(),
+            Some(task.to_owned()),
+            format!("long-{index}"),
+            repo.root
+                .path()
+                .join(format!("long-{index}"))
+                .into_boxed_path(),
+            CommitSha::parse(&repo.head_sha()).unwrap(),
+            None,
+            None,
         );
         let before = handle.clone();
         assert_eq!(
@@ -547,9 +572,8 @@ fn handle_wire_export_domain_refusals_do_not_mutate_operational_handles() {
             })
         );
         assert_eq!(handle, before);
-        assert!(worktree_registered(&repo, handle.worktree_path()));
-        let torn = WorkspaceTeardownRequest::new(repo.path())
-            .teardown(&handle)
+        let torn = handle
+            .transitioned(crate::WorkspaceState::TornDown, None)
             .unwrap();
         assert_eq!(
             WorkspaceHandleWire::try_from(&torn),

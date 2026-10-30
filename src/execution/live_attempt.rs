@@ -264,13 +264,38 @@ pub fn start_live_process_attempt(
     request: &ProcessRunRequest,
     policy: &ProcessTimeoutPolicy,
 ) -> Result<LiveProcessAttempt, LiveProcessStartError> {
+    start_customized_attempt(request, policy, LaunchCustomization::default())
+}
+
+/// Crate-private containment for protected launches: kill every member and
+/// prove emptiness. Runs during cleanup after process-group handling and
+/// before reader verification; it is a cleanup step, never a second timer.
+pub(crate) trait AttemptContainment: Send + Sync {
+    fn kill_and_verify_empty(&self) -> Result<(), String>;
+}
+
+/// Async-signal-safe child setup run after fork, before exec.
+pub(crate) type PreExecHook = Box<dyn FnMut() -> std::io::Result<()> + Send + Sync>;
+
+/// Crate-private launch customization. The default is the public behavior.
+#[derive(Default)]
+pub(crate) struct LaunchCustomization {
+    pub(crate) pre_exec: Option<PreExecHook>,
+    pub(crate) containment: Option<Arc<dyn AttemptContainment>>,
+}
+
+pub(crate) fn start_customized_attempt(
+    request: &ProcessRunRequest,
+    policy: &ProcessTimeoutPolicy,
+    customization: LaunchCustomization,
+) -> Result<LiveProcessAttempt, LiveProcessStartError> {
     #[cfg(unix)]
     {
-        platform::start(request, policy)
+        platform::start(request, policy, customization)
     }
     #[cfg(not(unix))]
     {
-        let _ = (request, policy);
+        let _ = (request, policy, customization);
         Err(ExecutionError::UnsupportedTimeoutPlatform.into())
     }
 }
@@ -325,11 +350,22 @@ mod platform {
         group: OwnedProcessGroup,
         readers: Vec<(&'static str, Reader)>,
         stdin: super::super::stdin::StdinDelivery,
+        containment: Option<Arc<dyn AttemptContainment>>,
     }
     impl Resources {
         fn cleanup(&mut self, primary: Option<&ExecutionError>) -> Result<(), ExecutionError> {
             if let Some(child) = self.child.take() {
                 runner::cleanup_owned_attempt(child, self.group, primary)?;
+            }
+            // Members that left the process group (setsid/double fork) are
+            // still contained; kill them and prove emptiness before readers
+            // are verified or any identity/cgroup can be reused.
+            if let Some(containment) = self.containment.take() {
+                containment.kill_and_verify_empty().map_err(|detail| {
+                    ExecutionError::ProcessGroupControlFailed {
+                        detail: format!("containment cleanup not proven: {detail}"),
+                    }
+                })?;
             }
             Ok(())
         }
@@ -432,18 +468,38 @@ mod platform {
         stdout: Retention,
         stderr: Retention,
         stdin: super::super::stdin::StdinDelivery,
+        containment: Option<Arc<dyn AttemptContainment>>,
     ) -> Result<Resources, ExecutionError> {
-        let child = command.spawn().map_err(runner::spawn_failed)?;
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                // A failed pre-exec setup may already have placed the forked
+                // child in containment; prove it empty before reporting.
+                if let Some(containment) = &containment {
+                    containment.kill_and_verify_empty().map_err(|detail| {
+                        ExecutionError::ProcessGroupControlFailed {
+                            detail: format!("containment cleanup not proven: {detail}"),
+                        }
+                    })?;
+                }
+                return Err(runner::spawn_failed(error));
+            }
+        };
         command.stdin(Stdio::null()); // Release the parent's stdin read end.
 
         let Some(group) = runner::owned_process_group(child.id()) else {
-            return Err(runner::process_group_ownership_failed(child));
+            let error = runner::process_group_ownership_failed(child);
+            if let Some(containment) = &containment {
+                let _ = containment.kill_and_verify_empty();
+            }
+            return Err(error);
         };
         let mut resources = Resources {
             child: Some(child),
             group,
             readers: Vec::with_capacity(2),
             stdin,
+            containment,
         };
         let setup = (|| {
             let child = resources.child.as_mut().unwrap();
@@ -480,6 +536,7 @@ mod platform {
     pub(super) fn start(
         request: &ProcessRunRequest,
         policy: &ProcessTimeoutPolicy,
+        customization: LaunchCustomization,
     ) -> Result<LiveProcessAttempt, LiveProcessStartError> {
         runner::ensure_timeout_platform_supported()?;
         let deadline = runner::validated_run_deadline(policy)?;
@@ -493,6 +550,15 @@ mod platform {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0);
+        let LaunchCustomization {
+            pre_exec,
+            containment,
+        } = customization;
+        if let Some(hook) = pre_exec {
+            // SAFETY: the hook is built by this crate from preformatted data
+            // and performs only async-signal-safe raw system calls.
+            unsafe { command.pre_exec(hook) };
+        }
         let stdin = super::super::stdin::StdinDelivery::prepare(&mut command, request.stdin())?;
         let closed_stdin = matches!(request.stdin(), super::super::ProcessStdin::Closed);
         let lifecycle = Arc::new(Mutex::new(Lifecycle::default()));
@@ -529,13 +595,14 @@ mod platform {
                 #[cfg(test)]
                 let _faults = runner::inject_capture_test_faults(faults);
                 let _closed = CloseLifecycle(state.clone());
-                let mut resources = match setup(&mut command, out.clone(), err.clone(), stdin) {
-                    Ok(resources) => resources,
-                    Err(error) => {
-                        let _ = ready.send(false);
-                        return Err(error);
-                    }
-                };
+                let mut resources =
+                    match setup(&mut command, out.clone(), err.clone(), stdin, containment) {
+                        Ok(resources) => resources,
+                        Err(error) => {
+                            let _ = ready.send(false);
+                            return Err(error);
+                        }
+                    };
                 if closed_stdin {
                     lock(&state).ready = true;
                     let _ = ready.send(true);
