@@ -717,15 +717,14 @@ fn foreign_same_id_instance_cannot_stream_cancel_or_collect_issuer_handles() {
         let f = Fixture::new("line-1\nline-2\n");
         let issuer = registered(&f);
         let foreign = registered(&f);
-        // Moving the registry must not change who issued a handle.
-        let mut issuer = Box::new(issuer);
         let handle = issuer
             .get(id)
             .unwrap()
             .start(&f.task(), &f.workspace, &policy(Duration::from_secs(15)))
             .unwrap_or_else(|_| panic!("{id} start refused"));
         f.ready();
-        issuer = Box::new(*issuer);
+        // Moving the registry (here across threads) must not change who issued a handle.
+        let issuer = thread::spawn(move || issuer).join().unwrap();
 
         let other = foreign.get(id).unwrap();
         assert!(other.stream_events(&handle).is_err(), "{id}");
