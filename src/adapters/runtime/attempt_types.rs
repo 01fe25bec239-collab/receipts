@@ -284,3 +284,33 @@ impl Drop for CodexEventStream<'_> {
         }
     }
 }
+
+use crate::registry::{DynAttemptEvent, RuntimeEventStream};
+impl RuntimeEventStream for ClaudeEventStream<'_> {
+    type Event = ClaudeAttemptEvent;
+    fn poll_event(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<ClaudeAttemptEvent>> {
+        self.poll_next(cx)
+    }
+}
+impl RuntimeEventStream for CodexEventStream<'_> {
+    type Event = CodexAttemptEvent;
+    fn poll_event(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<CodexAttemptEvent>> {
+        self.poll_next(cx)
+    }
+}
+impl From<ClaudeAttemptEvent> for DynAttemptEvent {
+    fn from(event: ClaudeAttemptEvent) -> Self {
+        match event {
+            ClaudeAttemptEvent::Record(record) => Self::Record(record),
+            ClaudeAttemptEvent::Unavailable(error) => Self::Unavailable(Box::new(error)),
+        }
+    }
+}
+impl From<CodexAttemptEvent> for DynAttemptEvent {
+    fn from(event: CodexAttemptEvent) -> Self {
+        match event {
+            CodexAttemptEvent::Record(record) => Self::Record(record),
+            CodexAttemptEvent::Unavailable(error) => Self::Unavailable(Box::new(error)),
+        }
+    }
+}

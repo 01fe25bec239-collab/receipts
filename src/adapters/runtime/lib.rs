@@ -78,7 +78,19 @@ pub use claude_stream_json::{
 
 pub use adapter::RuntimeAdapter;
 pub use attempt::{AttemptHandle, AttemptId, AttemptIdError, AttemptResult};
-pub use raw_failure::{RawFailure, RawFailureEvidence, RawFailureSource};
+pub use failure_classification::classify_live_outcome;
+pub use raw_failure::{
+    FailureChannel, RawFailure, RawFailureEvidence, RawFailureSource, RuntimeFailureOrigin,
+    RuntimeId, RuntimeIdError,
+};
+mod failure_classification;
+#[cfg(all(test, unix))]
+mod failure_classification_tests;
+/// Type-erased registry; a separate module so its trait methods never shadow
+/// `RuntimeAdapter` methods under crate-root glob imports.
+pub mod registry;
+#[cfg(all(test, unix))]
+mod third_adapter_lifecycle_tests;
 
 pub use auth_status::RuntimeAuthStatus;
 pub use codex_auth_status::{

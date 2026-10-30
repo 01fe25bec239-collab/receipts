@@ -24,7 +24,9 @@ impl RuntimeExecutionPolicy {
             structured_output_schema: None,
         }
     }
-    pub(crate) fn supported(&self) -> bool {
+    /// True only when no mandatory constraint beyond timeout/read-only is
+    /// requested; adapters refuse otherwise instead of prompt-only enforcement.
+    pub fn supported(&self) -> bool {
         self.sandbox_mode.is_none()
             && self.network_access.is_none()
             && self.filesystem_scope.is_none()
