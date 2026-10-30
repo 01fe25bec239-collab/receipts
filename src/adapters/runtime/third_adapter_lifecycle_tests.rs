@@ -24,8 +24,8 @@ use receipts_workspace_execution::execution::{
 use receipts_workspace_execution::{WorkspaceHandle, WorkspaceProvisionRequest};
 
 use crate::registry::{
-    AttemptFailure, DynAttemptEvent, HandleMismatch, RegistryError, RuntimeAdapterRegistry,
-    RuntimeEventStream,
+    AttemptFailure, DynAdapter, DynAttemptEvent, HandleMismatch, RegistryError,
+    RuntimeAdapterRegistry, RuntimeEventStream,
 };
 use crate::{
     CancelReason, CapabilityStatus, ClaudeAdapter, CodexAdapter, ExtensionCapabilityReport,
@@ -419,12 +419,12 @@ fn record(event: Option<DynAttemptEvent>) -> Vec<u8> {
 
 fn registered(f: &Fixture) -> RuntimeAdapterRegistry {
     let mut registry = RuntimeAdapterRegistry::new();
-    registry.register(Box::new(f.line())).unwrap();
+    registry.register(DynAdapter::new(f.line())).unwrap();
     registry
-        .register(Box::new(ClaudeAdapter::new(&f.executable)))
+        .register(DynAdapter::new(ClaudeAdapter::new(&f.executable)))
         .unwrap();
     registry
-        .register(Box::new(CodexAdapter::new(&f.executable)))
+        .register(DynAdapter::new(CodexAdapter::new(&f.executable)))
         .unwrap();
     registry
 }
@@ -444,7 +444,7 @@ fn registry_refuses_empty_and_duplicate_ids_without_replacing() {
         executable: f.root.join("never-used"),
     };
     assert_eq!(
-        registry.register(Box::new(other)),
+        registry.register(DynAdapter::new(other)),
         Err(RegistryError::DuplicateRuntimeId)
     );
     let empty = LineAdapter {
@@ -452,7 +452,7 @@ fn registry_refuses_empty_and_duplicate_ids_without_replacing() {
         executable: f.executable.clone(),
     };
     assert_eq!(
-        registry.register(Box::new(empty)),
+        registry.register(DynAdapter::new(empty)),
         Err(RegistryError::EmptyRuntimeId)
     );
     assert!(registry.get("Line-Echo.test").is_none());
@@ -707,4 +707,238 @@ fn core_files_name_no_concrete_runtime() {
             assert!(!source.contains(third), "{name} names the third adapter");
         }
     }
+}
+
+// ---- handle ownership: same runtime ID and handle type, different instance ----
+
+#[test]
+fn foreign_same_id_instance_cannot_stream_cancel_or_collect_issuer_handles() {
+    for id in [ID, "claude", "codex"] {
+        let f = Fixture::new("line-1\nline-2\n");
+        let issuer = registered(&f);
+        let foreign = registered(&f);
+        // Moving the registry must not change who issued a handle.
+        let mut issuer = Box::new(issuer);
+        let handle = issuer
+            .get(id)
+            .unwrap()
+            .start(&f.task(), &f.workspace, &policy(Duration::from_secs(15)))
+            .unwrap_or_else(|_| panic!("{id} start refused"));
+        f.ready();
+        issuer = Box::new(*issuer);
+
+        let other = foreign.get(id).unwrap();
+        assert!(other.stream_events(&handle).is_err(), "{id}");
+        assert_eq!(
+            other.cancel(&handle, &CancelReason::UserRequested),
+            Err(HandleMismatch),
+            "{id}"
+        );
+        assert!(matches!(other.collect_result(&handle), Err(HandleMismatch)));
+        assert!(foreign.for_handle(&handle).is_none(), "{id}");
+        assert!(!other.issued(&handle));
+        let own = issuer.for_handle(&handle).expect("issuer lost its handle");
+        assert!(own.issued(&handle) && std::ptr::eq(own, issuer.get(id).unwrap()));
+
+        if id == ID {
+            // Refused calls neither cancelled the process nor consumed events.
+            let typed: &LineHandle = handle.downcast_ref().unwrap();
+            assert!(typed.attempt.terminal_cause().is_none());
+            let mut stream = own.stream_events(&handle).unwrap();
+            f.release_later().join().unwrap();
+            assert_eq!(record(next(&mut stream).0), b"line-1\n");
+            assert_eq!(record(next(&mut stream).0), b"line-2\n");
+        } else {
+            f.release_later().join().unwrap();
+        }
+        // The single collection was not consumed; the issuer still gets the
+        // real outcome, not a foreign cancellation.
+        let result = own.collect_result(&handle).unwrap();
+        assert_ne!(result.failure(), Some(FailureClass::UserCancelled), "{id}");
+        if id == ID {
+            assert_eq!(result.failure(), None);
+        }
+        let again = own.collect_result(&handle).unwrap();
+        assert_eq!(again.failure(), Some(FailureClass::Unknown), "{id}");
+    }
+}
+
+#[test]
+fn handle_stays_bound_to_its_adapter_when_registered_after_start_and_after_drop() {
+    let f = Fixture::new("");
+    let adapter = DynAdapter::new(f.line());
+    let handle = adapter
+        .start(&f.task(), &f.workspace, &policy(Duration::from_secs(15)))
+        .unwrap_or_else(|_| panic!("start refused"));
+    f.ready();
+    let mut registry = RuntimeAdapterRegistry::new();
+    registry.register(adapter).unwrap();
+    let own = registry.for_handle(&handle).expect("moved issuer lost");
+    f.release_later().join().unwrap();
+    assert_eq!(own.collect_result(&handle).unwrap().failure(), None);
+    // A replacement with the same ID, in a registry or alone, is not the issuer.
+    let replacement = registered(&f);
+    assert!(replacement.for_handle(&handle).is_none());
+    assert!(
+        replacement
+            .get(ID)
+            .unwrap()
+            .collect_result(&handle)
+            .is_err()
+    );
+    // After the issuer is gone the handle is unowned, never adopted.
+    drop(registry);
+    assert!(replacement.for_handle(&handle).is_none());
+    assert_eq!(handle.runtime_id(), ID);
+}
+
+/// Counts every call that reaches the concrete adapter; its handle comes only
+/// from `resume`.
+struct ResumeAdapter(Arc<std::sync::atomic::AtomicUsize>);
+struct ResumeHandle;
+struct ResumeResult;
+struct NoEvents;
+impl AttemptFailure for ResumeResult {
+    fn failure(&self) -> Option<FailureClass> {
+        None
+    }
+}
+impl RuntimeEventStream for NoEvents {
+    type Event = DynAttemptEvent;
+    fn poll_event(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<DynAttemptEvent>> {
+        Poll::Ready(None)
+    }
+}
+impl RuntimeAdapter for ResumeAdapter {
+    type HealthReport = RuntimeObservation;
+    type Models = RuntimeObservation;
+    type ExecutionPolicy = RuntimeExecutionPolicy;
+    type AttemptHandle = ResumeHandle;
+    type AttemptEvent = DynAttemptEvent;
+    type EventStream<'a> = NoEvents;
+    type AttemptResult = ResumeResult;
+    type CancelReason = CancelReason;
+    fn runtime_id(&self) -> &str {
+        "resume.test"
+    }
+    fn health(&self) -> RuntimeObservation {
+        RuntimeObservation::Unknown
+    }
+    fn authenticate_status(&self) -> RuntimeAuthStatus {
+        RuntimeAuthStatus::Unknown
+    }
+    fn capabilities(&self) -> RuntimeCapabilities {
+        RuntimeCapabilities::Extension(
+            ExtensionCapabilityReport::new("resume.test", [] as [(&str, CapabilityStatus); 0])
+                .unwrap(),
+        )
+    }
+    fn models(&self) -> RuntimeObservation {
+        RuntimeObservation::Unknown
+    }
+    fn start(
+        &self,
+        _: &RuntimeCapsuleFamily,
+        _: &WorkspaceHandle,
+        _: &RuntimeExecutionPolicy,
+    ) -> Result<ResumeHandle, FailureClass> {
+        Err(FailureClass::PolicyBlocked)
+    }
+    fn stream_events<'a>(&'a self, _: &'a ResumeHandle) -> NoEvents {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        NoEvents
+    }
+    fn collect_result(&self, _: &ResumeHandle) -> ResumeResult {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        ResumeResult
+    }
+    fn cancel(&self, _: &ResumeHandle, _: &CancelReason) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+    fn classify_failure(&self, error: &RawFailure) -> FailureClass {
+        error.classify_failure()
+    }
+    fn resume(&self, _: &crate::AttemptId) -> Option<ResumeHandle> {
+        Some(ResumeHandle)
+    }
+}
+
+#[test]
+fn resume_issued_handles_are_bound_to_the_resuming_instance() {
+    let calls = || Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (issuer_calls, foreign_calls) = (calls(), calls());
+    let mut issuer = RuntimeAdapterRegistry::new();
+    issuer
+        .register(DynAdapter::new(ResumeAdapter(issuer_calls.clone())))
+        .unwrap();
+    let mut foreign = RuntimeAdapterRegistry::new();
+    foreign
+        .register(DynAdapter::new(ResumeAdapter(foreign_calls.clone())))
+        .unwrap();
+    let attempt = crate::AttemptId::new("a").unwrap();
+    let handle = issuer.get("resume.test").unwrap().resume(&attempt).unwrap();
+    let issuer = [issuer];
+    let other = foreign.get("resume.test").unwrap();
+    assert!(other.stream_events(&handle).is_err());
+    assert!(other.collect_result(&handle).is_err());
+    assert!(other.cancel(&handle, &CancelReason::UserRequested).is_err());
+    assert!(foreign.for_handle(&handle).is_none());
+    assert_eq!(foreign_calls.load(Ordering::SeqCst), 0, "foreign delegated");
+    assert_eq!(issuer_calls.load(Ordering::SeqCst), 0);
+    let own = issuer[0].for_handle(&handle).unwrap();
+    assert!(own.stream_events(&handle).is_ok());
+    assert!(own.collect_result(&handle).is_ok());
+    own.cancel(&handle, &CancelReason::UserRequested).unwrap();
+    assert_eq!(issuer_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(foreign_calls.load(Ordering::SeqCst), 0);
+}
+
+// ---- identity redaction ----
+
+#[test]
+fn open_origin_runtime_identity_is_redacted_in_all_ordinary_formatting() {
+    const MARKER: &str = "sk-test-NOT-A-REAL-CREDENTIAL-redaction-marker";
+    let id = RuntimeId::new(MARKER).unwrap();
+    let failures = [
+        RawFailure::live_start(id, &LiveProcessStartError::ControllerFailed),
+        RawFailure::live_snapshot(
+            id,
+            &receipts_workspace_execution::execution::ExecutionError::ProcessSpawnFailed {
+                detail: MARKER.into(),
+            },
+        ),
+        RawFailure::live_collect(
+            id,
+            &receipts_workspace_execution::execution::LiveProcessAttemptError::ControllerFailed,
+        ),
+    ];
+    for raw in failures {
+        let RawFailureSource::Runtime(origin) = raw.origin() else {
+            panic!("open origin lost");
+        };
+        // Exact identity stays available through explicit access.
+        assert_eq!(origin.runtime_id.as_str(), MARKER);
+        let nested = (Some(raw), vec![raw.origin()], Ok::<_, RawFailure>(origin));
+        for text in [
+            format!("{raw}"),
+            format!("{raw:?}"),
+            format!("{raw:#?}"),
+            format!("{origin:?}"),
+            format!("{origin:#?}"),
+            format!("{:?}", raw.origin()),
+            format!("{:#?}", raw.origin()),
+            format!("{:?}", origin.runtime_id),
+            format!("{:#?}", origin.runtime_id),
+            format!("{nested:?}"),
+            format!("{nested:#?}"),
+            format!("{:?}", Err::<(), _>(raw)),
+        ] {
+            assert!(!text.contains(MARKER), "identity leaked: {text}");
+            assert!(!text.contains("redaction"), "identity fragment: {text}");
+        }
+    }
+    // Redaction is structural, not a match on the value: any identity formats alike.
+    let other = RuntimeId::new("other id 世界").unwrap();
+    assert_eq!(format!("{id:?}"), format!("{other:?}"));
+    assert_ne!(id, other);
 }
