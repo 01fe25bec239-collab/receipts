@@ -10,7 +10,7 @@
 //! | `SET_NODE_STATE` | `node_id` | `{from: state, to: state, cause: {kind, ..}}` |
 //! | `ATTACH_RESULT` | `node_id` | `{result_ref: string, result: GraphNodeResult}` |
 //! | `CANCEL_NODE` | `node_id` | absent or `{}` |
-//! | `EXPAND_REPAIR` | rejected source `node_id` | `{nodes: [GraphNode], edges: [GraphEdge]}` |
+//! | `EXPAND_REPAIR` | rejected REVIEW `node_id` | `{nodes: [GraphNode], edges: [GraphEdge]}` |
 //!
 //! Other schema-valid detail is valid wire data but unsupported here. The
 //! whole ordered batch is validated and applied to a private candidate; the
@@ -22,6 +22,12 @@
 //! authenticated production issuer); `mutation.actor` must merely agree with
 //! it. Nothing here persists to State, deletes structure, rewrites a result,
 //! or accepts work implicitly.
+//!
+//! Execution identity is bound across calls: `DISPATCH` admits an attempt id
+//! into the returned [`GraphResultLedgerV1`]; `START`, `SUBMIT` and
+//! `ATTACH_RESULT` must match it. Resumption, admission and dispatch recheck
+//! the current prerequisites, and `EXPAND_REPAIR` requires a complete fresh
+//! repair/review round hung off a retained rejected `REVIEW`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -35,9 +41,9 @@ use crate::wire::{
 use crate::{
     CapabilityName, ControlKind, EdgeClass, ExecutionGraph, ExecutionGraphEnvelope, GraphEdge,
     GraphError, GraphMutation, GraphMutationOperation, GraphMutationOperationKind,
-    GraphMutationPreflightError, GraphNode, GraphNodeKind, GraphNodeResultOutcome, GraphNodeState,
-    GraphVersionV1, MAX_IDENTIFIER_LENGTH, content_digest::GraphContentDigestError,
-    validate_graph_mutation_preflight,
+    GraphMutationPreflightError, GraphNode, GraphNodeAttemptNumber, GraphNodeKind,
+    GraphNodeResultOutcome, GraphNodeState, GraphVersionV1, MAX_IDENTIFIER_LENGTH,
+    content_digest::GraphContentDigestError, validate_graph_mutation_preflight,
 };
 
 /// The admitted caller actor. Built by trusted core from its own facts,
@@ -107,25 +113,46 @@ impl GraphMutationScopeV1 {
     }
 }
 
-/// Attached results by immutable `result_ref`. Append-only through apply-v1.
+/// `(project_id, graph_id, node_id)`: the identity an attempt is admitted for.
+type AttemptKey = (String, String, String);
+
+/// The retained execution record of a graph: attached results by immutable
+/// `result_ref`, plus the attempt identity admitted at `DISPATCH` for each
+/// `(project, graph, node)`. Both are append-only through apply-v1 and travel
+/// in the returned outcome, so `START`, `SUBMIT` and `ATTACH_RESULT` in later
+/// calls or batches verify against what was actually dispatched. A ledger
+/// built with [`GraphResultLedgerV1::new`] holds no dispatch: executing a node
+/// that was never dispatched through it refuses as a missing binding.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct GraphResultLedgerV1(BTreeMap<String, GraphNodeResult>);
+pub struct GraphResultLedgerV1 {
+    results: BTreeMap<String, GraphNodeResult>,
+    /// The node's current admitted attempt (set by `DISPATCH`).
+    current: BTreeMap<AttemptKey, String>,
+    /// Every attempt id ever admitted, with its owner. Never reused.
+    admitted: BTreeMap<String, AttemptKey>,
+}
 
 impl GraphResultLedgerV1 {
     pub fn new() -> Self {
         Self::default()
     }
     pub fn get(&self, result_ref: &str) -> Option<&GraphNodeResult> {
-        self.0.get(result_ref)
+        self.results.get(result_ref)
     }
     pub fn iter(&self) -> impl Iterator<Item = (&str, &GraphNodeResult)> {
-        self.0.iter().map(|(k, v)| (k.as_str(), v))
+        self.results.iter().map(|(k, v)| (k.as_str(), v))
     }
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.results.len()
     }
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.results.is_empty()
+    }
+    /// The attempt id currently admitted for the node, if it was dispatched.
+    pub fn attempt(&self, project_id: &str, graph_id: &str, node_id: &str) -> Option<&str> {
+        self.current
+            .get(&(project_id.into(), graph_id.into(), node_id.into()))
+            .map(String::as_str)
     }
 }
 
@@ -158,6 +185,9 @@ pub enum GraphOperationError {
     EvidenceRefused(&'static str),
     ResultSlotOccupied,
     ResultAssociation(&'static str),
+    /// `DISPATCH`/`START`/`SUBMIT` attempt identity is reused, missing or
+    /// does not match the one admitted for the node.
+    Attempt(&'static str),
     NewNode(&'static str),
     Repair(&'static str),
     NotPermitted(&'static str),
@@ -247,6 +277,7 @@ pub fn apply_graph_mutation_v1(
     let mut batch = Batch {
         graph: envelope.graph().clone(),
         ledger: results.clone(),
+        project_id: envelope.project_id(),
         added: BTreeSet::new(),
         actor: &scope.actor,
         parent: envelope.graph_version(),
@@ -277,6 +308,7 @@ type Map = BTreeMap<String, V>;
 struct Batch<'a> {
     graph: ExecutionGraph,
     ledger: GraphResultLedgerV1,
+    project_id: &'a str,
     added: BTreeSet<String>,
     actor: &'a ScopedActorV1,
     parent: &'a GraphVersionV1,
@@ -463,7 +495,63 @@ impl Batch<'_> {
         let kind = cause_kind(text(cause, "kind")?)?;
         check_node_transition(from, to, kind)?;
         self.verify_cause(&node, to, kind, cause)?;
+        self.bind_attempt(&node, kind, cause)?;
         self.graph.replace_node(node.with_state(to));
+        Ok(())
+    }
+
+    /// `DISPATCH` admits a never-used attempt id for this exact
+    /// project/graph/node; `START` and `SUBMIT` must name the attempt
+    /// currently admitted for it. A missing or different binding refuses.
+    fn bind_attempt(
+        &mut self,
+        node: &GraphNode,
+        kind: TransitionCauseKind,
+        cause: &Map,
+    ) -> OpResult {
+        use GraphOperationError as E;
+        use TransitionCauseKind as C;
+        if !matches!(kind, C::Dispatch | C::Start | C::Submit) {
+            return Ok(());
+        }
+        let attempt = id(cause, "attempt_id")?;
+        let key = (
+            self.project_id.to_owned(),
+            self.graph.graph_id().to_owned(),
+            node.node_id().to_owned(),
+        );
+        if kind == C::Dispatch {
+            if self.ledger.admitted.contains_key(attempt) {
+                return Err(E::Attempt("attempt id already admitted"));
+            }
+            self.ledger.admitted.insert(attempt.to_owned(), key.clone());
+            self.ledger.current.insert(key, attempt.to_owned());
+            return Ok(());
+        }
+        match self.ledger.current.get(&key) {
+            None => Err(E::Attempt("node has no admitted attempt")),
+            Some(admitted) if admitted != attempt => Err(E::Attempt("attempt id not admitted")),
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// Every incoming precedence dependency must be satisfied *now*, against
+    /// the candidate graph (earlier operations of this batch included) and
+    /// the current parent version for interface evidence. Unavailable
+    /// interface evidence is reported as such, never assumed.
+    fn require_dependencies(&self, node: &GraphNode) -> OpResult {
+        use GraphOperationError as E;
+        let dag = TaskDag::over(&self.graph, self.parent, self.interface);
+        let checks = dag.dependency_status(node.node_id()).expect("node exists");
+        for check in &checks {
+            match &check.status {
+                status if status.is_satisfied() => {}
+                DependencyStatus::InterfaceRefused(r) if r.is_unavailable() => {
+                    return Err(E::EvidenceUnavailable("interface artifact"));
+                }
+                _ => return Err(E::EvidenceRefused("dependencies")),
+            }
+        }
         Ok(())
     }
 
@@ -504,36 +592,19 @@ impl Batch<'_> {
                 if node.kind() == &GraphNodeKind::HUMAN_GATE {
                     return Err(E::EvidenceRefused("human gate"));
                 }
-                let dag = TaskDag::over(&self.graph, self.parent, self.interface);
-                let checks = dag.dependency_status(node.node_id()).expect("node exists");
-                for check in &checks {
-                    match &check.status {
-                        status if status.is_satisfied() => {}
-                        DependencyStatus::InterfaceRefused(r) if r.is_unavailable() => {
-                            return Err(E::EvidenceUnavailable("interface artifact"));
-                        }
-                        _ => return Err(E::EvidenceRefused("dependencies")),
-                    }
-                }
-                Ok(())
+                self.require_dependencies(node)
             }
             C::ReviewVerdict => self.verify_verdict(node, to, id(cause, "result_node_id")?),
             C::RepairEntry => {
                 let repair = self.repair_child(node, id(cause, "repair_node_id")?)?;
-                let spawned = self.graph.control_edges().any(|edge| {
+                let mut sources = self.graph.control_edges().filter(|edge| {
                     edge.to_node() == repair.node_id()
                         && edge.control_kind() == Some(ControlKind::OnReject)
-                        && self
-                            .graph
-                            .node(edge.from_node())
-                            .is_some_and(|source| source.state() == GraphNodeState::Rejected)
                 });
-                if !spawned {
-                    return Err(E::EvidenceRefused(
-                        "repair not expanded from a rejected node",
-                    ));
+                match (sources.next(), sources.next()) {
+                    (Some(edge), None) => repair_provenance(&self.graph, edge.from_node(), repair),
+                    _ => Err(E::Repair("repair needs exactly one ON_REJECT source")),
                 }
-                Ok(())
             }
             C::RepairSubmitted => {
                 let repair = self.repair_child(node, id(cause, "repair_node_id")?)?;
@@ -556,6 +627,11 @@ impl Batch<'_> {
             ),
             C::HumanResolved if !matches!(self.actor, ScopedActorV1::User { .. }) => {
                 Err(E::NotPermitted("only USER resolves a human gate"))
+            }
+            // Resumption, fresh admission and dispatch recheck the current
+            // prerequisites; a resolution or admission reference proves none.
+            C::Resolved | C::HumanResolved | C::Admission | C::Dispatch => {
+                self.require_dependencies(node)
             }
             C::FeatureLocked => {
                 let capability = CapabilityName::new(text(cause, "capability_id")?)
@@ -671,10 +747,16 @@ impl Batch<'_> {
         if node.code_sha().is_some() && result.code_sha() != node.code_sha() {
             return Err(E::ResultAssociation("code_sha"));
         }
-        if node.attempt_number().is_some() && result.attempt_id().is_none() {
+        // Evidence must come from the attempt dispatched for this exact
+        // project/graph/node; a result claiming its own identity proves none.
+        let admitted = self
+            .ledger
+            .attempt(self.project_id, self.graph.graph_id(), node.node_id())
+            .ok_or(E::Attempt("node has no admitted attempt"))?;
+        if result.attempt_id() != Some(admitted) {
             return Err(E::ResultAssociation("attempt_id"));
         }
-        self.ledger.0.insert(result_ref.to_owned(), result);
+        self.ledger.results.insert(result_ref.to_owned(), result);
         self.graph.replace_node(node.with_result_ref(result_ref));
         Ok(())
     }
@@ -697,12 +779,17 @@ impl Batch<'_> {
         Ok(())
     }
 
+    /// Expands a retained `REJECTED` REVIEW into a fresh repair round: one
+    /// `REPAIR` (parent = the implementation that review judged), one
+    /// distinct fresh `REVIEW` after it, the review's `ON_REJECT` control edge
+    /// to the repair and the repair's forward precedence to the new review.
+    /// The rejected review, its result and attempts are never touched.
     fn expand_repair(&mut self, op: &GraphMutationOperation) -> OpResult {
         use GraphOperationError as E;
         let map = detail(op, &["nodes", "edges"])?;
         let source = self.existing(op)?;
-        if source.state() != GraphNodeState::Rejected {
-            return Err(E::Repair("source must be REJECTED"));
+        if !is_review(&source) || source.state() != GraphNodeState::Rejected {
+            return Err(E::Repair("source must be a REJECTED REVIEW"));
         }
         let (V::Array(nodes), V::Array(edges)) = (&map["nodes"], &map["edges"]) else {
             return Err(E::Detail("nodes/edges"));
@@ -715,24 +802,42 @@ impl Batch<'_> {
             .iter()
             .map(graph_edge_from_value)
             .collect::<Result<Vec<_>, _>>()?;
-        if !nodes.iter().any(|n| n.kind() == &GraphNodeKind::REPAIR) {
-            return Err(E::Repair("expansion needs a REPAIR node"));
-        }
         if nodes.iter().any(|n| n.created_in_version().is_none()) {
             return Err(E::NewNode("created_in_version"));
         }
-        let new_ids: BTreeSet<&str> = nodes.iter().map(GraphNode::node_id).collect();
         let source_id = source.node_id();
-        let on_reject = edges.iter().any(|edge| {
-            edge.control_kind() == Some(ControlKind::OnReject)
-                && edge.from_node() == source_id
-                && nodes
-                    .iter()
-                    .any(|n| n.node_id() == edge.to_node() && n.kind() == &GraphNodeKind::REPAIR)
-        });
-        if !on_reject {
-            return Err(E::Repair("missing ON_REJECT control edge to the repair"));
+        if self.graph.control_edges().any(|edge| {
+            edge.control_kind() == Some(ControlKind::OnReject) && edge.from_node() == source_id
+        }) {
+            return Err(E::Repair("rejected review is already expanded"));
         }
+        let subject = reviewed_subject(&self.graph, source_id)?;
+        let repair = only_new(&nodes, &GraphNodeKind::REPAIR)?;
+        let review = only_new(&nodes, &GraphNodeKind::REVIEW)?;
+        if repair.parent_node_id() != Some(subject.node_id()) {
+            return Err(E::Repair("repair parent must be the reviewed subject"));
+        }
+        if repair.workstream_id() != subject.workstream_id()
+            || review.workstream_id() != repair.workstream_id()
+        {
+            return Err(E::Repair("repair round workstream binding"));
+        }
+        fn round(n: &GraphNode) -> Option<&str> {
+            n.attempt_number().map(GraphNodeAttemptNumber::as_str)
+        }
+        let later = |new: Option<&str>, old: Option<&str>| match (new, old) {
+            (Some(new), Some(old)) => (new.len(), new) > (old.len(), old),
+            _ => true,
+        };
+        if round(repair)
+            .zip(round(review))
+            .is_some_and(|(a, b)| a != b)
+            || !later(round(repair), round(subject))
+            || !later(round(review), round(&source))
+        {
+            return Err(E::Repair("repair round ordinals"));
+        }
+        let new_ids: BTreeSet<&str> = nodes.iter().map(GraphNode::node_id).collect();
         if edges.iter().any(|edge| {
             edge.class() == EdgeClass::Precedence
                 && (edge.from_node() == source_id || edge.to_node() == source_id)
@@ -747,13 +852,99 @@ impl Batch<'_> {
         {
             return Err(E::Repair("every edge must touch an expanded node"));
         }
+        let (repair_id, review_id) = (repair.node_id().to_owned(), review.node_id().to_owned());
         for node in nodes {
             self.add_node(node, true)?;
         }
         for edge in edges {
             self.add_edge(edge)?;
         }
+        // The staged result must carry the complete provenance, and the new
+        // review must judge exactly this repair.
+        let repair = self.graph.node(&repair_id).expect("staged");
+        repair_provenance(&self.graph, source_id, repair)?;
+        if reviewed_subject(&self.graph, &review_id)?.node_id() != repair_id {
+            return Err(E::Repair("new review must judge exactly the repair"));
+        }
         Ok(())
+    }
+}
+
+/// The only node of `kind` in an expansion; none or several refuse.
+fn only_new<'n>(nodes: &'n [GraphNode], kind: &GraphNodeKind) -> OpResult<&'n GraphNode> {
+    let mut of_kind = nodes.iter().filter(|n| n.kind() == kind);
+    match (of_kind.next(), of_kind.next()) {
+        (Some(node), None) => Ok(node),
+        _ => Err(GraphOperationError::Repair(
+            "expansion needs exactly one REPAIR and one REVIEW node",
+        )),
+    }
+}
+
+/// The unique execution subject (`TASK`/`IMPLEMENTATION`/`REPAIR`) that
+/// precedes `review_id` by a PRECEDENCE edge: the prior work that review
+/// judged. None or several refuse.
+fn reviewed_subject<'g>(graph: &'g ExecutionGraph, review_id: &str) -> OpResult<&'g GraphNode> {
+    let subjects: BTreeSet<&str> = graph
+        .precedence_edges()
+        .filter(|edge| edge.to_node() == review_id)
+        .filter_map(|edge| graph.node(edge.from_node()))
+        .filter(|n| {
+            [
+                GraphNodeKind::TASK,
+                GraphNodeKind::IMPLEMENTATION,
+                GraphNodeKind::REPAIR,
+            ]
+            .contains(n.kind())
+        })
+        .map(GraphNode::node_id)
+        .collect();
+    let mut subjects = subjects.into_iter();
+    match (subjects.next(), subjects.next()) {
+        (Some(subject), None) => Ok(graph.node(subject).expect("listed")),
+        (None, _) => Err(GraphOperationError::Repair(
+            "rejected review has no reviewed subject",
+        )),
+        _ => Err(GraphOperationError::Repair(
+            "rejected review subject is ambiguous",
+        )),
+    }
+}
+
+/// Complete provenance of `repair` against its `ON_REJECT` source: the source
+/// is a retained `REJECTED` REVIEW; `repair.parent_node_id` is the
+/// implementation that review judged; the control edge exists; and the
+/// repair precedes exactly one other, distinct REVIEW that judges it.
+fn repair_provenance(graph: &ExecutionGraph, source_id: &str, repair: &GraphNode) -> OpResult {
+    use GraphOperationError as E;
+    let source = graph
+        .node(source_id)
+        .filter(|n| is_review(n) && n.state() == GraphNodeState::Rejected)
+        .ok_or(E::Repair("source must be a REJECTED REVIEW"))?;
+    let subject = reviewed_subject(graph, source.node_id())?;
+    if repair.kind() != &GraphNodeKind::REPAIR || repair.parent_node_id() != Some(subject.node_id())
+    {
+        return Err(E::Repair("repair parent must be the reviewed subject"));
+    }
+    let on_reject = graph.control_edges().any(|edge| {
+        edge.control_kind() == Some(ControlKind::OnReject)
+            && edge.from_node() == source.node_id()
+            && edge.to_node() == repair.node_id()
+    });
+    if !on_reject {
+        return Err(E::Repair("missing ON_REJECT control edge to the repair"));
+    }
+    let reviews: BTreeSet<&str> = graph
+        .precedence_edges()
+        .filter(|edge| edge.from_node() == repair.node_id())
+        .filter_map(|edge| graph.node(edge.to_node()))
+        .filter(|n| is_review(n))
+        .map(GraphNode::node_id)
+        .collect();
+    let mut reviews = reviews.into_iter();
+    match (reviews.next(), reviews.next()) {
+        (Some(fresh), None) if fresh != source.node_id() => Ok(()),
+        _ => Err(E::Repair("repair needs one distinct fresh REVIEW after it")),
     }
 }
 
