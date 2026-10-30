@@ -526,7 +526,7 @@ fn provenance_chain_reports_contradictions_with_stored_records() {
 #[test]
 fn v16_store_migrates_to_v17_preserving_rows_and_rejects_partial_v17() {
     let tmp = TempDir::new("decision-migrate");
-    let mut repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
+    let repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
     repo.connection()
         .execute_batch("INSERT INTO logical_role(role_id,project_id,role_type,status,current_context_epoch) VALUES ('sentinel','p','RUNTIME_A1','ACTIVE','0')")
         .unwrap();

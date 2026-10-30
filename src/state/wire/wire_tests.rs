@@ -64,10 +64,6 @@ fn conformance(name: &str, valid: &[String], invalid: &[String]) {
     }
 }
 
-fn s(v: &[&str]) -> Vec<String> {
-    v.iter().map(|x| x.to_string()).collect()
-}
-
 const ROLE: &str = r#"{"role_id":"r","project_id":"p","role_type":"RUNTIME_A2","status":"ACTIVE","current_context_epoch":0}"#;
 
 #[test]
