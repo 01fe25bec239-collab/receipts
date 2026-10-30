@@ -36,7 +36,7 @@ fn minimal_role(role_id: &str, role_type: LogicalRoleType) -> LogicalRole {
 fn t01_fresh_database_reaches_schema_version_7() {
     let tmp = TempDir::new("lr-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 16);
+    assert_eq!(repo.schema_version().expect("version read"), 17);
     assert!(
         repo.table_exists("logical_role").expect("table check"),
         "logical_role must exist after migration 2"
@@ -71,10 +71,10 @@ fn t02_version_7_reopen_idempotent() {
     let tmp = TempDir::new("lr-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 16);
+        assert_eq!(repo.schema_version().expect("version read"), 17);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            16,
+            17,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -97,7 +97,7 @@ fn t03_ordinary_open_of_version_1_database_fails() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 1,
-                supported: 16
+                supported: 17
             }
         ),
         "unexpected error: {error}"
@@ -582,6 +582,14 @@ fn project_role_list_validation_and_scoped_decode_failures() {
     let healthy = minimal_role("a-healthy", LogicalRoleType::RuntimeA1);
     repo.create_logical_role(healthy.clone()).unwrap();
     repo.create_logical_role(minimal_role("z-corrupt", LogicalRoleType::RuntimeA2))
+        .unwrap();
+    // Simulate out-of-band file tampering: v17 triggers refuse these raw
+    // updates, so the tamperer removes them first.
+    repo.connection()
+        .execute_batch(
+            "DROP TRIGGER logical_role_identity_immutable;
+             DROP TRIGGER logical_role_pointer_requires_history;",
+        )
         .unwrap();
     for (column, value) in [
         ("role_type", "RUNTIME_A3"),

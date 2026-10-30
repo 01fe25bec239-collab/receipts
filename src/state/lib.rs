@@ -16,10 +16,12 @@
 //! or model-facing mutation path.
 
 pub mod attempt;
+pub mod authority;
 pub mod canonical_timestamp;
 pub mod context_epoch;
 pub mod context_manifest;
 pub mod context_rehydration;
+pub mod decision_records;
 pub mod entitlement;
 pub mod epoch_value;
 pub mod error;
@@ -35,14 +37,19 @@ mod json_integer;
 #[cfg(test)]
 mod json_integer_tests;
 pub mod logical_role;
+pub mod logical_role_lifecycle;
 pub mod repository;
 pub mod startup_recovery;
 pub mod trusted_time;
+pub mod wire;
 
 mod migrations;
 
 #[cfg(test)]
 mod attempt_tests;
+
+#[cfg(test)]
+mod authority_tests;
 
 #[cfg(test)]
 mod context_epoch_advance_tests;
@@ -63,10 +70,16 @@ mod context_manifest_tests;
 mod context_rehydration_tests;
 
 #[cfg(test)]
+mod decision_records_tests;
+
+#[cfg(test)]
 mod event_query_tests;
 
 #[cfg(test)]
 mod event_tests;
+
+#[cfg(test)]
+mod event_time_query_tests;
 
 #[cfg(test)]
 mod graph_repository_tests;
@@ -93,6 +106,9 @@ mod executor_binding_single_active_tests;
 mod executor_binding_tests;
 
 #[cfg(test)]
+mod logical_role_lifecycle_tests;
+
+#[cfg(test)]
 mod logical_role_tests;
 
 #[cfg(test)]
@@ -105,6 +121,9 @@ mod trusted_time_watermark_tests;
 mod tests;
 
 pub use attempt::{AttemptFinish, AttemptId, AttemptRecord, AttemptRole, AttemptStart};
+pub use authority::{
+    StatePublisherV1, StateReader, authoritative_event_publisher, context_epoch_advance_publisher,
+};
 pub use canonical_timestamp::CanonicalTimestampV1;
 pub use context_epoch::{
     ChangedSource, ChangedSourceRefType, ChangedSources, ContextEpoch, ContextEpochTrigger,
@@ -122,13 +141,18 @@ pub use context_rehydration::{
     SourceDigestComparison, SourceDisposition, SourceMaterializationFailure, StateQueryRefV1,
     context_rehydration_event_payload, context_source_digest_v1,
 };
+pub use decision_records::{
+    DecisionRecordKind, DecisionRecordV1, ProvenanceChainV1, ProvenanceContradictionV1,
+    ProvenanceLinkKind,
+};
 pub use epoch_value::StateEpochValueV1;
 pub use error::{
-    AttemptFailureCode, AttemptField, GraphFailureCode, GraphField, GraphPhase, StateError,
+    AttemptFailureCode, AttemptField, GraphFailureCode, GraphField, GraphPhase, RecordFailureCode,
+    StateError,
 };
 pub use event::{
     ActorKind, EventActor, EventEnvelope, EventPayloadReference, EventQuery, EventSubject,
-    EventType, SubjectKind,
+    EventTimeQueryV1, EventType, SubjectKind,
 };
 pub use executor_binding::{ExecutorBinding, ReleaseReason};
 pub use executor_binding_lease_expiry::{
@@ -141,6 +165,9 @@ pub use graph_repository::{
     StateGraphGenesisV1, StateGraphNodeV1,
 };
 pub use logical_role::{LogicalRole, LogicalRoleStatus, LogicalRoleType};
+pub use logical_role_lifecycle::{
+    LogicalRoleHistoryEntryV1, RoleChangeEvidenceV1, RoleChangeKind, RoleChangeRefusal,
+};
 pub use repository::SqliteStateRepository;
 pub use startup_recovery::{
     DurableBindingState, StartupDurableInconsistency, StartupReconciliationRequirement,

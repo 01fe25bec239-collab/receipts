@@ -1037,7 +1037,7 @@ impl ReadOnlyGraphReader {
         if head.is_some_and(|version| version < 0) {
             return Err(corrupt());
         }
-        if head != Some(16) {
+        if head != Some(17) {
             return Err(failure(Phase::Read, Code::UnsupportedSchema, None));
         }
         verify_current(&self.conn, Phase::Read)
@@ -1514,9 +1514,23 @@ pub(crate) fn verify_v15(conn: &Connection, phase: Phase) -> Result<(), StateErr
     }
     Ok(())
 }
+/// Exact v16 postcondition, also required before applying migration 17.
+pub(crate) fn verify_v16(conn: &Connection, phase: Phase) -> Result<(), StateError> {
+    verify_ledger(conn, 16, phase)?;
+    verify_v16_objects(conn, phase)
+}
 /// Current stores retain all earlier checks and verify the new immutable definitions.
 pub(crate) fn verify_current(conn: &Connection, phase: Phase) -> Result<(), StateError> {
-    verify_ledger(conn, 16, phase)?;
+    verify_ledger(conn, 17, phase)?;
+    verify_v16_objects(conn, phase)?;
+    if !migrations::v0017_decision_records::schema_matches(conn)
+        .map_err(|e| schema_error(phase, e))?
+    {
+        return Err(failure(phase, Code::CorruptStore, None));
+    }
+    Ok(())
+}
+fn verify_v16_objects(conn: &Connection, phase: Phase) -> Result<(), StateError> {
     verify_schema(conn, phase, true)?;
     if !crate::attempt::schema_matches(conn).map_err(|e| schema_error(phase, e))?
         || !crate::graph_history::schema_matches(conn).map_err(|e| schema_error(phase, e))?

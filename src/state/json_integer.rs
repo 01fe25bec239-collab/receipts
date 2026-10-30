@@ -40,3 +40,30 @@ pub(crate) fn is_integer(value: &RawValue) -> bool {
         order != Ordering::Less
     }
 }
+
+/// Coefficient of a number token (before any exponent).
+fn coefficient(value: &RawValue) -> &str {
+    value.get().split(['e', 'E']).next().unwrap_or("")
+}
+
+/// True when a number token's exact value is zero (`-0`, `0.0e9`, ...).
+pub(crate) fn is_zero(value: &RawValue) -> bool {
+    !coefficient(value)
+        .bytes()
+        .any(|b| (b'1'..=b'9').contains(&b))
+}
+
+/// True when a number token's exact value is strictly negative.
+pub(crate) fn is_negative(value: &RawValue) -> bool {
+    value.get().starts_with('-') && !is_zero(value)
+}
+
+/// The token itself when it is already canonical non-negative decimal
+/// (`0` or digits without a leading zero); other integral spellings such
+/// as `1.0`, `1e2` or `-0` have no direct operational spelling.
+pub(crate) fn canonical_decimal(value: &RawValue) -> Option<&str> {
+    let text = value.get();
+    let b = text.as_bytes();
+    (!b.is_empty() && b.iter().all(u8::is_ascii_digit) && (b[0] != b'0' || b.len() == 1))
+        .then_some(text)
+}
