@@ -24,5 +24,9 @@ pub mod goal;
 
 pub mod orchestration;
 
+pub mod dag;
+
+pub mod wire;
+
 #[cfg(test)]
 mod facade_tests;

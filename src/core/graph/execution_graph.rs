@@ -283,6 +283,12 @@ impl ExecutionGraph {
         adjacency
     }
 
+    /// Replaces an existing node in place (same id); interpreter-only.
+    pub(crate) fn replace_node(&mut self, node: GraphNode) {
+        debug_assert!(self.nodes.contains_key(node.node_id()));
+        self.nodes.insert(node.node_id().to_owned(), node);
+    }
+
     /// Looks up a node by id.
     pub fn node(&self, node_id: &str) -> Option<&GraphNode> {
         self.nodes.get(node_id)
@@ -579,15 +585,32 @@ impl ExecutionGraphEnvelope {
                 .add_edge(edge.clone())
                 .map_err(GraphAppendError::Graph)?;
         }
-        let digest = graph_content_digest_v1(&candidate.graph).map_err(GraphAppendError::Digest)?;
+        self.successor(candidate.graph, mutation_time, expected_digest)
+            .map_err(|error| match error {
+                Some(error) => GraphAppendError::Digest(error),
+                None => GraphAppendError::ExpectedDigestMismatch,
+            })
+    }
+
+    /// Binds `graph` as the next version: computes the v1 child digest once,
+    /// compares an expected digest (`Err(None)` on mismatch), and carries all
+    /// other metadata forward. Shared by typed append and apply-v1.
+    pub(crate) fn successor(
+        &self,
+        graph: ExecutionGraph,
+        mutation_time: OrchestrationDateTimeV1,
+        expected_digest: Option<&str>,
+    ) -> Result<Self, Option<GraphContentDigestError>> {
+        let digest = graph_content_digest_v1(&graph).map_err(Some)?;
         if expected_digest.is_some_and(|expected| expected != digest) {
-            return Err(GraphAppendError::ExpectedDigestMismatch);
+            return Err(None);
         }
-        candidate.fields.graph_version = successor;
-        candidate.fields.parent_version = Some(Some(self.graph_version().clone()));
-        candidate.fields.created_at = mutation_time;
-        candidate.fields.resulting_digest = Some(digest);
-        Ok(candidate)
+        let mut fields = self.fields.clone();
+        fields.graph_version = self.graph_version().successor();
+        fields.parent_version = Some(Some(self.graph_version().clone()));
+        fields.created_at = mutation_time;
+        fields.resulting_digest = Some(digest);
+        Ok(Self { graph, fields })
     }
 
     /// Validates `fields` against a non-empty `graph` and returns the envelope
