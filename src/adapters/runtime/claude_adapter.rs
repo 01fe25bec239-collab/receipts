@@ -2,7 +2,9 @@
 //! Plan mode is reduced isolation, not filesystem or network confinement.
 use crate::*;
 use receipts_runtime_bindings::RuntimeCapsuleFamily;
-use receipts_workspace_execution::execution::{ChildEnvPolicy, MAX_STDIN_BYTES};
+use receipts_workspace_execution::execution::{
+    ChildEnvPolicy, LiveProcessCancelAcceptance, MAX_STDIN_BYTES,
+};
 use receipts_workspace_execution::{WorkspaceHandle, WorkspaceState};
 use std::{
     fmt::{self, Write},
@@ -47,6 +49,8 @@ pub struct ClaudeAttemptHandle {
     pub(crate) completed: Arc<AtomicU8>,
     result: Mutex<Option<mpsc::Receiver<Result<ClaudeLiveOutcome, RawFailure>>>>,
     collector: Mutex<Option<JoinHandle<()>>>,
+    // Held across Workspace's cancel claim, so collection reads the accepted reason.
+    cancel: Mutex<Option<CancelReason>>,
 }
 impl Drop for ClaudeAttemptHandle {
     fn drop(&mut self) {
@@ -66,6 +70,7 @@ impl Drop for ClaudeAttemptHandle {
 pub struct ClaudeAttemptResult {
     pub outcome: ClaudeLiveOutcome,
     pub reduced_isolation: bool,
+    cancel: Option<CancelReason>,
 }
 impl ClaudeAttemptResult {
     pub fn provider_result(&self) -> ClaudeProviderResult {
@@ -75,8 +80,12 @@ impl ClaudeAttemptResult {
             .and_then(|p| p.result().ok().map(|r| r.provider_result()))
             .unwrap_or(ClaudeProviderResult::Unknown)
     }
+    /// Accepted caller cancellation reason, if this attempt was cancelled by one.
+    pub fn cancel_reason(&self) -> Option<CancelReason> {
+        self.cancel
+    }
     pub fn failure(&self) -> Option<FailureClass> {
-        classify_claude_live_outcome(&self.outcome).or_else(|| {
+        classify_live_outcome(self.outcome.process(), self.cancel).or_else(|| {
             (self.provider_result() != ClaudeProviderResult::Success)
                 .then_some(FailureClass::Unknown)
         })
@@ -256,6 +265,7 @@ impl RuntimeAdapter for ClaudeAdapter {
             completed,
             result: Mutex::new(Some(receiver)),
             collector: Mutex::new(Some(worker)),
+            cancel: Mutex::new(None),
         })
     }
     fn stream_events<'a>(&'a self, handle: &'a ClaudeAttemptHandle) -> ClaudeEventStream<'a> {
@@ -280,12 +290,22 @@ impl RuntimeAdapter for ClaudeAdapter {
         Ok(ClaudeAttemptResult {
             outcome: result.map_err(|e| e.classify_failure())?,
             reduced_isolation: true,
+            cancel: *handle.cancel.lock().unwrap_or_else(|e| e.into_inner()),
         })
     }
-    fn cancel(&self, handle: &ClaudeAttemptHandle, _: &CancelReason) {
-        handle.attempt.cancel();
+    fn cancel(&self, handle: &ClaudeAttemptHandle, reason: &CancelReason) {
+        let mut accepted = handle.cancel.lock().unwrap_or_else(|e| e.into_inner());
+        if handle.attempt.cancel() == LiveProcessCancelAcceptance::CancelAccepted {
+            *accepted = Some(*reason);
+        }
     }
     fn classify_failure(&self, error: &RawFailure) -> FailureClass {
         error.classify_failure()
+    }
+}
+
+impl registry::AttemptFailure for ClaudeAttemptResult {
+    fn failure(&self) -> Option<FailureClass> {
+        ClaudeAttemptResult::failure(self)
     }
 }

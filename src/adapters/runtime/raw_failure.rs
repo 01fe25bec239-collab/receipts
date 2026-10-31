@@ -19,7 +19,8 @@ use crate::{
 };
 
 /// Runtime origin of one error observation, not a lifecycle cause or policy decision.
-/// Fixed-size tags carry no payload and grant no authority.
+/// Fixed-size tags grant no authority. `Runtime` carries a caller-chosen
+/// identifier that ordinary formatting redacts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RawFailureSource {
     ClaudeTask,
@@ -39,6 +40,63 @@ pub enum RawFailureSource {
     WorkspaceExecution,
     /// Fail-closed Codex protocol interpretation.
     CodexLiveProtocol,
+    /// Open origin for any other runtime; the legacy tags above stay unchanged.
+    Runtime(RuntimeFailureOrigin),
+}
+
+/// Nonempty exact runtime identifier for open failure origins. `'static` keeps
+/// `RawFailure` fixed-size and Copy. The text is caller-chosen and may be
+/// sensitive: Debug (also pretty and nested in `RawFailure`) and `RawFailure`
+/// Display redact it; only `as_str` returns it.
+// ponytail: static ids only; a runtime loaded by name at run time needs an interner.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RuntimeId(&'static str);
+
+impl fmt::Debug for RuntimeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RuntimeId([redacted])")
+    }
+}
+
+impl RuntimeId {
+    /// Refuses only the empty string; no trimming, normalization or catalog.
+    pub fn new(id: &'static str) -> Result<Self, RuntimeIdError> {
+        if id.is_empty() {
+            return Err(RuntimeIdError);
+        }
+        Ok(Self(id))
+    }
+    pub fn as_str(&self) -> &'static str {
+        self.0
+    }
+}
+
+/// Payload-free refusal of an empty runtime identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeIdError;
+impl fmt::Display for RuntimeIdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("runtime identifier must not be empty")
+    }
+}
+impl Error for RuntimeIdError {}
+
+/// Vendor-neutral lifecycle stage at which a Workspace-backed attempt failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureChannel {
+    /// Workspace live start, including terminal-before-ready evidence.
+    Start,
+    /// Bounded live output observation.
+    Events,
+    /// Single Workspace collection.
+    Collect,
+}
+
+/// Runtime-keyed origin; grants no authority. The identifier is redacted when formatted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeFailureOrigin {
+    pub runtime_id: RuntimeId,
+    pub channel: FailureChannel,
 }
 
 /// Fixed-size typed evidence retained by Runtime for classification and inspection.
@@ -83,7 +141,8 @@ pub enum RawFailureEvidence {
 
 /// One immutable, allocation-free Runtime failure projection for future trait binding.
 /// Constructors accept only existing typed errors. Original strings, output, paths,
-/// credentials and error chains are neither retained nor formatted. Evidence and the
+/// credentials and error chains are neither retained nor formatted; an open
+/// origin retains its caller-chosen runtime identifier but never formats it. Evidence and the
 /// existing conservative FailureClass are independent. Startup terminal errors
 /// retain only scalar evidence; output and provider events never supply classifications.
 /// No admission, routing, credential acquisition or recovery action is implemented.
@@ -122,6 +181,31 @@ impl RawFailure {
             probe: None,
             class: FailureClass::Unknown,
         }
+    }
+
+    fn keyed(mut self, runtime_id: RuntimeId, channel: FailureChannel) -> Self {
+        self.source = RawFailureSource::Runtime(RuntimeFailureOrigin {
+            runtime_id,
+            channel,
+        });
+        self
+    }
+
+    /// Any runtime's Workspace live-start failure. Classification is the same
+    /// typed projection as the legacy tags: only terminal TimedOut is Timeout.
+    pub fn live_start(runtime_id: RuntimeId, error: &LiveProcessStartError) -> Self {
+        Self::from(error).keyed(runtime_id, FailureChannel::Start)
+    }
+
+    /// Any runtime's Workspace output-snapshot failure; always Unknown.
+    pub fn live_snapshot(runtime_id: RuntimeId, error: &ExecutionError) -> Self {
+        Self::from(error).keyed(runtime_id, FailureChannel::Events)
+    }
+
+    /// Any runtime's Workspace collection failure; controller failure is never
+    /// RuntimeCrash and collection errors stay Unknown.
+    pub fn live_collect(runtime_id: RuntimeId, error: &LiveProcessAttemptError) -> Self {
+        Self::from(error).keyed(runtime_id, FailureChannel::Collect)
     }
 }
 

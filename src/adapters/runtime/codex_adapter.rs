@@ -2,7 +2,9 @@
 //! Sandbox flags are requests, not proof of filesystem or network confinement.
 use crate::*;
 use receipts_runtime_bindings::RuntimeCapsuleFamily;
-use receipts_workspace_execution::execution::{ChildEnvPolicy, MAX_STDIN_BYTES};
+use receipts_workspace_execution::execution::{
+    ChildEnvPolicy, LiveProcessCancelAcceptance, MAX_STDIN_BYTES,
+};
 use receipts_workspace_execution::{WorkspaceHandle, WorkspaceState};
 use std::{
     fmt::{self, Write},
@@ -38,6 +40,8 @@ pub struct CodexAttemptHandle {
     pub(crate) completed: Arc<AtomicU8>,
     result: Mutex<Option<mpsc::Receiver<Result<CodexLiveOutcome, RawFailure>>>>,
     collector: Mutex<Option<JoinHandle<()>>>,
+    // Held across Workspace's cancel claim, so collection reads the accepted reason.
+    cancel: Mutex<Option<CancelReason>>,
 }
 impl Drop for CodexAttemptHandle {
     fn drop(&mut self) {
@@ -56,6 +60,7 @@ impl Drop for CodexAttemptHandle {
 /// through `outcome.protocol()` and does not establish Receipts acceptance.
 pub struct CodexAttemptResult {
     pub outcome: CodexLiveOutcome,
+    cancel: Option<CancelReason>,
 }
 impl CodexAttemptResult {
     /// Protocol evidence only; never Receipts acceptance.
@@ -65,12 +70,17 @@ impl CodexAttemptResult {
             .map(|p| p.termination())
             .unwrap_or(CodexProtocolTermination::Indeterminate)
     }
+    /// Accepted caller cancellation reason, if this attempt was cancelled by one.
+    pub fn cancel_reason(&self) -> Option<CancelReason> {
+        self.cancel
+    }
     pub fn failure(&self) -> Option<FailureClass> {
         use receipts_workspace_execution::execution::LiveProcessTerminalCause;
         let process = self.outcome.process();
         match process.terminal_cause() {
-            LiveProcessTerminalCause::TimedOut => Some(FailureClass::Timeout),
-            LiveProcessTerminalCause::Cancelled => Some(FailureClass::Unknown),
+            LiveProcessTerminalCause::TimedOut | LiveProcessTerminalCause::Cancelled => {
+                classify_live_outcome(process, self.cancel)
+            }
             LiveProcessTerminalCause::Completed => (process.exit_code() != Some(0)
                 || process.stderr().truncated()
                 || self
@@ -257,6 +267,7 @@ impl RuntimeAdapter for CodexAdapter {
             completed,
             result: Mutex::new(Some(receiver)),
             collector: Mutex::new(Some(worker)),
+            cancel: Mutex::new(None),
         })
     }
     fn stream_events<'a>(&'a self, handle: &'a CodexAttemptHandle) -> CodexEventStream<'a> {
@@ -280,12 +291,22 @@ impl RuntimeAdapter for CodexAdapter {
         }
         Ok(CodexAttemptResult {
             outcome: result.map_err(|e| e.classify_failure())?,
+            cancel: *handle.cancel.lock().unwrap_or_else(|e| e.into_inner()),
         })
     }
-    fn cancel(&self, handle: &CodexAttemptHandle, _: &CancelReason) {
-        handle.attempt.cancel();
+    fn cancel(&self, handle: &CodexAttemptHandle, reason: &CancelReason) {
+        let mut accepted = handle.cancel.lock().unwrap_or_else(|e| e.into_inner());
+        if handle.attempt.cancel() == LiveProcessCancelAcceptance::CancelAccepted {
+            *accepted = Some(*reason);
+        }
     }
     fn classify_failure(&self, error: &RawFailure) -> FailureClass {
         error.classify_failure()
+    }
+}
+
+impl registry::AttemptFailure for CodexAttemptResult {
+    fn failure(&self) -> Option<FailureClass> {
+        CodexAttemptResult::failure(self)
     }
 }
