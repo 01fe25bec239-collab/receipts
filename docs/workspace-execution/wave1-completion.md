@@ -160,7 +160,10 @@ filter marker never appears; commit, checkpoint handle, custody release, dirty
 non-force teardown refusal and clean teardown with the task commit retained.
 `run.sh` records `test_status` and `cleanup_status` separately; PASS/exit 0
 requires both 0 (cgroup kill, emptiness, removal, no fixture-identity process,
-no fixture directory). `run.sh self-check` is the unprivileged control for that
+no fixture directory).
+Cleanup enumeration accepts regular `cgroup.*`/controller interface files of the
+delegated cgroup as kernel control files; any link (never followed), unexpected
+name, non-`receipts-*` directory or non-directory child is reported unowned. `run.sh self-check` is the unprivileged control for that
 verdict logic only.
 
 ## Proof status

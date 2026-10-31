@@ -61,6 +61,18 @@ log_cleanup() {
   echo "CLEANUP $*" >>"$out/diagnostic.log"
 }
 
+# True for a regular file whose name is a cgroup-v2 interface file of the
+# delegated cgroup (`cgroup.*` plus the controller prefixes). Directories,
+# links and any other name are never control files, so an unexpected child
+# cgroup or stray file is still reported as unowned.
+cgroup_control_file() {
+  [ -f "$1" ] && [ ! -L "$1" ] || return 1
+  case "${1##*/}" in
+    cgroup.* | cpu.* | cpuset.* | hugetlb.* | io.* | irq.* | memory.* | misc.* | pids.* | rdma.*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Owned cleanup with verification. Returns 0 only when this diagnostic's own
 # cgroup tree is killed, proven unpopulated and removed, no fixture identity
 # process remains and no fixture temp directory is retained. Every failure is
@@ -69,7 +81,17 @@ cleanup_owned() {
   local failed=0 entry empty
   if [ -e "$cgroup" ]; then
     for entry in "$cgroup"/*; do
-      [ -e "$entry" ] || continue # unmatched glob: no children
+      # Unmatched glob: no entries. A dangling symlink still counts as an entry.
+      [ -e "$entry" ] || [ -L "$entry" ] || continue
+      # Never follow or act through a link.
+      if [ -L "$entry" ]; then
+        log_cleanup "UNSAFE_LINK $entry"
+        failed=1
+        continue
+      fi
+      if cgroup_control_file "$entry"; then
+        continue # kernel control pseudo-file of the delegated cgroup, not a child
+      fi
       case "$entry" in
         "$cgroup"/receipts-*) ;;
         *)
@@ -206,6 +228,12 @@ self_check() {
     cgroup="$work/$name-cgroup"
     mkdir -p "$out" "$cgroup"
     : >"$out/diagnostic.log"
+    # A real cgroup-v2 directory always carries kernel control pseudo-files.
+    for control in cgroup.controllers cgroup.events cgroup.freeze cgroup.kill \
+      cgroup.max.depth cgroup.procs cgroup.stat cgroup.type cpu.stat memory.current \
+      memory.events pids.current io.stat; do
+      : >"$cgroup/$control"
+    done
     "$setup"
     test_status="$status"
     cleanup_status=unknown
@@ -235,6 +263,22 @@ self_check() {
     remove_cgroup_dir() { return 1; }
   }
   restore_remove() { remove_cgroup_dir() { rm -rf "$1"; }; }
+  setup_stranger_file() { leaf empty; : >"$cgroup/stranger.txt"; }
+  setup_unknown_control_prefix() { leaf empty; : >"$cgroup/cgroupish"; }
+  setup_symlinked_control() {
+    leaf empty
+    rm "$cgroup/cgroup.procs"
+    ln -s /nonexistent-target "$cgroup/cgroup.procs"
+  }
+  setup_symlinked_child() {
+    leaf empty
+    mkdir "$work/link-target"
+    : >"$work/link-target/cgroup.kill"
+    echo "populated 0" >"$work/link-target/cgroup.events"
+    ln -s "$work/link-target" "$cgroup/receipts-link"
+  }
+  setup_dangling_child_link() { leaf empty; ln -s /nonexistent-target "$cgroup/receipts-dangling"; }
+  setup_child_is_file() { leaf empty; : >"$cgroup/receipts-file"; }
   setup_process_remains() {
     leaf empty
     fixture_uid_in_use() { return 0; }
@@ -249,6 +293,13 @@ self_check() {
   scenario rmdir_fails 0 FAIL 1 setup_rmdir_fails
   restore_remove
   scenario both_fail 7 FAIL 1 setup_kill_fails
+  scenario stranger_file 0 FAIL 1 setup_stranger_file
+  scenario unknown_control_prefix 0 FAIL 1 setup_unknown_control_prefix
+  scenario symlinked_control 0 FAIL 1 setup_symlinked_control
+  scenario symlinked_child 0 FAIL 1 setup_symlinked_child
+  [ ! -s "$work/link-target/cgroup.kill" ] || { echo "SELF-CHECK FAILED: wrote through a symlink"; exit 1; }
+  scenario dangling_child_link 0 FAIL 1 setup_dangling_child_link
+  scenario child_is_file 0 FAIL 1 setup_child_is_file
   scenario process_remains 0 FAIL 1 setup_process_remains
   restore_uid
   scenario aborted_before_tests unknown FAIL 0 setup_clean
