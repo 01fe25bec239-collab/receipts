@@ -45,7 +45,7 @@ fn schema(kind: K) -> serde_json::Value {
     serde_json::from_str(text).unwrap()
 }
 
-fn oracle(kind: K, json: &str) -> bool {
+pub(crate) fn oracle(kind: K, json: &str) -> bool {
     let validator = jsonschema::validator_for(&schema(kind)).unwrap();
     validator.is_valid(&serde_json::from_str(json).unwrap())
 }

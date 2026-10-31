@@ -1,10 +1,16 @@
-//! v17: immutable decision/provenance records and append-only role history.
+//! v17: immutable decision/provenance records, append-only role history and
+//! immutable event rows.
 //!
 //! Decision records keep the exact supplied schema-shaped JSON bytes plus
 //! their SHA-256 and extracted identity metadata. Provenance links are filled
 //! one immutable row per link kind. Role pointer columns stay operational
 //! state, but every pointer update must be paired with a fresh history row in
 //! the same transaction; role identity columns and rows are immutable.
+//! Event rows are immutable too: UPDATE, DELETE and any replacing INSERT
+//! (`OR REPLACE`, `REPLACE`, upsert, `OR IGNORE` on an existing id) abort;
+//! a plain INSERT of a new `event_id` is the only way a row appears. These are
+//! direct-SQL backstops, not a defence against a caller who can drop schema
+//! objects; `schema_matches` detects a missing or altered guard on open.
 //! Statements are separated by `;\n`; trigger bodies must not contain `;\n`.
 use super::Migration;
 
@@ -66,6 +72,9 @@ CREATE TRIGGER logical_role_identity_immutable BEFORE UPDATE OF role_id,project_
 CREATE TRIGGER logical_role_pointer_requires_history BEFORE UPDATE OF status,active_binding_id,current_context_epoch,context_manifest_id ON logical_role WHEN NOT EXISTS (SELECT 1 FROM logical_role_history h WHERE h.role_id=OLD.role_id AND h.sequence=(SELECT MAX(sequence) FROM logical_role_history WHERE role_id=OLD.role_id) AND h.from_status=OLD.status AND h.to_status=NEW.status AND h.from_binding_id IS OLD.active_binding_id AND h.to_binding_id IS NEW.active_binding_id AND h.from_epoch=OLD.current_context_epoch AND h.to_epoch=NEW.current_context_epoch AND h.from_manifest_id IS OLD.context_manifest_id AND h.to_manifest_id IS NEW.context_manifest_id) BEGIN SELECT RAISE(ABORT,'role pointer change requires matching history'); END;
 CREATE TRIGGER logical_role_ownership_path_no_update BEFORE UPDATE ON logical_role_ownership_path BEGIN SELECT RAISE(ABORT,'immutable role ownership'); END;
 CREATE TRIGGER logical_role_ownership_path_no_delete BEFORE DELETE ON logical_role_ownership_path BEGIN SELECT RAISE(ABORT,'immutable role ownership'); END;
+CREATE TRIGGER event_no_update BEFORE UPDATE ON event BEGIN SELECT RAISE(ABORT,'immutable event'); END;
+CREATE TRIGGER event_no_delete BEFORE DELETE ON event BEGIN SELECT RAISE(ABORT,'immutable event'); END;
+CREATE TRIGGER event_no_replace BEFORE INSERT ON event WHEN EXISTS (SELECT 1 FROM event WHERE event_id=NEW.event_id) BEGIN SELECT RAISE(ABORT,'duplicate event'); END;
 INSERT INTO state_schema_version(version,migration_name) VALUES (17,'decision_records');
 "#;
 
@@ -95,7 +104,7 @@ pub(crate) fn schema_matches(conn: &rusqlite::Connection) -> Result<bool, rusqli
         }
     }
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND tbl_name IN ('decision_records','provenance_links','logical_role_history','logical_role','logical_role_ownership_path')",
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND tbl_name IN ('decision_records','provenance_links','logical_role_history','logical_role','logical_role_ownership_path','event')",
         [],
         |r| r.get(0),
     )?;

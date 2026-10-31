@@ -67,3 +67,49 @@ pub(crate) fn canonical_decimal(value: &RawValue) -> Option<&str> {
     (!b.is_empty() && b.iter().all(u8::is_ascii_digit) && (b[0] != b'0' || b.len() == 1))
         .then_some(text)
 }
+
+/// True when a number token's exact value is strictly greater than one.
+///
+/// Writes the value as `0.d1d2…dn × 10^k` (leading and trailing zeros
+/// removed) and decides from `k` and the digits alone: no `f64`, no ceiling.
+/// Exponents beyond `i128` saturate, which preserves their sign and is far
+/// larger than any digit count a token can carry.
+pub(crate) fn exceeds_one(value: &RawValue) -> bool {
+    let text = value.get();
+    if text.starts_with('-') {
+        return false;
+    }
+    let (coefficient, exponent) = text.split_once(['e', 'E']).unwrap_or((text, "0"));
+    let fractional = coefficient.split_once('.').map_or(0, |(_, f)| f.len());
+    let digits: String = coefficient.chars().filter(char::is_ascii_digit).collect();
+    let digits = digits.trim_start_matches('0').trim_end_matches('0');
+    if digits.is_empty() {
+        return false;
+    }
+    let exponent_negative = exponent.starts_with('-');
+    let magnitude = exponent
+        .trim_start_matches(['+', '-'])
+        .trim_start_matches('0');
+    let magnitude: i128 = if magnitude.len() > 30 {
+        i128::MAX / 4
+    } else {
+        magnitude.parse().unwrap_or(0)
+    };
+    let exponent = if exponent_negative {
+        -magnitude
+    } else {
+        magnitude
+    };
+    // Trailing zeros were dropped from `digits`, so recount against the
+    // original fractional length: value = digits × 10^(exponent − fractional
+    // + removed trailing zeros), and the magnitude exponent is k.
+    let all: String = coefficient.chars().filter(char::is_ascii_digit).collect();
+    let significant = all.trim_start_matches('0');
+    let trailing = i128::try_from(significant.len() - digits.len()).unwrap_or(0);
+    let k = i128::try_from(digits.len()).unwrap_or(0) + trailing - fractional as i128 + exponent;
+    match k {
+        ..=0 => false,
+        1 => digits != "1",
+        _ => true,
+    }
+}

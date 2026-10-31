@@ -4,7 +4,7 @@ State stores what other owners define. It never routes, reviews, runs failover o
 
 ## Schema version 17
 
-Migration 17 (`decision_records`) adds three tables. Migrations 1–16 are unchanged.
+Migration 17 (`decision_records`) adds three tables and immutable-event triggers. Migrations 1–16 are unchanged.
 
 | Table | What it holds | Immutability |
 | --- | --- | --- |
@@ -12,8 +12,9 @@ Migration 17 (`decision_records`) adds three tables. Migrations 1–16 are uncha
 | `provenance_links` | One row per task and link kind: START, IMPLEMENTATION and REVIEW SHAs, the VERDICT and ACCEPTANCE references, and the WORKSTREAM and MAIN SHAs | No update, delete or replace |
 | `logical_role_history` | A before/after snapshot of a role's status, binding pointer, epoch and manifest pointer for every change | No update or delete. Rows must start from the role's current row and use the next sequence number. |
 
-Version 17 also adds triggers on existing role tables:
+Version 17 also adds triggers on existing tables:
 
+- `event` rows cannot be updated or deleted, and an INSERT that names an existing `event_id` aborts however it is spelled (`OR REPLACE`, `REPLACE`, upsert, `OR IGNORE`). A plain INSERT of a new id is the only way a row appears, so append, find and list behave as before. These are direct-SQL backstops, not a defence against a caller who can drop schema objects: open, `StateReader` and explicit migration compare every stored definition with the migration text and refuse a missing, altered or extra trigger on `event` as corruption.
 - A role's identity columns and ownership paths cannot be updated or deleted.
 - Role rows cannot be deleted.
 - An update to a pointer column is refused unless a fresh matching history row exists.
@@ -26,14 +27,15 @@ Upgrades:
 
 ## Decision and provenance records
 
-`DecisionRecordV1::parse` checks the owner-frozen top level of each schema:
+`DecisionRecordV1::parse` validates the whole owner-frozen schema shape of all eight families (`RoutingDecision`, `ModelCapability`, `ModelObservation`, `AvailabilityState`, `ReviewRequest`, `A4Review`, `IntegrationRequest`, `IntegrationDecision`). The shape tables live in `decision_schema.rs`. At every nested level:
 
-- an object with no duplicate decoded keys at any depth;
-- no unknown property;
-- every required property present;
-- each property's type, enum, identifier length, SHA pattern, integer minimum or `minItems`.
+- no duplicate decoded keys at any depth;
+- no unknown property and every required property present (selection reason, score components, capability evidence and its source reference, alternatives, registry freshness, acceptance criteria, review policy, references, reviewer, findings, dimensions, reproduction checks, included tasks, attestations, check results, provenance entries);
+- each property's type, enum, identifier length (1–200), strict 40-hex SHA where the schema has the pattern, `minItems`, and exact integer and range rules.
 
-Nested contents beyond duplicate keys are the producing owner's codec obligation. Numbers stay raw tokens.
+Open fields stay open: `ModelCapability.value` and `capability_evidence[].value` accept any JSON. Numbers stay raw tokens and are never converted through `f64`: `1.0`, `1e3` and `-0` are integers, huge integers and exponents are admitted, and `expected_rejection_probability` is compared with 0 and 1 exactly. `date-time` is an annotation, so those fields accept any string. Plain-string SHA-like fields (`merge_commit`, `acceptance_sha`, `integration_sha`) are not pattern-checked because the schemas do not say so. Stored records are re-admitted on every read, so damaged nested content fails closed even when the stored digest was recomputed. The `jsonschema` crate is a test-only oracle; the validators are small `serde`/`RawValue` tables with no new dependency.
+
+State stores registry and lifecycle observations as supplied. Lifecycle eligibility and transition policy belong to Model Routing; a stored row is never routing or dispatch authority.
 
 `provenance_chain(project, task)` returns:
 
@@ -43,9 +45,11 @@ Nested contents beyond duplicate keys are the producing owner's codec obligation
   - REVIEW_SHA differs from IMPLEMENTATION_SHA;
   - a verdict or acceptance reference is dangling;
   - the referenced review is for another task, or its reviewed SHA differs;
-  - the integration decision's provenance entry or `integration_sha` disagrees with a link.
+  - the referenced integration decision's outcome is not `ACCEPT`;
+  - that decision has no provenance entry for the task (absent or foreign-only), or more than one (ambiguous, even if identical);
+  - its one entry for the task disagrees with a recorded START, IMPLEMENTATION or REVIEW link, or its `integration_sha` disagrees with MAIN_SHA.
 
-A complete and consistent chain is evidence for a gate to evaluate. It is not acceptance.
+Empty provenance and nonaccept outcomes are valid stored documents; they are reported as contradictions, not rejected on append. Unrecorded links are never inferred. A complete and consistent chain is evidence for a gate to evaluate. It is not acceptance and authenticates no issuer.
 
 ## Role lifecycle
 
@@ -79,7 +83,9 @@ Public renewal makes its whole decision in one serialized transaction and commit
 - trusted now is before the current deadline;
 - the new deadline is strictly later.
 
-Every refusal leaves the watermark and the binding unchanged. An unsupported stored deadline is refused and never rewritten. Explicit expiry keeps its own existing fence.
+Every refusal leaves the watermark and the binding unchanged, including a refusal at a later still-eligible sample. An unsupported stored deadline is refused and never rewritten. Explicit expiry keeps its own existing fence. The independently fenced helper that used to back renewal is `cfg(test)` only and has no production caller.
+
+Two writers on one store serialise on SQLite's write lock. Racing renewals to the same later deadline commit exactly one renewal; the other gets `ExecutorLeaseRenewalRefused`. Renewals to different later deadlines can both succeed in order. Role status, binding and context changes race the same way: one commit and one `StaleExpectation`. A held lock gives a diagnosed `TransactionBeginFailed` with no partial write. Tests: `two_writer_tests.rs`.
 
 ## Local authority
 

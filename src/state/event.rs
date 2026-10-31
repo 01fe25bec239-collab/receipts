@@ -29,8 +29,10 @@
 //!   behind an incomplete caller secret list).
 //!
 //! Events are immutable durable evidence: this module offers append and
-//! read-by-`event_id` only. There is no update, delete, replace, upsert,
-//! merge, rewrite, truncate, or clear capability, and a duplicate
+//! read-by-`event_id` only, and migration 17 adds storage triggers refusing
+//! UPDATE, DELETE and replacing INSERTs of an existing row. There is no
+//! update, delete, replace, upsert, merge, rewrite, truncate, or clear
+//! capability, and a duplicate
 //! `event_id` fails explicitly with the original row untouched. `event_id`
 //! is a canonical ULID (exactly 26 Crockford Base32 characters) validated
 //! structurally, without a new dependency. `occurred_at` is an opaque

@@ -22,6 +22,7 @@ pub mod context_epoch;
 pub mod context_manifest;
 pub mod context_rehydration;
 pub mod decision_records;
+mod decision_schema;
 pub mod entitlement;
 pub mod epoch_value;
 pub mod error;
@@ -70,7 +71,16 @@ mod context_manifest_tests;
 mod context_rehydration_tests;
 
 #[cfg(test)]
+mod decision_nested_tests;
+
+#[cfg(test)]
 mod decision_records_tests;
+
+#[cfg(test)]
+mod provenance_acceptance_tests;
+
+#[cfg(test)]
+mod event_guard_tests;
 
 #[cfg(test)]
 mod event_query_tests;
@@ -113,6 +123,9 @@ mod logical_role_tests;
 
 #[cfg(test)]
 mod startup_recovery_tests;
+
+#[cfg(test)]
+mod two_writer_tests;
 
 #[cfg(test)]
 mod trusted_time_watermark_tests;

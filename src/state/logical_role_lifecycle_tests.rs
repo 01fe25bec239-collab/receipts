@@ -10,16 +10,16 @@ use crate::logical_role_lifecycle::{RoleChangeEvidenceV1, RoleChangeKind, RoleCh
 use crate::repository::SqliteStateRepository;
 use crate::tests::{TempDir, state_epoch};
 
-const ROLE: &str = "role-a2";
+pub(crate) const ROLE: &str = "role-a2";
 
-fn evidence() -> RoleChangeEvidenceV1 {
+pub(crate) fn evidence() -> RoleChangeEvidenceV1 {
     RoleChangeEvidenceV1 {
         changed_at: CanonicalTimestampV1::parse("2026-10-29T10:00:00.000000000Z").unwrap(),
         reason: Some("orchestrator action".into()),
     }
 }
 
-fn role(role_id: &str, project: &str) -> LogicalRole {
+pub(crate) fn role(role_id: &str, project: &str) -> LogicalRole {
     LogicalRole {
         role_id: role_id.into(),
         project_id: project.into(),
@@ -36,7 +36,7 @@ fn role(role_id: &str, project: &str) -> LogicalRole {
     }
 }
 
-fn binding(binding_id: &str, role_id: &str) -> ExecutorBinding {
+pub(crate) fn binding(binding_id: &str, role_id: &str) -> ExecutorBinding {
     ExecutorBinding {
         binding_id: binding_id.into(),
         role_id: role_id.into(),

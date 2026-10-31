@@ -4,13 +4,13 @@
 //! State stores what other owners define; it never decides meaning. Each
 //! record keeps the exact supplied schema-shaped JSON bytes and their
 //! SHA-256, plus typed identity metadata extracted from them. Admission
-//! checks the owner-frozen top level of each schema: an object with unique
-//! keys at every depth, no unknown top-level property, required properties
-//! present, and every top-level property's type/enum/identifier constraint.
-//! Nested object/array contents beyond duplicate keys are the producing
-//! owner's codec obligation and are not re-validated here. Numbers are
-//! never converted through `f64`. External payloads stay
-//! reference+digest; storing a record is not acceptance.
+//! validates the full owner-frozen schema shape (`decision_schema`): unique
+//! keys at every depth, and at every nested level the required properties,
+//! no unknown property, types, enums, identifier lengths, SHA patterns,
+//! item shapes and exact-integer rules. Truly open fields stay open. Numbers
+//! are never converted through `f64`. Stored records are re-admitted on every
+//! read. External payloads stay reference+digest; storing a record is not
+//! acceptance.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -20,6 +20,7 @@ use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visit
 use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 
+use crate::decision_schema::{self as schema, Obj};
 use crate::error::{RecordFailureCode as Code, StateError};
 use crate::graph_repository::{hex, id};
 use crate::repository::SqliteStateRepository;
@@ -67,83 +68,20 @@ impl DecisionRecordKind {
     }
 }
 
-#[derive(Clone, Copy)]
-enum Check {
-    Id,
-    NonEmpty,
-    Sha,
-    Str,
-    Bool,
-    Enum(&'static [&'static str]),
-    Array,
-    NonEmptyArray,
-    Object,
-    IntMin0,
-    IntMin1,
-    NullOrIntMin0,
-    NullOrInt,
-    NullOrNumber,
-    NullOrStr,
-    Any,
-}
-
 struct Spec {
     storage: &'static str,
-    fields: &'static [(&'static str, Check)],
-    required: &'static [&'static str],
+    root: &'static Obj,
     id_key: Option<&'static str>,
     task_key: Option<&'static str>,
     link_key: Option<&'static str>,
     sha_key: Option<&'static str>,
 }
 
-use Check::*;
-const ASSURANCE: &[&str] = &["LIGHT", "STANDARD", "HIGH_ASSURANCE"];
-const LOW_MED_HIGH_UNKNOWN: &[&str] = &["LOW", "MEDIUM", "HIGH", "UNKNOWN"];
-
 fn spec(kind: DecisionRecordKind) -> &'static Spec {
     match kind {
         DecisionRecordKind::RoutingDecision => &Spec {
             storage: "ROUTING_DECISION",
-            fields: &[
-                ("decision_id", Id),
-                ("request_id", Id),
-                ("task_id", Id),
-                ("occurred_at", Str),
-                (
-                    "outcome",
-                    Enum(&[
-                        "SELECTED",
-                        "NO_ELIGIBLE_CANDIDATE",
-                        "USER_INPUT_REQUIRED",
-                        "BLOCKED",
-                    ]),
-                ),
-                ("selected_provider", NonEmpty),
-                ("selected_model", NonEmpty),
-                ("selected_runtime", NonEmpty),
-                ("selection_reason", Object),
-                ("capability_evidence", Array),
-                ("confidence", Enum(&["HIGH", "MEDIUM", "LOW"])),
-                ("availability_at_decision", Str),
-                ("estimated_cost_class", Enum(LOW_MED_HIGH_UNKNOWN)),
-                ("alternative_candidates", Array),
-                ("registry_freshness", Object),
-                (
-                    "mode",
-                    Enum(&["AUTO_CURRENT", "ASK_ON_UNCERTAINTY", "USER_CONTROLLED"]),
-                ),
-                ("user_involved", Bool),
-                ("user_pin_applied", Bool),
-                ("fallback_from", Id),
-            ],
-            required: &[
-                "decision_id",
-                "request_id",
-                "outcome",
-                "registry_freshness",
-                "mode",
-            ],
+            root: &schema::ROUTING_DECISION,
             id_key: Some("decision_id"),
             task_key: Some("task_id"),
             link_key: Some("request_id"),
@@ -151,45 +89,7 @@ fn spec(kind: DecisionRecordKind) -> &'static Spec {
         },
         DecisionRecordKind::RegistryCapability => &Spec {
             storage: "REGISTRY_CAPABILITY",
-            fields: &[
-                (
-                    "subject_kind",
-                    Enum(&["MODEL", "RUNTIME", "MODEL_RUNTIME_PAIR"]),
-                ),
-                ("provider_id", NonEmpty),
-                ("model_id", NonEmpty),
-                ("runtime_id", NonEmpty),
-                ("capability", NonEmpty),
-                ("value", Any),
-                (
-                    "confidence",
-                    Enum(&[
-                        "OFFICIAL_VERIFIED",
-                        "INDEPENDENT_VERIFIED",
-                        "LOCAL_EMPIRICAL",
-                        "USER_DECLARED",
-                        "UNVERIFIED",
-                    ]),
-                ),
-                ("source_ref", Object),
-                ("observed_at", Str),
-                ("sample_size", NullOrIntMin0),
-                (
-                    "lifecycle_state",
-                    Enum(&[
-                        "DISCOVERED",
-                        "UNASSESSED",
-                        "CAPABILITY_VERIFIED",
-                        "CALIBRATING",
-                        "ROUTABLE",
-                        "DEPRECATED",
-                        "DISABLED",
-                        "UNAVAILABLE",
-                        "USER_BLOCKED",
-                    ]),
-                ),
-            ],
-            required: &["subject_kind", "capability", "confidence", "observed_at"],
+            root: &schema::MODEL_CAPABILITY,
             id_key: None,
             task_key: None,
             link_key: None,
@@ -197,43 +97,7 @@ fn spec(kind: DecisionRecordKind) -> &'static Spec {
         },
         DecisionRecordKind::ModelObservation => &Spec {
             storage: "MODEL_OBSERVATION",
-            fields: &[
-                ("observation_id", Id),
-                ("provider_id", NonEmpty),
-                ("model_id", NonEmpty),
-                ("runtime_id", NonEmpty),
-                ("task_id", Id),
-                ("task_class", Str),
-                (
-                    "outcome",
-                    Enum(&[
-                        "ACCEPTED_FIRST_PASS",
-                        "ACCEPTED_AFTER_REPAIR",
-                        "REJECTED",
-                        "TIMEOUT",
-                        "RUNTIME_FAILURE",
-                        "CANCELLED",
-                        "USER_OVERRIDE",
-                    ]),
-                ),
-                ("repair_count", IntMin0),
-                ("cost", NullOrNumber),
-                ("tokens", NullOrInt),
-                ("latency_seconds", NullOrNumber),
-                ("cost_to_accepted_result", NullOrNumber),
-                ("difficulty_hint", Enum(LOW_MED_HIGH_UNKNOWN)),
-                ("excluded_from_calibration", Bool),
-                ("observed_at", Str),
-            ],
-            required: &[
-                "observation_id",
-                "provider_id",
-                "model_id",
-                "runtime_id",
-                "task_class",
-                "outcome",
-                "observed_at",
-            ],
+            root: &schema::MODEL_OBSERVATION,
             id_key: Some("observation_id"),
             task_key: Some("task_id"),
             link_key: None,
@@ -241,41 +105,7 @@ fn spec(kind: DecisionRecordKind) -> &'static Spec {
         },
         DecisionRecordKind::AvailabilityObservation => &Spec {
             storage: "AVAILABILITY_OBSERVATION",
-            fields: &[
-                ("provider_id", NonEmpty),
-                ("model_id", NonEmpty),
-                ("runtime_id", NonEmpty),
-                (
-                    "state",
-                    Enum(&[
-                        "AVAILABLE",
-                        "DEGRADED",
-                        "RATE_LIMITED",
-                        "SESSION_EXHAUSTED",
-                        "AUTH_REQUIRED",
-                        "PROVIDER_DOWN",
-                        "SAFETY_CHECK_PENDING",
-                        "POLICY_BLOCKED",
-                        "UNKNOWN",
-                    ]),
-                ),
-                ("retry_after_seconds", NullOrIntMin0),
-                (
-                    "signal_source",
-                    Enum(&[
-                        "RATE_LIMIT_HEADER",
-                        "EXIT_CODE",
-                        "STDERR_CLASSIFICATION",
-                        "LOCAL_USAGE_VIEW",
-                        "LATENCY_TREND",
-                        "PROBE",
-                        "UNKNOWN",
-                    ]),
-                ),
-                ("observed_at", Str),
-                ("note", Str),
-            ],
-            required: &["provider_id", "state", "observed_at"],
+            root: &schema::AVAILABILITY_STATE,
             id_key: None,
             task_key: None,
             link_key: None,
@@ -283,45 +113,7 @@ fn spec(kind: DecisionRecordKind) -> &'static Spec {
         },
         DecisionRecordKind::ReviewRequest => &Spec {
             storage: "REVIEW_REQUEST",
-            fields: &[
-                ("request_id", Id),
-                ("task_id", Id),
-                ("attempt_id", Id),
-                ("workstream_id", Id),
-                ("baseline_sha", Sha),
-                ("implementation_sha", Sha),
-                ("branch", Str),
-                ("objective", NonEmpty),
-                ("acceptance_criteria", NonEmptyArray),
-                ("non_goals", Array),
-                ("allowed_write_paths", NonEmptyArray),
-                ("architecture_refs", Array),
-                ("contract_refs", Array),
-                ("a3_handoff_ref", Object),
-                ("assurance_profile", Enum(ASSURANCE)),
-                (
-                    "review_scope",
-                    Enum(&["FULL", "SECURITY", "REGRESSION", "REPAIR_VERIFICATION"]),
-                ),
-                ("review_policy", Object),
-                ("prior_review_ids", Array),
-                ("attempt_number", IntMin1),
-                ("requested_at", Str),
-                ("context_epoch", IntMin0),
-            ],
-            required: &[
-                "request_id",
-                "task_id",
-                "attempt_id",
-                "implementation_sha",
-                "baseline_sha",
-                "objective",
-                "acceptance_criteria",
-                "allowed_write_paths",
-                "assurance_profile",
-                "review_scope",
-                "context_epoch",
-            ],
+            root: &schema::REVIEW_REQUEST,
             id_key: Some("request_id"),
             task_key: Some("task_id"),
             link_key: None,
@@ -329,43 +121,7 @@ fn spec(kind: DecisionRecordKind) -> &'static Spec {
         },
         DecisionRecordKind::A4Review => &Spec {
             storage: "A4_REVIEW",
-            fields: &[
-                ("review_id", Id),
-                ("task_id", Id),
-                ("reviewed_sha", Sha),
-                ("reviewer", Object),
-                ("reviewed_at", Str),
-                ("independence_attested", Bool),
-                (
-                    "verdict",
-                    Enum(&["PASS", "PASS_WITH_NONBLOCKING_FINDINGS", "REJECT"]),
-                ),
-                ("blocking_findings", Array),
-                ("nonblocking_findings", Array),
-                ("dimensions", NonEmptyArray),
-                ("reproduction", Object),
-                ("unauthorized_file_changes", Array),
-                (
-                    "recommended_action",
-                    Enum(&[
-                        "ACCEPT",
-                        "ACCEPT_WITH_FINDINGS_LOGGED",
-                        "REPAIR_REQUIRED",
-                        "ESCALATE_TO_A1",
-                    ]),
-                ),
-                ("rationale", Str),
-            ],
-            required: &[
-                "review_id",
-                "task_id",
-                "reviewed_sha",
-                "verdict",
-                "independence_attested",
-                "blocking_findings",
-                "nonblocking_findings",
-                "dimensions",
-            ],
+            root: &schema::A4_REVIEW,
             id_key: Some("review_id"),
             task_key: Some("task_id"),
             link_key: None,
@@ -373,27 +129,7 @@ fn spec(kind: DecisionRecordKind) -> &'static Spec {
         },
         DecisionRecordKind::IntegrationRequest => &Spec {
             storage: "INTEGRATION_REQUEST",
-            fields: &[
-                ("request_id", Id),
-                ("gate_level", Enum(&["A2_ACCEPTANCE", "A1_INTEGRATION"])),
-                ("source_branch", Str),
-                ("source_sha", Sha),
-                ("target_ref", Str),
-                ("tasks_included", NonEmptyArray),
-                ("assurance_profile", Enum(ASSURANCE)),
-                ("post_merge_checks", Array),
-                ("open_nonblocking_findings", Array),
-                ("known_limitations", Array),
-                ("attestations", Object),
-            ],
-            required: &[
-                "request_id",
-                "gate_level",
-                "source_branch",
-                "source_sha",
-                "target_ref",
-                "tasks_included",
-            ],
+            root: &schema::INTEGRATION_REQUEST,
             id_key: Some("request_id"),
             task_key: None,
             link_key: None,
@@ -401,26 +137,7 @@ fn spec(kind: DecisionRecordKind) -> &'static Spec {
         },
         DecisionRecordKind::IntegrationDecision => &Spec {
             storage: "INTEGRATION_DECISION",
-            fields: &[
-                ("decision_id", Id),
-                ("request_id", Id),
-                (
-                    "outcome",
-                    Enum(&["ACCEPT", "REPAIR", "BLOCKED", "HUMAN_REQUIRED"]),
-                ),
-                ("checks_evaluated", NonEmptyArray),
-                ("provenance_chain", Array),
-                ("unmet_conditions", Array),
-                ("integration_sha", NullOrStr),
-                ("decided_at", Str),
-            ],
-            required: &[
-                "decision_id",
-                "request_id",
-                "outcome",
-                "checks_evaluated",
-                "decided_at",
-            ],
+            root: &schema::INTEGRATION_DECISION,
             id_key: Some("decision_id"),
             task_key: None,
             link_key: Some("request_id"),
@@ -462,7 +179,7 @@ impl fmt::Debug for DecisionRecordV1 {
 }
 
 impl DecisionRecordV1 {
-    /// Validates `record_json` against `kind`'s frozen top-level shape.
+    /// Validates `record_json` against `kind`'s complete frozen schema shape.
     ///
     /// `storage_id` is the record identity: for kinds with an intrinsic id
     /// it must equal that id; for registry/availability rows (whose schemas
@@ -478,21 +195,8 @@ impl DecisionRecordV1 {
         }
         let spec = spec(kind);
         let entries = top_level(record_json)?;
-        for (key, value) in &entries {
-            let (_, check) = spec
-                .fields
-                .iter()
-                .find(|(name, _)| name == key)
-                .ok_or_else(invalid)?;
-            if !admits(*check, value) {
-                return Err(invalid());
-            }
-        }
-        if spec
-            .required
-            .iter()
-            .any(|key| !entries.iter().any(|(name, _)| name == key))
-        {
+        let root = serde_json::from_str::<Box<RawValue>>(record_json).map_err(|_| invalid())?;
+        if !schema::admits_object(spec.root, &root) {
             return Err(invalid());
         }
         let text = |key: Option<&str>| -> Option<String> {
@@ -551,33 +255,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
-}
-
-fn admits(check: Check, raw: &RawValue) -> bool {
-    let text = raw.get();
-    let string = || serde_json::from_str::<String>(text).ok();
-    let number = || matches!(text.as_bytes().first(), Some(b'-' | b'0'..=b'9'));
-    let integer = || number() && crate::json_integer::is_integer(raw);
-    let negative = || crate::json_integer::is_negative(raw);
-    let zero = || crate::json_integer::is_zero(raw);
-    match check {
-        Id => string().is_some_and(|s| id(&s)),
-        NonEmpty => string().is_some_and(|s| !s.is_empty()),
-        Sha => string().is_some_and(|s| hex(&s, 40)),
-        Str => string().is_some(),
-        Bool => matches!(text, "true" | "false"),
-        Enum(values) => string().is_some_and(|s| values.contains(&s.as_str())),
-        Array => text.starts_with('['),
-        NonEmptyArray => text.starts_with('[') && text[1..].trim_start() != "]",
-        Object => text.starts_with('{'),
-        IntMin0 => integer() && !negative(),
-        IntMin1 => integer() && !negative() && !zero(),
-        NullOrIntMin0 => text == "null" || (integer() && !negative()),
-        NullOrInt => text == "null" || integer(),
-        NullOrNumber => text == "null" || number(),
-        NullOrStr => text == "null" || string().is_some(),
-        Any => true,
-    }
 }
 
 /// Parses one JSON object into ordered top-level entries, refusing duplicate
@@ -707,7 +384,13 @@ pub enum ProvenanceContradictionV1 {
     VerdictShaMismatch,
     /// ACCEPTANCE_REF names no persisted INTEGRATION_DECISION in this project.
     DanglingAcceptanceRef,
-    /// The decision's own provenance entry for this task disagrees with a link.
+    /// The referenced decision's outcome is not `ACCEPT`.
+    AcceptanceNotAccepted,
+    /// The referenced decision has no provenance entry for this task.
+    AcceptanceTaskEntryAbsent,
+    /// The referenced decision has more than one provenance entry for this task.
+    AcceptanceTaskEntryAmbiguous,
+    /// The decision's one provenance entry for this task disagrees with a link.
     AcceptanceChainMismatch,
     /// The decision's non-null `integration_sha` differs from MAIN_SHA.
     MainShaMismatch,
@@ -944,12 +627,18 @@ fn build_chain(
             Some(record) => {
                 let decision: AcceptanceView = serde_json::from_str(record.record_json())
                     .map_err(|_| failure(Code::CorruptStore, RECORD))?;
-                if decision
+                if decision.outcome != "ACCEPT" {
+                    chain.contradictions.push(C::AcceptanceNotAccepted);
+                }
+                let entries: Vec<&AcceptanceEntry> = decision
                     .provenance_chain
                     .iter()
                     .filter(|entry| entry.task_id == task_id)
-                    .any(|entry| {
-                        [
+                    .collect();
+                match entries.as_slice() {
+                    [] => chain.contradictions.push(C::AcceptanceTaskEntryAbsent),
+                    [entry] => {
+                        let disagrees = [
                             (K::StartSha, &entry.start_sha),
                             (K::ImplementationSha, &entry.implementation_sha),
                             (K::ReviewSha, &entry.review_sha),
@@ -957,10 +646,12 @@ fn build_chain(
                         .iter()
                         .any(|(kind, value)| {
                             chain.link(*kind).is_some_and(|link| link != value.as_str())
-                        })
-                    })
-                {
-                    chain.contradictions.push(C::AcceptanceChainMismatch);
+                        });
+                        if disagrees {
+                            chain.contradictions.push(C::AcceptanceChainMismatch);
+                        }
+                    }
+                    _ => chain.contradictions.push(C::AcceptanceTaskEntryAmbiguous),
                 }
                 if let (Some(main), Some(integrated)) =
                     (chain.link(K::MainSha), &decision.integration_sha)
@@ -976,6 +667,7 @@ fn build_chain(
 
 #[derive(serde::Deserialize)]
 struct AcceptanceView {
+    outcome: String,
     #[serde(default)]
     provenance_chain: Vec<AcceptanceEntry>,
     #[serde(default)]
