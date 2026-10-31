@@ -22,7 +22,7 @@ jobs:
       github.repository == '01fe25bec239-collab/receipts' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.base.repo.full_name == github.repository &&
-      github.event.pull_request.head.ref == 'build/wave1-completion-workspace' &&
+      github.event.pull_request.head.ref == 'build/wave1-completion-workspace-clean' &&
       github.run_attempt == 1
     runs-on: ubuntu-24.04
     timeout-minutes: 20

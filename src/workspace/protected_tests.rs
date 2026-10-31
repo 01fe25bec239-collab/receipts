@@ -376,7 +376,10 @@ fn controller_stages_commits_and_checkpoints_the_actual_task_branch() {
     let tree = stdout_trimmed(&git(repo.path(), &["ls-tree", "--name-only", &branch_tip]));
     assert!(tree.lines().any(|l| l == "payload.txt") && !tree.lines().any(|l| l == "*"));
 
-    let ControllerResponse::Checkpointed(checkpoint) = send(
+    let ControllerResponse::Checkpointed {
+        handle: checkpointed,
+        checkpoint,
+    } = send(
         worker,
         3,
         ControllerOperation::Checkpoint {
@@ -385,10 +388,13 @@ fn controller_stages_commits_and_checkpoints_the_actual_task_branch() {
             captured_at: crate::WorkspaceDateTimeV1::try_new("2026-10-30T00:00:00Z").unwrap(),
         },
     )
-    .unwrap() else {
+    .unwrap()
+    else {
         panic!("checkpoint response")
     };
     assert_eq!(checkpoint.core().head_sha(), &commit);
+    assert_eq!(checkpointed.state(), WorkspaceState::Checkpointed);
+    assert_eq!(checkpointed.head_sha(), Some(&commit));
     assert_eq!(checkpoint.core().task_id(), Some("task-1"));
     assert_eq!(checkpoint.core().untracked_files(), &["*".to_string()]);
 
@@ -418,4 +424,262 @@ fn launch_refuses_requests_outside_the_admitted_worktree_or_launcher() {
             "admission belongs to another launcher"
         ))
     ));
+}
+
+/// Bearer values never reach ordinary, pretty, nested or error diagnostics,
+/// while the explicit protocol accessors keep returning them.
+#[test]
+fn controller_tokens_are_redacted_from_every_diagnostic_but_stay_accessible() {
+    const MARKER: &str = "SYNTHETIC-BEARER-MARKER-7f3a";
+    let marker_request = ControllerRequest {
+        attempt_id: "attempt-1".into(),
+        task_id: "task-1".into(),
+        token: MARKER.into(),
+        sequence: 3,
+        operation: ControllerOperation::Identity,
+    };
+    let wrapped = (Some(marker_request.clone()), vec![marker_request.clone()]);
+    for text in [
+        format!("{marker_request:?}"),
+        format!("{marker_request:#?}"),
+        format!("{wrapped:?}"),
+        format!("{wrapped:#?}"),
+    ] {
+        assert!(!text.contains(MARKER), "{text}");
+        assert!(text.contains("<redacted>") && text.contains("attempt-1"));
+    }
+    // Explicit protocol access is unchanged.
+    assert_eq!(marker_request.token, MARKER);
+    assert_eq!(marker_request.clone(), marker_request);
+
+    let launcher = ProtectedLauncher::unenforced_for_test(config());
+    let repo = TestRepo::new("protected-redact");
+    let handle = provisioned(&repo, Some("task-1"));
+    let admission = launcher.admit(&handle, repo.path()).unwrap();
+    let protected = launcher
+        .launch(admission, &request(handle.worktree_path()), &policy())
+        .unwrap();
+    let tokens = [
+        protected.worker_channel().credentials().token,
+        protected.reviewer_channel().credentials().token,
+    ];
+    assert_eq!(tokens[0].len(), 64);
+    for text in [
+        format!("{:?}", protected.worker_channel()),
+        format!("{:#?}", protected.reviewer_channel()),
+        format!("{protected:?}"),
+        format!("{protected:#?}"),
+        format!("{:?}", protected.worker_channel().credentials()),
+        format!("{:#?}", protected.reviewer_channel().credentials()),
+    ] {
+        for token in &tokens {
+            assert!(!text.contains(token.as_str()), "{text}");
+        }
+    }
+    // Refusals triggered by a marker-bearing forged request echo nothing.
+    let forged = ControllerRequest {
+        token: MARKER.into(),
+        ..marker_request
+    };
+    let refused = protected.worker_channel().handle(forged).unwrap_err();
+    for text in [format!("{refused}"), format!("{refused:?}")] {
+        assert!(!text.contains(MARKER), "{text}");
+    }
+    // The genuine credentials still drive the channel.
+    assert!(matches!(
+        send(protected.worker_channel(), 0, ControllerOperation::Identity),
+        Ok(ControllerResponse::Identity { .. })
+    ));
+    protected.attempt().wait_collect().unwrap();
+}
+
+fn nested_repository(worktree: &Path, name: &str) {
+    let nested = worktree.join(name);
+    std::fs::create_dir(&nested).unwrap();
+    git(&nested, &["init", "-q", "-b", "main"]);
+    git(
+        &nested,
+        &[
+            "-c",
+            "user.name=n",
+            "-c",
+            "user.email=n@n.invalid",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "nested",
+        ],
+    );
+}
+
+/// A tracked embedded repository would let worker-controlled config (for
+/// example a clean filter) run as the controller on a later status/diff.
+/// Staging one is refused, the index is restored and later work is unaffected.
+#[test]
+fn stage_refuses_embedded_repositories_and_restores_the_index() {
+    let launcher = ProtectedLauncher::unenforced_for_test(config());
+    let repo = TestRepo::new("protected-embedded");
+    let handle = provisioned(&repo, Some("task-1"));
+    let admission = launcher.admit(&handle, repo.path()).unwrap();
+    let protected = launcher
+        .launch(admission, &request(handle.worktree_path()), &policy())
+        .unwrap();
+    protected.attempt().wait_collect().unwrap();
+    let worker = protected.worker_channel();
+    let worktree = handle.worktree_path();
+    std::fs::write(worktree.join("ok.txt"), "fine").unwrap();
+    nested_repository(worktree, "evil");
+    std::fs::create_dir(worktree.join("sub")).unwrap();
+    nested_repository(worktree, "sub/inner");
+
+    let staged_index = || stdout_trimmed(&git(worktree, &["ls-files", "--stage"]));
+    assert!(matches!(
+        send(
+            worker,
+            0,
+            ControllerOperation::Stage {
+                paths: vec!["ok.txt".into(), "evil".into()]
+            }
+        ),
+        Err(ProtectedLaunchError::Binding(
+            "embedded repositories cannot be staged"
+        ))
+    ));
+    // Nothing from the refused request (not even ok.txt) stays staged.
+    assert_eq!(staged_index(), "");
+    // A request that reaches an embedded repository through its parent is refused too.
+    assert!(matches!(
+        send(
+            worker,
+            1,
+            ControllerOperation::Stage {
+                paths: vec!["sub".into()]
+            }
+        ),
+        Err(ProtectedLaunchError::Binding(
+            "embedded repositories cannot be staged"
+        ))
+    ));
+    assert_eq!(staged_index(), "");
+    assert!(
+        !git(worktree, &["ls-files", "--stage"])
+            .stdout
+            .windows(6)
+            .any(|window| window == b"160000")
+    );
+    // Ordinary staging and committing still work afterwards.
+    send(
+        worker,
+        2,
+        ControllerOperation::Stage {
+            paths: vec!["ok.txt".into()],
+        },
+    )
+    .unwrap();
+    assert!(staged_index().contains("ok.txt"));
+    let ControllerResponse::Committed { commit } = send(
+        worker,
+        3,
+        ControllerOperation::Commit {
+            message: "ok".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("commit response")
+    };
+    let tree = stdout_trimmed(&git(worktree, &["ls-tree", "-r", commit.as_str()]));
+    assert!(tree.contains("ok.txt") && !tree.contains("evil") && !tree.contains("160000"));
+}
+
+/// Commit, checkpoint, custody release and non-force teardown form one
+/// verified sequence; release is refused until collection proved cleanup.
+#[test]
+fn release_requires_proven_cleanup_then_checkpointed_handle_tears_down_without_force() {
+    let launcher = ProtectedLauncher::unenforced_for_test(config());
+    let repo = TestRepo::new("protected-release");
+    let handle = provisioned(&repo, Some("task-1"));
+    let admission = launcher.admit(&handle, repo.path()).unwrap();
+    let protected = launcher
+        .launch(admission, &request(handle.worktree_path()), &policy())
+        .unwrap();
+    let worker = protected.worker_channel();
+    let worktree = handle.worktree_path();
+
+    // Cleanup not proven yet: custody stays.
+    assert!(matches!(
+        protected.release_custody(),
+        Err(ProtectedLaunchError::CleanupUnknown(_))
+    ));
+    protected.attempt().wait_collect().unwrap();
+
+    std::fs::write(worktree.join("work.txt"), "work").unwrap();
+    send(
+        worker,
+        0,
+        ControllerOperation::Stage {
+            paths: vec!["work.txt".into()],
+        },
+    )
+    .unwrap();
+    let ControllerResponse::Committed { commit } = send(
+        worker,
+        1,
+        ControllerOperation::Commit {
+            message: "work".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("commit response")
+    };
+    let ControllerResponse::Checkpointed {
+        handle: checkpointed,
+        ..
+    } = send(
+        worker,
+        2,
+        ControllerOperation::Checkpoint {
+            checkpoint_id: "cp".into(),
+            kind: crate::WorkspaceCheckpointKind::Progress,
+            captured_at: crate::WorkspaceDateTimeV1::try_new("2026-10-30T00:00:00Z").unwrap(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("checkpoint response")
+    };
+
+    protected.release_custody().unwrap();
+    // Single use, and both channels refuse afterwards.
+    assert!(matches!(
+        protected.release_custody(),
+        Err(ProtectedLaunchError::Custody(_))
+    ));
+    for channel in [worker, protected.reviewer_channel()] {
+        assert!(matches!(
+            send(channel, 3, ControllerOperation::Status),
+            Err(ProtectedLaunchError::Binding("custody was released"))
+        ));
+    }
+
+    // Dirty payload refuses ordinary non-force teardown and survives.
+    std::fs::write(worktree.join("late.txt"), "late").unwrap();
+    let teardown = crate::WorkspaceTeardownRequest::new(repo.path());
+    assert!(matches!(
+        teardown.teardown(&checkpointed),
+        Err(WorkspaceError::TeardownWorktreeDirty { .. })
+    ));
+    assert!(worktree.join("late.txt").exists());
+    std::fs::remove_file(worktree.join("late.txt")).unwrap();
+    let torn = teardown.teardown(&checkpointed).unwrap();
+    assert_eq!(torn.state(), WorkspaceState::TornDown);
+    assert!(!worktree.exists());
+    assert_eq!(
+        stdout_trimmed(&git(
+            repo.path(),
+            &["rev-parse", "refs/heads/task/protected"]
+        )),
+        commit.as_str(),
+        "task branch and its commit are retained"
+    );
 }

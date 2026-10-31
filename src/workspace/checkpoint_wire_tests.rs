@@ -250,3 +250,196 @@ fn actual_capture_exports_decodes_and_converts_losslessly() {
     assert_eq!(wire.untracked_files(), Some(&["new".to_string()][..]));
     assert_eq!(wire.to_temporal_capture_core().unwrap(), captured);
 }
+
+/// Independent decoder oracle. Each case is `(JSON text, python-jsonschema
+/// verdict, decoder verdict)`; the enum values come from the frozen schema file
+/// itself, not from the Rust vocabularies. Cases where the two verdicts differ
+/// are the documented, deliberate divergences:
+/// * Python's `$` also matches before a trailing newline, so a SHA with `\n`
+///   passes the pattern while the decoder (strict SHA40) refuses it;
+/// * `json.loads` keeps the last duplicate key, the decoder refuses duplicates;
+/// * `json.loads` turns `1e400` into infinity (not an integer) while the
+///   decoder preserves the exact integer token.
+fn decoder_oracle_cases() -> Vec<(String, bool, bool)> {
+    let schema: Value = serde_json::from_str(include_str!(
+        "../../schemas/WorkspaceCheckpoint.schema.json"
+    ))
+    .unwrap();
+    let enum_values = |field: &str| -> Vec<String> {
+        schema["properties"][field]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_owned())
+            .collect()
+    };
+    let mut cases: Vec<(String, bool, bool)> = Vec::new();
+    let mut agree = |value: Value, valid: bool| cases.push((value.to_string(), valid, valid));
+    agree(minimal(), true);
+    agree(full(), true);
+    let mut present_empty = minimal();
+    present_empty["modified_files"] = json!([]);
+    present_empty["untracked_files"] = json!([]);
+    present_empty["executed_checks"] = json!([]);
+    present_empty["recovery_rationale"] = json!("");
+    agree(present_empty, true);
+    let mut crabs = minimal();
+    crabs["workspace_id"] = json!("🦀".repeat(200));
+    agree(crabs, true);
+    for kind in enum_values("kind") {
+        let mut value = minimal();
+        value["kind"] = json!(kind);
+        agree(value, true);
+    }
+    for crash in enum_values("crash_classification") {
+        let mut value = minimal();
+        value["crash_classification"] = json!(crash);
+        agree(value, true);
+    }
+    for decision in enum_values("recovery_decision") {
+        let mut value = minimal();
+        value["recovery_decision"] = json!(decision);
+        agree(value, true);
+    }
+    // Negative controls: schema-invalid input the decoder must also refuse.
+    for (field, bad) in [
+        ("checkpoint_id", json!("")),
+        ("workspace_id", json!("x".repeat(201))),
+        ("task_id", Value::Null),
+        ("kind", json!("PROGRES")),
+        ("head_sha", json!(SHA.to_uppercase())),
+        ("head_sha", json!(&SHA[1..])),
+        ("modified_files", Value::Null),
+        ("modified_files", json!([1])),
+        ("crash_classification", json!("TIMEOUTS")),
+        ("recovery_decision", Value::Null),
+        ("recovery_rationale", Value::Null),
+        ("unknown", json!(1)),
+        ("dirty_diff_ref", json!({"ref_type": "URL"})),
+        (
+            "dirty_diff_ref",
+            json!({"ref_type": "URL", "target": "x", "extra": 1}),
+        ),
+    ] {
+        let mut value = full();
+        value[field] = bad;
+        agree(value, false);
+    }
+    let mut empty_command = full();
+    empty_command["executed_checks"][0]["command"] = json!([]);
+    agree(empty_command, false);
+    let mut bad_result = full();
+    bad_result["executed_checks"][0]["result"] = json!("OK");
+    agree(bad_result, false);
+    let mut missing = minimal();
+    missing.as_object_mut().unwrap().remove("captured_at");
+    agree(missing, false);
+    cases.push(("[]".into(), false, false));
+    // Exit codes are exact integer tokens.
+    let with_exit = |token: &str| {
+        full()
+            .to_string()
+            .replace("\"exit_code\":0", &format!("\"exit_code\":{token}"))
+    };
+    for token in [
+        "1e2",
+        "1.0",
+        "-0",
+        "9223372036854775808",
+        "123456789012345678901234567890",
+    ] {
+        cases.push((with_exit(token), true, true));
+    }
+    for token in [
+        "1.5",
+        "1e-1",
+        "\"1\"",
+        "true",
+        "null",
+        "[0]",
+        "1.0000000001",
+    ] {
+        cases.push((with_exit(token), false, false));
+    }
+    // Documented divergences.
+    let mut newline = full();
+    newline["base_sha"] = json!(format!("{SHA}\n"));
+    cases.push((newline.to_string(), true, false));
+    cases.push((
+        format!(
+            r#"{{"checkpoint_id":"a","checkpoint_id":"b","workspace_id":"w","head_sha":"{SHA}","captured_at":"2026-10-30T00:00:00Z","kind":"PROGRESS"}}"#
+        ),
+        true,
+        false,
+    ));
+    cases.push((with_exit("1e400"), false, true));
+    cases
+}
+
+#[test]
+fn decoder_oracle_cases_match_the_expected_decoder_verdicts_without_python() {
+    let cases = decoder_oracle_cases();
+    assert!(cases.len() > 50, "{}", cases.len());
+    for (text, _, decoder_accepts) in &cases {
+        assert_eq!(
+            WorkspaceCheckpointWire::from_json(text).is_ok(),
+            *decoder_accepts,
+            "{text}"
+        );
+    }
+    // Accepted input re-encodes to an equal document.
+    for (text, _, accepts) in cases.iter().filter(|(_, _, accepts)| *accepts) {
+        let wire = WorkspaceCheckpointWire::from_json(text).unwrap();
+        let again = WorkspaceCheckpointWire::from_json(&wire.to_json().unwrap()).unwrap();
+        assert_eq!(wire, again, "{text} {accepts}");
+    }
+}
+
+#[test]
+#[ignore = "independent oracle: explicitly set WORKSPACE_SCHEMA_PYTHON to a Python with jsonschema and run with --ignored --nocapture"]
+fn decoder_structural_schema_conformance_with_documented_oracle_limits() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let cases = decoder_oracle_cases();
+    let input = json!({
+        "schema": serde_json::from_str::<Value>(include_str!("../../schemas/WorkspaceCheckpoint.schema.json")).unwrap(),
+        "texts": cases.iter().map(|(text, _, _)| text).collect::<Vec<_>>(),
+    });
+    // Structural validation only (no FormatChecker): `date-time` stays an annotation.
+    let script = r#"
+import sys, json, importlib.metadata
+from jsonschema import Draft202012Validator
+x=json.load(sys.stdin)
+Draft202012Validator.check_schema(x['schema'])
+v=Draft202012Validator(x['schema'])
+print(json.dumps([v.is_valid(json.loads(t)) for t in x['texts']]))
+print('jsonschema', importlib.metadata.version('jsonschema'), 'Draft202012 decoder cases', len(x['texts']), file=sys.stderr)
+"#;
+    let python = std::env::var_os("WORKSPACE_SCHEMA_PYTHON")
+        .expect("independent oracle requires WORKSPACE_SCHEMA_PYTHON and installed jsonschema");
+    let mut child = Command::new(python)
+        .args(["-c", script])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("required independent Draft202012 validator available");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.to_string().as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    println!("{}", String::from_utf8_lossy(&output.stderr));
+    let verdicts: Vec<bool> = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(verdicts.len(), cases.len());
+    for ((text, python_valid, _), verdict) in cases.iter().zip(verdicts) {
+        assert_eq!(verdict, *python_valid, "{text}");
+    }
+}

@@ -236,6 +236,9 @@ pub enum WorkspaceError {
     },
     /// An existing worktree did not match an idempotent create request.
     WorktreeCreateConflict { detail: String },
+    /// The persistent task binding could not be written during provisioning;
+    /// the attempt is rolled back (or reported rollback-incomplete).
+    WorktreeBindingFailed { detail: String },
 }
 
 impl fmt::Display for WorkspaceError {
@@ -376,6 +379,9 @@ impl fmt::Display for WorkspaceError {
                     f,
                     "existing worktree does not match the create request: {detail}"
                 )
+            }
+            WorkspaceError::WorktreeBindingFailed { detail } => {
+                write!(f, "worktree task binding could not be recorded: {detail}")
             }
         }
     }

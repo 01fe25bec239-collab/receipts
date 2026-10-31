@@ -50,6 +50,7 @@ mod imp {
     const PR_SET_NO_NEW_PRIVS: c_long = 38;
     const PR_CAP_AMBIENT: c_long = 47;
     const PR_CAP_AMBIENT_RAISE: c_long = 2;
+    const PR_CAP_AMBIENT_CLEAR_ALL: c_long = 4;
     const SECCOMP_MODE_FILTER: c_long = 2;
     const CAP_DAC_READ_SEARCH: c_long = 2;
     const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
@@ -239,6 +240,31 @@ mod imp {
         verify_custody(&binding.common_dir, &binding.worktree, cu, wg)
     }
 
+    /// Returns metadata and payload to the pre-admission owner. Called only
+    /// after the attempt's cgroup was proven empty; also requires that no live
+    /// process still holds the worker identity.
+    pub(crate) fn release_custody(binding: &Binding) -> Result<(), String> {
+        if uid_in_use(binding.worker_uid)? {
+            return Err("a process still runs as the worker identity".into());
+        }
+        let original = binding.original;
+        let give_back = &mut |path: &Path, _: &std::fs::Metadata| {
+            std::os::unix::fs::lchown(path, Some(original.uid), Some(original.gid))
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            Ok(true)
+        };
+        walk(&binding.common_dir, give_back)?;
+        walk(&binding.worktree, give_back)?;
+        set_mode(&binding.worktree, original.worktree_mode)?;
+        for path in [&binding.common_dir, &binding.worktree] {
+            let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+            if metadata.uid() != original.uid || metadata.gid() != original.gid {
+                return Err(format!("{} was not restored", path.display()));
+            }
+        }
+        Ok(())
+    }
+
     fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
@@ -388,29 +414,41 @@ mod imp {
                     self.uid as c_long,
                     self.uid as c_long,
                 ))?;
+                // Explicit final sets for BOTH identities: permitted, effective
+                // and inheritable are exactly the retained capability (none for
+                // the worker), the ambient set is cleared and then holds only
+                // that capability, and keep-caps is reset.
+                let header = CapHeader {
+                    version: LINUX_CAPABILITY_VERSION_3,
+                    pid: 0,
+                };
+                let bit = keep.map_or(0u32, |cap| 1u32 << cap);
+                let data = [
+                    CapData {
+                        effective: bit,
+                        permitted: bit,
+                        inheritable: bit,
+                    },
+                    CapData {
+                        effective: 0,
+                        permitted: 0,
+                        inheritable: 0,
+                    },
+                ];
+                check(syscall(
+                    SYS_CAPSET,
+                    &header as *const CapHeader,
+                    data.as_ptr(),
+                ))?;
+                check(syscall(
+                    SYS_PRCTL,
+                    PR_CAP_AMBIENT,
+                    PR_CAP_AMBIENT_CLEAR_ALL,
+                    Z,
+                    Z,
+                    Z,
+                ))?;
                 if let Some(cap) = keep {
-                    let header = CapHeader {
-                        version: LINUX_CAPABILITY_VERSION_3,
-                        pid: 0,
-                    };
-                    let bit = 1u32 << cap;
-                    let data = [
-                        CapData {
-                            effective: bit,
-                            permitted: bit,
-                            inheritable: bit,
-                        },
-                        CapData {
-                            effective: 0,
-                            permitted: 0,
-                            inheritable: 0,
-                        },
-                    ];
-                    check(syscall(
-                        SYS_CAPSET,
-                        &header as *const CapHeader,
-                        data.as_ptr(),
-                    ))?;
                     check(syscall(
                         SYS_PRCTL,
                         PR_CAP_AMBIENT,
@@ -420,6 +458,7 @@ mod imp {
                         Z,
                     ))?;
                 }
+                check(syscall(SYS_PRCTL, PR_SET_KEEPCAPS, Z, Z, Z, Z))?;
                 check(syscall(
                     SYS_PRCTL,
                     PR_SET_NO_NEW_PRIVS,
@@ -597,6 +636,9 @@ mod imp {
         _: &ProtectedLaunchConfig,
         _: &Binding,
     ) -> Result<Arc<dyn ControllerLaunch>, String> {
+        Err(REFUSAL.into())
+    }
+    pub(crate) fn release_custody(_: &Binding) -> Result<(), String> {
         Err(REFUSAL.into())
     }
 }

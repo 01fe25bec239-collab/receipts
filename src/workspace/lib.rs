@@ -72,6 +72,7 @@ pub mod provision;
 pub mod recovery_preparation;
 pub mod remote_publish_policy;
 pub mod teardown;
+mod worktree_binding;
 pub mod worktree_create;
 pub mod write_path_pattern;
 pub mod write_scope;

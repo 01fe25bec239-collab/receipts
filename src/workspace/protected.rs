@@ -50,10 +50,13 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::execution::{
-    LiveProcessAttempt, LiveProcessStartError, ProcessRunRequest, ProcessTimeoutPolicy,
+    ExecutionError, LiveProcessAttempt, LiveProcessAttemptError, LiveProcessCancelAcceptance,
+    LiveProcessOutcome, LiveProcessOutput, LiveProcessStartError, LiveProcessTerminalCause,
+    ProcessRunRequest, ProcessTimeoutPolicy,
 };
 use crate::{
     CommitSha, WorkspaceCheckpointKind, WorkspaceCheckpointLifecycleInput,
@@ -292,6 +295,7 @@ impl ProtectedLauncher {
             ));
         }
 
+        let original = original_custody(&common_dir, &worktree)?;
         let worker_uid = self.allocate_worker_uid()?;
         let attempt_id = random_hex(16)
             .map_err(|error| ProtectedLaunchError::Unsupported(format!("randomness: {error}")))?;
@@ -303,6 +307,8 @@ impl ProtectedLauncher {
             common_dir,
             worktree,
             worker_uid,
+            original,
+            released: AtomicBool::new(false),
             handle: handle.clone(),
         };
         match &self.inner.enforcement {
@@ -399,6 +405,7 @@ impl ProtectedLauncher {
         Ok(ProtectedAttempt {
             handle: active,
             attempt,
+            collected: AtomicBool::new(false),
             worker,
             reviewer,
         })
@@ -426,6 +433,20 @@ impl ProtectedAdmission {
     pub fn attempt_id(&self) -> &str {
         &self.binding.attempt_id
     }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn worker_uid_for_test(&self) -> u32 {
+        self.binding.worker_uid
+    }
+}
+
+/// Ownership of the repository metadata and worktree root before custody was
+/// transferred; restored by [`ProtectedAttempt::release_custody`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OriginalCustody {
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    pub(crate) worktree_mode: u32,
 }
 
 #[derive(Debug)]
@@ -437,6 +458,9 @@ pub(crate) struct Binding {
     pub(crate) common_dir: PathBuf,
     pub(crate) worktree: PathBuf,
     pub(crate) worker_uid: u32,
+    pub(crate) original: OriginalCustody,
+    /// Set once custody was returned; channels then refuse every request.
+    released: AtomicBool,
     handle: WorkspaceHandle,
 }
 
@@ -445,8 +469,42 @@ pub(crate) struct Binding {
 pub struct ProtectedAttempt {
     handle: WorkspaceHandle,
     attempt: LiveProcessAttempt,
+    /// Set only when `wait_collect` succeeded: the existing deadline/grace/
+    /// reap/EOF lifecycle and the cgroup kill/emptiness proof both completed.
+    collected: AtomicBool,
     worker: ControllerChannel,
     reviewer: ControllerChannel,
+}
+
+/// Borrowed view of the live attempt. It offers the same operations as the
+/// execution layer's handle and additionally records a successful collection,
+/// the only evidence that permits [`ProtectedAttempt::release_custody`].
+#[derive(Debug)]
+pub struct ProtectedAttemptView<'a> {
+    attempt: &'a LiveProcessAttempt,
+    collected: &'a AtomicBool,
+}
+
+impl ProtectedAttemptView<'_> {
+    /// See [`LiveProcessAttempt::snapshot_output`].
+    pub fn snapshot_output(&self) -> Result<LiveProcessOutput, ExecutionError> {
+        self.attempt.snapshot_output()
+    }
+    /// See [`LiveProcessAttempt::cancel`].
+    pub fn cancel(&self) -> LiveProcessCancelAcceptance {
+        self.attempt.cancel()
+    }
+    /// See [`LiveProcessAttempt::terminal_cause`].
+    pub fn terminal_cause(&self) -> Option<LiveProcessTerminalCause> {
+        self.attempt.terminal_cause()
+    }
+    /// See [`LiveProcessAttempt::wait_collect`]. A failed collection leaves
+    /// cleanup unproven: custody, cgroup and identity stay retained.
+    pub fn wait_collect(&self) -> Result<LiveProcessOutcome, LiveProcessAttemptError> {
+        let outcome = self.attempt.wait_collect()?;
+        self.collected.store(true, Ordering::SeqCst);
+        Ok(outcome)
+    }
 }
 
 impl ProtectedAttempt {
@@ -455,8 +513,11 @@ impl ProtectedAttempt {
         &self.handle
     }
     /// The live attempt (cancel/snapshot/collect).
-    pub fn attempt(&self) -> &LiveProcessAttempt {
-        &self.attempt
+    pub fn attempt(&self) -> ProtectedAttemptView<'_> {
+        ProtectedAttemptView {
+            attempt: &self.attempt,
+            collected: &self.collected,
+        }
     }
     /// The worker's task-bound channel.
     pub fn worker_channel(&self) -> &ControllerChannel {
@@ -465,6 +526,39 @@ impl ProtectedAttempt {
     /// The query-only reviewer channel.
     pub fn reviewer_channel(&self) -> &ControllerChannel {
         &self.reviewer
+    }
+
+    /// Returns the repository metadata and worktree to their pre-admission
+    /// owner so ordinary Workspace APIs (for example non-force teardown) run
+    /// as that owner again. Allowed exactly once, only after
+    /// [`ProtectedAttemptView::wait_collect`] succeeded (every attempt process
+    /// reaped, its cgroup killed and proven empty) and with no live process
+    /// left under the worker identity. Afterwards both channels refuse.
+    /// Refusal retains custody. File modes are not widened again.
+    pub fn release_custody(&self) -> Result<(), ProtectedLaunchError> {
+        if !self.collected.load(Ordering::SeqCst) {
+            return Err(ProtectedLaunchError::CleanupUnknown(
+                "attempt collection and cgroup cleanup were not proven; custody retained".into(),
+            ));
+        }
+        let binding = &self.worker.binding;
+        if binding.released.swap(true, Ordering::SeqCst) {
+            return Err(ProtectedLaunchError::Custody(
+                "custody was already released".into(),
+            ));
+        }
+        let result = match &self.worker.launcher.inner.enforcement {
+            #[cfg(target_os = "linux")]
+            Enforcement::Linux(_) => crate::protected_linux::release_custody(binding),
+            Enforcement::Unenforced => unenforced().map_err(|error| error.to_string()),
+        };
+        if let Err(detail) = result {
+            // Ownership may be half restored; never claim either state.
+            return Err(ProtectedLaunchError::CleanupUnknown(format!(
+                "custody release incomplete: {detail}"
+            )));
+        }
+        Ok(())
     }
 
     #[cfg(all(test, target_os = "linux"))]
@@ -528,14 +622,28 @@ pub enum ControllerOperation {
     },
 }
 
-/// One peer request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One peer request. `token` is a bearer credential: it stays an ordinary
+/// public field for the protocol, but `Debug` (ordinary, pretty and nested)
+/// never prints it.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ControllerRequest {
     pub attempt_id: String,
     pub task_id: String,
     pub token: String,
     pub sequence: u64,
     pub operation: ControllerOperation,
+}
+
+impl fmt::Debug for ControllerRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ControllerRequest")
+            .field("attempt_id", &self.attempt_id)
+            .field("task_id", &self.task_id)
+            .field("token", &"<redacted>")
+            .field("sequence", &self.sequence)
+            .field("operation", &self.operation)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -558,18 +666,35 @@ pub enum ControllerResponse {
     Committed {
         commit: CommitSha,
     },
-    Checkpointed(Box<WorkspaceCheckpointTemporalCaptureCore>),
+    /// The checkpoint observed from the actual worktree and the
+    /// `CHECKPOINTED` handle whose verified head is the captured head.
+    Checkpointed {
+        handle: Box<WorkspaceHandle>,
+        checkpoint: Box<WorkspaceCheckpointTemporalCaptureCore>,
+    },
 }
 
 /// Task-bound typed channel. Requests are serialized; each must present the
-/// channel's attempt, task, token and exactly the next sequence number.
-#[derive(Debug)]
+/// channel's attempt, task, token and exactly the next sequence number. The
+/// token is only reachable through [`ControllerChannel::credentials`];
+/// `Debug` never prints it.
 pub struct ControllerChannel {
     binding: Arc<Binding>,
     role: ControllerRole,
     token: String,
     next_sequence: Mutex<u64>,
     launcher: ProtectedLauncher,
+}
+
+impl fmt::Debug for ControllerChannel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ControllerChannel")
+            .field("attempt_id", &self.binding.attempt_id)
+            .field("task_id", &self.binding.task_id)
+            .field("role", &self.role)
+            .field("token", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl ControllerChannel {
@@ -611,6 +736,9 @@ impl ControllerChannel {
             .next_sequence
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.binding.released.load(Ordering::SeqCst) {
+            return Err(ProtectedLaunchError::Binding("custody was released"));
+        }
         if request.task_id != self.binding.task_id {
             return Err(ProtectedLaunchError::Binding("cross-task request"));
         }
@@ -697,6 +825,23 @@ impl ControllerChannel {
                         .map_err(|_| ProtectedLaunchError::Binding("invalid stage path"))?;
                 }
                 self.verified_head()?;
+                // Worker payload may contain an embedded repository whose own
+                // config/attributes name a filter. Once such a gitlink is
+                // tracked, a later `status`/`diff` would enter it and run that
+                // filter as the controller. Never stage one: remember the
+                // index and restore it if Git reports that it added an
+                // embedded repository. (Git also refuses to enter repositories
+                // owned by another UID, which the distinct worker identity
+                // provides; this is defense in depth.)
+                let index_before = git::capture(
+                    worktree,
+                    "controller index snapshot",
+                    &[OsStr::new("write-tree")],
+                )?
+                .require_success("controller index snapshot")?
+                .stdout
+                .trim()
+                .to_owned();
                 let mut args = vec![
                     OsStr::new("--literal-pathspecs"),
                     OsStr::new("add"),
@@ -704,8 +849,19 @@ impl ControllerChannel {
                     OsStr::new("--"),
                 ];
                 args.extend(paths.iter().map(OsStr::new));
-                git::capture(worktree, "controller stage", &args)?
-                    .require_success("controller stage")?;
+                let staged = git::capture(worktree, "controller stage", &args)?;
+                if staged.stderr.contains("adding embedded git repository") {
+                    git::capture(
+                        worktree,
+                        "controller index restore",
+                        &[OsStr::new("read-tree"), OsStr::new(index_before.as_str())],
+                    )?
+                    .require_success("controller index restore")?;
+                    return Err(ProtectedLaunchError::Binding(
+                        "embedded repositories cannot be staged",
+                    ));
+                }
+                staged.require_success("controller stage")?;
                 Ok(ControllerResponse::Staged { paths })
             }
             ControllerOperation::Commit { message } => {
@@ -745,7 +901,7 @@ impl ControllerChannel {
                     .handle
                     .transitioned(WorkspaceState::Active, None)
                     .map_err(ProtectedLaunchError::Workspace)?;
-                let (_, checkpoint) = crate::checkpoint_workspace(
+                let (checkpointed, checkpoint) = crate::checkpoint_workspace(
                     &active,
                     WorkspaceCheckpointLifecycleInput {
                         checkpoint_id,
@@ -757,7 +913,10 @@ impl ControllerChannel {
                     },
                 )
                 .map_err(ProtectedLaunchError::Lifecycle)?;
-                Ok(ControllerResponse::Checkpointed(Box::new(checkpoint)))
+                Ok(ControllerResponse::Checkpointed {
+                    handle: Box::new(checkpointed),
+                    checkpoint: Box::new(checkpoint),
+                })
             }
         }
     }
@@ -791,6 +950,33 @@ impl ControllerChannel {
         .require_success("controller head")?;
         CommitSha::parse(head.stdout.trim()).map_err(ProtectedLaunchError::Workspace)
     }
+}
+
+/// Ownership and root mode recorded before custody transfer.
+#[cfg(unix)]
+fn original_custody(
+    common_dir: &Path,
+    worktree: &Path,
+) -> Result<OriginalCustody, ProtectedLaunchError> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = |path: &Path| {
+        std::fs::symlink_metadata(path)
+            .map_err(|error| ProtectedLaunchError::Custody(format!("{}: {error}", path.display())))
+    };
+    let metadata = meta(common_dir)?;
+    let root = meta(worktree)?;
+    Ok(OriginalCustody {
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        worktree_mode: root.mode() & 0o7777,
+    })
+}
+
+#[cfg(not(unix))]
+fn original_custody(_: &Path, _: &Path) -> Result<OriginalCustody, ProtectedLaunchError> {
+    Err(ProtectedLaunchError::Unsupported(
+        "custody requires Unix ownership".into(),
+    ))
 }
 
 fn git_path(directory: &Path, flag: &str) -> Result<PathBuf, ProtectedLaunchError> {

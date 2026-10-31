@@ -1,22 +1,28 @@
 //! `WorktreeCreate` semantics (WE-W1-5, P-12). Host hook installation and
 //! translation are Host-owned plumbing outside this crate.
 //!
-//! * **Task context:** a fresh request runs hardened provisioning and returns
-//!   the new `PROVISIONED` handle. A repeated request for the same
-//!   repository/path/branch/base attaches idempotently, but only to the exact
+//! * **Task context:** a fresh request runs hardened provisioning, which
+//!   records the exact task identity in protected Git administrative metadata
+//!   (see [`crate::worktree_binding`]), and returns the new `PROVISIONED`
+//!   handle. A repeated request attaches idempotently only to the exact
 //!   verified registered worktree: the branch must be checked out there and
-//!   nowhere else, and the requested base must still be an ancestor of (or
-//!   equal to) its current HEAD. Edited work is never reset; the response
-//!   reports the actual current HEAD and cleanliness and carries no new
-//!   handle. Any mismatch refuses.
+//!   nowhere else, the recorded repository/path/branch/original base/workspace
+//!   /task binding must be present, authenticated and equal to the request,
+//!   and the base must still be an ancestor of (or equal to) the branch. A
+//!   different (even ancestral) base, task or workspace, a missing, corrupt
+//!   or unauthenticated binding, or a worktree that was created without task
+//!   context refuses; no binding is adopted or repaired from ancestry. Edited
+//!   work is never reset; the response reports the actual current HEAD and
+//!   cleanliness and carries no new handle.
 //! * **No task context:** ordinary Git worktree semantics only (a new branch
 //!   at the base, or idempotent attach to the identical worktree). No task
-//!   admission, handle or controller privilege is granted.
+//!   admission, handle or controller privilege is granted, and a task-bound
+//!   worktree is refused rather than attached as a plain one.
 //!
 //! No fetch or other remote operation ever happens; every Git call uses the
 //! hardened boundary. The returned path is the canonical absolute path.
-//! Limit: an existing worktree's original base is verified by ancestry, so a
-//! different base that is also an ancestor of HEAD cannot be distinguished.
+//! Limit: plain (no-task) attach has no recorded base, so for plain worktrees
+//! the original base is still verified by ancestry only.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -29,6 +35,7 @@ use crate::provision::{
     validate_identifier,
 };
 use crate::teardown::{list_registered_worktrees, record_matches};
+use crate::worktree_binding::{self, TaskBinding};
 
 /// Optional orchestrator task context.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,10 +230,36 @@ impl WorktreeCreateRequest {
                 detail: "the requested base is not an ancestor of the existing branch".into(),
             });
         }
-        let mode = if self.task.is_some() {
-            WorktreeCreateMode::TaskAttached
-        } else {
-            WorktreeCreateMode::PlainAttached
+        // Exact identity, never ancestry alone: a task request needs the
+        // recorded repository/path/branch/ORIGINAL base/workspace/task to
+        // match exactly; a no-task request may not attach a task-bound
+        // worktree. Nothing is created, repaired or promoted here.
+        let conflict = |detail: String| WorkspaceError::WorktreeCreateConflict { detail };
+        let mode = match &self.task {
+            Some(task) => {
+                worktree_binding::verify(
+                    root,
+                    &TaskBinding {
+                        repository: root.to_path_buf(),
+                        worktree: target.to_path_buf(),
+                        branch: self.branch.clone(),
+                        base_sha: self.base_sha.clone(),
+                        workspace_id: task.workspace_id.clone(),
+                        task_id: task.task_id.clone(),
+                    },
+                )
+                .map_err(conflict)?;
+                WorktreeCreateMode::TaskAttached
+            }
+            None => {
+                if worktree_binding::is_task_bound(root, target).map_err(conflict)? {
+                    return Err(conflict(
+                        "the worktree is bound to a task; a no-task request cannot attach it"
+                            .into(),
+                    ));
+                }
+                WorktreeCreateMode::PlainAttached
+            }
         };
         self.observe(target, mode)
     }

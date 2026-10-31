@@ -2,6 +2,11 @@
 //! hosted disposable-VM diagnostic (`.github/scripts/we-w1-completion-linux`),
 //! as root, with `RECEIPTS_WE_HOSTED_CGROUP` naming a delegated cgroup v2
 //! directory. Never run them with sudo on a workstation.
+//!
+//! The probes run inside the real boundary (fresh worker identity, or the
+//! confined controller identity) and print `key=bool` receipts; the parent test
+//! asserts every expected receipt and the parent-side custody, channel,
+//! lifecycle and teardown properties.
 
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -13,17 +18,39 @@ use crate::execution::{LiveProcessTerminalCause, ProcessRunRequest, ProcessTimeo
 use crate::test_support::{TempDir, git};
 use crate::{
     ControllerOperation, ControllerRequest, ControllerResponse, ProtectedLaunchConfig,
-    ProtectedLauncher, WorkspaceProvisionRequest,
+    ProtectedLaunchError, ProtectedLauncher, WorkspaceError, WorkspaceProvisionRequest,
+    WorkspaceState, WorkspaceTeardownRequest,
 };
 
 const PROBE_DIR: &str = "RECEIPTS_PROBE";
+const CONTROLLER_ID: u32 = 61001;
+const WORKER_GID: u32 = 61002;
+const WORKER_RANGE: std::ops::RangeInclusive<u32> = 62000..=62063;
+const FILTER_MARKER: &str = "FILTER_RAN";
+
+unsafe extern "C" {
+    fn syscall(number: i64, ...) -> i64;
+}
+const SYS_PROCESS_VM_READV: i64 = 310;
+const SYS_OPEN_BY_HANDLE_AT: i64 = 304;
+const SYS_SETNS: i64 = 308;
+const SYS_UNSHARE: i64 = 272;
+const SYS_PIDFD_GETFD: i64 = 438;
+const EPERM: i32 = 1;
 
 fn hosted_cgroup() -> PathBuf {
     PathBuf::from(std::env::var_os("RECEIPTS_WE_HOSTED_CGROUP").expect("hosted diagnostic only"))
 }
 
 fn config() -> ProtectedLaunchConfig {
-    ProtectedLaunchConfig::new(61001, 61001, 61002, 62000..=62063, hosted_cgroup()).unwrap()
+    ProtectedLaunchConfig::new(
+        CONTROLLER_ID,
+        CONTROLLER_ID,
+        WORKER_GID,
+        WORKER_RANGE,
+        hosted_cgroup(),
+    )
+    .unwrap()
 }
 
 fn probe_request(worktree: &Path, executable: &Path, name: &str) -> ProcessRunRequest {
@@ -72,6 +99,96 @@ fn fixture() -> (TempDir, PathBuf, crate::WorkspaceHandle) {
     (dir, repo, handle)
 }
 
+// ---- probe-side helpers (run inside the boundary) ----
+
+/// Value of one `/proc/self/status` field.
+fn status_field(name: &str) -> String {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{name}:")))
+        .unwrap_or_else(|| panic!("no {name} in status"))
+        .trim()
+        .to_owned()
+}
+
+/// Real, effective, saved and filesystem IDs are one value inside `allowed`.
+fn single_id(name: &str, allowed: std::ops::RangeInclusive<u32>) -> bool {
+    let ids: Vec<u32> = status_field(name)
+        .split_whitespace()
+        .map(|id| id.parse().unwrap())
+        .collect();
+    ids.len() == 4 && ids.iter().all(|id| *id == ids[0]) && allowed.contains(&ids[0])
+}
+
+/// Exact capability sets, no supplementary groups, no-new-privs, seccomp filter.
+fn identity_receipt(uid: std::ops::RangeInclusive<u32>, gid: u32, caps: &str) -> String {
+    let sets = ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"];
+    let caps_exact = sets.iter().all(|name| {
+        u64::from_str_radix(&status_field(name), 16).ok() == u64::from_str_radix(caps, 16).ok()
+    });
+    format!(
+        "uid_exact={} gid_exact={} no_groups={} caps_exact={} nnp={} seccomp_filter={}",
+        single_id("Uid", uid),
+        single_id("Gid", gid..=gid),
+        status_field("Groups").is_empty(),
+        caps_exact,
+        status_field("NoNewPrivs") == "1",
+        status_field("Seccomp") == "2",
+    )
+}
+
+/// Only stdio and this probe's own directory descriptor are open: no leaked
+/// metadata, cgroup, namespace or privileged descriptor survives.
+fn fds_sealed() -> bool {
+    let own = PathBuf::from(format!("/proc/{}/fd", std::process::id()));
+    let open: Vec<(u32, PathBuf)> = std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let number: u32 = entry.file_name().to_str()?.parse().ok()?;
+            Some((number, std::fs::read_link(entry.path()).ok()?))
+        })
+        .collect();
+    open.iter().all(|(number, target)| {
+        if *number <= 2 {
+            let text = target.to_string_lossy();
+            text.starts_with("pipe:") || text == "/dev/null"
+        } else {
+            *target == own
+        }
+    })
+}
+
+/// The filtered syscall returns EPERM although unfiltered it would succeed or
+/// fail differently for these arguments.
+fn filtered(number: i64, a: i64, b: i64, c: i64) -> bool {
+    // SAFETY: every probed call takes only integer arguments that the kernel
+    // validates; a rejected call has no side effect, and the unfiltered
+    // variants used here (`unshare(0)`, `process_vm_readv` with zero vectors)
+    // are harmless.
+    let result = unsafe { syscall(number, a, b, c, 0i64, 0i64, 0i64) };
+    result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(EPERM)
+}
+
+fn cgroup_lines(probe: &Path) -> Vec<PathBuf> {
+    std::fs::read_to_string(probe.join("cgroups.txt"))
+        .unwrap()
+        .lines()
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// Migration into another cgroup needs write access to its `cgroup.procs`.
+fn cgroup_migration_denied(paths: &[PathBuf]) -> bool {
+    paths.iter().all(|cgroup| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(cgroup.join("cgroup.procs"))
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+    })
+}
+
 /// Worker-side probe (runs as the fresh worker UID inside the boundary).
 #[test]
 #[ignore = "hosted worker probe"]
@@ -114,6 +231,20 @@ fn worker_probe() {
         std::fs::write(common.join("hooks/post-commit"), "x").is_err(),
     );
     record(
+        "metadata_replace_denied",
+        std::fs::rename(worktree.join("tracked.txt"), common.join("config")).is_err(),
+    );
+    record(
+        "proc_root_metadata_denied",
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(format!(
+                "/proc/self/root{}",
+                common.join("config").display()
+            ))
+            .is_err(),
+    );
+    record(
         "payload_edit",
         std::fs::write(worktree.join("tracked.txt"), "edited\n").is_ok(),
     );
@@ -138,10 +269,60 @@ fn worker_probe() {
         std::fs::write(worktree.join("escapee.pid"), child.id().to_string()).unwrap();
     }
     record("escapee_spawned", escapee.is_ok());
-    unsafe extern "C" {
-        fn unshare(flags: i32) -> i32;
-    }
-    record("unshare_denied", unsafe { unshare(0x1000_0000) } != 0);
+
+    // Exact identity and sealed descriptors.
+    println!(
+        "IDENTITY {}",
+        identity_receipt(WORKER_RANGE, WORKER_GID, "0")
+    );
+    record("fds_sealed", fds_sealed());
+    // Namespace, handle and descriptor-stealing syscalls are filtered.
+    record("unshare_filtered", filtered(SYS_UNSHARE, 0, 0, 0));
+    record("setns_filtered", filtered(SYS_SETNS, -1, 0, 0));
+    record("pidfd_getfd_filtered", filtered(SYS_PIDFD_GETFD, -1, -1, 0));
+    record(
+        "process_vm_filtered",
+        filtered(SYS_PROCESS_VM_READV, 0, 0, 0),
+    );
+    // cgroup escape: root, sibling and own cgroup cannot be written.
+    record(
+        "cgroup_migration_denied",
+        cgroup_migration_denied(&cgroup_lines(&worktree.join(PROBE_DIR))),
+    );
+    // A worker-owned embedded repository whose config names a clean filter. It
+    // must never run (the controller refuses to stage it; the distinct owner
+    // would also stop Git from entering it).
+    let evil = worktree.join("evil");
+    let run_git = |args: &[&str]| {
+        std::process::Command::new("/usr/bin/git")
+            .env_clear()
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("HOME", "/nonexistent")
+            .args(["-C", evil.to_str().unwrap()])
+            .args(args)
+            .output()
+            .is_ok_and(|output| output.status.success())
+    };
+    let marker = worktree.join(FILTER_MARKER);
+    let filter = format!("sh -c 'touch {}; cat'", marker.display());
+    let embedded = std::fs::create_dir(&evil).is_ok()
+        && run_git(&["init", "-q", "-b", "main"])
+        && std::fs::write(evil.join(".gitattributes"), "* filter=x\n").is_ok()
+        && run_git(&["config", "filter.x.clean", &filter])
+        && std::fs::write(evil.join("f"), "data").is_ok()
+        && run_git(&["add", "-A"])
+        && run_git(&[
+            "-c",
+            "user.name=w",
+            "-c",
+            "user.email=w@w.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "w",
+        ]);
+    record("embedded_repo_created", embedded);
     println!("PROBE {}", report.join(" "));
     std::mem::forget(escapee);
 }
@@ -154,12 +335,74 @@ fn controller_probe() {
         return;
     };
     let read = |path: &Path| std::fs::read(path).is_ok();
+    let sentinel = worktree.join("../sentinel");
+    let outside_by_proc = PathBuf::from(format!(
+        "/proc/self/root{}",
+        std::fs::canonicalize(&sentinel)
+            .unwrap_or_else(|_| sentinel.clone())
+            .display()
+    ));
+    let probe = worktree.join(PROBE_DIR);
+    // Migration targets are the delegated root and the sibling only (the
+    // controller's own per-call cgroup name is unknown to the probe).
+    let migration_targets: Vec<PathBuf> = cgroup_lines(&probe).into_iter().take(2).collect();
     println!(
-        "CONTROLLER private_read={} sentinel_denied={} sentinel_visible={}",
+        "CONTROLLER private_read={} sentinel_denied={} sentinel_visible={} proc_root_outside_denied={}",
         read(&worktree.join("private.txt")),
-        !read(&worktree.join("../sentinel")),
-        worktree.join("../sentinel").exists(),
+        !read(&sentinel),
+        sentinel.exists(),
+        !read(&outside_by_proc),
     );
+    println!(
+        "CONTROLLER_IDENTITY {}",
+        identity_receipt(CONTROLLER_ID..=CONTROLLER_ID, CONTROLLER_ID, "4")
+    );
+    println!(
+        "CONTROLLER_ESCAPE fds_sealed={} open_by_handle_filtered={} setns_filtered={} unshare_filtered={} pidfd_getfd_filtered={} cgroup_migration_denied={}",
+        fds_sealed(),
+        filtered(SYS_OPEN_BY_HANDLE_AT, -1, 0, 0),
+        filtered(SYS_SETNS, -1, 0, 0),
+        filtered(SYS_UNSHARE, 0, 0, 0),
+        filtered(SYS_PIDFD_GETFD, -1, -1, 0),
+        cgroup_migration_denied(&migration_targets),
+    );
+}
+
+fn assert_receipts(stdout: &str, expected: &[&str]) {
+    for check in expected {
+        assert!(stdout.contains(check), "missing {check} in:\n{stdout}");
+    }
+}
+
+/// Exact custody after admission: owners, modes, ancestors and payload.
+fn assert_custody(common: &Path, worktree: &Path, worker_uid: u32) {
+    let mut pending = vec![common.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert_eq!(
+            (metadata.uid(), metadata.gid()),
+            (CONTROLLER_ID, CONTROLLER_ID),
+            "{}",
+            path.display()
+        );
+        assert_eq!(metadata.mode() & 0o022, 0, "{}", path.display());
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(&path).unwrap() {
+                pending.push(entry.unwrap().path());
+            }
+        }
+    }
+    let root = std::fs::symlink_metadata(worktree).unwrap();
+    assert_eq!(
+        (root.uid(), root.gid(), root.mode() & 0o7777),
+        (CONTROLLER_ID, WORKER_GID, 0o1770)
+    );
+    let pointer = std::fs::symlink_metadata(worktree.join(".git")).unwrap();
+    assert_eq!((pointer.uid(), pointer.mode() & 0o022), (CONTROLLER_ID, 0));
+    let payload = std::fs::symlink_metadata(worktree.join("tracked.txt")).unwrap();
+    assert_eq!((payload.uid(), payload.gid()), (worker_uid, WORKER_GID));
+    crate::protected::verify_custody(common, worktree, CONTROLLER_ID, WORKER_GID)
+        .expect("ancestors and custody verify");
 }
 
 #[test]
@@ -169,14 +412,31 @@ fn hosted_protected_worker_controller_and_cleanup() {
     let launcher = ProtectedLauncher::new(config()).expect("hosted admission must succeed");
     let admission = launcher.admit(&handle, &repo).expect("custody");
     let config_before = std::fs::read(repo.join(".git/config")).unwrap();
-
     let worktree = handle.worktree_path().to_path_buf();
+    let common = std::fs::canonicalize(repo.join(".git")).unwrap();
+    assert_custody(&common, &worktree, admission.worker_uid_for_test());
+
     let probe = worktree.join(PROBE_DIR);
     std::fs::create_dir(&probe).unwrap();
     let executable = probe.join("probe");
     std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
     std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Cgroup paths the probes must be unable to migrate into: the delegated
+    // root, a real sibling, and the worker's own cgroup.
+    let sibling = hosted_cgroup().join("receipts-sibling");
+    std::fs::create_dir(&sibling).unwrap();
+    let worker_cgroup = hosted_cgroup().join(format!("receipts-{}-worker", admission.attempt_id()));
+    let lines = [hosted_cgroup(), sibling.clone(), worker_cgroup];
+    std::fs::write(
+        probe.join("cgroups.txt"),
+        lines
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
 
     let protected = launcher
         .launch(
@@ -195,19 +455,29 @@ fn hosted_protected_worker_controller_and_cleanup() {
     );
     let stdout = String::from_utf8_lossy(outcome.stdout().head()).into_owned();
     println!("{stdout}");
-    for check in [
-        "uid_nonroot=true",
-        "config_write_denied=true",
-        "pointer_unlink_denied=true",
-        "pointer_rename_denied=true",
-        "hooks_create_denied=true",
-        "payload_edit=true",
-        "private_payload=true",
-        "escapee_spawned=true",
-        "unshare_denied=true",
-    ] {
-        assert!(stdout.contains(check), "missing {check}");
-    }
+    assert_receipts(
+        &stdout,
+        &[
+            "uid_nonroot=true",
+            "config_write_denied=true",
+            "pointer_unlink_denied=true",
+            "pointer_rename_denied=true",
+            "hooks_create_denied=true",
+            "metadata_replace_denied=true",
+            "proc_root_metadata_denied=true",
+            "payload_edit=true",
+            "private_payload=true",
+            "escapee_spawned=true",
+            "fds_sealed=true",
+            "unshare_filtered=true",
+            "setns_filtered=true",
+            "pidfd_getfd_filtered=true",
+            "process_vm_filtered=true",
+            "cgroup_migration_denied=true",
+            "embedded_repo_created=true",
+            "uid_exact=true gid_exact=true no_groups=true caps_exact=true nnp=true seccomp_filter=true",
+        ],
+    );
     let pid = std::fs::read_to_string(worktree.join("escapee.pid")).unwrap();
     let alive = std::fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
         .map(|stat| !stat.contains(") Z "))
@@ -219,7 +489,7 @@ fn hosted_protected_worker_controller_and_cleanup() {
     );
     assert_eq!(
         std::fs::metadata(worktree.join(".git")).unwrap().uid(),
-        61001
+        CONTROLLER_ID
     );
 
     // Controller: read worker 0600 payload without chmod/chown, deny an
@@ -235,24 +505,63 @@ fn hosted_protected_worker_controller_and_cleanup() {
         .mode();
     let worker = protected.worker_channel();
     let credentials = worker.credentials();
-    let send = |sequence, operation| {
-        worker.handle(ControllerRequest {
-            attempt_id: credentials.attempt_id.clone(),
-            task_id: credentials.task_id.clone(),
-            token: credentials.token.clone(),
+    let send = |channel: &crate::ControllerChannel, sequence, operation| {
+        let credentials = channel.credentials();
+        channel.handle(ControllerRequest {
+            attempt_id: credentials.attempt_id,
+            task_id: credentials.task_id,
+            token: credentials.token,
             sequence,
             operation,
         })
     };
+    assert_eq!(credentials.task_id, "task-hosted");
+
+    // Reviewer: query-only on the enforced channel, mutations refused.
+    let reviewer = protected.reviewer_channel();
+    assert!(send(reviewer, 0, ControllerOperation::Status).is_ok());
+    // A role refusal does not consume the sequence, so both use number 1.
+    for operation in [
+        ControllerOperation::Stage {
+            paths: vec!["tracked.txt".into()],
+        },
+        ControllerOperation::Commit {
+            message: "reviewer".into(),
+        },
+    ] {
+        assert!(matches!(
+            send(reviewer, 1, operation),
+            Err(ProtectedLaunchError::Binding(
+                "reviewer channel is query-only"
+            ))
+        ));
+    }
+
+    // The worker-planted embedded repository is never staged, so its filter
+    // can never run as the controller.
+    assert!(matches!(
+        send(
+            worker,
+            0,
+            ControllerOperation::Stage {
+                paths: vec!["evil".into()]
+            }
+        ),
+        Err(ProtectedLaunchError::Binding(
+            "embedded repositories cannot be staged"
+        ))
+    ));
     send(
-        0,
+        worker,
+        1,
         ControllerOperation::Stage {
             paths: vec!["tracked.txt".into(), "private.txt".into()],
         },
     )
     .expect("controller stages worker payload");
     let ControllerResponse::Committed { commit } = send(
-        1,
+        worker,
+        2,
         ControllerOperation::Commit {
             message: "worker work".into(),
         },
@@ -270,18 +579,29 @@ fn hosted_protected_worker_controller_and_cleanup() {
             .mode(),
         mode_before
     );
-    let ControllerResponse::Checkpointed(checkpoint) = send(
-        2,
+    let ControllerResponse::Checkpointed {
+        handle: checkpointed,
+        checkpoint,
+    } = send(
+        worker,
+        3,
         ControllerOperation::Checkpoint {
             checkpoint_id: "hosted".into(),
             kind: crate::WorkspaceCheckpointKind::Progress,
             captured_at: crate::WorkspaceDateTimeV1::try_new("2026-10-30T00:00:00Z").unwrap(),
         },
     )
-    .expect("checkpoint") else {
+    .expect("checkpoint")
+    else {
         panic!("checkpoint")
     };
     assert_eq!(checkpoint.core().head_sha(), &commit);
+    assert_eq!(checkpointed.state(), WorkspaceState::Checkpointed);
+    assert_eq!(checkpointed.head_sha(), Some(&commit));
+    assert!(
+        !worktree.join(FILTER_MARKER).exists(),
+        "a worker-supplied filter ran as the controller"
+    );
 
     // Controller identity probe through the same confinement.
     let launch = protected.controller_launch_for_test();
@@ -294,13 +614,58 @@ fn hosted_protected_worker_controller_and_cleanup() {
     let outcome = attempt.wait_collect().expect("controller probe cleanup");
     let stdout = String::from_utf8_lossy(outcome.stdout().head()).into_owned();
     println!("{stdout}");
-    for check in [
-        "private_read=true",
-        "sentinel_denied=true",
-        "sentinel_visible=true",
-    ] {
-        assert!(stdout.contains(check), "missing {check}");
-    }
+    assert_receipts(
+        &stdout,
+        &[
+            "private_read=true",
+            "sentinel_denied=true",
+            "sentinel_visible=true",
+            "proc_root_outside_denied=true",
+            "uid_exact=true gid_exact=true no_groups=true caps_exact=true nnp=true seccomp_filter=true",
+            "fds_sealed=true",
+            "open_by_handle_filtered=true",
+            "setns_filtered=true",
+            "unshare_filtered=true",
+            "pidfd_getfd_filtered=true",
+            "cgroup_migration_denied=true",
+        ],
+    );
+
+    // Custody returns only after proven cleanup; channels then refuse.
+    protected.release_custody().expect("custody release");
+    let restored = std::fs::symlink_metadata(&common).unwrap();
+    assert_eq!(
+        restored.uid(),
+        0,
+        "metadata returns to the root-owned fixture"
+    );
+    assert!(matches!(
+        send(worker, 4, ControllerOperation::Status),
+        Err(ProtectedLaunchError::Binding("custody was released"))
+    ));
+
+    // Non-force teardown: dirty payload (probe files, the embedded repository)
+    // refuses and survives; once removed, teardown succeeds and the task
+    // branch keeps its commit.
+    let teardown = WorkspaceTeardownRequest::new(&repo);
+    assert!(matches!(
+        teardown.teardown(&checkpointed),
+        Err(WorkspaceError::TeardownWorktreeDirty { .. })
+    ));
+    assert!(worktree.join("evil").exists() && probe.exists());
+    std::fs::remove_dir_all(&probe).unwrap();
+    std::fs::remove_dir_all(worktree.join("evil")).unwrap();
+    std::fs::remove_file(worktree.join("escapee.pid")).unwrap();
+    let torn = teardown
+        .teardown(&checkpointed)
+        .expect("non-force teardown");
+    assert_eq!(torn.state(), WorkspaceState::TornDown);
+    assert!(!worktree.exists());
+    let tip =
+        crate::test_support::stdout_trimmed(&git(&repo, &["rev-parse", "refs/heads/task/hosted"]));
+    assert_eq!(tip, commit.as_str());
+
+    std::fs::remove_dir(&sibling).unwrap();
     let leftovers: Vec<_> = std::fs::read_dir(hosted_cgroup())
         .unwrap()
         .filter_map(Result::ok)

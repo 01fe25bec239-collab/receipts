@@ -286,6 +286,33 @@ impl WorkspaceProvisionRequest {
             });
         }
 
+        // A task-bound worktree records its exact identity in protected Git
+        // administrative metadata before any handle exists. `create_new`
+        // never overwrites a marker; failure rolls this attempt back.
+        if let Some(task_id) = &self.task_id {
+            test_fault(ProvisionFault::Binding)?;
+            #[cfg(test)]
+            if PROVISION_FAULT.get() == Some(ProvisionFault::BindingBlocked) {
+                use std::os::unix::fs::PermissionsExt;
+                PROVISION_FAULT.set(None);
+                let dir = crate::worktree_binding::admin_dir(root, &created_worktree)
+                    .expect("fixture admin dir");
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500))
+                    .expect("fixture chmod");
+            }
+            crate::worktree_binding::record(
+                root,
+                &crate::worktree_binding::TaskBinding {
+                    repository: root.to_path_buf(),
+                    worktree: created_worktree.clone(),
+                    branch: self.branch.clone(),
+                    base_sha: self.base_sha.clone(),
+                    workspace_id: self.workspace_id.clone(),
+                    task_id: task_id.clone(),
+                },
+            )?;
+        }
+
         Ok(WorkspaceHandle::provisioned(
             self.workspace_id.clone(),
             self.task_id.clone(),
@@ -529,6 +556,12 @@ pub(crate) enum ProvisionFault {
     /// Also leaves an untracked file in the new worktree, which non-force
     /// rollback must refuse to delete.
     DirtyWorktree,
+    /// Fails before the task binding is written (clean rollback expected).
+    Binding,
+    /// Makes the worktree's administrative directory unwritable so the real
+    /// binding write fails and non-force rollback cannot remove it.
+    #[cfg(test)]
+    BindingBlocked,
 }
 
 #[cfg(test)]
