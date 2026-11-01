@@ -3,38 +3,45 @@
 
 use serde_json::{Value, json};
 
+use super::review_evidence_tests::{Rec, ReviewDir};
 use crate::dag::{
     InterfaceArtifactRecord, InterfaceArtifactSource, InterfaceEvidenceVerifier,
     InterfaceProvenance, InterfaceSourceUnavailable,
 };
 use crate::orchestration::OrchestrationDateTimeV1;
+use crate::review_evidence::ReviewEvidenceVerifier;
 use crate::wire::GraphMutationWireV1;
 use crate::{
-    ExecutionGraph, ExecutionGraphEnvelope, ExecutionGraphEnvelopeFields, GraphEdge, GraphMutation,
-    GraphMutationApplyError, GraphMutationOutcomeV1, GraphMutationScopeV1, GraphNode,
-    GraphNodeKind, GraphNodeState as S, GraphOperationError as O, GraphResultLedgerV1,
-    GraphVersionV1, PrecedenceKind, ScopedActorV1, apply_graph_mutation_v1,
+    ApplyEvidenceV1, ExecutionGraph, ExecutionGraphEnvelope, ExecutionGraphEnvelopeFields,
+    GraphEdge, GraphMutation, GraphMutationApplyError, GraphMutationOutcomeV1,
+    GraphMutationScopeV1, GraphNode, GraphNodeKind, GraphNodeState as S, GraphOperationError as O,
+    GraphResultLedgerV1, GraphVersionV1, PrecedenceKind, ReviewEvidenceRefusal, ReviewOutcome,
+    ScopedActorV1, apply_graph_mutation_v1, apply_graph_mutation_with_evidence_v1,
     graph_content_digest_v1,
 };
 
-const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+pub(super) const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
-fn ver(v: &str) -> GraphVersionV1 {
+pub(super) fn ver(v: &str) -> GraphVersionV1 {
     GraphVersionV1::try_new(v).unwrap()
 }
 
-fn node(id: &str, kind: GraphNodeKind, state: S) -> GraphNode {
+pub(super) fn node(id: &str, kind: GraphNodeKind, state: S) -> GraphNode {
     GraphNode::new(id, "g", kind, state)
         .unwrap()
         .with_workstream_id("w")
         .unwrap()
 }
 
-fn envelope(nodes: Vec<GraphNode>, edges: Vec<GraphEdge>, version: &str) -> ExecutionGraphEnvelope {
+pub(super) fn envelope(
+    nodes: Vec<GraphNode>,
+    edges: Vec<GraphEdge>,
+    version: &str,
+) -> ExecutionGraphEnvelope {
     envelope_in("P", "g", nodes, edges, version)
 }
 
-fn envelope_in(
+pub(super) fn envelope_in(
     project: &str,
     graph_id: &str,
     nodes: Vec<GraphNode>,
@@ -56,16 +63,16 @@ fn envelope_in(
     .unwrap()
 }
 
-fn a1() -> ScopedActorV1 {
+pub(super) fn a1() -> ScopedActorV1 {
     ScopedActorV1::RuntimeA1 { role_id: None }
 }
-fn a2(ws: &str) -> ScopedActorV1 {
+pub(super) fn a2(ws: &str) -> ScopedActorV1 {
     ScopedActorV1::RuntimeA2 {
         role_id: Some("a2".into()),
         workstream_id: ws.into(),
     }
 }
-fn role(actor: &ScopedActorV1) -> Value {
+pub(super) fn role(actor: &ScopedActorV1) -> Value {
     match actor {
         ScopedActorV1::User { .. } => json!({"role":"USER"}),
         ScopedActorV1::RuntimeA1 { .. } => json!({"role":"RUNTIME_A1"}),
@@ -74,7 +81,11 @@ fn role(actor: &ScopedActorV1) -> Value {
     }
 }
 
-fn mutation(env: &ExecutionGraphEnvelope, actor: &ScopedActorV1, ops: Value) -> GraphMutation {
+pub(super) fn mutation(
+    env: &ExecutionGraphEnvelope,
+    actor: &ScopedActorV1,
+    ops: Value,
+) -> GraphMutation {
     let parent: u128 = env.graph_version().as_str().parse().unwrap();
     let text = json!({
         "mutation_id": "m", "graph_id": env.graph_id(), "parent_version": parent,
@@ -87,7 +98,7 @@ fn mutation(env: &ExecutionGraphEnvelope, actor: &ScopedActorV1, ops: Value) -> 
         .unwrap()
 }
 
-fn scope(env: &ExecutionGraphEnvelope, actor: ScopedActorV1) -> GraphMutationScopeV1 {
+pub(super) fn scope(env: &ExecutionGraphEnvelope, actor: ScopedActorV1) -> GraphMutationScopeV1 {
     GraphMutationScopeV1::new(
         env.project_id(),
         env.graph_id(),
@@ -96,30 +107,30 @@ fn scope(env: &ExecutionGraphEnvelope, actor: ScopedActorV1) -> GraphMutationSco
     )
 }
 
-fn apply(
+pub(super) fn apply(
     env: &ExecutionGraphEnvelope,
     results: &GraphResultLedgerV1,
     actor: ScopedActorV1,
     ops: Value,
 ) -> Result<GraphMutationOutcomeV1, GraphMutationApplyError> {
-    apply_with(env, results, actor, ops, None)
+    apply_with(env, results, actor, ops, ApplyEvidenceV1::default())
 }
 
-fn apply_with(
+pub(super) fn apply_with(
     env: &ExecutionGraphEnvelope,
     results: &GraphResultLedgerV1,
     actor: ScopedActorV1,
     ops: Value,
-    interface: Option<InterfaceEvidenceVerifier<'_>>,
+    evidence: ApplyEvidenceV1<'_>,
 ) -> Result<GraphMutationOutcomeV1, GraphMutationApplyError> {
     let before = (env.clone(), results.clone());
     let m = mutation(env, &actor, ops);
-    let out = apply_graph_mutation_v1(env, results, &m, &scope(env, actor), interface);
+    let out = apply_graph_mutation_with_evidence_v1(env, results, &m, &scope(env, actor), evidence);
     assert_eq!((env.clone(), results.clone()), before, "inputs changed");
     out
 }
 
-fn ok(
+pub(super) fn ok(
     env: &ExecutionGraphEnvelope,
     results: &GraphResultLedgerV1,
     actor: ScopedActorV1,
@@ -129,7 +140,7 @@ fn ok(
     (out.envelope, out.results)
 }
 
-fn op_err(
+pub(super) fn op_err(
     env: &ExecutionGraphEnvelope,
     results: &GraphResultLedgerV1,
     actor: ScopedActorV1,
@@ -141,16 +152,48 @@ fn op_err(
     }
 }
 
-fn set(id: &str, from: &str, to: &str, cause: Value) -> Value {
+/// Evidence a trusted core would supply: the file-backed review source.
+pub(super) fn rev(dir: &ReviewDir) -> ApplyEvidenceV1<'_> {
+    ApplyEvidenceV1 {
+        interface: None,
+        review: Some(ReviewEvidenceVerifier::new(dir)),
+    }
+}
+
+pub(super) fn ok_ev(
+    env: &ExecutionGraphEnvelope,
+    results: &GraphResultLedgerV1,
+    actor: ScopedActorV1,
+    ops: Value,
+    evidence: ApplyEvidenceV1<'_>,
+) -> (ExecutionGraphEnvelope, GraphResultLedgerV1) {
+    let out = apply_with(env, results, actor, ops, evidence).unwrap();
+    (out.envelope, out.results)
+}
+
+pub(super) fn op_err_ev(
+    env: &ExecutionGraphEnvelope,
+    results: &GraphResultLedgerV1,
+    actor: ScopedActorV1,
+    ops: Value,
+    evidence: ApplyEvidenceV1<'_>,
+) -> (usize, O) {
+    match apply_with(env, results, actor, ops, evidence) {
+        Err(GraphMutationApplyError::Operation { index, error }) => (index, error),
+        other => panic!("expected operation refusal, got {other:?}"),
+    }
+}
+
+pub(super) fn set(id: &str, from: &str, to: &str, cause: Value) -> Value {
     json!({"op":"SET_NODE_STATE","node_id":id,"detail":{"from":from,"to":to,"cause":cause}})
 }
 
-fn run_to_review(id: &str) -> Vec<Value> {
+pub(super) fn run_to_review(id: &str) -> Vec<Value> {
     run_as(id, "at1")
 }
 
 /// PLANNED → AWAITING_REVIEW as one admitted execution `attempt`.
-fn run_as(id: &str, attempt: &str) -> Vec<Value> {
+pub(super) fn run_as(id: &str, attempt: &str) -> Vec<Value> {
     vec![
         set(
             id,
@@ -185,17 +228,23 @@ fn run_as(id: &str, attempt: &str) -> Vec<Value> {
     ]
 }
 
-fn result(id: &str, outcome: &str, review: &str) -> Value {
+pub(super) fn result(id: &str, outcome: &str, review: &str) -> Value {
     json!({"node_id":id,"graph_id":"g","outcome":outcome,"produced_at":"2026-10-29T00:00:00Z",
            "attempt_id":"at1","review_id":review,"code_sha":SHA,
            "checks":[{"command":["cargo","test"],"exit_code":0}]})
 }
 
-fn attach(id: &str, r: &str, result: Value) -> Value {
+/// A result for a node with no known code SHA: no code claim.
+pub(super) fn bare(mut result: Value) -> Value {
+    result.as_object_mut().unwrap().remove("code_sha");
+    result
+}
+
+pub(super) fn attach(id: &str, r: &str, result: Value) -> Value {
     json!({"op":"ATTACH_RESULT","node_id":id,"detail":{"result_ref":r,"result":result}})
 }
 
-fn verdict(id: &str, to: &str, cited: &str) -> Value {
+pub(super) fn verdict(id: &str, to: &str, cited: &str) -> Value {
     set(
         id,
         "AWAITING_REVIEW",
@@ -204,7 +253,18 @@ fn verdict(id: &str, to: &str, cited: &str) -> Value {
     )
 }
 
-fn task_env() -> ExecutionGraphEnvelope {
+/// A verdict that names the independent review a work node's first round
+/// rests on.
+pub(super) fn verdict_rv(id: &str, to: &str, cited: &str, review: &str) -> Value {
+    set(
+        id,
+        "AWAITING_REVIEW",
+        to,
+        json!({"kind":"REVIEW_VERDICT","result_node_id":cited,"review_id":review}),
+    )
+}
+
+pub(super) fn task_env() -> ExecutionGraphEnvelope {
     envelope(
         vec![
             node("t", GraphNodeKind::TASK, S::Planned)
@@ -247,16 +307,25 @@ fn full_lifecycle_through_apply_with_digest_and_successor() {
     );
     assert_eq!(e, O::EvidenceRefused("dependencies"));
 
-    let (env3, results) = ok(
+    // The verdict rests on independent review evidence for exactly this
+    // attempt and commit, admitted by trusted core; t has no round number.
+    let dir = ReviewDir::new("lifecycle");
+    dir.put(&Rec::new("rv1", "t", "at1", SHA, ""));
+    let (env3, results) = ok_ev(
         &env2,
         &results,
         a2("w"),
         json!([
             attach("t", "res-1", result("t", "PASS", "rv1")),
-            verdict("t", "PASSED", "t")
+            verdict_rv("t", "PASSED", "t", "rv1")
         ]),
+        rev(&dir),
     );
     assert_eq!(env3.graph().node("t").unwrap().result_ref(), Some("res-1"));
+    assert_eq!(
+        results.review("P", "g", "t"),
+        Some(("rv1", ReviewOutcome::Pass))
+    );
     // A2 cannot accept its own work; A1 can, then integrate.
     let accept = set(
         "t",
@@ -639,7 +708,7 @@ fn result_attachment_is_immutable_and_associated() {
         op_err(&env, &admitted, a1(), json!([attach("t", "r", no_attempt)])).1,
         O::ResultAssociation("attempt_id")
     );
-    // Verdict needs a matching attached result; a missing one is unavailable.
+    // A verdict needs the attached implementation result and review evidence.
     let (env3, r3) = ok(
         &env,
         &admitted,
@@ -651,546 +720,35 @@ fn result_attachment_is_immutable_and_associated() {
             json!({"kind":"SUBMIT","attempt_id":"at1"})
         )]),
     );
+    let dir = ReviewDir::new("attach");
+    dir.put(&Rec::new("rv9", "t", "at1", SHA, "1"));
+    let judge = verdict_rv("t", "PASSED", "t", "rv9");
+    // No trusted source at all: unavailable, however the worker's result reads.
     assert_eq!(
-        op_err(&env3, &r3, a1(), json!([verdict("t", "PASSED", "t")])).1,
-        O::EvidenceUnavailable("attached review result")
+        op_err(&env3, &r3, a1(), json!([judge.clone()])).1,
+        O::Review(ReviewEvidenceRefusal::NoSource)
     );
     assert_eq!(
-        op_err(
+        op_err_ev(&env3, &r3, a1(), json!([judge.clone()]), rev(&dir)).1,
+        O::EvidenceUnavailable("attached implementation result")
+    );
+    assert_eq!(
+        op_err_ev(
             &env3,
             &r3,
             a1(),
             json!([
-                attach("t", "r", result("t", "FAIL", "rv")),
-                verdict("t", "PASSED", "t")
-            ])
-        )
-        .0,
-        1
+                attach("t", "r", {
+                    let mut b = result("t", "FAIL", "rv");
+                    b["attempt_id"] = json!("at1");
+                    b
+                }),
+                judge
+            ]),
+            rev(&dir)
+        ),
+        (1, O::EvidenceRefused("implementation result outcome"))
     );
-}
-
-// --- repair provenance (S32) ----------------------------------------------
-
-fn repair_node() -> Value {
-    json!({"node_id":"t-r2","graph_id":"g","kind":"REPAIR","state":"PLANNED","workstream_id":"w","parent_node_id":"t","attempt_number":2,"created_in_version":3})
-}
-fn review_node() -> Value {
-    json!({"node_id":"r2","graph_id":"g","kind":"REVIEW","state":"PLANNED","workstream_id":"w","attempt_number":2,"created_in_version":3})
-}
-fn control_edge(id: &str, from: &str, to: &str) -> Value {
-    json!({"edge_id":id,"graph_id":"g","from_node":from,"to_node":to,"edge_class":"CONTROL","control_kind":"ON_REJECT"})
-}
-fn prec_edge(id: &str, from: &str, to: &str) -> Value {
-    json!({"edge_id":id,"graph_id":"g","from_node":from,"to_node":to,"edge_class":"PRECEDENCE","precedence_kind":"REQUIRES_ACCEPTED"})
-}
-fn expand(source: &str, nodes: Vec<Value>, edges: Vec<Value>) -> Value {
-    json!({"op":"EXPAND_REPAIR","node_id":source,"detail":{"nodes":nodes,"edges":edges}})
-}
-fn edited(mut node: Value, edit: Value) -> Value {
-    for (k, v) in edit.as_object().unwrap() {
-        if v.is_null() {
-            node.as_object_mut().unwrap().remove(k);
-        } else {
-            node[k] = v.clone();
-        }
-    }
-    node
-}
-
-/// `t` (the implementation) precedes the retained REJECTED review `r1`;
-/// `t` itself then runs and is rejected with its own attached result.
-fn rejected_round() -> (ExecutionGraphEnvelope, GraphResultLedgerV1) {
-    let env = envelope(
-        vec![
-            node("t", GraphNodeKind::TASK, S::Planned)
-                .with_code_sha(SHA)
-                .unwrap()
-                .with_attempt_number(crate::GraphNodeAttemptNumber::try_new("1").unwrap()),
-            node("r1", GraphNodeKind::REVIEW, S::Rejected)
-                .with_attempt_number(crate::GraphNodeAttemptNumber::try_new("1").unwrap()),
-            node("next", GraphNodeKind::TASK, S::Planned),
-        ],
-        vec![
-            GraphEdge::precedence("e", "g", "t", "next", PrecedenceKind::RequiresAccepted).unwrap(),
-            GraphEdge::precedence("pr", "g", "t", "r1", PrecedenceKind::RequiresAccepted).unwrap(),
-        ],
-        "1",
-    );
-    let mut ops = run_to_review("t");
-    ops.push(attach("t", "res-1", result("t", "REJECTED", "rv1")));
-    ops.push(verdict("t", "REJECTED", "t"));
-    ok(
-        &env,
-        &GraphResultLedgerV1::new(),
-        a2("w"),
-        Value::Array(ops),
-    )
-}
-
-#[test]
-fn repair_expansion_refuses_incomplete_or_wrong_provenance() {
-    let (env, results) = rejected_round();
-    let (repair, review) = (repair_node(), review_node());
-    let (c1, p1, p2) = (
-        control_edge("c1", "r1", "t-r2"),
-        prec_edge("p1", "t-r2", "r2"),
-        prec_edge("p2", "r2", "next"),
-    );
-    let no_version = json!({"created_in_version": null});
-    let other_repair = edited(repair.clone(), json!({"node_id":"t-r3","attempt_number":2}));
-    let other_review = edited(review.clone(), json!({"node_id":"r3"}));
-    let cases: Vec<(&str, &str, Value)> = vec![
-        // A3 reproduction: no parent and no REVIEW at all.
-        (
-            "no parent, no review",
-            "exactly one REPAIR and one REVIEW",
-            expand(
-                "r1",
-                vec![edited(repair.clone(), json!({"parent_node_id": null}))],
-                vec![c1.clone()],
-            ),
-        ),
-        (
-            "missing parent",
-            "repair parent must be the reviewed subject",
-            expand(
-                "r1",
-                vec![
-                    edited(repair.clone(), json!({"parent_node_id": null})),
-                    review.clone(),
-                ],
-                vec![c1.clone(), p1.clone(), p2.clone()],
-            ),
-        ),
-        (
-            "parent is the old review, not the reviewed implementation",
-            "repair parent must be the reviewed subject",
-            expand(
-                "r1",
-                vec![
-                    edited(repair.clone(), json!({"parent_node_id":"r1"})),
-                    review.clone(),
-                ],
-                vec![c1.clone(), p1.clone(), p2.clone()],
-            ),
-        ),
-        (
-            "parent is an unrelated node",
-            "repair parent must be the reviewed subject",
-            expand(
-                "r1",
-                vec![
-                    edited(repair.clone(), json!({"parent_node_id":"next"})),
-                    review.clone(),
-                ],
-                vec![c1.clone(), p1.clone(), p2.clone()],
-            ),
-        ),
-        (
-            "no fresh review",
-            "exactly one REPAIR and one REVIEW",
-            expand("r1", vec![repair.clone()], vec![c1.clone()]),
-        ),
-        (
-            "orphan review (no repair → review precedence)",
-            "one distinct fresh REVIEW",
-            expand(
-                "r1",
-                vec![repair.clone(), review.clone()],
-                vec![c1.clone(), p2.clone()],
-            ),
-        ),
-        (
-            "review precedes the repair instead of following it",
-            "one distinct fresh REVIEW",
-            expand(
-                "r1",
-                vec![repair.clone(), review.clone()],
-                vec![c1.clone(), prec_edge("p1", "r2", "t-r2")],
-            ),
-        ),
-        (
-            "repair points back at the old review",
-            "may not touch the rejected source",
-            expand(
-                "r1",
-                vec![repair.clone(), review.clone()],
-                vec![c1.clone(), p1.clone(), prec_edge("p3", "t-r2", "r1")],
-            ),
-        ),
-        (
-            "old review reused as the new review",
-            "DuplicateNodeId",
-            expand(
-                "r1",
-                vec![
-                    repair.clone(),
-                    edited(review.clone(), json!({"node_id":"r1"})),
-                ],
-                vec![c1.clone()],
-            ),
-        ),
-        (
-            "two repairs",
-            "exactly one REPAIR and one REVIEW",
-            expand(
-                "r1",
-                vec![repair.clone(), other_repair, review.clone()],
-                vec![c1.clone(), p1.clone()],
-            ),
-        ),
-        (
-            "two reviews",
-            "exactly one REPAIR and one REVIEW",
-            expand(
-                "r1",
-                vec![repair.clone(), review.clone(), other_review],
-                vec![c1.clone(), p1.clone()],
-            ),
-        ),
-        (
-            "rejected TASK as the source",
-            "source must be a REJECTED REVIEW",
-            expand(
-                "t",
-                vec![repair.clone(), review.clone()],
-                vec![control_edge("c1", "t", "t-r2"), p1.clone()],
-            ),
-        ),
-        (
-            "no ON_REJECT edge",
-            "missing ON_REJECT",
-            expand(
-                "r1",
-                vec![repair.clone(), review.clone()],
-                vec![p1.clone(), p2.clone()],
-            ),
-        ),
-        (
-            "ON_REJECT from the implementation, not the review",
-            "missing ON_REJECT",
-            expand(
-                "r1",
-                vec![repair.clone(), review.clone()],
-                vec![control_edge("c1", "t", "t-r2"), p1.clone()],
-            ),
-        ),
-        (
-            "unversioned review",
-            "created_in_version",
-            expand(
-                "r1",
-                vec![repair.clone(), edited(review.clone(), no_version)],
-                vec![c1.clone(), p1.clone()],
-            ),
-        ),
-        (
-            "repair created in the wrong version",
-            "created_in_version",
-            expand(
-                "r1",
-                vec![
-                    edited(repair.clone(), json!({"created_in_version":4})),
-                    review.clone(),
-                ],
-                vec![c1.clone(), p1.clone()],
-            ),
-        ),
-        (
-            "child names another graph",
-            "ChildGraphIdMismatch",
-            expand(
-                "r1",
-                vec![
-                    edited(repair.clone(), json!({"graph_id":"h"})),
-                    review.clone(),
-                ],
-                vec![c1.clone(), p1.clone()],
-            ),
-        ),
-        (
-            "precedence cycle through the new round",
-            "PrecedenceCycleRejected",
-            expand(
-                "r1",
-                vec![repair.clone(), review.clone()],
-                vec![
-                    c1.clone(),
-                    p1.clone(),
-                    p2.clone(),
-                    prec_edge("p4", "next", "t-r2"),
-                ],
-            ),
-        ),
-        (
-            "repair in another workstream than the subject",
-            "workstream binding",
-            expand(
-                "r1",
-                vec![
-                    edited(repair.clone(), json!({"workstream_id":"x"})),
-                    review.clone(),
-                ],
-                vec![c1.clone(), p1.clone()],
-            ),
-        ),
-        (
-            "review in another workstream than the repair",
-            "workstream binding",
-            expand(
-                "r1",
-                vec![
-                    repair.clone(),
-                    edited(review.clone(), json!({"workstream_id":"x"})),
-                ],
-                vec![c1.clone(), p1.clone()],
-            ),
-        ),
-        (
-            "repair round does not follow the subject's",
-            "round ordinals",
-            expand(
-                "r1",
-                vec![
-                    edited(repair.clone(), json!({"attempt_number":1})),
-                    edited(review.clone(), json!({"attempt_number":1})),
-                ],
-                vec![c1.clone(), p1.clone()],
-            ),
-        ),
-        (
-            "review round differs from the repair's",
-            "round ordinals",
-            expand(
-                "r1",
-                vec![
-                    repair.clone(),
-                    edited(review.clone(), json!({"attempt_number":3})),
-                ],
-                vec![c1.clone(), p1.clone()],
-            ),
-        ),
-        (
-            "second execution subject also precedes the new review",
-            "subject is ambiguous",
-            expand(
-                "r1",
-                vec![repair.clone(), review.clone()],
-                vec![c1.clone(), p1.clone(), prec_edge("p5", "t", "r2")],
-            ),
-        ),
-    ];
-    for (label, reason, op) in cases {
-        let (index, error) = op_err(&env, &results, a2("w"), json!([op]));
-        assert_eq!(index, 0, "{label}");
-        assert!(format!("{error:?}").contains(reason), "{label}: {error:?}");
-    }
-    // Ambiguous or missing subject linkage on the retained review.
-    for (label, reason, edges) in [
-        ("no subject", "no reviewed subject", vec![]),
-        (
-            "two subjects",
-            "subject is ambiguous",
-            vec![
-                GraphEdge::precedence("a", "g", "x", "rv", PrecedenceKind::RequiresAccepted)
-                    .unwrap(),
-                GraphEdge::precedence("b", "g", "y", "rv", PrecedenceKind::RequiresAccepted)
-                    .unwrap(),
-            ],
-        ),
-    ] {
-        let env = envelope(
-            vec![
-                node("x", GraphNodeKind::TASK, S::Accepted),
-                node("y", GraphNodeKind::IMPLEMENTATION, S::Accepted),
-                node("rv", GraphNodeKind::REVIEW, S::Rejected),
-            ],
-            edges,
-            "1",
-        );
-        let repair = edited(
-            repair_node(),
-            json!({"parent_node_id":"x","created_in_version":2}),
-        );
-        let review = edited(review_node(), json!({"created_in_version":2}));
-        let op = expand(
-            "rv",
-            vec![repair, review],
-            vec![
-                control_edge("c1", "rv", "t-r2"),
-                prec_edge("p1", "t-r2", "r2"),
-            ],
-        );
-        let (_, error) = op_err(&env, &GraphResultLedgerV1::new(), a1(), json!([op]));
-        assert!(format!("{error:?}").contains(reason), "{label}: {error:?}");
-    }
-    // A repair smuggled in through ADD_NODE/ADD_EDGE cannot be entered
-    // without the same provenance.
-    let smuggle = json!([
-        {"op":"ADD_NODE","node_id":"x","detail":{"node":edited(repair_node(), json!({"node_id":"x"}))}},
-        {"op":"ADD_EDGE","edge_id":"cx","detail":{"edge":control_edge("cx", "r1", "x")}},
-        set("t", "REJECTED", "REPAIRING", json!({"kind":"REPAIR_ENTRY","repair_node_id":"x"})),
-    ]);
-    let (index, error) = op_err(&env, &results, a1(), smuggle);
-    assert_eq!(index, 2);
-    assert!(
-        format!("{error:?}").contains("one distinct fresh REVIEW"),
-        "{error:?}"
-    );
-    // Nothing above changed the retained rejected history.
-    assert_eq!(env.graph().node_state("r1"), Some(S::Rejected));
-}
-
-/// S32: rejected REVIEW → repair expansion with ON_REJECT control edge, a
-/// distinct fresh review after the repair, no precedence cycle, rejected
-/// review/result retained, fresh identities — and the new round completes.
-#[test]
-fn repair_review_round_completes_and_retains_rejected_history() {
-    let (env, results) = rejected_round();
-    let ops = json!([expand(
-        "r1",
-        vec![repair_node(), review_node()],
-        vec![
-            control_edge("c1", "r1", "t-r2"),
-            prec_edge("p1", "t-r2", "r2"),
-            prec_edge("p2", "r2", "next"),
-        ]
-    )]);
-    let (env, results) = ok(&env, &results, a2("w"), ops.clone());
-    assert!(!env.graph().has_precedence_cycle());
-    assert_eq!(
-        env.graph().edge("c1").unwrap().control_kind(),
-        Some(crate::ControlKind::OnReject)
-    );
-    assert_eq!(
-        env.graph().node("t-r2").unwrap().parent_node_id(),
-        Some("t")
-    );
-    // The same rejected review cannot be expanded a second time.
-    let again = expand(
-        "r1",
-        vec![
-            edited(
-                repair_node(),
-                json!({"node_id":"t-r3","created_in_version":4}),
-            ),
-            edited(
-                review_node(),
-                json!({"node_id":"r3","created_in_version":4}),
-            ),
-        ],
-        vec![
-            control_edge("c9", "r1", "t-r3"),
-            prec_edge("p9", "t-r3", "r3"),
-        ],
-    );
-    assert!(matches!(
-        op_err(&env, &results, a2("w"), json!([again])).1,
-        O::Repair(_)
-    ));
-    // The retained verdict cannot be reopened or revised.
-    assert_eq!(
-        op_err(
-            &env,
-            &results,
-            a1(),
-            json!([set(
-                "r1",
-                "REJECTED",
-                "PASSED",
-                json!({"kind":"REVIEW_VERDICT","result_node_id":"r1"})
-            )])
-        )
-        .1,
-        O::RetainedVerdict
-    );
-
-    // The repaired subject cannot reuse its rejected round's result.
-    let mut ops = vec![set(
-        "t",
-        "REJECTED",
-        "REPAIRING",
-        json!({"kind":"REPAIR_ENTRY","repair_node_id":"t-r2"}),
-    )];
-    ops.extend(run_as("t-r2", "at2"));
-    ops.push(attach("t-r2", "res-2", {
-        let mut r = result("t-r2", "PASS", "rv2");
-        r["attempt_id"] = json!("at2");
-        r.as_object_mut().unwrap().remove("code_sha");
-        r
-    }));
-    ops.push(verdict("t-r2", "PASSED", "t-r2"));
-    ops.push(set(
-        "t",
-        "REPAIRING",
-        "AWAITING_REVIEW",
-        json!({"kind":"REPAIR_SUBMITTED","repair_node_id":"t-r2"}),
-    ));
-    let (env, results) = ok(&env, &results, a2("w"), Value::Array(ops));
-    assert!(matches!(
-        op_err(
-            &env,
-            &results,
-            a2("w"),
-            json!([verdict("t", "PASSED", "t")])
-        )
-        .1,
-        O::EvidenceRefused(_)
-    ));
-    let (env, results) = ok(
-        &env,
-        &results,
-        a2("w"),
-        json!([verdict("t", "PASSED", "t-r2")]),
-    );
-    assert_eq!(env.graph().node_state("t"), Some(S::Passed));
-
-    // The fresh review waits for the repair's acceptance, then completes its
-    // own round with its own admitted attempt and verdict.
-    let ready_r2 = set(
-        "r2",
-        "PLANNED",
-        "READY",
-        json!({"kind":"DEPENDENCIES_SATISFIED"}),
-    );
-    assert_eq!(
-        op_err(&env, &results, a1(), json!([ready_r2])).1,
-        O::EvidenceRefused("dependencies")
-    );
-    let (env, results) = ok(
-        &env,
-        &results,
-        a1(),
-        json!([set(
-            "t-r2",
-            "PASSED",
-            "ACCEPTED",
-            json!({"kind":"ACCEPTANCE","decision_id":"d3"})
-        )]),
-    );
-    let mut ops = run_as("r2", "at3");
-    ops.push(attach("r2", "res-3", {
-        let mut r = result("r2", "PASS", "rv3");
-        r["attempt_id"] = json!("at3");
-        r
-    }));
-    ops.push(verdict("r2", "PASSED", "r2"));
-    let (env, results) = ok(&env, &results, a2("w"), Value::Array(ops));
-    assert_eq!(env.graph().node_state("r2"), Some(S::Passed));
-
-    // History retained: rejected review, its subject's rejected result and
-    // every attempt identity.
-    assert_eq!(env.graph().node_state("r1"), Some(S::Rejected));
-    assert_eq!(env.graph().node("t").unwrap().result_ref(), Some("res-1"));
-    assert_eq!(
-        results.get("res-1").unwrap().outcome(),
-        crate::GraphNodeResultOutcome::Rejected
-    );
-    assert_eq!(results.len(), 3);
-    for (node, attempt) in [("t", "at1"), ("t-r2", "at2"), ("r2", "at3")] {
-        assert_eq!(results.attempt("P", "g", node), Some(attempt));
-    }
 }
 
 #[test]
@@ -1452,7 +1010,31 @@ const NOT_ADMITTED: O = O::Attempt("attempt id not admitted");
 const NO_ATTEMPT: O = O::Attempt("node has no admitted attempt");
 const REUSED: O = O::Attempt("attempt id already admitted");
 
-fn dispatch(id: &str, attempt: &str) -> Value {
+pub(super) fn prec_edge(id: &str, from: &str, to: &str) -> Value {
+    json!({"edge_id":id,"graph_id":"g","from_node":from,"to_node":to,"edge_class":"PRECEDENCE","precedence_kind":"REQUIRES_ACCEPTED"})
+}
+
+pub(super) fn control_edge(id: &str, from: &str, to: &str) -> Value {
+    json!({"edge_id":id,"graph_id":"g","from_node":from,"to_node":to,"edge_class":"CONTROL","control_kind":"ON_REJECT"})
+}
+
+pub(super) fn expand(source: &str, nodes: Vec<Value>, edges: Vec<Value>) -> Value {
+    json!({"op":"EXPAND_REPAIR","node_id":source,"detail":{"nodes":nodes,"edges":edges}})
+}
+
+/// `node` with the given keys replaced; a null value removes the key.
+pub(super) fn edited(mut node: Value, edit: Value) -> Value {
+    for (k, v) in edit.as_object().unwrap() {
+        if v.is_null() {
+            node.as_object_mut().unwrap().remove(k);
+        } else {
+            node[k] = v.clone();
+        }
+    }
+    node
+}
+
+pub(super) fn dispatch(id: &str, attempt: &str) -> Value {
     set(
         id,
         "ADMITTED",
@@ -1460,7 +1042,7 @@ fn dispatch(id: &str, attempt: &str) -> Value {
         json!({"kind":"DISPATCH","attempt_id":attempt}),
     )
 }
-fn start(id: &str, attempt: &str) -> Value {
+pub(super) fn start(id: &str, attempt: &str) -> Value {
     set(
         id,
         "DISPATCHED",
@@ -1468,7 +1050,7 @@ fn start(id: &str, attempt: &str) -> Value {
         json!({"kind":"START","attempt_id":attempt}),
     )
 }
-fn submit(id: &str, attempt: &str) -> Value {
+pub(super) fn submit(id: &str, attempt: &str) -> Value {
     set(
         id,
         "RUNNING",
@@ -1476,7 +1058,7 @@ fn submit(id: &str, attempt: &str) -> Value {
         json!({"kind":"SUBMIT","attempt_id":attempt}),
     )
 }
-fn with_attempt(mut result: Value, attempt: &str) -> Value {
+pub(super) fn with_attempt(mut result: Value, attempt: &str) -> Value {
     result["attempt_id"] = json!(attempt);
     result
 }
@@ -1663,7 +1245,7 @@ fn attempt_ids_are_never_reused_across_nodes_or_rounds() {
             json!([attach(
                 "u",
                 "x",
-                with_attempt(result("u", "PASS", "rv"), "at1")
+                with_attempt(bare(result("u", "PASS", "rv")), "at1")
             )])
         ),
         (0, O::ResultAssociation("attempt_id"))
@@ -1711,7 +1293,7 @@ fn attempt_ids_are_never_reused_across_nodes_or_rounds() {
             json!([attach(
                 "t",
                 "x",
-                with_attempt(result("t", "PASS", "rv"), "at1")
+                with_attempt(bare(result("t", "PASS", "rv")), "at1")
             )])
         ),
         (0, O::ResultAssociation("attempt_id"))
@@ -1754,7 +1336,7 @@ fn attempt_binding_does_not_cross_project_or_graph() {
 
 // --- dependency recheck on resumption, admission and dispatch ----------------
 
-fn dep_env(pred: S, node_state: S, kind: GraphNodeKind) -> ExecutionGraphEnvelope {
+pub(super) fn dep_env(pred: S, node_state: S, kind: GraphNodeKind) -> ExecutionGraphEnvelope {
     envelope(
         vec![
             node("p", GraphNodeKind::TASK, pred),
@@ -1768,7 +1350,7 @@ fn dep_env(pred: S, node_state: S, kind: GraphNodeKind) -> ExecutionGraphEnvelop
     )
 }
 
-fn resume_and_dispatch(from: &str, cause: Value) -> Value {
+pub(super) fn resume_and_dispatch(from: &str, cause: Value) -> Value {
     json!([
         set("t", from, "READY", cause),
         set(
@@ -1781,7 +1363,7 @@ fn resume_and_dispatch(from: &str, cause: Value) -> Value {
     ])
 }
 
-fn add_dependency(from: &str) -> Value {
+pub(super) fn add_dependency(from: &str) -> Value {
     json!({"op":"ADD_EDGE","edge_id":"late","detail":{"edge":prec_edge("late", from, "t")}})
 }
 
@@ -1985,6 +1567,13 @@ impl InterfaceArtifactSource for MemSource {
     }
 }
 
+pub(super) fn iface(interface: Option<InterfaceEvidenceVerifier<'_>>) -> ApplyEvidenceV1<'_> {
+    ApplyEvidenceV1 {
+        interface,
+        review: None,
+    }
+}
+
 const IFACE: &[u8] = b"pub trait AuthApi { fn login(&self); }\n";
 
 fn iface_source(version: &str) -> MemSource {
@@ -2045,7 +1634,13 @@ fn interface_evidence_is_rechecked_at_resumption_admission_and_dispatch() {
         json!({"kind":"RESOLVED","resolution_ref":"x"}),
     );
     let run = |env: &ExecutionGraphEnvelope, ledger, op: &Value, src: Option<&MemSource>| {
-        apply_with(env, ledger, a1(), json!([op]), src.and_then(verifier))
+        apply_with(
+            env,
+            ledger,
+            a1(),
+            json!([op]),
+            iface(src.and_then(verifier)),
+        )
     };
     let refusal = |r: Result<GraphMutationOutcomeV1, GraphMutationApplyError>| match r {
         Err(GraphMutationApplyError::Operation { index: 0, error }) => error,
@@ -2091,9 +1686,10 @@ fn interface_evidence_is_rechecked_at_resumption_admission_and_dispatch() {
     }
     // Admitted at version 4, evidence bound to 4. At dispatch (version 5) the
     // old record is stale; the source must supply the current version.
-    let (admitted, ledger) = apply_with(&ready, &none, a1(), json!([admit]), verifier(&good))
-        .map(|o| (o.envelope, o.results))
-        .unwrap();
+    let (admitted, ledger) =
+        apply_with(&ready, &none, a1(), json!([admit]), iface(verifier(&good)))
+            .map(|o| (o.envelope, o.results))
+            .unwrap();
     let go = dispatch("t", "at");
     assert_eq!(refusal(run(&admitted, &ledger, &go, Some(&good))), UNMET);
     assert_eq!(refusal(run(&admitted, &ledger, &go, None)), unavailable);

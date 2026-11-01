@@ -28,13 +28,26 @@
 //! `ATTACH_RESULT` must match it. Resumption, admission and dispatch recheck
 //! the current prerequisites, and `EXPAND_REPAIR` requires a complete fresh
 //! repair/review round hung off a retained rejected `REVIEW`.
+//!
+//! An aggregate verdict and its acceptance rest on independent review
+//! evidence that trusted core admits through a [`ReviewEvidenceVerifier`]
+//! (see [`apply_graph_mutation_with_evidence_v1`]); the worker's own result and
+//! an opaque `review_id` prove nothing. Known code SHAs are bound to the
+//! admitted attempt, and a code claim for a node with no known SHA is
+//! unavailable until trusted core admits it
+//! ([`GraphResultLedgerV1::admit_attempt_code_sha`]).
 
 use std::collections::{BTreeMap, BTreeSet};
+
+use receipts_workspace_execution::CommitSha;
 
 use crate::dag::{DependencyStatus, InterfaceEvidenceVerifier, TaskDag};
 use crate::node_result::GraphNodeResult;
 use crate::node_state_machine::{NodeTransitionError, TransitionCauseKind, check_node_transition};
 use crate::orchestration::{OrchestrationJsonObjectV1, OrchestrationJsonValueV1 as V};
+use crate::review_evidence::{
+    ReviewEvidenceRefusal, ReviewEvidenceVerifier, ReviewOutcome, ReviewedWork,
+};
 use crate::wire::{
     GraphWireError, graph_edge_from_value, graph_node_from_value, graph_node_result_from_value,
 };
@@ -42,7 +55,7 @@ use crate::{
     CapabilityName, ControlKind, EdgeClass, ExecutionGraph, ExecutionGraphEnvelope, GraphEdge,
     GraphError, GraphMutation, GraphMutationOperation, GraphMutationOperationKind,
     GraphMutationPreflightError, GraphNode, GraphNodeAttemptNumber, GraphNodeKind,
-    GraphNodeResultOutcome, GraphNodeState, GraphVersionV1, MAX_IDENTIFIER_LENGTH,
+    GraphNodeResultOutcome, GraphNodeState, GraphVersionV1, MAX_IDENTIFIER_LENGTH, PrecedenceKind,
     content_digest::GraphContentDigestError, validate_graph_mutation_preflight,
 };
 
@@ -116,20 +129,53 @@ impl GraphMutationScopeV1 {
 /// `(project_id, graph_id, node_id)`: the identity an attempt is admitted for.
 type AttemptKey = (String, String, String);
 
+/// What `DISPATCH` admitted for a node: the attempt and, when known, the
+/// code SHA that attempt is bound to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttemptBinding {
+    attempt_id: String,
+    code_sha: Option<String>,
+}
+
+/// Independent review evidence retained once admitted for a node attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RetainedReview {
+    review_id: String,
+    outcome: ReviewOutcome,
+    code_sha: Option<String>,
+}
+
 /// The retained execution record of a graph: attached results by immutable
-/// `result_ref`, plus the attempt identity admitted at `DISPATCH` for each
-/// `(project, graph, node)`. Both are append-only through apply-v1 and travel
-/// in the returned outcome, so `START`, `SUBMIT` and `ATTACH_RESULT` in later
-/// calls or batches verify against what was actually dispatched. A ledger
-/// built with [`GraphResultLedgerV1::new`] holds no dispatch: executing a node
-/// that was never dispatched through it refuses as a missing binding.
+/// `result_ref`, the attempt identity (and bound code SHA) admitted at
+/// `DISPATCH` for each `(project, graph, node)`, and the independent review
+/// evidence admitted for each attempt. All of it is append-only through
+/// apply-v1 and travels in the returned outcome, so `START`, `SUBMIT`,
+/// `ATTACH_RESULT`, verdicts and acceptance in later calls or batches verify
+/// against what was actually dispatched and reviewed. A ledger built with
+/// [`GraphResultLedgerV1::new`] holds no history: executing, judging or
+/// accepting a node through it refuses as missing evidence.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GraphResultLedgerV1 {
     results: BTreeMap<String, GraphNodeResult>,
     /// The node's current admitted attempt (set by `DISPATCH`).
-    current: BTreeMap<AttemptKey, String>,
+    current: BTreeMap<AttemptKey, AttemptBinding>,
     /// Every attempt id ever admitted, with its owner. Never reused.
     admitted: BTreeMap<String, AttemptKey>,
+    /// Admitted review evidence by reviewed `(node, attempt)`.
+    reviews: BTreeMap<(AttemptKey, String), RetainedReview>,
+    /// Every review identity ever consumed. A review judges one attempt once.
+    review_ids: BTreeMap<String, (AttemptKey, String)>,
+}
+
+/// Why trusted core could not admit a code SHA for an attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptAdmissionError {
+    /// The node has no admitted attempt of that id.
+    NoSuchAttempt,
+    /// Not exactly 40 lowercase hex digits.
+    InvalidCodeSha,
+    /// A different SHA is already bound to the attempt.
+    Conflict,
 }
 
 impl GraphResultLedgerV1 {
@@ -148,11 +194,70 @@ impl GraphResultLedgerV1 {
     pub fn is_empty(&self) -> bool {
         self.results.is_empty()
     }
-    /// The attempt id currently admitted for the node, if it was dispatched.
-    pub fn attempt(&self, project_id: &str, graph_id: &str, node_id: &str) -> Option<&str> {
+    fn binding(&self, project_id: &str, graph_id: &str, node_id: &str) -> Option<&AttemptBinding> {
         self.current
             .get(&(project_id.into(), graph_id.into(), node_id.into()))
-            .map(String::as_str)
+    }
+    /// The attempt id currently admitted for the node, if it was dispatched.
+    pub fn attempt(&self, project_id: &str, graph_id: &str, node_id: &str) -> Option<&str> {
+        self.binding(project_id, graph_id, node_id)
+            .map(|b| b.attempt_id.as_str())
+    }
+    /// The code SHA bound to the node's current attempt, if known.
+    pub fn attempt_code_sha(
+        &self,
+        project_id: &str,
+        graph_id: &str,
+        node_id: &str,
+    ) -> Option<&str> {
+        self.binding(project_id, graph_id, node_id)?
+            .code_sha
+            .as_deref()
+    }
+    /// The review identity and outcome admitted for the node's current attempt.
+    pub fn review(
+        &self,
+        project_id: &str,
+        graph_id: &str,
+        node_id: &str,
+    ) -> Option<(&str, ReviewOutcome)> {
+        let key = (project_id.into(), graph_id.into(), node_id.into());
+        let attempt = self.current.get(&key)?.attempt_id.clone();
+        let review = self.reviews.get(&(key, attempt))?;
+        Some((review.review_id.as_str(), review.outcome))
+    }
+
+    /// Trusted core admits the code SHA an attempt produced. Required before
+    /// a result may claim a SHA for a node whose graph data names none: a
+    /// result's own `code_sha` never creates this binding. The attempt must be
+    /// the node's current admitted attempt; a different SHA already bound
+    /// (from the node's known SHA or an earlier admission) refuses. Returns a
+    /// new ledger; `self` is unchanged.
+    pub fn admit_attempt_code_sha(
+        &self,
+        project_id: &str,
+        graph_id: &str,
+        node_id: &str,
+        attempt_id: &str,
+        code_sha: &str,
+    ) -> Result<Self, AttemptAdmissionError> {
+        let key: AttemptKey = (project_id.into(), graph_id.into(), node_id.into());
+        let binding = self
+            .current
+            .get(&key)
+            .filter(|b| b.attempt_id == attempt_id)
+            .ok_or(AttemptAdmissionError::NoSuchAttempt)?;
+        CommitSha::parse(code_sha).map_err(|_| AttemptAdmissionError::InvalidCodeSha)?;
+        if binding
+            .code_sha
+            .as_deref()
+            .is_some_and(|bound| bound != code_sha)
+        {
+            return Err(AttemptAdmissionError::Conflict);
+        }
+        let mut next = self.clone();
+        next.current.get_mut(&key).expect("checked above").code_sha = Some(code_sha.to_owned());
+        Ok(next)
     }
 }
 
@@ -188,6 +293,9 @@ pub enum GraphOperationError {
     /// `DISPATCH`/`START`/`SUBMIT` attempt identity is reused, missing or
     /// does not match the one admitted for the node.
     Attempt(&'static str),
+    /// Independent review evidence was unavailable or contradicted; the
+    /// typed reason says which.
+    Review(ReviewEvidenceRefusal),
     NewNode(&'static str),
     Repair(&'static str),
     NotPermitted(&'static str),
@@ -242,15 +350,48 @@ impl std::fmt::Display for GraphMutationApplyError {
 
 impl std::error::Error for GraphMutationApplyError {}
 
+/// Trusted evidence sources apply-v1 may consult. Supplied by trusted core,
+/// never derived from a mutation or a result.
+#[derive(Clone, Copy, Default)]
+pub struct ApplyEvidenceV1<'a> {
+    /// Verifies `REQUIRES_INTERFACE` dependencies.
+    pub interface: Option<InterfaceEvidenceVerifier<'a>>,
+    /// Admits independent review evidence for aggregate verdicts. With none,
+    /// every verdict that needs it refuses as unavailable.
+    pub review: Option<ReviewEvidenceVerifier<'a>>,
+}
+
 /// Applies `mutation` to `envelope`/`results` atomically under `scope`.
 /// `interface` is the optional trusted interface-evidence verifier used when
-/// `PLANNED → READY` depends on a `REQUIRES_INTERFACE` edge.
+/// a step depends on a `REQUIRES_INTERFACE` edge. No review evidence is
+/// available through this entry point: use
+/// [`apply_graph_mutation_with_evidence_v1`] for evidence-backed verdicts.
 pub fn apply_graph_mutation_v1(
     envelope: &ExecutionGraphEnvelope,
     results: &GraphResultLedgerV1,
     mutation: &GraphMutation,
     scope: &GraphMutationScopeV1,
     interface: Option<InterfaceEvidenceVerifier<'_>>,
+) -> Result<GraphMutationOutcomeV1, GraphMutationApplyError> {
+    apply_graph_mutation_with_evidence_v1(
+        envelope,
+        results,
+        mutation,
+        scope,
+        ApplyEvidenceV1 {
+            interface,
+            review: None,
+        },
+    )
+}
+
+/// [`apply_graph_mutation_v1`] with every trusted evidence source.
+pub fn apply_graph_mutation_with_evidence_v1(
+    envelope: &ExecutionGraphEnvelope,
+    results: &GraphResultLedgerV1,
+    mutation: &GraphMutation,
+    scope: &GraphMutationScopeV1,
+    evidence: ApplyEvidenceV1<'_>,
 ) -> Result<GraphMutationOutcomeV1, GraphMutationApplyError> {
     use GraphMutationApplyError as E;
     validate_graph_mutation_preflight(envelope.graph(), envelope.graph_version(), mutation)
@@ -282,7 +423,8 @@ pub fn apply_graph_mutation_v1(
         actor: &scope.actor,
         parent: envelope.graph_version(),
         successor,
-        interface,
+        interface: evidence.interface,
+        review: evidence.review,
     };
     for (index, operation) in mutation.operations().iter().enumerate() {
         batch
@@ -314,6 +456,7 @@ struct Batch<'a> {
     parent: &'a GraphVersionV1,
     successor: GraphVersionV1,
     interface: Option<InterfaceEvidenceVerifier<'a>>,
+    review: Option<ReviewEvidenceVerifier<'a>>,
 }
 
 fn detail<'d>(op: &'d GraphMutationOperation, fields: &[&'static str]) -> OpResult<&'d Map> {
@@ -500,9 +643,30 @@ impl Batch<'_> {
         Ok(())
     }
 
+    fn key_of(&self, node: &GraphNode) -> AttemptKey {
+        (
+            self.project_id.to_owned(),
+            self.graph.graph_id().to_owned(),
+            node.node_id().to_owned(),
+        )
+    }
+
+    fn binding(&self, node: &GraphNode) -> Option<&AttemptBinding> {
+        self.ledger
+            .binding(self.project_id, self.graph.graph_id(), node.node_id())
+    }
+
+    /// The review evidence admitted for the node's current attempt.
+    fn retained_review(&self, node: &GraphNode) -> Option<&RetainedReview> {
+        let attempt = self.binding(node)?.attempt_id.clone();
+        self.ledger.reviews.get(&(self.key_of(node), attempt))
+    }
+
     /// `DISPATCH` admits a never-used attempt id for this exact
-    /// project/graph/node; `START` and `SUBMIT` must name the attempt
-    /// currently admitted for it. A missing or different binding refuses.
+    /// project/graph/node and binds the node's known code SHA to it; `START`
+    /// and `SUBMIT` must name the attempt currently admitted for it and the
+    /// node's known SHA must still be the one bound. A missing, different or
+    /// conflicting binding refuses.
     fn bind_attempt(
         &mut self,
         node: &GraphNode,
@@ -515,24 +679,30 @@ impl Batch<'_> {
             return Ok(());
         }
         let attempt = id(cause, "attempt_id")?;
-        let key = (
-            self.project_id.to_owned(),
-            self.graph.graph_id().to_owned(),
-            node.node_id().to_owned(),
-        );
+        let key = self.key_of(node);
         if kind == C::Dispatch {
             if self.ledger.admitted.contains_key(attempt) {
                 return Err(E::Attempt("attempt id already admitted"));
             }
             self.ledger.admitted.insert(attempt.to_owned(), key.clone());
-            self.ledger.current.insert(key, attempt.to_owned());
+            self.ledger.current.insert(
+                key,
+                AttemptBinding {
+                    attempt_id: attempt.to_owned(),
+                    code_sha: node.code_sha().map(str::to_owned),
+                },
+            );
             return Ok(());
         }
-        match self.ledger.current.get(&key) {
-            None => Err(E::Attempt("node has no admitted attempt")),
-            Some(admitted) if admitted != attempt => Err(E::Attempt("attempt id not admitted")),
-            Some(_) => Ok(()),
+        let binding = self
+            .ledger
+            .current
+            .get(&key)
+            .ok_or(E::Attempt("node has no admitted attempt"))?;
+        if binding.attempt_id != attempt {
+            return Err(E::Attempt("attempt id not admitted"));
         }
+        check_code_binding(node, binding)
     }
 
     /// Every incoming precedence dependency must be satisfied *now*, against
@@ -556,7 +726,7 @@ impl Batch<'_> {
     }
 
     fn verify_cause(
-        &self,
+        &mut self,
         node: &GraphNode,
         to: GraphNodeState,
         kind: TransitionCauseKind,
@@ -568,6 +738,9 @@ impl Batch<'_> {
             C::DependenciesSatisfied | C::CapabilityAdmission => &["kind"],
             C::Admission => &["kind", "admission_decision_id"],
             C::Dispatch | C::Start | C::Submit => &["kind", "attempt_id"],
+            C::ReviewVerdict if self.verdict_names_review(node) => {
+                &["kind", "result_node_id", "review_id"]
+            }
             C::ReviewVerdict => &["kind", "result_node_id"],
             C::RepairEntry | C::RepairSubmitted => &["kind", "repair_node_id"],
             C::Acceptance | C::Integration => &["kind", "decision_id"],
@@ -594,7 +767,7 @@ impl Batch<'_> {
                 }
                 self.require_dependencies(node)
             }
-            C::ReviewVerdict => self.verify_verdict(node, to, id(cause, "result_node_id")?),
+            C::ReviewVerdict => self.verify_verdict(node, to, cause),
             C::RepairEntry => {
                 let repair = self.repair_child(node, id(cause, "repair_node_id")?)?;
                 let mut sources = self.graph.control_edges().filter(|edge| {
@@ -622,6 +795,7 @@ impl Batch<'_> {
             C::Acceptance | C::Integration if !self.actor.is_global() => Err(E::NotPermitted(
                 "acceptance and integration need RUNTIME_A1 or USER",
             )),
+            C::Acceptance => self.require_review_for_acceptance(node),
             C::Resolved | C::HumanResolved if node.result_ref().is_some() => Err(
                 E::EvidenceRefused("resuming would reuse an attached result; expand a repair"),
             ),
@@ -664,18 +838,204 @@ impl Batch<'_> {
         Ok(repair)
     }
 
-    /// Verdict evidence is an attached result: the subject's own (first
-    /// round, no repair children yet) or that of its newest REPAIR child,
-    /// which must already carry the same verdict. A rejected round's result
-    /// is never reused for a later verdict.
-    fn verify_verdict(&self, node: &GraphNode, to: GraphNodeState, cited_id: &str) -> OpResult {
+    /// Whether the verdict cause must also name the independent review: the
+    /// first judgement of a work node's current attempt. Once judged, a
+    /// node's next verdict cites its repair, whose own verdict already
+    /// consumed the review; other kinds judge by their result.
+    fn verdict_names_review(&self, node: &GraphNode) -> bool {
+        requires_independent_review(node) && self.retained_review(node).is_none()
+    }
+
+    /// A work node's verdict rests on independent review evidence admitted
+    /// by trusted core for its exact current attempt, SHA and round; its own
+    /// result and a `review_id` it names prove nothing. A node already
+    /// judged (rejected) is judged again through its newest repair, whose own
+    /// admitted review (and matching state) is the evidence. Other kinds (a
+    /// REVIEW node, a deterministic check, ...) keep their own result as the
+    /// evidence.
+    fn verify_verdict(&mut self, node: &GraphNode, to: GraphNodeState, cause: &Map) -> OpResult {
+        use GraphOperationError as E;
+        let cited_id = id(cause, "result_node_id")?;
+        if !requires_independent_review(node) {
+            let newest = self.newest_repair_child(node)?.cloned();
+            return self.verify_own_result_verdict(node, to, cited_id, newest.as_ref());
+        }
+        if self.retained_review(node).is_none() {
+            if cited_id != node.node_id() {
+                return Err(E::EvidenceRefused("cited result is not the current round"));
+            }
+            return self.admit_review(node, to, id(cause, "review_id")?);
+        }
+        let repaired = || E::EvidenceRefused("repaired node needs its repair's verdict");
+        if cited_id == node.node_id() {
+            return Err(repaired());
+        }
+        let child = self
+            .newest_repair_child(node)?
+            .cloned()
+            .ok_or_else(repaired)?;
+        if child.node_id() != cited_id || child.state() != to {
+            return Err(E::EvidenceRefused("cited result is not the current round"));
+        }
+        let retained = self
+            .retained_review(&child)
+            .ok_or(E::Review(ReviewEvidenceRefusal::MissingRecord))?;
+        if retained.outcome != review_outcome(to) {
+            return Err(E::Review(ReviewEvidenceRefusal::OutcomeMismatch));
+        }
+        Ok(())
+    }
+
+    /// Resolves, verifies and retains the independent review of `node`'s
+    /// current attempt (see [`Self::verify_verdict`]).
+    fn admit_review(&mut self, node: &GraphNode, to: GraphNodeState, review_id: &str) -> OpResult {
+        use GraphOperationError as E;
+        let binding = self
+            .binding(node)
+            .cloned()
+            .ok_or(E::Attempt("node has no admitted attempt"))?;
+        let verifier = self
+            .review
+            .ok_or(E::Review(ReviewEvidenceRefusal::NoSource))?;
+        let result = node
+            .result_ref()
+            .and_then(|r| self.ledger.get(r))
+            .ok_or(E::EvidenceUnavailable("attached implementation result"))?;
+        if to == GraphNodeState::Passed && result.outcome() != GraphNodeResultOutcome::Pass {
+            return Err(E::EvidenceRefused("implementation result outcome"));
+        }
+        let key = self.key_of(node);
+        if self
+            .ledger
+            .reviews
+            .contains_key(&(key.clone(), binding.attempt_id.clone()))
+        {
+            return Err(E::EvidenceRefused("attempt already has admitted review"));
+        }
+        if self.ledger.review_ids.contains_key(review_id) {
+            return Err(E::EvidenceRefused("review identity already used"));
+        }
+        self.review_not_circular(node, review_id, to)?;
+        let work = ReviewedWork {
+            project_id: self.project_id,
+            graph_id: self.graph.graph_id(),
+            review_id,
+            node_id: node.node_id(),
+            attempt_id: &binding.attempt_id,
+            code_sha: binding.code_sha.as_deref(),
+            round: node.attempt_number().map(GraphNodeAttemptNumber::as_str),
+            expected: review_outcome(to),
+        };
+        let admitted = verifier.verify(&work).map_err(E::Review)?;
+        self.ledger.reviews.insert(
+            (key.clone(), binding.attempt_id.clone()),
+            RetainedReview {
+                review_id: admitted.review_id().to_owned(),
+                outcome: admitted.outcome(),
+                code_sha: admitted.code_sha().map(str::to_owned),
+            },
+        );
+        self.ledger
+            .review_ids
+            .insert(admitted.review_id().to_owned(), (key, binding.attempt_id));
+        Ok(())
+    }
+
+    /// A review that waits for the very acceptance it would gate is circular
+    /// and never evidence. A graph-resident review is used only once it
+    /// holds the matching verdict and its dependencies were satisfiable; any
+    /// other identity is an external review from the trusted source.
+    fn review_not_circular(
+        &self,
+        subject: &GraphNode,
+        review_id: &str,
+        to: GraphNodeState,
+    ) -> OpResult {
+        use GraphOperationError as E;
+        let Some(review) = self.graph.node(review_id) else {
+            return Ok(());
+        };
+        if !is_review(review) {
+            return Err(E::EvidenceRefused(
+                "review identity names a non-review node",
+            ));
+        }
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        let mut pending = vec![subject.node_id()];
+        while let Some(from) = pending.pop() {
+            for edge in self.graph.precedence_edges().filter(|edge| {
+                edge.from_node() == from
+                    && edge.precedence_kind() != Some(PrecedenceKind::RequiresInterface)
+            }) {
+                if edge.to_node() == review_id {
+                    return Err(E::EvidenceRefused(
+                        "review requires the acceptance it would gate",
+                    ));
+                }
+                if seen.insert(edge.to_node()) {
+                    pending.push(edge.to_node());
+                }
+            }
+        }
+        let judged = match to {
+            GraphNodeState::Passed => matches!(
+                review.state(),
+                GraphNodeState::Passed | GraphNodeState::Accepted | GraphNodeState::Integrated
+            ),
+            _ => review.state() == GraphNodeState::Rejected,
+        };
+        if !judged {
+            return Err(E::EvidenceRefused("graph review has no matching verdict"));
+        }
+        Ok(())
+    }
+
+    /// Acceptance needs the admitted `PASS` review of the judged attempt
+    /// (the newest repair's after a repair), still bound to the same SHA.
+    fn require_review_for_acceptance(&self, node: &GraphNode) -> OpResult {
+        use GraphOperationError as E;
+        if !requires_independent_review(node) {
+            return Ok(());
+        }
+        // A node accepted on its own review is judged by it; one rejected
+        // once is accepted on its newest repair's review.
+        let own_pass = self
+            .retained_review(node)
+            .is_some_and(|review| review.outcome == ReviewOutcome::Pass);
+        let judged = match self.newest_repair_child(node)? {
+            Some(child) if !own_pass => child,
+            _ => node,
+        };
+        let retained = self
+            .retained_review(judged)
+            .ok_or(E::Review(ReviewEvidenceRefusal::MissingRecord))?;
+        if retained.outcome != ReviewOutcome::Pass {
+            return Err(E::Review(ReviewEvidenceRefusal::OutcomeMismatch));
+        }
+        let bound = self.binding(judged).and_then(|b| b.code_sha.as_deref());
+        if retained.code_sha.as_deref() != bound {
+            return Err(E::Review(ReviewEvidenceRefusal::CodeMismatch));
+        }
+        Ok(())
+    }
+
+    /// Verdict evidence for kinds that are their own review: an attached
+    /// result, the subject's own (no repair children yet) or that of its
+    /// newest REPAIR child, which must already carry the same verdict. A
+    /// rejected round's result is never reused for a later verdict.
+    fn verify_own_result_verdict(
+        &self,
+        node: &GraphNode,
+        to: GraphNodeState,
+        cited_id: &str,
+        newest: Option<&GraphNode>,
+    ) -> OpResult {
         use GraphOperationError as E;
         let expected = if to == GraphNodeState::Passed {
             GraphNodeResultOutcome::Pass
         } else {
             GraphNodeResultOutcome::Rejected
         };
-        let newest = self.newest_repair_child(node)?;
         let cited = if cited_id == node.node_id() {
             if newest.is_some() {
                 return Err(E::EvidenceRefused(
@@ -744,16 +1104,24 @@ impl Batch<'_> {
         if result.node_id() != node.node_id() {
             return Err(E::ResultAssociation("node_id"));
         }
-        if node.code_sha().is_some() && result.code_sha() != node.code_sha() {
-            return Err(E::ResultAssociation("code_sha"));
-        }
         // Evidence must come from the attempt dispatched for this exact
         // project/graph/node; a result claiming its own identity proves none.
-        let admitted = self
-            .ledger
-            .attempt(self.project_id, self.graph.graph_id(), node.node_id())
+        let binding = self
+            .binding(&node)
+            .cloned()
             .ok_or(E::Attempt("node has no admitted attempt"))?;
-        if result.attempt_id() != Some(admitted) {
+        check_code_binding(&node, &binding)?;
+        // A code claim needs the SHA bound to the attempt: the node's known
+        // one, or one trusted core admitted. The claim alone never binds.
+        match (binding.code_sha.as_deref(), result.code_sha()) {
+            (Some(bound), Some(claimed)) if bound == claimed => {}
+            (Some(_), _) => return Err(E::ResultAssociation("code_sha")),
+            (None, Some(_)) => {
+                return Err(E::EvidenceUnavailable("admitted execution code evidence"));
+            }
+            (None, None) => {}
+        }
+        if result.attempt_id() != Some(binding.attempt_id.as_str()) {
             return Err(E::ResultAssociation("attempt_id"));
         }
         self.ledger.results.insert(result_ref.to_owned(), result);
@@ -945,6 +1313,41 @@ fn repair_provenance(graph: &ExecutionGraph, source_id: &str, repair: &GraphNode
     match (reviews.next(), reviews.next()) {
         (Some(fresh), None) if fresh != source.node_id() => Ok(()),
         _ => Err(E::Repair("repair needs one distinct fresh REVIEW after it")),
+    }
+}
+
+/// Work nodes need independent review; a REVIEW node and the other
+/// self-judging kinds are judged by their own attached result. Unknown kinds
+/// fail closed (they need review).
+fn requires_independent_review(node: &GraphNode) -> bool {
+    ![
+        GraphNodeKind::REVIEW,
+        GraphNodeKind::DETERMINISTIC_CHECK,
+        GraphNodeKind::GOAL,
+        GraphNodeKind::WORKSTREAM,
+        GraphNodeKind::GOAL_EVALUATION,
+        GraphNodeKind::ROUTING,
+        GraphNodeKind::INTEGRATION,
+        GraphNodeKind::HUMAN_GATE,
+    ]
+    .contains(node.kind())
+}
+
+fn review_outcome(to: GraphNodeState) -> ReviewOutcome {
+    if to == GraphNodeState::Passed {
+        ReviewOutcome::Pass
+    } else {
+        ReviewOutcome::Rejected
+    }
+}
+
+/// The node's known code SHA must be the one bound to its admitted attempt.
+fn check_code_binding(node: &GraphNode, binding: &AttemptBinding) -> OpResult {
+    match node.code_sha() {
+        Some(known) if binding.code_sha.as_deref() != Some(known) => Err(
+            GraphOperationError::Attempt("code sha differs from the admitted attempt"),
+        ),
+        _ => Ok(()),
     }
 }
 

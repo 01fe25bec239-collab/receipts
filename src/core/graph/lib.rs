@@ -58,6 +58,7 @@ pub mod persisted_snapshot_projection;
 pub mod records;
 pub mod rejected_repair_transition;
 pub mod repair_completion_transition;
+pub mod review_evidence;
 pub mod review_verdict_transition;
 pub mod version;
 
@@ -97,6 +98,8 @@ mod mutation_apply_tests;
 #[cfg(test)]
 mod mutation_interpreter_tests;
 #[cfg(test)]
+mod mutation_review_tests;
+#[cfg(test)]
 mod node_result_vocabulary_tests;
 #[cfg(test)]
 mod node_state_machine_tests;
@@ -112,6 +115,8 @@ mod persisted_snapshot_projection_tests;
 mod rejected_repair_transition_tests;
 #[cfg(test)]
 mod repair_completion_transition_tests;
+#[cfg(test)]
+mod review_evidence_tests;
 #[cfg(test)]
 mod review_verdict_transition_tests;
 
@@ -140,8 +145,9 @@ pub use graph_mutation_target_graph_policy::{
 };
 pub use graph_mutation_vocabulary::GraphMutationOperationKind;
 pub use mutation_apply::{
-    GraphMutationApplyError, GraphMutationOutcomeV1, GraphMutationScopeV1, GraphOperationError,
-    GraphResultLedgerV1, ScopedActorV1, apply_graph_mutation_v1,
+    ApplyEvidenceV1, AttemptAdmissionError, GraphMutationApplyError, GraphMutationOutcomeV1,
+    GraphMutationScopeV1, GraphOperationError, GraphResultLedgerV1, ScopedActorV1,
+    apply_graph_mutation_v1, apply_graph_mutation_with_evidence_v1,
 };
 pub use node::{CapabilityName, GraphNode, GraphNodeAttemptNumber, GraphNodeKind};
 pub use node_result::{GraphNodeCheck, GraphNodeResult, GraphNodeResultError};
@@ -169,6 +175,10 @@ pub use rejected_repair_transition::{
 pub use repair_completion_transition::{
     AUTHORIZED_REPAIR_COMPLETION_TRANSITIONS, RepairCompletionTransitionError,
     validate_repair_completion_transition,
+};
+pub use review_evidence::{
+    AdmittedReviewEvidence, ReviewEvidenceRecord, ReviewEvidenceRefusal, ReviewEvidenceSource,
+    ReviewEvidenceVerifier, ReviewOutcome, ReviewProvenance, ReviewSourceUnavailable, ReviewedWork,
 };
 pub use review_verdict_transition::{
     AUTHORIZED_REVIEW_VERDICT_TRANSITIONS, ReviewVerdictTransitionError,
