@@ -609,3 +609,31 @@ fn activation_state_presence_and_conversion() {
         );
     }
 }
+
+#[test]
+fn derived_state_duplicate_decoded_keys_are_refused_at_every_depth() {
+    // The oracle's Value model keeps the last duplicate, so it would accept
+    // these; the codec refuses them because the object identity is ambiguous.
+    // Same-named keys at different depths remain ordinary data.
+    for derived in [
+        r#"{"a":1,"a":2}"#,
+        r#"{"a":1,"a":2}"#,
+        r#"{"x":{"a":1,"a":1}}"#,
+        r#"{"x":[{"a":null,"a":null}]}"#,
+    ] {
+        let text = manifest(SOURCE, &format!(r#","derived_state":{derived}"#));
+        assert!(
+            matches!(
+                ContextManifestWireV1::parse_json(&text),
+                Err(StateError::WireDecode {
+                    schema: "ContextManifest"
+                })
+            ),
+            "{derived}"
+        );
+    }
+    let nested = r#"{"a":{"a":1},"b":[{"a":2},{"a":3}]}"#;
+    let text = manifest(SOURCE, &format!(r#","derived_state":{nested}"#));
+    let wire = ContextManifestWireV1::parse_json(&text).unwrap();
+    assert!(wire.to_json().unwrap().contains(nested), "bytes kept");
+}

@@ -57,7 +57,7 @@ struct SourceWire {
 }
 
 /// Schema-shaped ContextManifest; keeps the open `derived_state` object's
-/// exact bytes, `URL` references and absent vs `null` optionals.
+/// exact bytes (duplicate decoded keys are refused), `URL` references and absent vs `null` optionals.
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextManifestWireV1 {
@@ -116,6 +116,11 @@ impl ContextManifestWireV1 {
                 && id(&self.role_id)
                 && self.project_id.as_deref().is_none_or(id)
                 && self.epoch.at_least(0)
+                // An open object with duplicate decoded keys has no single identity.
+                && self
+                    .derived_state
+                    .as_ref()
+                    .is_none_or(|open| crate::decision_records::unique_keys(&open.0).is_ok())
                 && !self.sources.is_empty()
                 && self.sources.iter().all(|s| {
                     matches!(

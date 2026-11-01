@@ -46,10 +46,11 @@ State stores registry and lifecycle observations as supplied. Lifecycle eligibil
   - a verdict or acceptance reference is dangling;
   - the referenced review is for another task, or its reviewed SHA differs;
   - the referenced integration decision's outcome is not `ACCEPT`;
+  - an `ACCEPT` decision is the acceptance but the same task's review at the same SHA (the VERDICT_REF) is a `REJECT`;
   - that decision has no provenance entry for the task (absent or foreign-only), or more than one (ambiguous, even if identical);
   - its one entry for the task disagrees with a recorded START, IMPLEMENTATION or REVIEW link, or its `integration_sha` disagrees with MAIN_SHA.
 
-Empty provenance and nonaccept outcomes are valid stored documents; they are reported as contradictions, not rejected on append. Unrecorded links are never inferred. A complete and consistent chain is evidence for a gate to evaluate. It is not acceptance and authenticates no issuer.
+Empty provenance, nonaccept outcomes and `REJECT` reviews are valid, readable, immutable stored documents; a rejected review with no acceptance claimed is ordinary incomplete history, not a contradiction. `PASS` and `PASS_WITH_NONBLOCKING_FINDINGS` are not rejected for carrying nonblocking findings. Contradictions are reported, never used to refuse an append. Unrecorded links are never inferred. A complete and consistent chain is evidence for a gate to evaluate. It is not acceptance and authenticates no issuer.
 
 ## Role lifecycle
 
@@ -103,7 +104,7 @@ What the codecs preserve:
 
 - absent versus `null`, and absent versus `[]`;
 - exact number tokens, with no numeric ceiling;
-- the open `derived_state` bytes.
+- the open `derived_state` bytes (an object with duplicate decoded keys at any depth is refused, because it has no single identity; the schema oracle would accept it by keeping the last key).
 
 `date-time` is treated as a schema annotation, so dates are not checked as dates.
 

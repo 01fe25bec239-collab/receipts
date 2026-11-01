@@ -386,6 +386,9 @@ pub enum ProvenanceContradictionV1 {
     DanglingAcceptanceRef,
     /// The referenced decision's outcome is not `ACCEPT`.
     AcceptanceNotAccepted,
+    /// An `ACCEPT` decision is the acceptance, but the same task's review at
+    /// the same SHA (the VERDICT_REF) is a `REJECT`.
+    AcceptanceWithRejectedVerdict,
     /// The referenced decision has no provenance entry for this task.
     AcceptanceTaskEntryAbsent,
     /// The referenced decision has more than one provenance entry for this task.
@@ -603,16 +606,22 @@ fn build_chain(
     {
         chain.contradictions.push(C::ReviewShaNotImplementationSha);
     }
+    let mut rejected_verdict = false;
     if let Some(verdict) = chain.link(K::VerdictRef).map(str::to_string) {
         match read_record(conn, project_id, DecisionRecordKind::A4Review, &verdict)? {
             None => chain.contradictions.push(C::DanglingVerdictRef),
             Some(record) => {
-                if record.task_id() != Some(task_id) {
+                let same_task = record.task_id() == Some(task_id);
+                if !same_task {
                     chain.contradictions.push(C::VerdictTaskMismatch);
                 }
-                if review.is_some() && record.subject_sha() != review.as_deref() {
+                let same_sha = review.is_none() || record.subject_sha() == review.as_deref();
+                if !same_sha {
                     chain.contradictions.push(C::VerdictShaMismatch);
                 }
+                let view: VerdictView = serde_json::from_str(record.record_json())
+                    .map_err(|_| failure(Code::CorruptStore, RECORD))?;
+                rejected_verdict = same_task && same_sha && view.verdict == "REJECT";
             }
         }
     }
@@ -629,6 +638,8 @@ fn build_chain(
                     .map_err(|_| failure(Code::CorruptStore, RECORD))?;
                 if decision.outcome != "ACCEPT" {
                     chain.contradictions.push(C::AcceptanceNotAccepted);
+                } else if rejected_verdict {
+                    chain.contradictions.push(C::AcceptanceWithRejectedVerdict);
                 }
                 let entries: Vec<&AcceptanceEntry> = decision
                     .provenance_chain
@@ -665,6 +676,10 @@ fn build_chain(
     Ok(chain)
 }
 
+#[derive(serde::Deserialize)]
+struct VerdictView {
+    verdict: String,
+}
 #[derive(serde::Deserialize)]
 struct AcceptanceView {
     outcome: String,
