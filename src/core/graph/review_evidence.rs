@@ -4,8 +4,8 @@
 //! by the worker's own result or by an opaque `review_id` it names. Trusted
 //! core supplies a [`ReviewEvidenceSource`]; [`ReviewEvidenceVerifier`] checks
 //! that the record the source holds for that review identity is bound to the
-//! exact project, graph, subject node, admitted attempt, code SHA, round and
-//! outcome being judged, was admitted by the source, and has the content the
+//! exact project, graph, subject node, admitted attempt, code SHA (or its
+//! admitted non-code classification), round and outcome being judged, was admitted by the source, and has the content the
 //! source stores. Anything missing is *unavailable*, never assumed.
 //!
 //! No production source exists in Wave1: with none supplied every
@@ -45,7 +45,8 @@ pub struct ReviewEvidenceRecord {
     pub subject_node_id: String,
     /// The subject attempt that was reviewed.
     pub subject_attempt_id: String,
-    /// The reviewed commit; absent for a non-code subject.
+    /// The reviewed commit. Absent matches only an attempt trusted core
+    /// admitted as non-code, never an unclassified one.
     pub code_sha: Option<String>,
     /// The reviewed round (the subject's `attempt_number` when it has one).
     pub round: Option<String>,

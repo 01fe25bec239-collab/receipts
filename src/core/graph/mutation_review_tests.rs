@@ -31,10 +31,10 @@ fn user() -> ScopedActorV1 {
 // --- repair provenance and the supported noncircular review round -----------
 
 fn repair_node() -> Value {
-    json!({"node_id":"i2","graph_id":"g","kind":"REPAIR","state":"PLANNED","workstream_id":"w","parent_node_id":"i1","attempt_number":2,"created_in_version":3})
+    json!({"node_id":"i2","graph_id":"g","kind":"REPAIR","state":"PLANNED","workstream_id":"w","parent_node_id":"i1","attempt_number":2,"created_in_version":4})
 }
 fn review_node() -> Value {
-    json!({"node_id":"r2","graph_id":"g","kind":"REVIEW","state":"PLANNED","workstream_id":"w","attempt_number":2,"created_in_version":3})
+    json!({"node_id":"r2","graph_id":"g","kind":"REVIEW","state":"PLANNED","workstream_id":"w","attempt_number":2,"created_in_version":4})
 }
 
 /// `i1` is an existing, already ACCEPTED source artifact; its post-acceptance
@@ -59,26 +59,50 @@ fn source_env() -> ExecutionGraphEnvelope {
     )
 }
 
+/// Runs `id` as `attempt` to `RUNNING`, lets trusted core admit that attempt
+/// as non-code (a SHA-less result alone never would), then applies `rest`.
+fn run_non_code(
+    env: &ExecutionGraphEnvelope,
+    ledger: &GraphResultLedgerV1,
+    actor: ScopedActorV1,
+    id: &str,
+    attempt: &str,
+    rest: Vec<Value>,
+) -> (ExecutionGraphEnvelope, GraphResultLedgerV1) {
+    let mut ops = run_as(id, attempt);
+    let submit = ops.pop().unwrap();
+    let (env, ledger) = ok(env, ledger, actor.clone(), Value::Array(ops));
+    let ledger = ledger
+        .admit_attempt_non_code("P", "g", id, attempt)
+        .unwrap();
+    let mut ops = vec![submit];
+    ops.extend(rest);
+    ok(&env, &ledger, actor, Value::Array(ops))
+}
+
 /// `r1` runs and rejects through apply: a retained REJECTED REVIEW with its
-/// own result and attempt, no seeded terminal state.
+/// own result and attempt, no seeded terminal state. Its attempt is admitted
+/// as non-code by trusted core.
 fn rejected_review() -> (ExecutionGraphEnvelope, GraphResultLedgerV1) {
-    let mut ops = run_as("r1", "ar1");
-    ops.push(attach(
-        "r1",
-        "res-r1",
-        with_attempt(
-            bare(super::mutation_interpreter_tests::result(
-                "r1", "REJECTED", "rv-r1",
-            )),
-            "ar1",
-        ),
-    ));
-    ops.push(verdict("r1", "REJECTED", "r1"));
-    ok(
+    run_non_code(
         &source_env(),
         &GraphResultLedgerV1::new(),
         a2("w"),
-        Value::Array(ops),
+        "r1",
+        "ar1",
+        vec![
+            attach(
+                "r1",
+                "res-r1",
+                with_attempt(
+                    bare(super::mutation_interpreter_tests::result(
+                        "r1", "REJECTED", "rv-r1",
+                    )),
+                    "ar1",
+                ),
+            ),
+            verdict("r1", "REJECTED", "r1"),
+        ],
     )
 }
 
@@ -257,7 +281,7 @@ fn repair_expansion_refuses_incomplete_or_wrong_provenance() {
             expand(
                 "r1",
                 vec![
-                    edited(repair.clone(), json!({"created_in_version":4})),
+                    edited(repair.clone(), json!({"created_in_version":5})),
                     review.clone(),
                 ],
                 vec![c1.clone(), p1.clone()],
@@ -444,11 +468,11 @@ fn repair_review_round_completes_without_circular_acceptance() {
         vec![
             edited(
                 repair_node(),
-                json!({"node_id":"i3","created_in_version":4}),
+                json!({"node_id":"i3","created_in_version":5}),
             ),
             edited(
                 review_node(),
-                json!({"node_id":"r3","created_in_version":4}),
+                json!({"node_id":"r3","created_in_version":5}),
             ),
         ],
         vec![control_edge("c9", "r1", "i3"), prec_edge("p9", "i3", "r3")],
@@ -488,16 +512,20 @@ fn repair_review_round_completes_without_circular_acceptance() {
         }
         r
     };
-    assert_eq!(
-        op_err(
-            &env,
-            &results,
-            a2("w"),
-            json!([attach("i2", "res-i2", claim(Some(SHA2), "ai2"))])
-        )
-        .1,
-        O::EvidenceUnavailable("admitted execution code evidence")
-    );
+    // Neither a code claim nor its omission classifies the attempt.
+    for sha in [Some(SHA2), None] {
+        assert_eq!(
+            op_err(
+                &env,
+                &results,
+                a2("w"),
+                json!([attach("i2", "res-i2", claim(sha, "ai2"))])
+            )
+            .1,
+            O::EvidenceUnavailable("attempt code or non-code classification"),
+            "{sha:?}"
+        );
+    }
     let admitted = results
         .admit_attempt_code_sha("P", "g", "i2", "ai2", SHA2)
         .unwrap();
@@ -659,32 +687,40 @@ fn repair_review_round_completes_without_circular_acceptance() {
     let (env, results) = ok(&env, &results, a1(), json!([accept]));
     assert_eq!(env.graph().node_state("i2"), Some(S::Accepted));
 
-    // r2 is a different review, now actually runnable, with its own attempt.
-    let mut ops = run_as("r2", "ar2");
-    ops.push(attach(
+    // r2 is a different review, now actually runnable, with its own attempt
+    // (admitted as non-code by trusted core).
+    let (env, results) = run_non_code(
+        &env,
+        &results,
+        a1(),
         "r2",
-        "res-r2",
-        with_attempt(
-            bare(super::mutation_interpreter_tests::result(
-                "r2", "PASS", "rv-r2",
-            )),
-            "ar2",
-        ),
-    ));
-    ops.push(verdict("r2", "PASSED", "r2"));
-    ops.push(set(
-        "r2",
-        "PASSED",
-        "ACCEPTED",
-        json!({"kind":"ACCEPTANCE","decision_id":"d-r2"}),
-    ));
-    ops.push(set(
-        "next",
-        "PLANNED",
-        "READY",
-        json!({"kind":"DEPENDENCIES_SATISFIED"}),
-    ));
-    let (env, results) = ok(&env, &results, a1(), Value::Array(ops));
+        "ar2",
+        vec![
+            attach(
+                "r2",
+                "res-r2",
+                with_attempt(
+                    bare(super::mutation_interpreter_tests::result(
+                        "r2", "PASS", "rv-r2",
+                    )),
+                    "ar2",
+                ),
+            ),
+            verdict("r2", "PASSED", "r2"),
+            set(
+                "r2",
+                "PASSED",
+                "ACCEPTED",
+                json!({"kind":"ACCEPTANCE","decision_id":"d-r2"}),
+            ),
+            set(
+                "next",
+                "PLANNED",
+                "READY",
+                json!({"kind":"DEPENDENCIES_SATISFIED"}),
+            ),
+        ],
+    );
     assert_eq!(env.graph().node_state("r2"), Some(S::Accepted));
     assert_eq!(env.graph().node_state("next"), Some(S::Ready));
 
@@ -934,19 +970,57 @@ fn code_sha_is_bound_to_the_admitted_attempt() {
         }
         attach(id, "r", r)
     };
-    // A node with no known SHA: a code claim is unavailable until trusted
-    // core admits it; a non-code result carries no invented SHA requirement.
+    // A node with no known SHA is unclassified: neither a code claim nor its
+    // omission makes the attempt code or non-code, so both are unavailable
+    // until trusted core admits one.
+    for claim in [Some(SHA), None] {
+        assert_eq!(
+            op_err(&env, &ledger, a1(), json!([result_for("w", "aw1", claim)])).1,
+            O::EvidenceUnavailable("attempt code or non-code classification"),
+            "{claim:?}"
+        );
+    }
+    // Explicit non-code admission: a SHA-less result is fine with no invented
+    // SHA, a code claim is not, and the SHA cannot be admitted afterwards.
+    let non_code = ledger.admit_attempt_non_code("P", "g", "w", "aw1").unwrap();
+    assert!(non_code.attempt_is_non_code("P", "g", "w"));
+    assert!(
+        !ledger.attempt_is_non_code("P", "g", "w"),
+        "input unchanged"
+    );
+    assert_eq!(non_code.attempt_code_sha("P", "g", "w"), None);
+    ok(&env, &non_code, a1(), json!([result_for("w", "aw1", None)]));
     assert_eq!(
         op_err(
             &env,
-            &ledger,
+            &non_code,
             a1(),
             json!([result_for("w", "aw1", Some(SHA))])
         )
         .1,
-        O::EvidenceUnavailable("admitted execution code evidence")
+        O::ResultAssociation("code_sha")
     );
-    ok(&env, &ledger, a1(), json!([result_for("w", "aw1", None)]));
+    assert_eq!(
+        non_code.admit_attempt_code_sha("P", "g", "w", "aw1", SHA),
+        Err(AttemptAdmissionError::DomainConflict)
+    );
+    assert_eq!(
+        non_code.admit_attempt_non_code("P", "g", "w", "aw1"),
+        Ok(non_code.clone())
+    );
+    // Non-code admission is for the exact current attempt, and a code attempt
+    // (known to the graph or admitted) is never downgraded.
+    for (id, attempt) in [("w", "other"), ("ghost", "aw1"), ("t", "other")] {
+        assert_eq!(
+            ledger.admit_attempt_non_code("P", "g", id, attempt),
+            Err(AttemptAdmissionError::NoSuchAttempt),
+            "{id}/{attempt}"
+        );
+    }
+    assert_eq!(
+        ledger.admit_attempt_non_code("P", "g", "t", "at1"),
+        Err(AttemptAdmissionError::DomainConflict)
+    );
     // Admission is trusted core's, for the current attempt, a valid SHA, once.
     for (id, attempt, sha, expect) in [
         ("w", "other", SHA, AttemptAdmissionError::NoSuchAttempt),
@@ -973,6 +1047,11 @@ fn code_sha_is_bound_to_the_admitted_attempt() {
         ledger.attempt_code_sha("P", "g", "w"),
         None,
         "input unchanged"
+    );
+    assert_eq!(
+        admitted.admit_attempt_non_code("P", "g", "w", "aw1"),
+        Err(AttemptAdmissionError::DomainConflict),
+        "admitted code is never downgraded"
     );
     assert_eq!(
         admitted.admit_attempt_code_sha("P", "g", "w", "aw1", SHA2),
@@ -1171,19 +1250,26 @@ fn graph_review_is_evidence_only_when_it_does_not_wait_on_the_acceptance_it_gate
         op_err_ev(&env, &results, a2("w"), judge("rg"), rev(&dir)).1,
         O::EvidenceRefused("graph review has no matching verdict")
     );
-    let mut ops = run_as("rg", "arg");
-    ops.push(attach(
+    let (env, results) = run_non_code(
+        &env,
+        &results,
+        a2("w"),
         "rg",
-        "res-rg",
-        with_attempt(
-            bare(super::mutation_interpreter_tests::result(
-                "rg", "PASS", "rv-rg",
-            )),
-            "arg",
-        ),
-    ));
-    ops.push(verdict("rg", "PASSED", "rg"));
-    let (env, results) = ok(&env, &results, a2("w"), Value::Array(ops));
+        "arg",
+        vec![
+            attach(
+                "rg",
+                "res-rg",
+                with_attempt(
+                    bare(super::mutation_interpreter_tests::result(
+                        "rg", "PASS", "rv-rg",
+                    )),
+                    "arg",
+                ),
+            ),
+            verdict("rg", "PASSED", "rg"),
+        ],
+    );
     let (env, results) = ok_ev(&env, &results, a2("w"), judge("rg"), rev(&dir));
     assert_eq!(env.graph().node_state("s"), Some(S::Passed));
     assert_eq!(

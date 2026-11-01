@@ -96,6 +96,8 @@ mod graph_mutation_vocabulary_tests;
 #[cfg(test)]
 mod mutation_apply_tests;
 #[cfg(test)]
+mod mutation_domain_tests;
+#[cfg(test)]
 mod mutation_interpreter_tests;
 #[cfg(test)]
 mod mutation_review_tests;

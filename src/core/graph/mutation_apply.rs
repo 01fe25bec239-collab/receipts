@@ -32,10 +32,12 @@
 //! An aggregate verdict and its acceptance rest on independent review
 //! evidence that trusted core admits through a [`ReviewEvidenceVerifier`]
 //! (see [`apply_graph_mutation_with_evidence_v1`]); the worker's own result and
-//! an opaque `review_id` prove nothing. Known code SHAs are bound to the
-//! admitted attempt, and a code claim for a node with no known SHA is
-//! unavailable until trusted core admits it
-//! ([`GraphResultLedgerV1::admit_attempt_code_sha`]).
+//! an opaque `review_id` prove nothing. Every attempt is code or non-code only
+//! by trusted core's say-so: a known node SHA or
+//! [`GraphResultLedgerV1::admit_attempt_code_sha`] makes it code, and
+//! [`GraphResultLedgerV1::admit_attempt_non_code`] makes it non-code. An
+//! omitted SHA classifies nothing: until admitted, results, verdicts and
+//! acceptance for the attempt are unavailable.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -129,12 +131,30 @@ impl GraphMutationScopeV1 {
 /// `(project_id, graph_id, node_id)`: the identity an attempt is admitted for.
 type AttemptKey = (String, String, String);
 
-/// What `DISPATCH` admitted for a node: the attempt and, when known, the
-/// code SHA that attempt is bound to.
+/// Whether an attempt produced code. Unclassified is the default: an absent
+/// SHA is not evidence of non-code. Only trusted core leaves it, once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AttemptDomain {
+    Unclassified,
+    Code(String),
+    NonCode,
+}
+
+impl AttemptDomain {
+    /// The SHA a review of this attempt must name (none for non-code).
+    fn sha(&self) -> Option<&str> {
+        match self {
+            Self::Code(sha) => Some(sha),
+            _ => None,
+        }
+    }
+}
+
+/// What `DISPATCH` admitted for a node: the attempt and its code domain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AttemptBinding {
     attempt_id: String,
-    code_sha: Option<String>,
+    domain: AttemptDomain,
 }
 
 /// Independent review evidence retained once admitted for a node attempt.
@@ -176,6 +196,9 @@ pub enum AttemptAdmissionError {
     InvalidCodeSha,
     /// A different SHA is already bound to the attempt.
     Conflict,
+    /// The attempt is already classified the other way (code versus
+    /// non-code); a classification is never downgraded or rebound.
+    DomainConflict,
 }
 
 impl GraphResultLedgerV1 {
@@ -210,9 +233,12 @@ impl GraphResultLedgerV1 {
         graph_id: &str,
         node_id: &str,
     ) -> Option<&str> {
-        self.binding(project_id, graph_id, node_id)?
-            .code_sha
-            .as_deref()
+        self.binding(project_id, graph_id, node_id)?.domain.sha()
+    }
+    /// Whether trusted core admitted the node's current attempt as non-code.
+    pub fn attempt_is_non_code(&self, project_id: &str, graph_id: &str, node_id: &str) -> bool {
+        self.binding(project_id, graph_id, node_id)
+            .is_some_and(|b| b.domain == AttemptDomain::NonCode)
     }
     /// The review identity and outcome admitted for the node's current attempt.
     pub fn review(
@@ -231,8 +257,9 @@ impl GraphResultLedgerV1 {
     /// a result may claim a SHA for a node whose graph data names none: a
     /// result's own `code_sha` never creates this binding. The attempt must be
     /// the node's current admitted attempt; a different SHA already bound
-    /// (from the node's known SHA or an earlier admission) refuses. Returns a
-    /// new ledger; `self` is unchanged.
+    /// (from the node's known SHA or an earlier admission) refuses, as does an
+    /// attempt already admitted as non-code. Returns a new ledger; `self` is
+    /// unchanged.
     pub fn admit_attempt_code_sha(
         &self,
         project_id: &str,
@@ -248,15 +275,42 @@ impl GraphResultLedgerV1 {
             .filter(|b| b.attempt_id == attempt_id)
             .ok_or(AttemptAdmissionError::NoSuchAttempt)?;
         CommitSha::parse(code_sha).map_err(|_| AttemptAdmissionError::InvalidCodeSha)?;
-        if binding
-            .code_sha
-            .as_deref()
-            .is_some_and(|bound| bound != code_sha)
-        {
-            return Err(AttemptAdmissionError::Conflict);
+        match &binding.domain {
+            AttemptDomain::NonCode => return Err(AttemptAdmissionError::DomainConflict),
+            AttemptDomain::Code(bound) if bound != code_sha => {
+                return Err(AttemptAdmissionError::Conflict);
+            }
+            _ => {}
         }
         let mut next = self.clone();
-        next.current.get_mut(&key).expect("checked above").code_sha = Some(code_sha.to_owned());
+        next.current.get_mut(&key).expect("checked above").domain =
+            AttemptDomain::Code(code_sha.to_owned());
+        Ok(next)
+    }
+
+    /// Trusted core admits that an attempt produced no code. This is the only
+    /// way a SHA-less attempt becomes promotable: an omitted SHA, a node
+    /// label, a worker result or a review record cannot. Keyed to the exact
+    /// project/graph/node/current attempt; an attempt with a known or admitted
+    /// code SHA refuses (never downgraded). Returns a new ledger.
+    pub fn admit_attempt_non_code(
+        &self,
+        project_id: &str,
+        graph_id: &str,
+        node_id: &str,
+        attempt_id: &str,
+    ) -> Result<Self, AttemptAdmissionError> {
+        let key: AttemptKey = (project_id.into(), graph_id.into(), node_id.into());
+        let binding = self
+            .current
+            .get(&key)
+            .filter(|b| b.attempt_id == attempt_id)
+            .ok_or(AttemptAdmissionError::NoSuchAttempt)?;
+        if matches!(binding.domain, AttemptDomain::Code(_)) {
+            return Err(AttemptAdmissionError::DomainConflict);
+        }
+        let mut next = self.clone();
+        next.current.get_mut(&key).expect("checked above").domain = AttemptDomain::NonCode;
         Ok(next)
     }
 }
@@ -443,6 +497,8 @@ pub fn apply_graph_mutation_with_evidence_v1(
         results: batch.ledger,
     })
 }
+
+const UNCLASSIFIED: &str = "attempt code or non-code classification";
 
 type OpResult<T = ()> = Result<T, GraphOperationError>;
 type Map = BTreeMap<String, V>;
@@ -656,6 +712,20 @@ impl Batch<'_> {
             .binding(self.project_id, self.graph.graph_id(), node.node_id())
     }
 
+    /// The node's current attempt, which trusted core must have classified as
+    /// code (known or admitted SHA) or non-code before its result, verdict or
+    /// acceptance can be used. Missing or unclassified is unavailable.
+    fn classified_binding(&self, node: &GraphNode) -> OpResult<AttemptBinding> {
+        use GraphOperationError as E;
+        let binding = self
+            .binding(node)
+            .ok_or(E::Attempt("node has no admitted attempt"))?;
+        if binding.domain == AttemptDomain::Unclassified {
+            return Err(E::EvidenceUnavailable(UNCLASSIFIED));
+        }
+        Ok(binding.clone())
+    }
+
     /// The review evidence admitted for the node's current attempt.
     fn retained_review(&self, node: &GraphNode) -> Option<&RetainedReview> {
         let attempt = self.binding(node)?.attempt_id.clone();
@@ -689,7 +759,9 @@ impl Batch<'_> {
                 key,
                 AttemptBinding {
                     attempt_id: attempt.to_owned(),
-                    code_sha: node.code_sha().map(str::to_owned),
+                    domain: node.code_sha().map_or(AttemptDomain::Unclassified, |sha| {
+                        AttemptDomain::Code(sha.to_owned())
+                    }),
                 },
             );
             return Ok(());
@@ -856,6 +928,8 @@ impl Batch<'_> {
     fn verify_verdict(&mut self, node: &GraphNode, to: GraphNodeState, cause: &Map) -> OpResult {
         use GraphOperationError as E;
         let cited_id = id(cause, "result_node_id")?;
+        // No kind is exempt: an omitted SHA never says the attempt is non-code.
+        self.classified_binding(node)?;
         if !requires_independent_review(node) {
             let newest = self.newest_repair_child(node)?.cloned();
             return self.verify_own_result_verdict(node, to, cited_id, newest.as_ref());
@@ -890,10 +964,7 @@ impl Batch<'_> {
     /// current attempt (see [`Self::verify_verdict`]).
     fn admit_review(&mut self, node: &GraphNode, to: GraphNodeState, review_id: &str) -> OpResult {
         use GraphOperationError as E;
-        let binding = self
-            .binding(node)
-            .cloned()
-            .ok_or(E::Attempt("node has no admitted attempt"))?;
+        let binding = self.classified_binding(node)?;
         let verifier = self
             .review
             .ok_or(E::Review(ReviewEvidenceRefusal::NoSource))?;
@@ -922,7 +993,7 @@ impl Batch<'_> {
             review_id,
             node_id: node.node_id(),
             attempt_id: &binding.attempt_id,
-            code_sha: binding.code_sha.as_deref(),
+            code_sha: binding.domain.sha(),
             round: node.attempt_number().map(GraphNodeAttemptNumber::as_str),
             expected: review_outcome(to),
         };
@@ -1012,8 +1083,8 @@ impl Batch<'_> {
         if retained.outcome != ReviewOutcome::Pass {
             return Err(E::Review(ReviewEvidenceRefusal::OutcomeMismatch));
         }
-        let bound = self.binding(judged).and_then(|b| b.code_sha.as_deref());
-        if retained.code_sha.as_deref() != bound {
+        let bound = self.classified_binding(judged)?;
+        if retained.code_sha.as_deref() != bound.domain.sha() {
             return Err(E::Review(ReviewEvidenceRefusal::CodeMismatch));
         }
         Ok(())
@@ -1111,18 +1182,17 @@ impl Batch<'_> {
             .cloned()
             .ok_or(E::Attempt("node has no admitted attempt"))?;
         check_code_binding(&node, &binding)?;
-        // A code claim needs the SHA bound to the attempt: the node's known
-        // one, or one trusted core admitted. The claim alone never binds.
-        match (binding.code_sha.as_deref(), result.code_sha()) {
-            (Some(bound), Some(claimed)) if bound == claimed => {}
-            (Some(_), _) => return Err(E::ResultAssociation("code_sha")),
-            (None, Some(_)) => {
-                return Err(E::EvidenceUnavailable("admitted execution code evidence"));
-            }
-            (None, None) => {}
-        }
         if result.attempt_id() != Some(binding.attempt_id.as_str()) {
             return Err(E::ResultAssociation("attempt_id"));
+        }
+        // The result must match the domain trusted core classified: a code
+        // attempt's result carries exactly its SHA, a non-code one none. The
+        // claim (or its absence) never classifies the attempt.
+        match (&binding.domain, result.code_sha()) {
+            (AttemptDomain::Unclassified, _) => return Err(E::EvidenceUnavailable(UNCLASSIFIED)),
+            (AttemptDomain::Code(bound), Some(claimed)) if bound == claimed => {}
+            (AttemptDomain::NonCode, None) => {}
+            _ => return Err(E::ResultAssociation("code_sha")),
         }
         self.ledger.results.insert(result_ref.to_owned(), result);
         self.graph.replace_node(node.with_result_ref(result_ref));
@@ -1344,9 +1414,9 @@ fn review_outcome(to: GraphNodeState) -> ReviewOutcome {
 /// The node's known code SHA must be the one bound to its admitted attempt.
 fn check_code_binding(node: &GraphNode, binding: &AttemptBinding) -> OpResult {
     match node.code_sha() {
-        Some(known) if binding.code_sha.as_deref() != Some(known) => Err(
-            GraphOperationError::Attempt("code sha differs from the admitted attempt"),
-        ),
+        Some(known) if binding.domain.sha() != Some(known) => Err(GraphOperationError::Attempt(
+            "code sha differs from the admitted attempt",
+        )),
         _ => Ok(()),
     }
 }
