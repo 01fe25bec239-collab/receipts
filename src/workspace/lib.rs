@@ -66,6 +66,7 @@ pub mod handle;
 pub mod handle_wire;
 pub mod lifecycle;
 pub mod protected;
+mod protected_custody;
 #[cfg(target_os = "linux")]
 mod protected_linux;
 pub mod provision;

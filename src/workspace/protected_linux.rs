@@ -11,7 +11,7 @@ mod imp {
     use std::io;
     use std::os::fd::{AsRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::OpenOptionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,9 +20,10 @@ mod imp {
     use crate::execution::{AttemptContainment, LaunchCustomization};
     use crate::git::ControllerLaunch;
     use crate::protected::{
-        Binding, LANDLOCK_ACCESS_FS_ABI3, ProtectedLaunchConfig, SockFilter,
-        controller_landlock_plan, seccomp_program_x86_64, verify_custody,
+        Binding, EstablishError, Gate, LANDLOCK_ACCESS_FS_ABI3, ProtectedLaunchConfig, SockFilter,
+        controller_landlock_plan, seccomp_program_x86_64, verify_ancestors, verify_custody,
     };
+    use crate::protected_custody as custody;
 
     unsafe extern "C" {
         fn syscall(number: c_long, ...) -> c_long;
@@ -200,93 +201,65 @@ mod imp {
 
     /// Transfers metadata to the controller, payload to the attempt's worker
     /// and the worktree root to controller:worker 01770, then verifies.
+    ///
+    /// Everything that can refuse runs first and read-only on stable
+    /// descriptors (recorded root identities, ancestors, mount topology, the
+    /// `.git` pointer, link/special-file policy of both trees). Only then does
+    /// the reservation record move to `custody` and ownership change, every
+    /// time through the same verified object.
     pub(crate) fn establish_custody(
         config: &ProtectedLaunchConfig,
         binding: &Binding,
-    ) -> Result<(), String> {
+    ) -> Result<(), EstablishError> {
         let (cu, cg, wg) = (
             config.controller_uid,
             config.controller_gid,
             config.worker_gid,
         );
-        walk(
-            &binding.common_dir,
-            &mut |path: &Path, metadata: &std::fs::Metadata| {
-                std::os::unix::fs::lchown(path, Some(cu), Some(cg)).map_err(|e| e.to_string())?;
-                if !metadata.file_type().is_symlink() {
-                    let mode = metadata.mode() & 0o7777 & !0o022;
-                    set_mode(path, mode)?;
-                }
-                Ok(true)
-            },
-        )?;
-        let pointer = binding.worktree.join(".git");
-        walk(
-            &binding.worktree,
-            &mut |path: &Path, _: &std::fs::Metadata| {
-                if path == binding.worktree || path == pointer {
-                    return Ok(path == binding.worktree);
-                }
-                std::os::unix::fs::lchown(path, Some(binding.worker_uid), Some(wg))
-                    .map_err(|e| e.to_string())?;
-                Ok(true)
-            },
-        )?;
-        std::os::unix::fs::chown(&binding.worktree, Some(cu), Some(wg))
-            .map_err(|e| e.to_string())?;
-        set_mode(&binding.worktree, 0o1770)?;
-        std::os::unix::fs::lchown(&pointer, Some(cu), Some(cg)).map_err(|e| e.to_string())?;
-        set_mode(&pointer, 0o644)?;
+        let refused = EstablishError::Refused;
+        let ids = binding
+            .reservation
+            .ids()
+            .ok_or_else(|| refused("custody record has no root identities".into()))?;
+        let roots = custody::Roots::open(&binding.common_dir, &binding.worktree, Some(ids))
+            .map_err(refused)?;
+        verify_ancestors(&binding.common_dir, &binding.worktree, cu).map_err(refused)?;
+        custody::preflight_roots(&roots, &binding.common_dir, &binding.worktree)
+            .map_err(refused)?;
+        binding
+            .reservation
+            .set_phase(custody::Phase::Custody)
+            .map_err(|error| refused(format!("custody record: {error}")))?;
+        let own = custody::Ownership {
+            controller_uid: cu,
+            controller_gid: cg,
+            worker_uid: binding.worker_uid,
+            worker_gid: wg,
+        };
+        custody::acquire(&roots, &own).map_err(EstablishError::Incomplete)?;
         verify_custody(&binding.common_dir, &binding.worktree, cu, wg)
+            .map_err(EstablishError::Incomplete)
     }
 
     /// Returns metadata and payload to the pre-admission owner. Called only
-    /// after the attempt's cgroup was proven empty; also requires that no live
-    /// process still holds the worker identity.
+    /// after the attempt's cgroup was proven empty and the shared release
+    /// barrier drained every controller operation; also requires that no live
+    /// process still holds the worker identity. Validates the persisted
+    /// original-owner evidence and the recorded root identities, and checks the
+    /// same link/mount boundaries as acquisition BEFORE the first ownership
+    /// change; every change then goes through a verified object.
     pub(crate) fn release_custody(binding: &Binding) -> Result<(), String> {
         if uid_in_use(binding.worker_uid)? {
             return Err("a process still runs as the worker identity".into());
         }
         let original = binding.original;
-        let give_back = &mut |path: &Path, _: &std::fs::Metadata| {
-            std::os::unix::fs::lchown(path, Some(original.uid), Some(original.gid))
-                .map_err(|error| format!("{}: {error}", path.display()))?;
-            Ok(true)
-        };
-        walk(&binding.common_dir, give_back)?;
-        walk(&binding.worktree, give_back)?;
-        set_mode(&binding.worktree, original.worktree_mode)?;
-        for path in [&binding.common_dir, &binding.worktree] {
-            let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
-            if metadata.uid() != original.uid || metadata.gid() != original.gid {
-                return Err(format!("{} was not restored", path.display()));
-            }
-        }
-        Ok(())
-    }
-
-    fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-            .map_err(|error| format!("{}: {error}", path.display()))
-    }
-
-    /// Depth-first walk without following symlinks; `visit` returns whether
-    /// to descend into a directory.
-    fn walk(
-        root: &Path,
-        visit: &mut dyn FnMut(&Path, &std::fs::Metadata) -> Result<bool, String>,
-    ) -> Result<(), String> {
-        let mut pending = vec![root.to_path_buf()];
-        while let Some(path) = pending.pop() {
-            let metadata = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
-            if visit(&path, &metadata)? && metadata.is_dir() {
-                for entry in std::fs::read_dir(&path).map_err(|e| e.to_string())? {
-                    pending.push(entry.map_err(|e| e.to_string())?.path());
-                }
-            }
-        }
-        Ok(())
+        let ids = binding
+            .reservation
+            .ids()
+            .ok_or("custody record has no root identities")?;
+        let roots = custody::Roots::open(&binding.common_dir, &binding.worktree, Some(ids))?;
+        custody::preflight_roots(&roots, &binding.common_dir, &binding.worktree)?;
+        custody::restore(&roots, original.uid, original.gid, original.worktree_mode)
     }
 
     /// One owned leaf cgroup; containment kills it, proves it unpopulated
@@ -551,9 +524,14 @@ mod imp {
         cap_last_cap: u32,
         plan: Vec<(PathBuf, u64)>,
         counter: AtomicU64,
+        gate: Arc<Gate>,
     }
 
     impl ControllerLaunch for Controller {
+        fn cleanup_unproven(&self) {
+            self.gate.mark_controller_unproven();
+        }
+
         fn customization(&self) -> Result<LaunchCustomization, String> {
             let mut landlock = Vec::new();
             for (path, access) in &self.plan {
@@ -597,6 +575,7 @@ mod imp {
             cap_last_cap: support.cap_last_cap,
             plan: controller_landlock_plan(binding),
             counter: AtomicU64::new(0),
+            gate: binding.gate.clone(),
         }))
     }
 }
@@ -608,7 +587,7 @@ mod imp {
 
     use crate::execution::LaunchCustomization;
     use crate::git::ControllerLaunch;
-    use crate::protected::{Binding, ProtectedLaunchConfig};
+    use crate::protected::{Binding, EstablishError, ProtectedLaunchConfig};
 
     const REFUSAL: &str = "protected launch is qualified only for Linux x86_64";
 
@@ -621,8 +600,11 @@ mod imp {
     pub(crate) fn uid_in_use(_: u32) -> Result<bool, String> {
         Err(REFUSAL.into())
     }
-    pub(crate) fn establish_custody(_: &ProtectedLaunchConfig, _: &Binding) -> Result<(), String> {
-        Err(REFUSAL.into())
+    pub(crate) fn establish_custody(
+        _: &ProtectedLaunchConfig,
+        _: &Binding,
+    ) -> Result<(), EstablishError> {
+        Err(EstablishError::Refused(REFUSAL.into()))
     }
     pub(crate) fn worker_launch(
         _: &LinuxSupport,

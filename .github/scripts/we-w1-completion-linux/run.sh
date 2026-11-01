@@ -14,6 +14,7 @@ cgroup="/sys/fs/cgroup/receipts-we-w1-diagnostic"
 cleanup_polls=50
 tests=(
   "protected_linux_tests::hosted_protected_worker_controller_and_cleanup"
+  "protected_linux_tests::hosted_exclusive_custody_and_linked_target_refusals"
 )
 
 prepare() {

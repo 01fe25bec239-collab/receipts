@@ -99,6 +99,46 @@ and `protected_hardlinks`/`protected_symlinks`. All other platforms refuse.
   controller-owned and not worker-writable (sticky allowed); worktree root
   controller:worker `01770`; `.git` pointer controller-owned; payload → fresh
   worker UID (monotonic, never reused by a launcher).
+- One custody owner per resource (`protected_custody`): before reading
+  ownership or changing anything, admission reserves the **actual Git common
+  directory** by creating `receipts-custody.state` there with
+  `O_CREAT|O_EXCL|O_NOFOLLOW` and holding `flock(LOCK_EX|LOCK_NB)`. A second
+  admission of the same worktree, of another linked worktree (they share the
+  common directory), through an alias path, from another launcher object or
+  from another process refuses with a typed `Custody` error before any ownership
+  or mode change and without consuming a worker identity. The record names the
+  attempt, phase (`reserved` → `custody` → `releasing` | `incomplete`), worker
+  UID, the true original owner (written once before any change) and the root
+  directory identities. Process exit releases only the lock: a leftover record
+  from a crash or incomplete setup/release is unknown prior custody and refuses
+  (`no live owner: retained state`); there is no automatic recovery, force
+  unlock or W3 recovery here. Only a refused setup that changed nothing, a
+  verified complete release, or an admission dropped/misdirected before any
+  worker existed (it gives custody straight back) deletes the record. A
+  repository whose owner already looks like the controller UID, a worker UID or
+  the worker GID is refused as prior custody. Limits: ONE protected attempt per
+  repository at a time (the serialization limit of this bounded
+  implementation); coordination among admitted trusted controllers on a local
+  filesystem, not protection against root/controller compromise; two
+  repositories whose worktrees are nested inside each other are not detected
+  beyond the existing ancestor-ownership check.
+- Stable objects (`protected_custody`): both trees are walked and mutated only
+  through directory descriptors (`openat(O_NOFOLLOW)`, `fchown`/`fchmod` on the
+  object just opened, root identities recorded at admission and re-checked at
+  release). Everything that can refuse runs first and read-only: overlapping
+  roots, ancestors, mount points strictly inside either root
+  (`/proc/self/mountinfo`, so bind mounts count), the `.git` pointer (plain
+  single-link regular file), and the link policy of both trees. Refused as
+  unsupported, with the external object unchanged: regular files with more than
+  one hard link (a possible external alias; Git content is never copied or
+  detached), special files, entries on another device, symlinks anywhere in Git
+  metadata, nesting deeper than 256 directories. Payload symlinks stay supported
+  because they are re-owned in place (`fchownat(AT_SYMLINK_NOFOLLOW)` by name
+  inside the verified parent) and never followed or traversed. The same checks
+  repeat on each object about to change, so a link created after preflight
+  refuses at that object (earlier objects of a transfer already begun stay
+  attributed to the retained record). Release applies the same preflight and
+  verified-object operations after validating the persisted original owner.
 - Worker: own cgroup, private mount namespace with metadata bind-mounted
   read-only, no groups/capabilities, no-new-privs, close-on-exec FDs, seccomp
   (EPERM: `open_by_handle_at`, `setns`, `unshare`, mount family, `ptrace`,
@@ -111,6 +151,17 @@ and `protected_hardlinks`/`protected_symlinks`. All other platforms refuse.
 - Cleanup: existing deadline/grace/reap lifecycle, then `cgroup.kill` and
   `populated 0` proof before reader verification. Unknown cleanup refuses
   success and retains the cgroup and identity.
+- Release barrier: both channels and the release share one lifecycle gate.
+  Every controller operation holds it for its whole duration (including its
+  reaped Git children); `release_custody` atomically closes admission, waits for
+  all admitted operations, and only then restores ownership. Requests that
+  arrive during (`custody release in progress`) or after (`custody was
+  released`) the release refuse before executing; replay consumption and typed
+  errors are unchanged. No lock is held across Git work or restoration. A
+  confined controller run whose containment was not proven, or a failed
+  restoration, quarantines custody: the record becomes `incomplete`, both
+  channels refuse (`custody release incomplete`), later release attempts return
+  `CleanupUnknown` and the repository stays reserved.
 - Channel: requests carry attempt, task, per-channel secret token and the next
   sequence number; forged, cross-task, replayed and reviewer write requests
   refuse. Operations: identity, status, stage (literal pathspecs), commit
@@ -122,7 +173,8 @@ and `protected_hardlinks`/`protected_symlinks`. All other platforms refuse.
   repository. Repositories whose base already tracks initialized submodules are
   not supported under protected launch (their worker-owned worktrees fail
   Git's ownership check). `Checkpoint` returns the `CHECKPOINTED` handle with
-  the captured evidence.
+  the captured evidence. Nested checkpoint records (`executed_checks[]`,
+  `dirty_diff_ref`, `output_ref`) decode only from JSON objects.
 - Diagnostics: `ControllerRequest`/`ControllerChannel` (and everything that
   nests them) print `<redacted>` for bearer tokens in ordinary, pretty and
   nested `Debug`; errors never echo request tokens. Explicit protocol access
@@ -148,7 +200,11 @@ keep-caps.
 `hosted_protected_worker_controller_and_cleanup` asserts, inside the real
 boundary: exact custody owners/modes/ancestors after admission; worker and
 controller real/effective/saved/fs IDs, groups, all five capability sets,
-no-new-privs and seccomp mode; only stdio plus the probe's own directory FD open;
+no-new-privs and seccomp mode, observed by the probes through system calls
+(`getresuid`/`getresgid`/`setfsuid(-1)`/`getgroups`/`capget`/`prctl`/`fcntl`/
+`getrlimit`) because the controller's Landlock plan grants no `/proc` access and
+production access is not widened; only stdio open (every other descriptor
+number up to the limit answers `EBADF`);
 `unshare`/`setns`/`open_by_handle_at`/`pidfd_getfd`/`process_vm_readv` return
 `EPERM` where the unfiltered result would differ; root, sibling and own cgroup
 `cgroup.procs` cannot be opened for writing; metadata write, replace, rename and
@@ -156,8 +212,18 @@ no-new-privs and seccomp mode; only stdio plus the probe's own directory FD open
 work; the controller reads that `0600` file, is denied the outside sentinel
 directly and through `/proc/self/root`; reviewer mutation requests refuse on the
 enforced channel; a worker-planted embedded repository is never staged and its
-filter marker never appears; commit, checkpoint handle, custody release, dirty
-non-force teardown refusal and clean teardown with the task commit retained.
+filter marker never appears. The worker prepares the embedded repository BEFORE
+the filter exists, arms it, proves with a worker-side `git add` that the filter
+really runs, then resets the marker; the parent asserts the marker absent at that
+baseline and after every controller operation, so a marker can only come from
+controller execution. Commit, checkpoint handle, custody release (record deleted
+only then), dirty non-force teardown refusal and clean teardown with the task
+commit retained. A second hosted test
+(`hosted_exclusive_custody_and_linked_target_refusals`) covers, with real
+chown: duplicate, linked-worktree, alias and second-launcher admission refusals
+that change nothing, safe re-admission after a complete release, and the
+external-symlink `.git` pointer and payload hardlink refusals with external
+owner/mode unchanged.
 `run.sh` records `test_status` and `cleanup_status` separately; PASS/exit 0
 requires both 0 (cgroup kill, emptiness, removal, no fixture-identity process,
 no fixture directory).
@@ -169,7 +235,12 @@ verdict logic only.
 ## Proof status
 
 Local Darwin tests cover all platform-neutral behavior and the refusal on
-non-Linux. Linux enforcement code and the hosted test were type-checked and
+non-Linux, including the reservation (threads and a separate process), the
+release barrier (barrier- and condition-coordinated, no sleeps), the descriptor
+engine against real symlink/hardlink/replacement fixtures with external
+sentinels, and the filter-marker phases with an unprivileged positive control.
+Ownership changes to other users, `/proc/self/mountinfo` on a real bind mount,
+Landlock and cgroups need the hosted run. Linux enforcement code and the hosted tests were type-checked and
 Clippy-checked locally only in a throwaway copy with the Linux cfg gates
 retargeted to Darwin (no link, nothing committed from that copy); they have NOT
 been executed. The hosted

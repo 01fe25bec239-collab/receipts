@@ -2,6 +2,9 @@
 //! exercises admission binding and channel semantics WITHOUT enforcement;
 //! these tests prove no Linux confinement property.
 
+use std::ffi::OsStr;
+use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 
 use super::*;
@@ -216,22 +219,293 @@ fn admission_requires_task_binding_matching_head_branch_and_repository() {
     ));
 }
 
+/// Identities stay noncolliding and are never reused. Admissions here use
+/// nonoverlapping repositories: one repository has one custody owner (F2).
 #[test]
 fn identities_are_noncolliding_and_never_reused() {
     let launcher = ProtectedLauncher::unenforced_for_test(
         ProtectedLaunchConfig::new(61001, 61001, 61002, 62000..=62001, "/c").unwrap(),
     );
-    let repo = TestRepo::new("protected-ids");
-    let handle = provisioned(&repo, Some("task-1"));
-    let first = launcher.admit(&handle, repo.path()).unwrap();
-    let second = launcher.admit(&handle, repo.path()).unwrap();
+    let (repo_a, repo_b, repo_c) = (
+        TestRepo::new("protected-ids-a"),
+        TestRepo::new("protected-ids-b"),
+        TestRepo::new("protected-ids-c"),
+    );
+    let (handle_a, handle_b, handle_c) = (
+        provisioned(&repo_a, Some("task-1")),
+        provisioned(&repo_b, Some("task-1")),
+        provisioned(&repo_c, Some("task-1")),
+    );
+    let first = launcher.admit(&handle_a, repo_a.path()).unwrap();
+    let second = launcher.admit(&handle_b, repo_b.path()).unwrap();
     assert_ne!(first.binding.worker_uid, second.binding.worker_uid);
     assert_ne!(first.attempt_id(), second.attempt_id());
     drop((first, second));
+    // Both identities stay retained after their custody was given back.
     assert!(matches!(
-        launcher.admit(&handle, repo.path()),
+        launcher.admit(&handle_c, repo_c.path()),
         Err(ProtectedLaunchError::IdentityExhausted)
     ));
+    // Exhaustion freed its own reservation again.
+    assert!(!marker_path(&repo_c).exists());
+    assert!(!marker_path(&repo_a).exists() && !marker_path(&repo_b).exists());
+}
+
+fn marker_path(repo: &TestRepo) -> PathBuf {
+    repo.path().join(".git/receipts-custody.state")
+}
+
+fn marker_text(repo: &TestRepo) -> String {
+    std::fs::read_to_string(marker_path(repo)).unwrap()
+}
+
+/// Every entry of the repository's Git directory with mode and size.
+fn git_dir_listing(repo: &TestRepo) -> Vec<(PathBuf, u32, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let mut out = Vec::new();
+    let mut pending = vec![repo.path().join(".git")];
+    while let Some(path) = pending.pop() {
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        // The reservation record is the only thing admission may add.
+        if path
+            .file_name()
+            .is_some_and(|name| name == "receipts-custody.state")
+        {
+            continue;
+        }
+        out.push((path.clone(), metadata.mode(), metadata.len()));
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(&path).unwrap() {
+                pending.push(entry.unwrap().path());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn unenforced(uids: std::ops::RangeInclusive<u32>) -> ProtectedLauncher {
+    ProtectedLauncher::unenforced_for_test(
+        ProtectedLaunchConfig::new(61001, 61001, 61002, uids, "/c").unwrap(),
+    )
+}
+
+fn custody_refusal(result: Result<ProtectedAdmission, ProtectedLaunchError>) -> String {
+    match result {
+        Err(ProtectedLaunchError::Custody(detail)) => detail,
+        other => panic!("expected a custody refusal, got {other:?}"),
+    }
+}
+
+/// F2: one owner per actual common directory/worktree. A duplicate admission
+/// of the same handle refuses before any change and burns no identity.
+#[test]
+fn duplicate_admission_of_one_handle_refuses_before_any_change() {
+    let launcher = unenforced(62000..=62001);
+    let repo = TestRepo::new("protected-dup");
+    let handle = provisioned(&repo, Some("task-1"));
+    let first = launcher.admit(&handle, repo.path()).unwrap();
+    let (record, listing) = (marker_text(&repo), git_dir_listing(&repo));
+    assert!(record.contains(&format!("attempt={}", first.attempt_id())));
+    assert!(record.contains("phase=custody") && record.contains("worker_uid=62000"));
+    assert!(record.contains("original_uid=") && record.contains("worktree_identity="));
+
+    let detail = custody_refusal(launcher.admit(&handle, repo.path()));
+    assert!(detail.contains("owner alive"), "{detail}");
+    // Separate launcher instance with its own allocator: same resource.
+    let detail = custody_refusal(unenforced(62000..=62001).admit(&handle, repo.path()));
+    assert!(detail.contains(first.attempt_id()), "{detail}");
+    assert_eq!(
+        marker_text(&repo),
+        record,
+        "losing admissions changed the record"
+    );
+    assert_eq!(
+        git_dir_listing(&repo),
+        listing,
+        "losing admissions mutated Git metadata"
+    );
+
+    // The refusals consumed no worker identity: after the owner gives custody
+    // back, the next admission gets the next unused UID, not IdentityExhausted.
+    drop(first);
+    assert!(!marker_path(&repo).exists());
+    let again = launcher.admit(&handle, repo.path()).unwrap();
+    assert_eq!(again.binding.worker_uid, 62001);
+}
+
+/// F2: another linked worktree of the same repository, an alias spelling of
+/// the repository, the worktree given as the repository root and a different
+/// launcher all meet at the same common directory.
+#[test]
+fn linked_worktrees_aliases_and_launchers_share_one_custody_owner() {
+    let repo = TestRepo::new_nested("protected-linked", "repo");
+    let first_handle = provisioned(&repo, Some("task-1"));
+    let second_handle = WorkspaceProvisionRequest::new(
+        repo.path(),
+        "ws-second",
+        Some("task-2"),
+        "task/second",
+        repo.path().join("wt2"),
+        &repo.head_sha(),
+    )
+    .unwrap()
+    .provision()
+    .unwrap();
+    let alias = repo.root.path().join("alias");
+    std::os::unix::fs::symlink(repo.path(), &alias).unwrap();
+    let dotdot = repo.path().join("wt").join("..");
+
+    let (launcher_a, launcher_b) = (unenforced(62000..=62009), unenforced(62000..=62009));
+    let first = launcher_a.admit(&first_handle, repo.path()).unwrap();
+    let (record, listing) = (marker_text(&repo), git_dir_listing(&repo));
+    for (launcher, handle, root) in [
+        (&launcher_a, &second_handle, repo.path().to_path_buf()),
+        (&launcher_b, &second_handle, repo.path().to_path_buf()),
+        (&launcher_b, &second_handle, alias.clone()),
+        (&launcher_b, &second_handle, dotdot.clone()),
+        (
+            &launcher_b,
+            &second_handle,
+            first_handle.worktree_path().to_path_buf(),
+        ),
+        (&launcher_b, &first_handle, alias.clone()),
+        (&launcher_b, &first_handle, dotdot.clone()),
+    ] {
+        let detail = custody_refusal(launcher.admit(handle, &root));
+        assert!(
+            detail.contains(first.attempt_id()),
+            "{}: {detail}",
+            root.display()
+        );
+    }
+    assert_eq!(marker_text(&repo), record);
+    assert_eq!(git_dir_listing(&repo), listing);
+
+    // After the first owner's complete release, the other worktree is free to
+    // be admitted by a different launcher (safe re-admission).
+    drop(first);
+    assert!(!marker_path(&repo).exists());
+    let second = launcher_b.admit(&second_handle, &alias).unwrap();
+    assert!(marker_text(&repo).contains(second.attempt_id()));
+}
+
+/// Unrelated, nonoverlapping repositories are unaffected by each other.
+#[test]
+fn nonoverlapping_repositories_admit_independently() {
+    let launcher = unenforced(62000..=62009);
+    let (repo_a, repo_b) = (
+        TestRepo::new("protected-n-a"),
+        TestRepo::new("protected-n-b"),
+    );
+    let (handle_a, handle_b) = (
+        provisioned(&repo_a, Some("task-1")),
+        provisioned(&repo_b, Some("task-1")),
+    );
+    let first = launcher.admit(&handle_a, repo_a.path()).unwrap();
+    let second = unenforced(62000..=62009)
+        .admit(&handle_b, repo_b.path())
+        .unwrap();
+    assert!(marker_text(&repo_a).contains(first.attempt_id()));
+    assert!(marker_text(&repo_b).contains(second.attempt_id()));
+}
+
+/// Concurrent contenders with independent launchers: exactly one wins.
+#[test]
+fn concurrent_admissions_have_exactly_one_winner() {
+    let repo = TestRepo::new("protected-race");
+    let handle = provisioned(&repo, Some("task-1"));
+    let barrier = Barrier::new(6);
+    let results: Vec<_> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..6)
+            .map(|_| {
+                scope.spawn(|| {
+                    let launcher = unenforced(62000..=62009);
+                    barrier.wait();
+                    launcher.admit(&handle, repo.path())
+                })
+            })
+            .collect();
+        workers.into_iter().map(|w| w.join().unwrap()).collect()
+    });
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    let winner = results.iter().find_map(|r| r.as_ref().ok()).unwrap();
+    assert!(marker_text(&repo).contains(winner.attempt_id()));
+    for refused in results.iter().filter_map(|r| r.as_ref().err()) {
+        assert!(
+            matches!(refused, ProtectedLaunchError::Custody(_)),
+            "{refused:?}"
+        );
+    }
+}
+
+/// A retained record from a crashed or incomplete owner is unknown prior
+/// custody: it refuses, is never overwritten and is not recovered here.
+#[test]
+fn retained_reservation_state_refuses_new_admission_without_recovery() {
+    let launcher = unenforced(62000..=62009);
+    let repo = TestRepo::new("protected-retained");
+    let handle = provisioned(&repo, Some("task-1"));
+    let crashed = "receipts-custody-v1\nattempt=deadbeef\nphase=custody\nworker_uid=62000\n";
+    std::fs::write(marker_path(&repo), crashed).unwrap();
+    let detail = custody_refusal(launcher.admit(&handle, repo.path()));
+    assert!(
+        detail.contains("attempt deadbeef")
+            && detail.contains("phase custody")
+            && detail.contains("no live owner: retained state"),
+        "{detail}"
+    );
+    assert_eq!(marker_text(&repo), crashed);
+}
+
+/// A repository already owned by the controller or in the worker group looks
+/// like earlier custody; it refuses instead of being adopted as "original".
+#[test]
+fn ownership_that_already_looks_like_custody_is_unknown_prior_custody() {
+    use std::os::unix::fs::MetadataExt;
+    let repo = TestRepo::new("protected-prior");
+    let handle = provisioned(&repo, Some("task-1"));
+    let metadata = std::fs::metadata(repo.path().join(".git")).unwrap();
+    let (uid, gid) = (metadata.uid(), metadata.gid());
+    let as_controller = ProtectedLauncher::unenforced_for_test(
+        ProtectedLaunchConfig::new(uid, uid, 62500, 62000..=62009, "/c").unwrap(),
+    );
+    let in_worker_group = ProtectedLauncher::unenforced_for_test(
+        ProtectedLaunchConfig::new(61001, 61001, gid, 62000..=62009, "/c").unwrap(),
+    );
+    for launcher in [&as_controller, &in_worker_group] {
+        let detail = custody_refusal(launcher.admit(&handle, repo.path()));
+        assert!(detail.contains("unknown prior custody"), "{detail}");
+        assert!(
+            !marker_path(&repo).exists(),
+            "refusal must free its own reservation"
+        );
+    }
+}
+
+/// An invalid layout is refused with the repository and Git metadata untouched
+/// and the reservation freed: here an external `.git` pointer symlink that Git
+/// itself accepts.
+#[test]
+fn admission_refuses_an_external_pointer_symlink_without_any_change() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let repo = TestRepo::new_nested("protected-pointer", "repo");
+    let handle = provisioned(&repo, Some("task-1"));
+    let external = repo.root.path().join("external-pointer");
+    let pointer = handle.worktree_path().join(".git");
+    std::fs::copy(&pointer, &external).unwrap();
+    std::fs::set_permissions(&external, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::remove_file(&pointer).unwrap();
+    std::os::unix::fs::symlink(&external, &pointer).unwrap();
+    // Git's own prechecks accept this layout.
+    git(handle.worktree_path(), &["rev-parse", "--git-common-dir"]);
+    let listing = git_dir_listing(&repo);
+
+    let detail = custody_refusal(unenforced(62000..=62009).admit(&handle, repo.path()));
+    assert!(detail.contains(".git pointer is a symlink"), "{detail}");
+    assert_eq!(std::fs::metadata(&external).unwrap().mode() & 0o7777, 0o600);
+    assert_eq!(git_dir_listing(&repo), listing);
+    assert!(!marker_path(&repo).exists());
 }
 
 #[test]
@@ -682,4 +956,513 @@ fn release_requires_proven_cleanup_then_checkpointed_handle_tears_down_without_f
         commit.as_str(),
         "task branch and its commit are retained"
     );
+}
+
+// ------------------------------------------------------------ F1: release barrier
+
+fn started(tag: &str) -> (TestRepo, WorkspaceHandle, ProtectedAttempt) {
+    let launcher = ProtectedLauncher::unenforced_for_test(config());
+    let repo = TestRepo::new(tag);
+    let handle = provisioned(&repo, Some("task-1"));
+    let admission = launcher.admit(&handle, repo.path()).unwrap();
+    let protected = launcher
+        .launch(admission, &request(handle.worktree_path()), &policy())
+        .unwrap();
+    protected.attempt().wait_collect().unwrap();
+    (repo, handle, protected)
+}
+
+fn set_hooks(
+    protected: &ProtectedAttempt,
+    before: impl Fn(ControllerRole) + Send + Sync + 'static,
+    after: impl Fn(ControllerRole) + Send + Sync + 'static,
+) {
+    let hooks = &protected.worker_channel().binding.hooks;
+    *hooks.before.lock().unwrap() = Some(Arc::new(before));
+    *hooks.after.lock().unwrap() = Some(Arc::new(after));
+}
+
+/// One-way latch with a bounded wait: a regression fails the test instead of
+/// hanging it. Coordination is by this latch and the gate's phase condition,
+/// never by sleeping for a guessed duration.
+#[derive(Default)]
+struct Latch(Mutex<bool>, std::sync::Condvar);
+
+impl Latch {
+    fn open(&self) {
+        *self.0.lock().unwrap() = true;
+        self.1.notify_all();
+    }
+    fn wait(&self) {
+        let (open, timeout) = self
+            .1
+            .wait_timeout_while(self.0.lock().unwrap(), Duration::from_secs(20), |open| {
+                !*open
+            })
+            .unwrap();
+        assert!(*open && !timeout.timed_out(), "latch never opened");
+    }
+}
+
+/// Parks the first `count` operations that reach the "before" point until
+/// `proceed` opens, announcing each on `parked`.
+fn park_first_operations(
+    protected: &ProtectedAttempt,
+    count: usize,
+    parked: std::sync::mpsc::Sender<ControllerRole>,
+    proceed: Arc<Latch>,
+    after: impl Fn(ControllerRole) + Send + Sync + 'static,
+) {
+    let seen = AtomicUsize::new(0);
+    let parked = Mutex::new(parked);
+    set_hooks(
+        protected,
+        move |role| {
+            if seen.fetch_add(1, Ordering::SeqCst) < count {
+                parked.lock().unwrap().send(role).unwrap();
+                proceed.wait();
+            }
+        },
+        after,
+    );
+}
+
+/// An operation already in flight on EACH channel holds the release back; the
+/// release closes admission first (new requests on both channels refuse while
+/// it waits) and restores custody only after both operations finished.
+#[test]
+fn release_waits_for_in_flight_operations_on_both_channels() {
+    let (_repo, _handle, protected) = started("protected-barrier");
+    let (worker, reviewer) = (protected.worker_channel(), protected.reviewer_channel());
+    let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+    let proceed = Arc::new(Latch::default());
+    let log: Arc<Mutex<Vec<&'static str>>> = Arc::default();
+    {
+        let log = log.clone();
+        park_first_operations(&protected, 2, parked_tx, proceed.clone(), move |_| {
+            log.lock().unwrap().push("operation-complete");
+        });
+    }
+    let gate = protected.worker_channel().binding.gate.clone();
+    std::thread::scope(|scope| {
+        let worker_op = scope.spawn(|| send(worker, 0, ControllerOperation::Status));
+        let reviewer_op = scope.spawn(|| send(reviewer, 0, ControllerOperation::Status));
+        let mut roles = [
+            parked_rx.recv_timeout(Duration::from_secs(20)).unwrap(),
+            parked_rx.recv_timeout(Duration::from_secs(20)).unwrap(),
+        ];
+        roles.sort_by_key(|role| *role == ControllerRole::Reviewer);
+        assert_eq!(roles, [ControllerRole::Worker, ControllerRole::Reviewer]);
+        let release = scope.spawn(|| {
+            let result = protected.release_custody();
+            log.lock().unwrap().push("release-returned");
+            result
+        });
+        gate.wait_for_phase_for_test(Phase::Releasing);
+        // New work on either channel refuses before executing.
+        for channel in [worker, reviewer] {
+            assert!(matches!(
+                send(channel, 1, ControllerOperation::Status),
+                Err(ProtectedLaunchError::Binding("custody release in progress"))
+            ));
+        }
+        assert!(
+            !release.is_finished(),
+            "release overtook an in-flight operation"
+        );
+        assert_eq!(gate.phase_for_test(), Phase::Releasing);
+        proceed.open();
+        assert!(matches!(
+            worker_op.join().unwrap(),
+            Ok(ControllerResponse::Status { .. })
+        ));
+        assert!(matches!(
+            reviewer_op.join().unwrap(),
+            Ok(ControllerResponse::Status { .. })
+        ));
+        release.join().unwrap().unwrap();
+    });
+    assert_eq!(
+        *log.lock().unwrap(),
+        [
+            "operation-complete",
+            "operation-complete",
+            "release-returned"
+        ],
+        "custody was restored before both operations completed"
+    );
+    assert_eq!(gate.phase_for_test(), Phase::Released);
+    // Release first, request second: refuses and consumes nothing.
+    for channel in [worker, reviewer] {
+        assert!(matches!(
+            send(channel, 1, ControllerOperation::Status),
+            Err(ProtectedLaunchError::Binding("custody was released"))
+        ));
+    }
+}
+
+/// A mutating operation (worker stage) in flight is also drained, and a
+/// second release attempt during the first is refused as such.
+#[test]
+fn release_drains_a_mutating_operation_and_refuses_a_concurrent_second_release() {
+    let (_repo, handle, protected) = started("protected-barrier-stage");
+    std::fs::write(handle.worktree_path().join("late.txt"), "late").unwrap();
+    let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+    let proceed = Arc::new(Latch::default());
+    park_first_operations(&protected, 1, parked_tx, proceed.clone(), |_| {});
+    let gate = protected.worker_channel().binding.gate.clone();
+    std::thread::scope(|scope| {
+        let stage = scope.spawn(|| {
+            send(
+                protected.worker_channel(),
+                0,
+                ControllerOperation::Stage {
+                    paths: vec!["late.txt".into()],
+                },
+            )
+        });
+        parked_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        let release = scope.spawn(|| protected.release_custody());
+        gate.wait_for_phase_for_test(Phase::Releasing);
+        assert!(matches!(
+            protected.release_custody(),
+            Err(ProtectedLaunchError::Custody(detail)) if detail.contains("already in progress")
+        ));
+        proceed.open();
+        assert!(matches!(
+            stage.join().unwrap(),
+            Ok(ControllerResponse::Staged { .. })
+        ));
+        release.join().unwrap().unwrap();
+    });
+    // The staged work completed before custody moved.
+    let staged = stdout_trimmed(&git(
+        handle.worktree_path(),
+        &["diff", "--cached", "--name-only"],
+    ));
+    assert_eq!(staged, "late.txt");
+}
+
+/// Failed or partial release: custody stays quarantined, the reservation record
+/// survives (nothing looks free), channels refuse, a retry and a new admission
+/// refuse; dropping the attempt does not free the repository either.
+#[test]
+fn failed_release_retains_custody_and_the_reservation_with_no_new_work() {
+    let (repo, handle, protected) = started("protected-failed-release");
+    protected
+        .worker_channel()
+        .binding
+        .hooks
+        .fail_restore
+        .store(true, Ordering::SeqCst);
+    let error = protected.release_custody().unwrap_err();
+    assert!(
+        matches!(&error, ProtectedLaunchError::CleanupUnknown(d) if d.contains("injected restoration failure")),
+        "{error:?}"
+    );
+    let record = marker_text(&repo);
+    assert!(record.contains("phase=incomplete"), "{record}");
+    for channel in [protected.worker_channel(), protected.reviewer_channel()] {
+        assert!(matches!(
+            send(channel, 0, ControllerOperation::Status),
+            Err(ProtectedLaunchError::Binding("custody release incomplete"))
+        ));
+    }
+    assert!(matches!(
+        protected.release_custody(),
+        Err(ProtectedLaunchError::CleanupUnknown(_))
+    ));
+    let detail = custody_refusal(unenforced(62000..=62009).admit(&handle, repo.path()));
+    assert!(detail.contains("phase incomplete"), "{detail}");
+    drop(protected);
+    assert_eq!(
+        marker_text(&repo),
+        record,
+        "dropping the attempt freed nothing"
+    );
+    assert!(matches!(
+        unenforced(62000..=62009).admit(&handle, repo.path()),
+        Err(ProtectedLaunchError::Custody(_))
+    ));
+}
+
+/// A confined controller run whose containment was not proven quarantines the
+/// release; nothing is restored. Exercised through the real confined-run path
+/// with a launch whose containment fails.
+#[test]
+fn unproven_controller_cleanup_quarantines_release() {
+    struct Failing(Arc<Gate>);
+    struct Unprovable;
+    impl crate::execution::AttemptContainment for Unprovable {
+        fn kill_and_verify_empty(&self) -> Result<(), String> {
+            Err("injected: group not proven empty".into())
+        }
+    }
+    impl git::ControllerLaunch for Failing {
+        fn customization(&self) -> Result<crate::execution::LaunchCustomization, String> {
+            Ok(crate::execution::LaunchCustomization {
+                pre_exec: None,
+                containment: Some(Arc::new(Unprovable)),
+            })
+        }
+        fn cleanup_unproven(&self) {
+            self.0.mark_controller_unproven();
+        }
+    }
+    let (repo, _handle, protected) = started("protected-unproven");
+    let binding = protected.worker_channel().binding.clone();
+    {
+        let _scope = git::ControllerScope::enter(Arc::new(Failing(binding.gate.clone())));
+        assert!(git::capture(&binding.worktree, "unproven", &[OsStr::new("--version")]).is_err());
+    }
+    assert!(binding.gate.controller_unproven());
+    let error = protected.release_custody().unwrap_err();
+    assert!(
+        matches!(&error, ProtectedLaunchError::CleanupUnknown(d) if d.contains("not proven")),
+        "{error:?}"
+    );
+    assert!(marker_text(&repo).contains("phase=incomplete"));
+    assert!(matches!(
+        send(protected.worker_channel(), 0, ControllerOperation::Status),
+        Err(ProtectedLaunchError::Binding("custody release incomplete"))
+    ));
+}
+
+/// The valid flow is deadlock free: both channels are driven continuously while
+/// release runs; every request is either completed or refused by the closed
+/// barrier, release succeeds and nothing runs after it returned.
+#[test]
+fn concurrent_traffic_and_release_never_deadlock() {
+    let (_repo, _handle, protected) = started("protected-traffic");
+    let start = Barrier::new(3);
+    let completed = AtomicUsize::new(0);
+    let after_release = AtomicBool::new(false);
+    let ran_after_release = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        for channel in [protected.worker_channel(), protected.reviewer_channel()] {
+            let (start, completed, after_release, ran_after) =
+                (&start, &completed, &after_release, &ran_after_release);
+            scope.spawn(move || {
+                start.wait();
+                let mut sequence = 0;
+                loop {
+                    match send(channel, sequence, ControllerOperation::Status) {
+                        Ok(_) => {
+                            if after_release.load(Ordering::SeqCst) {
+                                ran_after.store(true, Ordering::SeqCst);
+                            }
+                            completed.fetch_add(1, Ordering::SeqCst);
+                            sequence += 1;
+                        }
+                        Err(ProtectedLaunchError::Binding(reason)) => {
+                            assert!(reason.starts_with("custody"), "unexpected refusal {reason}");
+                            break;
+                        }
+                        Err(other) => panic!("{other:?}"),
+                    }
+                }
+            });
+        }
+        start.wait();
+        // Let at least one operation complete before closing the barrier.
+        let waiting = std::time::Instant::now();
+        while completed.load(Ordering::SeqCst) == 0 {
+            assert!(
+                waiting.elapsed() < Duration::from_secs(20),
+                "no operation completed"
+            );
+            std::thread::yield_now();
+        }
+        protected.release_custody().unwrap();
+        after_release.store(true, Ordering::SeqCst);
+    });
+    assert!(completed.load(Ordering::SeqCst) >= 1);
+    assert!(
+        !ran_after_release.load(Ordering::SeqCst),
+        "an operation completed after custody was returned"
+    );
+}
+
+/// Dropping an unused admission, and failed launch checks, give custody back;
+/// a failure after a worker may exist keeps the record.
+#[test]
+fn unused_and_misdirected_admissions_release_while_unknown_ones_stay_retained() {
+    let launcher = unenforced(62000..=62009);
+    let repo = TestRepo::new("protected-unused");
+    let handle = provisioned(&repo, Some("task-1"));
+    drop(launcher.admit(&handle, repo.path()).unwrap());
+    assert!(
+        !marker_path(&repo).exists(),
+        "unused admission was not released"
+    );
+
+    let admission = launcher.admit(&handle, repo.path()).unwrap();
+    assert!(matches!(
+        launcher.launch(admission, &request(repo.path()), &policy()),
+        Err(ProtectedLaunchError::Binding(_))
+    ));
+    assert!(
+        !marker_path(&repo).exists(),
+        "misdirected launch kept custody"
+    );
+
+    // If giving custody back fails, the refusal says so and the record stays.
+    let admission = launcher.admit(&handle, repo.path()).unwrap();
+    admission
+        .binding
+        .hooks
+        .fail_restore
+        .store(true, Ordering::SeqCst);
+    let error = launcher
+        .launch(admission, &request(repo.path()), &policy())
+        .unwrap_err();
+    assert!(
+        matches!(&error, ProtectedLaunchError::CleanupUnknown(d) if d.contains("also failed")),
+        "{error:?}"
+    );
+    assert!(marker_text(&repo).contains("phase=incomplete"));
+}
+
+// -------------------------------------------- F5: filter marker attribution
+
+fn arm_clean_filter(nested: &Path, marker: &Path) {
+    std::fs::write(nested.join(".gitattributes"), "* filter=x\n").unwrap();
+    git(
+        nested,
+        &[
+            "config",
+            "filter.x.clean",
+            &format!("sh -c 'touch {}; cat'", marker.display()),
+        ],
+    );
+}
+
+fn commit_all(nested: &Path) {
+    git(nested, &["add", "-A"]);
+    git(
+        nested,
+        &[
+            "-c",
+            "user.name=w",
+            "-c",
+            "user.email=w@w.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "w",
+        ],
+    );
+}
+
+/// The retained finding: a fixture that installs the filter before preparing
+/// the embedded repository runs the filter itself, so a marker at the
+/// controller baseline proves nothing about the controller.
+#[test]
+fn filter_installed_before_preparation_creates_a_worker_marker_before_any_controller() {
+    let repo = TestRepo::new("protected-filter-old-order");
+    let handle = provisioned(&repo, Some("task-1"));
+    let nested = handle.worktree_path().join("evil");
+    let marker = handle.worktree_path().join("FILTER_RAN");
+    std::fs::create_dir(&nested).unwrap();
+    git(&nested, &["init", "-q", "-b", "main"]);
+    arm_clean_filter(&nested, &marker);
+    std::fs::write(nested.join("f"), "data").unwrap();
+    commit_all(&nested);
+    assert!(marker.exists(), "worker preparation ran its own filter");
+}
+
+/// F5: worker preparation (init/commit before the filter exists), arming, a
+/// positive control (the unsafe Git path runs the marker as the worker) and a
+/// reset establish a baseline; afterwards every controller operation leaves the
+/// marker absent, so a marker could only have come from controller execution.
+#[test]
+fn filter_marker_distinguishes_worker_preparation_from_controller_execution() {
+    let launcher = ProtectedLauncher::unenforced_for_test(config());
+    let repo = TestRepo::new("protected-filter-phases");
+    let handle = provisioned(&repo, Some("task-1"));
+    let admission = launcher.admit(&handle, repo.path()).unwrap();
+    let protected = launcher
+        .launch(admission, &request(handle.worktree_path()), &policy())
+        .unwrap();
+    protected.attempt().wait_collect().unwrap();
+    let worker = protected.worker_channel();
+    let worktree = handle.worktree_path();
+    let marker = worktree.join("FILTER_RAN");
+    let nested = worktree.join("evil");
+
+    // 1. Worker preparation: no filter exists yet, so nothing can run it.
+    std::fs::create_dir(&nested).unwrap();
+    git(&nested, &["init", "-q", "-b", "main"]);
+    std::fs::write(nested.join("f"), "data").unwrap();
+    commit_all(&nested);
+    assert!(!marker.exists(), "preparation must not run the filter");
+    // 2. Arm the malicious filter.
+    arm_clean_filter(&nested, &marker);
+    assert!(!marker.exists(), "arming must not run the filter");
+    // 3. Positive control: the attempted unsafe Git path really runs it.
+    std::fs::write(nested.join("f"), "changed").unwrap();
+    git(&nested, &["add", "f"]);
+    assert!(
+        marker.exists(),
+        "control: Git inside the repo runs the filter"
+    );
+    std::fs::remove_file(&marker).unwrap();
+
+    // Controller phase: the protected path refuses without running anything.
+    std::fs::write(worktree.join("ok.txt"), "fine").unwrap();
+    assert!(matches!(
+        send(
+            worker,
+            0,
+            ControllerOperation::Stage {
+                paths: vec!["ok.txt".into(), "evil".into()]
+            }
+        ),
+        Err(ProtectedLaunchError::Binding(
+            "embedded repositories cannot be staged"
+        ))
+    ));
+    assert!(!marker.exists(), "refusal executed the worker filter");
+    assert!(matches!(
+        send(worker, 1, ControllerOperation::Status),
+        Ok(ControllerResponse::Status { .. })
+    ));
+    assert!(!marker.exists(), "status executed the worker filter");
+    // Ordinary stage, commit and checkpoint keep working.
+    send(
+        worker,
+        2,
+        ControllerOperation::Stage {
+            paths: vec!["ok.txt".into()],
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        send(
+            worker,
+            3,
+            ControllerOperation::Commit {
+                message: "ok".into()
+            }
+        ),
+        Ok(ControllerResponse::Committed { .. })
+    ));
+    assert!(matches!(
+        send(
+            worker,
+            4,
+            ControllerOperation::Checkpoint {
+                checkpoint_id: "cp".into(),
+                kind: crate::WorkspaceCheckpointKind::Progress,
+                captured_at: crate::WorkspaceDateTimeV1::try_new("2026-10-30T00:00:00Z").unwrap(),
+            }
+        ),
+        Ok(ControllerResponse::Checkpointed { .. })
+    ));
+    assert!(
+        !marker.exists(),
+        "a controller operation ran the worker filter"
+    );
+    let tree = stdout_trimmed(&git(worktree, &["ls-tree", "-r", "HEAD"]));
+    assert!(tree.contains("ok.txt") && !tree.contains("evil"), "{tree}");
 }

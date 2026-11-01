@@ -201,6 +201,77 @@ fn invalid_null_unknown_duplicate_and_domain_values_refuse() {
     decode(&value).unwrap();
 }
 
+/// F3: every nested check and reference is a JSON object. A serde struct derive
+/// also admits sequences, so a positional array must refuse instead of being
+/// silently re-encoded as an object.
+#[test]
+fn nested_checks_and_references_require_json_objects_not_positional_arrays() {
+    // The exact retained regression input and its object counterpart.
+    let mut retained = minimal();
+    retained["dirty_diff_ref"] = json!(["ARTIFACT_ID", "synthetic", "", ""]);
+    let error = decode(&retained).unwrap_err().to_string();
+    assert!(error.contains("a JSON object"), "{error}");
+    let mut object = minimal();
+    object["dirty_diff_ref"] =
+        json!({"ref_type": "ARTIFACT_ID", "target": "synthetic", "digest": "", "section": ""});
+    let accepted = decode(&object).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&accepted.to_json().unwrap()).unwrap(),
+        object,
+        "the object form keeps present-empty digest/section"
+    );
+
+    let positional_check = json!([
+        "WORKER_EXECUTION",
+        ["cargo", "test"],
+        0,
+        SHA,
+        false,
+        "2026-10-30T00:00:00Z",
+        "2026-10-30T00:00:01Z",
+        {"ref_type": "URL", "target": "u"},
+        "PASS"
+    ]);
+    let mut check_array = full();
+    check_array["executed_checks"] = json!([positional_check]);
+    let mut empty_check = full();
+    empty_check["executed_checks"] = json!([[]]);
+    let mut second_check_array = full();
+    let first = second_check_array["executed_checks"][0].clone();
+    second_check_array["executed_checks"] = json!([first, ["WORKER_EXECUTION"]]);
+    let mut output_array = full();
+    output_array["executed_checks"][0]["output_ref"] = json!(["URL", "u", "", ""]);
+    let mut dirty_scalar = full();
+    dirty_scalar["dirty_diff_ref"] = json!(7);
+    let mut check_null = full();
+    check_null["executed_checks"][0]["output_ref"] = Value::Null;
+    for (name, case) in [
+        ("executed_checks[0] positional array", check_array),
+        ("executed_checks[0] empty array", empty_check),
+        ("executed_checks[1] positional array", second_check_array),
+        ("output_ref positional array", output_array),
+        ("dirty_diff_ref scalar", dirty_scalar),
+        ("output_ref null", check_null),
+    ] {
+        assert!(decode(&case).is_err(), "{name} must refuse");
+    }
+
+    // Valid object-only documents still round-trip exactly, including optional
+    // absence versus present-empty and an exact large integer exit token.
+    let mut valid = full();
+    valid["executed_checks"][0]["exit_code"] = json!(0);
+    let exact = valid
+        .to_string()
+        .replace("\"exit_code\":0", "\"exit_code\":1e2");
+    let wire = WorkspaceCheckpointWire::from_json(&exact).unwrap();
+    assert_eq!(wire.executed_check_exit_code(0).unwrap().as_json(), "1e2");
+    assert_eq!(
+        WorkspaceCheckpointWire::from_json(&wire.to_json().unwrap()).unwrap(),
+        wire
+    );
+    assert_eq!(wire.executed_check_count(), Some(1));
+}
+
 #[test]
 fn date_time_is_annotation_on_wire_and_validated_on_conversion() {
     let mut value = full();
@@ -320,11 +391,28 @@ fn decoder_oracle_cases() -> Vec<(String, bool, bool)> {
             "dirty_diff_ref",
             json!({"ref_type": "URL", "target": "x", "extra": 1}),
         ),
+        // Positional arrays are not objects (F3).
+        (
+            "dirty_diff_ref",
+            json!(["ARTIFACT_ID", "synthetic", "", ""]),
+        ),
+        ("dirty_diff_ref", json!(["URL", "x"])),
+        ("dirty_diff_ref", json!([])),
+        ("dirty_diff_ref", json!("URL")),
+        (
+            "executed_checks",
+            json!([["WORKER_EXECUTION", ["cargo"], 0, SHA]]),
+        ),
+        ("executed_checks", json!([[]])),
+        ("executed_checks", json!([null])),
     ] {
         let mut value = full();
         value[field] = bad;
         agree(value, false);
     }
+    let mut positional_output_ref = full();
+    positional_output_ref["executed_checks"][0]["output_ref"] = json!(["URL", "u"]);
+    agree(positional_output_ref, false);
     let mut empty_command = full();
     empty_command["executed_checks"][0]["command"] = json!([]);
     agree(empty_command, false);

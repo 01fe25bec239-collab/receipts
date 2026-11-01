@@ -305,6 +305,11 @@ pub(crate) fn run(
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) trait ControllerLaunch: Send + Sync {
     fn customization(&self) -> Result<crate::execution::LaunchCustomization, String>;
+
+    /// A confined run failed to start or to be collected, so its process
+    /// containment is not proven. The protected release must then retain
+    /// custody instead of returning ownership.
+    fn cleanup_unproven(&self) {}
 }
 
 thread_local! {
@@ -343,10 +348,14 @@ fn run_confined(
     let failed = |detail: String| WorkspaceError::GitSpawnFailed { operation, detail };
     let customization = launch.customization().map_err(failed)?;
     let attempt = crate::execution::live_attempt_start_customized(request, policy, customization)
-        .map_err(|error| failed(error.to_string()))?;
-    let outcome = attempt
-        .wait_collect()
-        .map_err(|error| failed(error.to_string()))?;
+        .map_err(|error| {
+        launch.cleanup_unproven();
+        failed(error.to_string())
+    })?;
+    let outcome = attempt.wait_collect().map_err(|error| {
+        launch.cleanup_unproven();
+        failed(error.to_string())
+    })?;
     if outcome.terminal_cause() == LiveProcessTerminalCause::TimedOut {
         return Err(WorkspaceError::GitTimedOut {
             operation,

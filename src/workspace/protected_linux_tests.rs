@@ -7,6 +7,11 @@
 //! confined controller identity) and print `key=bool` receipts; the parent test
 //! asserts every expected receipt and the parent-side custody, channel,
 //! lifecycle and teardown properties.
+//!
+//! Probes observe their own confinement through system calls
+//! (`getresuid`/`getresgid`/`getgroups`/`capget`/`prctl`/`fcntl`/`getrlimit`),
+//! never `/proc`: the controller's Landlock plan grants no `/proc` access and
+//! production access is not widened for the probe.
 
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -27,10 +32,29 @@ const CONTROLLER_ID: u32 = 61001;
 const WORKER_GID: u32 = 61002;
 const WORKER_RANGE: std::ops::RangeInclusive<u32> = 62000..=62063;
 const FILTER_MARKER: &str = "FILTER_RAN";
+const CUSTODY_MARKER: &str = "receipts-custody.state";
 
 unsafe extern "C" {
     fn syscall(number: i64, ...) -> i64;
 }
+const SYS_GETRLIMIT: i64 = 97;
+const SYS_FCNTL: i64 = 72;
+const SYS_GETGROUPS: i64 = 115;
+const SYS_GETRESUID: i64 = 118;
+const SYS_GETRESGID: i64 = 120;
+const SYS_SETFSUID: i64 = 122;
+const SYS_SETFSGID: i64 = 123;
+const SYS_CAPGET: i64 = 125;
+const SYS_PRCTL: i64 = 157;
+const PR_GET_SECCOMP: i64 = 21;
+const PR_CAPBSET_READ: i64 = 23;
+const PR_GET_NO_NEW_PRIVS: i64 = 39;
+const PR_CAP_AMBIENT: i64 = 47;
+const PR_CAP_AMBIENT_IS_SET: i64 = 1;
+const F_GETFD: i64 = 1;
+const RLIMIT_NOFILE: i64 = 7;
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+const EBADF: i32 = 9;
 const SYS_PROCESS_VM_READV: i64 = 310;
 const SYS_OPEN_BY_HANDLE_AT: i64 = 304;
 const SYS_SETNS: i64 = 308;
@@ -101,63 +125,123 @@ fn fixture() -> (TempDir, PathBuf, crate::WorkspaceHandle) {
 
 // ---- probe-side helpers (run inside the boundary) ----
 
-/// Value of one `/proc/self/status` field.
-fn status_field(name: &str) -> String {
-    let status = std::fs::read_to_string("/proc/self/status").unwrap();
-    status
-        .lines()
-        .find_map(|line| line.strip_prefix(&format!("{name}:")))
-        .unwrap_or_else(|| panic!("no {name} in status"))
-        .trim()
-        .to_owned()
+/// Raw system call; `None` when it fails (errno is then read by the caller).
+fn call(number: i64, a: i64, b: i64, c: i64) -> Option<i64> {
+    // SAFETY: every call below passes integers or pointers to live local
+    // buffers of the size the kernel documents for that call.
+    let result = unsafe { syscall(number, a, b, c, 0i64, 0i64, 0i64) };
+    (result >= 0).then_some(result)
 }
 
-/// Real, effective, saved and filesystem IDs are one value inside `allowed`.
-fn single_id(name: &str, allowed: std::ops::RangeInclusive<u32>) -> bool {
-    let ids: Vec<u32> = status_field(name)
-        .split_whitespace()
-        .map(|id| id.parse().unwrap())
-        .collect();
-    ids.len() == 4 && ids.iter().all(|id| *id == ids[0]) && allowed.contains(&ids[0])
+/// Real, effective, saved and filesystem IDs of one kind.
+fn id_quad(real_effective_saved: i64, fs_setter: i64) -> Option<[u32; 4]> {
+    let mut ids = [u32::MAX; 3];
+    let base = ids.as_mut_ptr();
+    // SAFETY: three adjacent u32 slots, as `getres[ug]id` requires.
+    let ok = unsafe {
+        syscall(
+            real_effective_saved,
+            base as i64,
+            base.wrapping_add(1) as i64,
+            base.wrapping_add(2) as i64,
+            0i64,
+            0i64,
+            0i64,
+        )
+    } == 0;
+    // `setfs[ug]id(-1)` is rejected without effect and returns the CURRENT
+    // filesystem ID.
+    let fs = call(fs_setter, -1, 0, 0)? as u32;
+    ok.then_some([ids[0], ids[1], ids[2], fs])
+}
+
+/// All four IDs are one value inside `allowed`.
+fn single_id(quad: Option<[u32; 4]>, allowed: std::ops::RangeInclusive<u32>) -> bool {
+    quad.is_some_and(|ids| ids.iter().all(|id| *id == ids[0]) && allowed.contains(&ids[0]))
+}
+
+/// `(effective, permitted, inheritable)` capability sets of this thread.
+fn capability_sets() -> Option<[u64; 3]> {
+    let header: [u32; 2] = [LINUX_CAPABILITY_VERSION_3, 0];
+    let mut data = [0u32; 6]; // two (effective, permitted, inheritable) words
+    call(
+        SYS_CAPGET,
+        header.as_ptr() as i64,
+        data.as_mut_ptr() as i64,
+        0,
+    )?;
+    let set = |slot: usize| u64::from(data[slot]) | (u64::from(data[3 + slot]) << 32);
+    Some([set(0), set(1), set(2)])
+}
+
+/// Bit set of capabilities for which `query(cap)` reports 1, over every
+/// capability the kernel knows (it answers `EINVAL` beyond the last one). An
+/// unanswered first query means the set is unobservable, never "empty".
+fn capability_mask(query: impl Fn(i64) -> Option<i64>) -> Option<u64> {
+    let mut mask = 0u64;
+    for cap in 0..64 {
+        match query(cap) {
+            Some(1) => mask |= 1 << cap,
+            Some(_) => {}
+            None if cap == 0 => return None,
+            None => break,
+        }
+    }
+    Some(mask)
 }
 
 /// Exact capability sets, no supplementary groups, no-new-privs, seccomp filter.
 fn identity_receipt(uid: std::ops::RangeInclusive<u32>, gid: u32, caps: &str) -> String {
-    let sets = ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"];
-    let caps_exact = sets.iter().all(|name| {
-        u64::from_str_radix(&status_field(name), 16).ok() == u64::from_str_radix(caps, 16).ok()
-    });
+    let expected = u64::from_str_radix(caps, 16).ok();
+    let bounding = capability_mask(|cap| call(SYS_PRCTL, PR_CAPBSET_READ, cap, 0));
+    let ambient =
+        capability_mask(|cap| call(SYS_PRCTL, PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, cap));
+    let [effective, permitted, inheritable] = capability_sets().unwrap_or([u64::MAX; 3]);
+    let caps_exact = [
+        Some(effective),
+        Some(permitted),
+        Some(inheritable),
+        bounding,
+        ambient,
+    ]
+    .iter()
+    .all(|set| *set == expected);
     format!(
         "uid_exact={} gid_exact={} no_groups={} caps_exact={} nnp={} seccomp_filter={}",
-        single_id("Uid", uid),
-        single_id("Gid", gid..=gid),
-        status_field("Groups").is_empty(),
+        single_id(id_quad(SYS_GETRESUID, SYS_SETFSUID), uid),
+        single_id(id_quad(SYS_GETRESGID, SYS_SETFSGID), gid..=gid),
+        call(SYS_GETGROUPS, 0, 0, 0) == Some(0),
         caps_exact,
-        status_field("NoNewPrivs") == "1",
-        status_field("Seccomp") == "2",
+        call(SYS_PRCTL, PR_GET_NO_NEW_PRIVS, 0, 0) == Some(1),
+        call(SYS_PRCTL, PR_GET_SECCOMP, 0, 0) == Some(2),
     )
 }
 
-/// Only stdio and this probe's own directory descriptor are open: no leaked
-/// metadata, cgroup, namespace or privileged descriptor survives.
+/// Only stdio is open: every other descriptor number up to the process limit
+/// answers `EBADF`, so no leaked metadata, cgroup, namespace or privileged
+/// descriptor survives. Observed by number, without `/proc`.
 fn fds_sealed() -> bool {
-    let own = PathBuf::from(format!("/proc/{}/fd", std::process::id()));
-    let open: Vec<(u32, PathBuf)> = std::fs::read_dir("/proc/self/fd")
-        .unwrap()
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let number: u32 = entry.file_name().to_str()?.parse().ok()?;
-            Some((number, std::fs::read_link(entry.path()).ok()?))
+    use std::os::fd::FromRawFd;
+    let mut limit = [0u64; 2];
+    if call(SYS_GETRLIMIT, RLIMIT_NOFILE, limit.as_mut_ptr() as i64, 0).is_none() {
+        return false;
+    }
+    let bound = limit[0].min(1 << 16) as i64;
+    let closed = |fd: i64| {
+        call(SYS_FCNTL, fd, F_GETFD, 0).is_none()
+            && std::io::Error::last_os_error().raw_os_error() == Some(EBADF)
+    };
+    let stdio_ok = (0..3).all(|fd| {
+        // SAFETY: descriptors 0..=2 are open; the temporary `File` is never
+        // dropped, so it cannot close them.
+        let file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+        file.metadata().is_ok_and(|metadata| {
+            let kind = metadata.file_type();
+            use std::os::unix::fs::FileTypeExt;
+            kind.is_fifo() || kind.is_char_device()
         })
-        .collect();
-    open.iter().all(|(number, target)| {
-        if *number <= 2 {
-            let text = target.to_string_lossy();
-            text.starts_with("pipe:") || text == "/dev/null"
-        } else {
-            *target == own
-        }
-    })
+    });
+    stdio_ok && (3..bound).all(closed)
 }
 
 /// The filtered syscall returns EPERM although unfiltered it would succeed or
@@ -203,7 +287,7 @@ fn worker_probe() {
     let mut record = |name: &str, ok: bool| report.push(format!("{name}={ok}"));
     record(
         "uid_nonroot",
-        std::fs::metadata("/proc/self").unwrap().uid() != 0,
+        id_quad(SYS_GETRESUID, SYS_SETFSUID).is_some_and(|ids| ids.iter().all(|id| *id != 0)),
     );
     let gitdir = std::fs::read_to_string(worktree.join(".git")).unwrap();
     let common = PathBuf::from(gitdir.trim().trim_start_matches("gitdir: "))
@@ -290,8 +374,17 @@ fn worker_probe() {
         cgroup_migration_denied(&cgroup_lines(&worktree.join(PROBE_DIR))),
     );
     // A worker-owned embedded repository whose config names a clean filter. It
-    // must never run (the controller refuses to stage it; the distinct owner
-    // would also stop Git from entering it).
+    // must never run as the controller (the controller refuses to stage it; the
+    // distinct owner would also stop Git from entering it).
+    //
+    // Phases keep worker preparation apart from controller execution:
+    //  1. PREPARE: initialize and commit the repository BEFORE any filter exists,
+    //     so preparing it cannot run (and cannot create) the marker.
+    //  2. ARM: install the malicious filter only afterwards.
+    //  3. CONTROL: modify a tracked file and `git add` it as the worker; that
+    //     attempted unsafe Git path really runs the filter, proving the marker
+    //     mechanism is live in this boundary. The marker is then removed, so a
+    //     marker seen later can only come from a later execution.
     let evil = worktree.join("evil");
     let run_git = |args: &[&str]| {
         std::process::Command::new("/usr/bin/git")
@@ -305,11 +398,8 @@ fn worker_probe() {
             .is_ok_and(|output| output.status.success())
     };
     let marker = worktree.join(FILTER_MARKER);
-    let filter = format!("sh -c 'touch {}; cat'", marker.display());
-    let embedded = std::fs::create_dir(&evil).is_ok()
+    let prepared = std::fs::create_dir(&evil).is_ok()
         && run_git(&["init", "-q", "-b", "main"])
-        && std::fs::write(evil.join(".gitattributes"), "* filter=x\n").is_ok()
-        && run_git(&["config", "filter.x.clean", &filter])
         && std::fs::write(evil.join("f"), "data").is_ok()
         && run_git(&["add", "-A"])
         && run_git(&[
@@ -322,7 +412,19 @@ fn worker_probe() {
             "-m",
             "w",
         ]);
-    record("embedded_repo_created", embedded);
+    record("embedded_repo_prepared", prepared);
+    record("filter_absent_after_preparation", !marker.exists());
+    let filter = format!("sh -c 'touch {}; cat'", marker.display());
+    let armed = std::fs::write(evil.join(".gitattributes"), "* filter=x\n").is_ok()
+        && run_git(&["config", "filter.x.clean", &filter]);
+    record("embedded_filter_armed", armed);
+    record("filter_absent_after_arming", !marker.exists());
+    let touched = std::fs::write(evil.join("f"), "changed").is_ok() && run_git(&["add", "f"]);
+    record("filter_control_fires", touched && marker.exists());
+    record(
+        "marker_reset_for_controller_phase",
+        std::fs::remove_file(&marker).is_ok() && !marker.exists(),
+    );
     println!("PROBE {}", report.join(" "));
     std::mem::forget(escapee);
 }
@@ -474,9 +576,20 @@ fn hosted_protected_worker_controller_and_cleanup() {
             "pidfd_getfd_filtered=true",
             "process_vm_filtered=true",
             "cgroup_migration_denied=true",
-            "embedded_repo_created=true",
+            "embedded_repo_prepared=true",
+            "filter_absent_after_preparation=true",
+            "embedded_filter_armed=true",
+            "filter_absent_after_arming=true",
+            "filter_control_fires=true",
+            "marker_reset_for_controller_phase=true",
             "uid_exact=true gid_exact=true no_groups=true caps_exact=true nnp=true seccomp_filter=true",
         ],
+    );
+    // Baseline before ANY controller operation: the worker phase ended with the
+    // marker reset, so a marker later is attributable to controller execution.
+    assert!(
+        !worktree.join(FILTER_MARKER).exists(),
+        "filter marker present at the controller baseline"
     );
     let pid = std::fs::read_to_string(worktree.join("escapee.pid")).unwrap();
     let alive = std::fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
@@ -600,7 +713,7 @@ fn hosted_protected_worker_controller_and_cleanup() {
     assert_eq!(checkpointed.head_sha(), Some(&commit));
     assert!(
         !worktree.join(FILTER_MARKER).exists(),
-        "a worker-supplied filter ran as the controller"
+        "a worker-supplied filter ran as the controller (marker absent at the baseline)"
     );
 
     // Controller identity probe through the same confinement.
@@ -632,7 +745,12 @@ fn hosted_protected_worker_controller_and_cleanup() {
     );
 
     // Custody returns only after proven cleanup; channels then refuse.
+    assert!(common.join(CUSTODY_MARKER).exists(), "reservation record");
     protected.release_custody().expect("custody release");
+    assert!(
+        !common.join(CUSTODY_MARKER).exists(),
+        "complete release deletes the reservation record"
+    );
     let restored = std::fs::symlink_metadata(&common).unwrap();
     assert_eq!(
         restored.uid(),
@@ -672,4 +790,152 @@ fn hosted_protected_worker_controller_and_cleanup() {
         .filter(|entry| entry.file_name().to_string_lossy().starts_with("receipts-"))
         .collect();
     assert!(leftovers.is_empty(), "owned cgroups remain: {leftovers:?}");
+}
+
+fn owner_mode(path: &Path) -> (u32, u32, u32) {
+    let metadata = std::fs::symlink_metadata(path).unwrap();
+    (metadata.uid(), metadata.gid(), metadata.mode() & 0o7777)
+}
+
+/// F2/F4 in the real boundary (root, real chown): one custody owner per Git
+/// common directory across launcher instances, linked worktrees and aliases,
+/// refusals that change nothing (including external symlink and hardlink
+/// targets), and safe re-admission after a complete release.
+#[test]
+#[ignore = "privileged hosted diagnostic"]
+fn hosted_exclusive_custody_and_linked_target_refusals() {
+    let (dir, repo, first_handle) = fixture();
+    let base = crate::test_support::stdout_trimmed(&git(&repo, &["rev-parse", "HEAD"]));
+    let second_handle = WorkspaceProvisionRequest::new(
+        &repo,
+        "ws-second",
+        Some("task-second"),
+        "task/second",
+        dir.path().join("wt2"),
+        &base,
+    )
+    .unwrap()
+    .provision()
+    .unwrap();
+    let launcher_a = ProtectedLauncher::new(config()).expect("hosted admission A");
+    let launcher_b = ProtectedLauncher::new(config()).expect("hosted admission B");
+    let common = std::fs::canonicalize(repo.join(".git")).unwrap();
+    let first_root = first_handle.worktree_path().to_path_buf();
+    let second_root = std::fs::canonicalize(second_handle.worktree_path()).unwrap();
+    let marker = common.join(CUSTODY_MARKER);
+    let second_before = owner_mode(&second_root);
+
+    let admission = launcher_a
+        .admit(&first_handle, &repo)
+        .expect("first custody");
+    let record = std::fs::read(&marker).unwrap();
+    let common_after_first = owner_mode(&common);
+    assert_eq!(common_after_first.0, CONTROLLER_ID);
+    // Same handle, another linked worktree, another launcher instance and the
+    // worktree spelled as the repository root all meet the same owner.
+    for (launcher, handle, root) in [
+        (&launcher_a, &first_handle, repo.clone()),
+        (&launcher_b, &first_handle, repo.clone()),
+        (&launcher_a, &second_handle, repo.clone()),
+        (&launcher_b, &second_handle, repo.clone()),
+        (&launcher_b, &second_handle, first_root.clone()),
+    ] {
+        match launcher.admit(handle, &root) {
+            Err(ProtectedLaunchError::Custody(detail)) => {
+                assert!(detail.contains(admission.attempt_id()), "{detail}");
+            }
+            other => panic!("second owner must refuse: {other:?}"),
+        }
+    }
+    assert_eq!(std::fs::read(&marker).unwrap(), record);
+    assert_eq!(owner_mode(&common), common_after_first);
+    assert_eq!(
+        owner_mode(&second_root),
+        second_before,
+        "loser changed ownership"
+    );
+
+    // Complete lifecycle, then safe re-admission by the other launcher.
+    let request = ProcessRunRequest::new(
+        "/usr/bin/true",
+        Vec::<String>::new(),
+        &first_root,
+        &first_root,
+    )
+    .unwrap();
+    let protected = launcher_a
+        .launch(admission, &request, &policy())
+        .expect("launch");
+    protected.attempt().wait_collect().expect("collected");
+    protected.release_custody().expect("complete release");
+    assert!(!marker.exists(), "record removed by the complete release");
+    assert_eq!(
+        owner_mode(&common).0,
+        0,
+        "metadata back to its original owner"
+    );
+    drop(protected);
+    let second = launcher_b
+        .admit(&second_handle, &repo)
+        .expect("re-admission after a complete release");
+    assert!(marker.exists());
+    drop(second); // unused admission: custody is returned
+    assert!(!marker.exists());
+    assert_eq!(owner_mode(&second_root), second_before);
+
+    // External symlink pointer: Git's own prechecks accept it; custody refuses
+    // before it changes the external target, the common directory or the
+    // worktree.
+    let pointer = second_root.join(".git");
+    let pointer_text = std::fs::read(&pointer).unwrap();
+    let external = dir.path().join("external-pointer");
+    std::fs::write(&external, &pointer_text).unwrap();
+    std::fs::set_permissions(&external, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::remove_file(&pointer).unwrap();
+    std::os::unix::fs::symlink(&external, &pointer).unwrap();
+    let state = || {
+        (
+            owner_mode(&common),
+            owner_mode(&second_root),
+            owner_mode(&external),
+        )
+    };
+    let before = state();
+    match launcher_b.admit(&second_handle, &repo) {
+        Err(ProtectedLaunchError::Custody(detail)) => {
+            assert!(detail.contains(".git pointer is a symlink"), "{detail}");
+        }
+        other => panic!("symlink pointer must refuse: {other:?}"),
+    }
+    assert_eq!(state(), before, "external pointer target or roots changed");
+    assert!(!marker.exists());
+    std::fs::remove_file(&pointer).unwrap();
+    std::fs::write(&pointer, &pointer_text).unwrap();
+
+    // Hardlink alias in the payload: the shared inode keeps its external owner
+    // and mode.
+    let shared = dir.path().join("external-alias");
+    std::fs::write(&shared, "shared").unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::hard_link(&shared, second_root.join("alias")).unwrap();
+    let before = (
+        owner_mode(&common),
+        owner_mode(&second_root),
+        owner_mode(&shared),
+    );
+    match launcher_b.admit(&second_handle, &repo) {
+        Err(ProtectedLaunchError::Custody(detail)) => {
+            assert!(detail.contains("hard links"), "{detail}");
+        }
+        other => panic!("hardlink alias must refuse: {other:?}"),
+    }
+    assert_eq!(
+        (
+            owner_mode(&common),
+            owner_mode(&second_root),
+            owner_mode(&shared)
+        ),
+        before
+    );
+    assert!(!marker.exists());
 }

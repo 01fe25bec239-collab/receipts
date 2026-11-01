@@ -39,6 +39,20 @@
 //!   checkpoint; reviewer: identity/status only). Requests must carry the
 //!   channel's attempt, task, secret token and next sequence number, so
 //!   forged, cross-task and replayed requests refuse.
+//! * **One owner per resource.** Admission first reserves the actual Git
+//!   common directory (see `protected_custody`): a second admission of the
+//!   same worktree, of another linked worktree of the same repository or from
+//!   another launcher or process refuses before any ownership or mode change.
+//!   The reservation and its attributable state marker survive crashes and
+//!   failed setup or release; only a verified complete release deletes them.
+//!   Unrelated repositories proceed. Limit: one protected attempt per
+//!   repository at a time. This coordinates admitted trusted controllers; it is
+//!   not protection against root or controller compromise.
+//! * **Release barrier.** Both channels share one lifecycle gate. Releasing
+//!   custody closes admission of new operations, waits for every admitted
+//!   operation (and its Git children, which each operation reaps) to finish,
+//!   and only then restores ownership. Requests during or after release
+//!   refuse before execution; unknown cleanup quarantines custody.
 //!
 //! Limits: this is a qualified design, not a whole-platform sandbox. Root or
 //! controller compromise, kernel bugs, non-filesystem Landlock scope and
@@ -51,13 +65,14 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::execution::{
     ExecutionError, LiveProcessAttempt, LiveProcessAttemptError, LiveProcessCancelAcceptance,
     LiveProcessOutcome, LiveProcessOutput, LiveProcessStartError, LiveProcessTerminalCause,
     ProcessRunRequest, ProcessTimeoutPolicy,
 };
+use crate::protected_custody as custody;
 use crate::{
     CommitSha, WorkspaceCheckpointKind, WorkspaceCheckpointLifecycleInput,
     WorkspaceCheckpointTemporalCaptureCore, WorkspaceDateTimeV1, WorkspaceError, WorkspaceHandle,
@@ -159,6 +174,152 @@ impl From<WorkspaceError> for ProtectedLaunchError {
 struct Allocator {
     next_offset: u64,
     live_or_retained: std::collections::BTreeSet<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Phase {
+    Open,
+    Releasing,
+    Released,
+    Incomplete,
+}
+
+#[derive(Debug)]
+struct GateState {
+    phase: Phase,
+    active: usize,
+}
+
+/// Shared lifecycle barrier of one admission: every controller operation on
+/// either channel holds an [`Operation`] for its whole duration; releasing
+/// custody closes admission and waits until none remain. No lock is held
+/// while an operation or the restoration runs.
+#[derive(Debug)]
+pub(crate) struct Gate {
+    state: Mutex<GateState>,
+    changed: Condvar,
+    /// A confined controller run whose cleanup was not proven.
+    controller_unproven: AtomicBool,
+}
+
+/// An admitted controller operation; dropping it ends the operation.
+pub(crate) struct Operation<'a>(&'a Gate);
+
+impl Drop for Operation<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.lock();
+        state.active -= 1;
+        if state.active == 0 {
+            self.0.changed.notify_all();
+        }
+    }
+}
+
+impl Gate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(GateState {
+                phase: Phase::Open,
+                active: 0,
+            }),
+            changed: Condvar::new(),
+            controller_unproven: AtomicBool::new(false),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, GateState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Admits one operation, or refuses once release began.
+    fn enter(&self) -> Result<Operation<'_>, ProtectedLaunchError> {
+        let mut state = self.lock();
+        match state.phase {
+            Phase::Open => {
+                state.active += 1;
+                Ok(Operation(self))
+            }
+            Phase::Releasing => Err(ProtectedLaunchError::Binding("custody release in progress")),
+            Phase::Released => Err(ProtectedLaunchError::Binding("custody was released")),
+            Phase::Incomplete => Err(ProtectedLaunchError::Binding("custody release incomplete")),
+        }
+    }
+
+    /// Atomically closes admission, then waits for every admitted operation.
+    fn close_and_drain(&self) -> Result<(), ProtectedLaunchError> {
+        let mut state = self.lock();
+        match state.phase {
+            Phase::Open => {
+                state.phase = Phase::Releasing;
+                self.changed.notify_all();
+            }
+            Phase::Releasing => {
+                return Err(ProtectedLaunchError::Custody(
+                    "custody release already in progress".into(),
+                ));
+            }
+            Phase::Released => {
+                return Err(ProtectedLaunchError::Custody(
+                    "custody was already released".into(),
+                ));
+            }
+            Phase::Incomplete => {
+                return Err(ProtectedLaunchError::CleanupUnknown(
+                    "custody release was incomplete earlier; custody retained".into(),
+                ));
+            }
+        }
+        while state.active > 0 {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        Ok(())
+    }
+
+    fn settle(&self, released: bool) {
+        self.lock().phase = if released {
+            Phase::Released
+        } else {
+            Phase::Incomplete
+        };
+        self.changed.notify_all();
+    }
+
+    pub(crate) fn mark_controller_unproven(&self) {
+        self.controller_unproven.store(true, Ordering::SeqCst);
+    }
+
+    fn controller_unproven(&self) -> bool {
+        self.controller_unproven.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn phase_for_test(&self) -> Phase {
+        self.lock().phase
+    }
+
+    /// Blocks until `phase` is reached (condition-based, no sleeping).
+    #[cfg(test)]
+    pub(crate) fn wait_for_phase_for_test(&self, phase: Phase) {
+        let mut state = self.lock();
+        while state.phase != phase {
+            assert!(
+                !(phase == Phase::Releasing
+                    && matches!(state.phase, Phase::Released | Phase::Incomplete)),
+                "release finished without ever waiting for in-flight operations"
+            );
+            let (next, timeout) = self
+                .changed
+                .wait_timeout(state, std::time::Duration::from_secs(30))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+            assert!(!timeout.timed_out(), "phase {phase:?} never reached");
+        }
+    }
 }
 
 /// Whether launches are enforced. `Unenforced` exists only for this crate's
@@ -295,10 +456,30 @@ impl ProtectedLauncher {
             ));
         }
 
-        let original = original_custody(&common_dir, &worktree)?;
-        let worker_uid = self.allocate_worker_uid()?;
         let attempt_id = random_hex(16)
             .map_err(|error| ProtectedLaunchError::Unsupported(format!("randomness: {error}")))?;
+
+        // One protected custody owner per actual Git common directory: reserve
+        // it before reading ownership or changing anything. A loser mutates
+        // nothing; a refused setup below deletes only its own reservation.
+        let reservation = custody::Reservation::begin(&common_dir, &attempt_id, &worktree)
+            .map_err(ProtectedLaunchError::Custody)?;
+        let cancel = |error: ProtectedLaunchError| {
+            let _ = reservation.finish();
+            error
+        };
+        let original =
+            original_custody(&common_dir, &worktree, &self.inner.config).map_err(cancel)?;
+        let ids = custody::preflight_layout(&common_dir, &worktree)
+            .map_err(|detail| cancel(ProtectedLaunchError::Custody(detail)))?;
+        let worker_uid = self.allocate_worker_uid().map_err(cancel)?;
+        reservation
+            .record_identity(worker_uid, original, ids)
+            .map_err(|error| {
+                cancel(ProtectedLaunchError::Custody(format!(
+                    "custody record could not be written: {error}"
+                )))
+            })?;
         let binding = Binding {
             attempt_id,
             task_id,
@@ -308,24 +489,110 @@ impl ProtectedLauncher {
             worktree,
             worker_uid,
             original,
-            released: AtomicBool::new(false),
+            gate: Arc::new(Gate::new()),
+            reservation,
             handle: handle.clone(),
+            #[cfg(test)]
+            hooks: TestHooks::default(),
         };
         match &self.inner.enforcement {
             #[cfg(target_os = "linux")]
             Enforcement::Linux(_) => {
                 let config = &self.inner.config;
-                if let Err(error) = crate::protected_linux::establish_custody(config, &binding) {
-                    self.retain(worker_uid);
-                    return Err(ProtectedLaunchError::Custody(error));
+                match crate::protected_linux::establish_custody(config, &binding) {
+                    Ok(()) => {}
+                    Err(EstablishError::Refused(detail)) => {
+                        // Nothing was changed: free only this reservation.
+                        self.retain(worker_uid);
+                        let _ = binding.reservation.finish();
+                        return Err(ProtectedLaunchError::Custody(detail));
+                    }
+                    Err(EstablishError::Incomplete(detail)) => {
+                        // Ownership may be half transferred: keep the
+                        // reservation and its record; nothing looks free.
+                        self.retain(worker_uid);
+                        let _ = binding.reservation.set_phase(custody::Phase::Incomplete);
+                        return Err(ProtectedLaunchError::Custody(format!(
+                            "custody transfer incomplete; reservation retained: {detail}"
+                        )));
+                    }
                 }
             }
-            Enforcement::Unenforced => unenforced()?,
+            Enforcement::Unenforced => {
+                if let Err(error) = unenforced() {
+                    let _ = binding.reservation.finish();
+                    return Err(error);
+                }
+                binding
+                    .reservation
+                    .set_phase(custody::Phase::Custody)
+                    .map_err(|error| {
+                        let _ = binding.reservation.finish();
+                        ProtectedLaunchError::Custody(format!("custody record: {error}"))
+                    })?;
+            }
         }
         Ok(ProtectedAdmission {
             binding: Arc::new(binding),
             launcher: self.clone(),
+            consumed: false,
         })
+    }
+
+    /// Restores ownership under the shared release barrier's result. Unknown
+    /// outcomes (including an unproven controller cleanup) quarantine custody:
+    /// the reservation record stays and every channel refuses.
+    fn settle_release(&self, binding: &Binding) -> Result<(), ProtectedLaunchError> {
+        let outcome = if binding.gate.controller_unproven() {
+            Err("a confined controller operation's cleanup was not proven".to_owned())
+        } else {
+            self.restore(binding)
+        };
+        match outcome {
+            Ok(()) => {
+                binding.gate.settle(true);
+                Ok(())
+            }
+            Err(detail) => {
+                let _ = binding.reservation.set_phase(custody::Phase::Incomplete);
+                binding.gate.settle(false);
+                // Ownership may be half restored; never claim either state.
+                Err(ProtectedLaunchError::CleanupUnknown(format!(
+                    "custody release incomplete: {detail}"
+                )))
+            }
+        }
+    }
+
+    fn restore(&self, binding: &Binding) -> Result<(), String> {
+        binding
+            .reservation
+            .set_phase(custody::Phase::Releasing)
+            .map_err(|error| format!("custody record: {error}"))?;
+        binding.reservation.verify_original(binding.original)?;
+        #[cfg(test)]
+        if binding.hooks.fail_restore.load(Ordering::SeqCst) {
+            return Err("injected restoration failure".into());
+        }
+        match &self.inner.enforcement {
+            #[cfg(target_os = "linux")]
+            Enforcement::Linux(_) => crate::protected_linux::release_custody(binding)?,
+            Enforcement::Unenforced => unenforced().map_err(|error| error.to_string())?,
+        }
+        binding.reservation.finish()
+    }
+
+    /// An admission that never reached a started worker gives custody back
+    /// (nothing ran under the worker identity); failure keeps the quarantine.
+    fn abandon(&self, binding: &Binding) -> Result<(), ProtectedLaunchError> {
+        binding.gate.close_and_drain()?;
+        self.settle_release(binding)
+    }
+
+    /// Setup failed after a worker may exist: keep custody and the record.
+    fn retain_incomplete(&self, binding: &Binding) {
+        let _ = binding.reservation.set_phase(custody::Phase::Incomplete);
+        binding.gate.settle(false);
     }
 
     fn allocate_worker_uid(&self) -> Result<u32, ProtectedLaunchError> {
@@ -363,45 +630,68 @@ impl ProtectedLauncher {
     /// the task-bound channels.
     pub fn launch(
         &self,
-        admission: ProtectedAdmission,
+        mut admission: ProtectedAdmission,
         request: &ProcessRunRequest,
         policy: &ProcessTimeoutPolicy,
     ) -> Result<ProtectedAttempt, ProtectedLaunchError> {
-        if !Arc::ptr_eq(&admission.launcher.inner, &self.inner) {
-            return Err(ProtectedLaunchError::Binding(
+        admission.consumed = true;
+        let binding = admission.binding.clone();
+        // The admission's own launcher established custody, so it restores it.
+        let owner = &admission.launcher;
+        // Refusals before any worker could exist give custody straight back.
+        let refuse_unstarted = |error: ProtectedLaunchError| match owner.abandon(&binding) {
+            Ok(()) => error,
+            Err(release) => ProtectedLaunchError::CleanupUnknown(format!(
+                "{error}; custody release also failed: {release}"
+            )),
+        };
+        if !Arc::ptr_eq(&owner.inner, &self.inner) {
+            return Err(refuse_unstarted(ProtectedLaunchError::Binding(
                 "admission belongs to another launcher",
-            ));
+            )));
         }
-        let binding = admission.binding;
         match std::fs::canonicalize(request.workspace_root()) {
             Ok(root) if root == binding.worktree => {}
             _ => {
-                return Err(ProtectedLaunchError::Binding(
+                return Err(refuse_unstarted(ProtectedLaunchError::Binding(
                     "request workspace root is not the admitted worktree",
-                ));
+                )));
             }
         }
         let customization = match &self.inner.enforcement {
             #[cfg(target_os = "linux")]
             Enforcement::Linux(support) => {
                 crate::protected_linux::worker_launch(support, &self.inner.config, &binding)
-                    .map_err(ProtectedLaunchError::Unsupported)?
+                    .map_err(|detail| refuse_unstarted(ProtectedLaunchError::Unsupported(detail)))?
             }
             Enforcement::Unenforced => {
-                unenforced()?;
+                unenforced().map_err(refuse_unstarted)?;
                 Default::default()
             }
         };
+        // From here a worker may exist: failures keep custody and its record.
         let attempt =
             crate::execution::live_attempt_start_customized(request, policy, customization)
-                .map_err(ProtectedLaunchError::Start)?;
-        let active = binding
+                .map_err(|error| {
+                    self.retain_incomplete(&binding);
+                    ProtectedLaunchError::Start(error)
+                })?;
+        let channels = binding
             .handle
             .transitioned(WorkspaceState::Active, None)
-            .map_err(ProtectedLaunchError::Workspace)?;
-        let worker = ControllerChannel::new(binding.clone(), ControllerRole::Worker, self.clone())?;
-        let reviewer =
-            ControllerChannel::new(binding.clone(), ControllerRole::Reviewer, self.clone())?;
+            .map_err(ProtectedLaunchError::Workspace)
+            .and_then(|active| {
+                let worker =
+                    ControllerChannel::new(binding.clone(), ControllerRole::Worker, self.clone())?;
+                let reviewer = ControllerChannel::new(
+                    binding.clone(),
+                    ControllerRole::Reviewer,
+                    self.clone(),
+                )?;
+                Ok((active, worker, reviewer))
+            })
+            .inspect_err(|_| self.retain_incomplete(&binding))?;
+        let (active, worker, reviewer) = channels;
         Ok(ProtectedAttempt {
             handle: active,
             attempt,
@@ -427,6 +717,18 @@ impl ProtectedLauncher {
 pub struct ProtectedAdmission {
     binding: Arc<Binding>,
     launcher: ProtectedLauncher,
+    /// Set once `launch` took the admission.
+    consumed: bool,
+}
+
+impl Drop for ProtectedAdmission {
+    /// An admission dropped without a launch never ran a worker: give custody
+    /// back. If that cannot be proven the reservation record stays.
+    fn drop(&mut self) {
+        if !self.consumed {
+            let _ = self.launcher.abandon(&self.binding);
+        }
+    }
 }
 
 impl ProtectedAdmission {
@@ -441,12 +743,50 @@ impl ProtectedAdmission {
 }
 
 /// Ownership of the repository metadata and worktree root before custody was
-/// transferred; restored by [`ProtectedAttempt::release_custody`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct OriginalCustody {
-    pub(crate) uid: u32,
-    pub(crate) gid: u32,
-    pub(crate) worktree_mode: u32,
+/// transferred; restored by [`ProtectedAttempt::release_custody`] and
+/// persisted once in the custody reservation record.
+pub(crate) type OriginalCustody = custody::OriginalOwner;
+
+/// Why custody transfer stopped.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) enum EstablishError {
+    /// Refused before the first ownership or mode change.
+    Refused(String),
+    /// Changes began; ownership may be half transferred.
+    Incomplete(String),
+}
+
+/// Test-only coordination points inside controller operations and release.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestHooks {
+    pub(crate) before: Mutex<Option<ChannelHook>>,
+    pub(crate) after: Mutex<Option<ChannelHook>>,
+    pub(crate) fail_restore: AtomicBool,
+}
+
+#[cfg(test)]
+pub(crate) type ChannelHook = Arc<dyn Fn(ControllerRole) + Send + Sync>;
+
+#[cfg(test)]
+impl fmt::Debug for TestHooks {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("TestHooks")
+    }
+}
+
+#[cfg(test)]
+impl TestHooks {
+    fn fire(slot: &Mutex<Option<ChannelHook>>, role: ControllerRole) {
+        let hook = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook(role);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -459,9 +799,13 @@ pub(crate) struct Binding {
     pub(crate) worktree: PathBuf,
     pub(crate) worker_uid: u32,
     pub(crate) original: OriginalCustody,
-    /// Set once custody was returned; channels then refuse every request.
-    released: AtomicBool,
+    /// Shared lifecycle barrier of both channels and the release.
+    pub(crate) gate: Arc<Gate>,
+    /// Exclusive reservation of the Git common directory and its record.
+    pub(crate) reservation: custody::Reservation,
     handle: WorkspaceHandle,
+    #[cfg(test)]
+    pub(crate) hooks: TestHooks,
 }
 
 /// A running protected attempt.
@@ -542,23 +886,10 @@ impl ProtectedAttempt {
             ));
         }
         let binding = &self.worker.binding;
-        if binding.released.swap(true, Ordering::SeqCst) {
-            return Err(ProtectedLaunchError::Custody(
-                "custody was already released".into(),
-            ));
-        }
-        let result = match &self.worker.launcher.inner.enforcement {
-            #[cfg(target_os = "linux")]
-            Enforcement::Linux(_) => crate::protected_linux::release_custody(binding),
-            Enforcement::Unenforced => unenforced().map_err(|error| error.to_string()),
-        };
-        if let Err(detail) = result {
-            // Ownership may be half restored; never claim either state.
-            return Err(ProtectedLaunchError::CleanupUnknown(format!(
-                "custody release incomplete: {detail}"
-            )));
-        }
-        Ok(())
+        // Close admission on BOTH channels and drain every admitted operation
+        // (each reaps its Git children) before ownership moves.
+        binding.gate.close_and_drain()?;
+        self.worker.launcher.settle_release(binding)
     }
 
     #[cfg(all(test, target_os = "linux"))]
@@ -732,13 +1063,12 @@ impl ControllerChannel {
         &self,
         request: ControllerRequest,
     ) -> Result<ControllerResponse, ProtectedLaunchError> {
+        // Admitted for the whole operation; refuses once release began.
+        let _operation = self.binding.gate.enter()?;
         let mut next = self
             .next_sequence
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.binding.released.load(Ordering::SeqCst) {
-            return Err(ProtectedLaunchError::Binding("custody was released"));
-        }
         if request.task_id != self.binding.task_id {
             return Err(ProtectedLaunchError::Binding("cross-task request"));
         }
@@ -763,8 +1093,14 @@ impl ControllerChannel {
         }
         // The sequence is consumed even if the operation fails: no replay.
         *next += 1;
-        let _confined = self.confine()?;
-        self.perform(request.operation)
+        #[cfg(test)]
+        TestHooks::fire(&self.binding.hooks.before, self.role);
+        let result = self
+            .confine()
+            .and_then(|_confined| self.perform(request.operation));
+        #[cfg(test)]
+        TestHooks::fire(&self.binding.hooks.after, self.role);
+        result
     }
 
     fn confine(&self) -> Result<Option<git::ControllerScope>, ProtectedLaunchError> {
@@ -952,11 +1288,14 @@ impl ControllerChannel {
     }
 }
 
-/// Ownership and root mode recorded before custody transfer.
+/// Ownership and root mode recorded before custody transfer. An owner that
+/// already looks like controller or worker custody is prior, unknown custody
+/// and refuses (there is no automatic recovery).
 #[cfg(unix)]
 fn original_custody(
     common_dir: &Path,
     worktree: &Path,
+    config: &ProtectedLaunchConfig,
 ) -> Result<OriginalCustody, ProtectedLaunchError> {
     use std::os::unix::fs::MetadataExt;
     let meta = |path: &Path| {
@@ -965,6 +1304,18 @@ fn original_custody(
     };
     let metadata = meta(common_dir)?;
     let root = meta(worktree)?;
+    let looks_held = |uid: u32, gid: u32| {
+        uid == config.controller_uid
+            || config.worker_uids.contains(&uid)
+            || gid == config.worker_gid
+    };
+    if looks_held(metadata.uid(), metadata.gid()) || looks_held(root.uid(), root.gid()) {
+        return Err(ProtectedLaunchError::Custody(
+            "repository ownership already matches controller or worker custody \
+             (unknown prior custody); refusing without recovery"
+                .into(),
+        ));
+    }
     Ok(OriginalCustody {
         uid: metadata.uid(),
         gid: metadata.gid(),
@@ -973,7 +1324,11 @@ fn original_custody(
 }
 
 #[cfg(not(unix))]
-fn original_custody(_: &Path, _: &Path) -> Result<OriginalCustody, ProtectedLaunchError> {
+fn original_custody(
+    _: &Path,
+    _: &Path,
+    _: &ProtectedLaunchConfig,
+) -> Result<OriginalCustody, ProtectedLaunchError> {
     Err(ProtectedLaunchError::Unsupported(
         "custody requires Unix ownership".into(),
     ))
@@ -1019,6 +1374,30 @@ fn uid_in_use(uid: u32) -> Result<bool, ProtectedLaunchError> {
     }
 }
 
+/// Every ancestor of both custody roots is root- or controller-owned and not
+/// group/other writable (unless sticky). Read-only; also run before the first
+/// mutation.
+#[cfg(unix)]
+pub(crate) fn verify_ancestors(
+    common_dir: &Path,
+    worktree: &Path,
+    controller_uid: u32,
+) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    for top in [common_dir, worktree] {
+        for ancestor in top.ancestors().skip(1) {
+            let metadata = std::fs::symlink_metadata(ancestor)
+                .map_err(|error| format!("{}: {error}", ancestor.display()))?;
+            let trusted = metadata.uid() == 0 || metadata.uid() == controller_uid;
+            let mode = metadata.mode();
+            if !trusted || (mode & 0o022 != 0 && mode & 0o1000 == 0) {
+                return Err(format!("ancestor {} is not protected", ancestor.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Custody verification over filesystem metadata (no following of links).
 /// Ancestors: owned by root or the controller and not group/other writable
 /// unless sticky. Metadata tree: controller-owned, no group/other write.
@@ -1035,16 +1414,7 @@ pub(crate) fn verify_custody(
     let meta = |path: &Path| {
         std::fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))
     };
-    for top in [common_dir, worktree] {
-        for ancestor in top.ancestors().skip(1) {
-            let metadata = meta(ancestor)?;
-            let trusted = metadata.uid() == 0 || metadata.uid() == controller_uid;
-            let mode = metadata.mode();
-            if !trusted || (mode & 0o022 != 0 && mode & 0o1000 == 0) {
-                return Err(format!("ancestor {} is not protected", ancestor.display()));
-            }
-        }
-    }
+    verify_ancestors(common_dir, worktree, controller_uid)?;
     let mut pending = vec![common_dir.to_path_buf()];
     while let Some(path) = pending.pop() {
         let metadata = meta(&path)?;

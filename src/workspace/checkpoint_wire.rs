@@ -72,7 +72,7 @@ struct Fields {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "present"
+        deserialize_with = "present_object"
     )]
     dirty_diff_ref: Option<RefFields>,
     #[serde(
@@ -90,7 +90,7 @@ struct Fields {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "present"
+        deserialize_with = "present_objects"
     )]
     executed_checks: Option<Vec<CheckFields>>,
     #[serde(
@@ -142,7 +142,7 @@ struct CheckFields {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "present"
+        deserialize_with = "present_object"
     )]
     output_ref: Option<RefFields>,
     #[serde(
@@ -179,6 +179,34 @@ where
     T: Deserialize<'de>,
 {
     T::deserialize(deserializer).map(Some)
+}
+
+// Nested records are objects too: a present value (null included) must be a
+// JSON object, never a positional sequence a struct derive would also accept.
+fn present_object<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Obj::<T>::deserialize(deserializer).map(|Obj(value)| Some(value))
+}
+
+fn present_objects<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Vec::<Obj<T>>::deserialize(deserializer)
+        .map(|items| Some(items.into_iter().map(|Obj(value)| value).collect()))
+}
+
+/// Deserializes `T` only from a JSON object (see [`object`]).
+struct Obj<T>(T);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Obj<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        object(deserializer).map(Self)
+    }
 }
 
 fn one_of<T: Copy>(value: &str, all: &[T], as_str: fn(T) -> &'static str) -> Option<T> {
