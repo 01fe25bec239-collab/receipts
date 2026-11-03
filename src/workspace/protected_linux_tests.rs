@@ -9,7 +9,7 @@
 //! lifecycle and teardown properties.
 //!
 //! Probes observe their own confinement through system calls
-//! (`getresuid`/`getresgid`/`getgroups`/`capget`/`prctl`/`fcntl`/`getrlimit`),
+//! (`getresuid`/`getresgid`/`getgroups`/`capget`/`prctl`),
 //! never `/proc`: the controller's Landlock plan grants no `/proc` access and
 //! production access is not widened for the probe.
 
@@ -17,7 +17,7 @@ use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::execution::{LiveProcessTerminalCause, ProcessRunRequest, ProcessTimeoutPolicy};
 use crate::test_support::{TempDir, git};
@@ -37,8 +37,6 @@ const CUSTODY_MARKER: &str = "receipts-custody.state";
 unsafe extern "C" {
     fn syscall(number: i64, ...) -> i64;
 }
-const SYS_GETRLIMIT: i64 = 97;
-const SYS_FCNTL: i64 = 72;
 const SYS_GETGROUPS: i64 = 115;
 const SYS_GETRESUID: i64 = 118;
 const SYS_GETRESGID: i64 = 120;
@@ -51,10 +49,7 @@ const PR_CAPBSET_READ: i64 = 23;
 const PR_GET_NO_NEW_PRIVS: i64 = 39;
 const PR_CAP_AMBIENT: i64 = 47;
 const PR_CAP_AMBIENT_IS_SET: i64 = 1;
-const F_GETFD: i64 = 1;
-const RLIMIT_NOFILE: i64 = 7;
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
-const EBADF: i32 = 9;
 const SYS_PROCESS_VM_READV: i64 = 310;
 const SYS_OPEN_BY_HANDLE_AT: i64 = 304;
 const SYS_SETNS: i64 = 308;
@@ -161,7 +156,7 @@ fn single_id(quad: Option<[u32; 4]>, allowed: std::ops::RangeInclusive<u32>) -> 
 }
 
 /// `(effective, permitted, inheritable)` capability sets of this thread.
-fn capability_sets() -> Option<[u64; 3]> {
+fn capability_sets() -> std::io::Result<[u64; 3]> {
     let header: [u32; 2] = [LINUX_CAPABILITY_VERSION_3, 0];
     let mut data = [0u32; 6]; // two (effective, permitted, inheritable) words
     call(
@@ -169,43 +164,79 @@ fn capability_sets() -> Option<[u64; 3]> {
         header.as_ptr() as i64,
         data.as_mut_ptr() as i64,
         0,
-    )?;
+    )
+    .ok_or_else(std::io::Error::last_os_error)?;
     let set = |slot: usize| u64::from(data[slot]) | (u64::from(data[3 + slot]) << 32);
-    Some([set(0), set(1), set(2)])
+    Ok([set(0), set(1), set(2)])
 }
 
-/// Bit set of capabilities for which `query(cap)` reports 1, over every
-/// capability the kernel knows (it answers `EINVAL` beyond the last one). An
-/// unanswered first query means the set is unobservable, never "empty".
-fn capability_mask(query: impl Fn(i64) -> Option<i64>) -> Option<u64> {
+/// Query every capability in the admitted kernel range; any failed or
+/// unexpected response makes the observation unavailable.
+fn capability_mask(last: u32, query: impl Fn(i64) -> std::io::Result<i64>) -> std::io::Result<u64> {
+    if last > 63 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unsupported capability range",
+        ));
+    }
     let mut mask = 0u64;
-    for cap in 0..64 {
-        match query(cap) {
-            Some(1) => mask |= 1 << cap,
-            Some(_) => {}
-            None if cap == 0 => return None,
-            None => break,
+    for cap in 0..=last {
+        match query(i64::from(cap))? {
+            0 => {}
+            1 => mask |= 1 << cap,
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unexpected capability response",
+                ));
+            }
         }
     }
-    Some(mask)
+    Ok(mask)
+}
+
+fn capability_query(a: i64, b: i64, c: i64) -> std::io::Result<i64> {
+    call(SYS_PRCTL, a, b, c).ok_or_else(std::io::Error::last_os_error)
 }
 
 /// Exact capability sets, no supplementary groups, no-new-privs, seccomp filter.
 fn identity_receipt(uid: std::ops::RangeInclusive<u32>, gid: u32, caps: &str) -> String {
     let expected = u64::from_str_radix(caps, 16).ok();
-    let bounding = capability_mask(|cap| call(SYS_PRCTL, PR_CAPBSET_READ, cap, 0));
-    let ambient =
-        capability_mask(|cap| call(SYS_PRCTL, PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, cap));
-    let [effective, permitted, inheritable] = capability_sets().unwrap_or([u64::MAX; 3]);
-    let caps_exact = [
-        Some(effective),
-        Some(permitted),
-        Some(inheritable),
-        bounding,
-        ambient,
-    ]
-    .iter()
-    .all(|set| *set == expected);
+    let last = std::fs::read_to_string(Path::new(PROBE_DIR).join("cap_last_cap"))
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok());
+    let observe = |query: &dyn Fn(i64) -> std::io::Result<i64>| {
+        last.and_then(|last| match capability_mask(last, query) {
+            Ok(mask) => Some(mask),
+            Err(error) => {
+                eprintln!(
+                    "capability observation unavailable: {error} (errno {:?})",
+                    error.raw_os_error()
+                );
+                None
+            }
+        })
+    };
+    let bounding = observe(&|cap| capability_query(PR_CAPBSET_READ, cap, 0));
+    let ambient = observe(&|cap| capability_query(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, cap));
+    let sets = capability_sets()
+        .inspect_err(|error| {
+            eprintln!(
+                "capget observation unavailable: {error} (errno {:?})",
+                error.raw_os_error()
+            );
+        })
+        .ok();
+    let caps_exact = expected.is_some()
+        && [
+            sets.map(|sets| sets[0]),
+            sets.map(|sets| sets[1]),
+            sets.map(|sets| sets[2]),
+            bounding,
+            ambient,
+        ]
+        .iter()
+        .all(|set| *set == expected);
     format!(
         "uid_exact={} gid_exact={} no_groups={} caps_exact={} nnp={} seccomp_filter={}",
         single_id(id_quad(SYS_GETRESUID, SYS_SETFSUID), uid),
@@ -217,31 +248,191 @@ fn identity_receipt(uid: std::ops::RangeInclusive<u32>, gid: u32, caps: &str) ->
     )
 }
 
-/// Only stdio is open: every other descriptor number up to the process limit
-/// answers `EBADF`, so no leaked metadata, cgroup, namespace or privileged
-/// descriptor survives. Observed by number, without `/proc`.
-fn fds_sealed() -> bool {
-    use std::os::fd::FromRawFd;
-    let mut limit = [0u64; 2];
-    if call(SYS_GETRLIMIT, RLIMIT_NOFILE, limit.as_mut_ptr() as i64, 0).is_none() {
+/// Stop all probe threads until the privileged parent completes observation.
+fn pause_for_observation() {
+    // SAFETY: getpid and kill with SIGSTOP only stop this process.
+    assert_eq!(unsafe { syscall(62, syscall(39), 19i64) }, 0);
+}
+
+/// Enumerate the kernel's full descriptor table, including descriptors above
+/// a subsequently lowered limit. Any read or metadata error fails closed.
+fn observed_fds_sealed(pid: u32) -> std::io::Result<bool> {
+    let mut count = 0;
+    for task in std::fs::read_dir(format!("/proc/{pid}/task"))? {
+        if !descriptor_table_sealed(&task?.path().join("fd"))? {
+            return Ok(false);
+        }
+        count += 1;
+    }
+    Ok(count > 0)
+}
+
+fn descriptor_table_sealed(dir: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::FileTypeExt;
+    let mut numbers = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let number: u32 = entry.file_name().to_string_lossy().parse().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid descriptor")
+        })?;
+        numbers.push(number);
+    }
+    numbers.sort_unstable();
+    if numbers != [0, 1, 2] {
+        return Ok(false);
+    }
+    for fd in 0..3 {
+        let kind = std::fs::metadata(dir.join(fd.to_string()))?.file_type();
+        if !kind.is_fifo() && !kind.is_char_device() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Observe the sole stopped process in this attempt's cgroup, pinning its
+/// lifetime until it has been resumed through the same pidfd.
+fn observe_child(cgroup: &Path) -> bool {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let pid = loop {
+        if let Ok(text) = std::fs::read_to_string(cgroup.join("cgroup.procs")) {
+            let pids: Vec<_> = text.lines().collect();
+            if pids.len() == 1
+                && let Ok(pid) = pids[0].parse::<u32>()
+            {
+                break pid;
+            }
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    // SAFETY: pidfd_open takes a PID and zero flags.
+    let fd = unsafe { syscall(434, i64::from(pid), 0i64) };
+    if fd < 0 {
         return false;
     }
-    let bound = limit[0].min(1 << 16) as i64;
-    let closed = |fd: i64| {
-        call(SYS_FCNTL, fd, F_GETFD, 0).is_none()
-            && std::io::Error::last_os_error().raw_os_error() == Some(EBADF)
+    // SAFETY: successful pidfd_open returns a new owned descriptor.
+    let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) };
+    #[repr(C)]
+    struct PollFd {
+        fd: i32,
+        events: i16,
+        revents: i16,
+    }
+    let alive = || {
+        let mut pollfd = PollFd {
+            fd: pidfd.as_raw_fd(),
+            events: 1,
+            revents: 0,
+        };
+        // SAFETY: poll receives one initialized pollfd and a zero timeout.
+        unsafe { syscall(7, &mut pollfd as *mut PollFd, 1i64, 0i64) == 0 }
     };
-    let stdio_ok = (0..3).all(|fd| {
-        // SAFETY: descriptors 0..=2 are open; the temporary `File` is never
-        // dropped, so it cannot close them.
-        let file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
-        file.metadata().is_ok_and(|metadata| {
-            let kind = metadata.file_type();
-            use std::os::unix::fs::FileTypeExt;
-            kind.is_fifo() || kind.is_char_device()
-        })
-    });
-    stdio_ok && (3..bound).all(closed)
+    let matches = || {
+        std::fs::read_to_string(cgroup.join("cgroup.procs"))
+            .is_ok_and(|text| text.lines().collect::<Vec<_>>() == [pid.to_string()])
+    };
+    let stopped = || -> std::io::Result<bool> {
+        let mut count = 0;
+        for task in std::fs::read_dir(format!("/proc/{pid}/task"))? {
+            let status = std::fs::read_to_string(task?.path().join("status"))?;
+            if !status.lines().any(|line| line.starts_with("State:\tT")) {
+                return Ok(false);
+            }
+            count += 1;
+        }
+        Ok(count > 0)
+    };
+    while Instant::now() < deadline && matches() && !stopped().unwrap_or(false) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let sealed = alive()
+        && matches()
+        && stopped().unwrap_or(false)
+        && observed_fds_sealed(pid).unwrap_or(false)
+        && stopped().unwrap_or(false)
+        && matches()
+        && alive();
+    // SAFETY: pidfd_send_signal targets the pinned process, with SIGCONT and no siginfo.
+    let resumed = unsafe { syscall(424, i64::from(pidfd.as_raw_fd()), 18i64, 0i64, 0i64) } == 0;
+    sealed && resumed
+}
+
+fn fd_observer_controls() {
+    use std::os::fd::AsRawFd;
+    for target in [None, Some(128i64), Some(65536i64)] {
+        let source = std::fs::File::open("/dev/null").unwrap();
+        let source_fd = source.as_raw_fd();
+        let mut command = std::process::Command::new("/usr/bin/sleep");
+        command
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // SAFETY: the pre-exec hook only uses async-signal-safe system calls.
+        unsafe {
+            command.pre_exec(move || {
+                if let Some(fd) = target {
+                    if syscall(33, i64::from(source_fd), fd) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let limit = [64u64, 64u64];
+                    if syscall(160, 7i64, limit.as_ptr()) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().expect("FD control must be supported");
+        std::thread::sleep(Duration::from_millis(100));
+        let retained = target.map(|fd| std::fs::read_link(format!("/proc/{}/fd/{fd}", child.id())));
+        let limits =
+            target.map(|_| std::fs::read_to_string(format!("/proc/{}/limits", child.id())));
+        let result = observed_fds_sealed(child.id());
+        // Collect the owned control before any observation assertion can panic.
+        let killed = child.kill();
+        let reaped = child.wait();
+        killed.unwrap();
+        reaped.unwrap();
+        if let Some(retained) = retained {
+            retained.unwrap();
+            let limits = limits.unwrap().unwrap();
+            let nofile = limits
+                .lines()
+                .find(|line| line.starts_with("Max open files"))
+                .unwrap();
+            let fields: Vec<_> = nofile.split_whitespace().collect();
+            assert_eq!(&fields[3..5], &["64", "64"]);
+        }
+        assert_eq!(
+            result.unwrap(),
+            target.is_none(),
+            "descriptor control {target:?}"
+        );
+    }
+}
+
+#[test]
+fn capability_mask_requires_complete_range() {
+    assert_eq!(
+        capability_mask(3, |cap| Ok(i64::from(cap == 2))).unwrap(),
+        4
+    );
+    let error = capability_mask(3, |cap| {
+        if cap == 1 {
+            Err(std::io::Error::from_raw_os_error(5))
+        } else {
+            Ok(0)
+        }
+    })
+    .unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(5));
+    assert!(capability_mask(64, |_| Ok(0)).is_err());
+    assert!(capability_mask(1, |_| Ok(2)).is_err());
 }
 
 /// The filtered syscall returns EPERM although unfiltered it would succeed or
@@ -341,6 +532,7 @@ fn worker_probe() {
         .and_then(|mut file| file.write_all(b"worker secret\n"))
         .is_ok();
     record("private_payload", wrote);
+    pause_for_observation();
     // Escape the process group; only cgroup containment can reach this.
     let escapee = std::process::Command::new("/usr/bin/sleep")
         .arg("300")
@@ -359,7 +551,6 @@ fn worker_probe() {
         "IDENTITY {}",
         identity_receipt(WORKER_RANGE, WORKER_GID, "0")
     );
-    record("fds_sealed", fds_sealed());
     // Namespace, handle and descriptor-stealing syscalls are filtered.
     record("unshare_filtered", filtered(SYS_UNSHARE, 0, 0, 0));
     record("setns_filtered", filtered(SYS_SETNS, -1, 0, 0));
@@ -459,9 +650,9 @@ fn controller_probe() {
         "CONTROLLER_IDENTITY {}",
         identity_receipt(CONTROLLER_ID..=CONTROLLER_ID, CONTROLLER_ID, "4")
     );
+    pause_for_observation();
     println!(
-        "CONTROLLER_ESCAPE fds_sealed={} open_by_handle_filtered={} setns_filtered={} unshare_filtered={} pidfd_getfd_filtered={} cgroup_migration_denied={}",
-        fds_sealed(),
+        "CONTROLLER_ESCAPE open_by_handle_filtered={} setns_filtered={} unshare_filtered={} pidfd_getfd_filtered={} cgroup_migration_denied={}",
         filtered(SYS_OPEN_BY_HANDLE_AT, -1, 0, 0),
         filtered(SYS_SETNS, -1, 0, 0),
         filtered(SYS_UNSHARE, 0, 0, 0),
@@ -510,6 +701,7 @@ fn assert_custody(common: &Path, worktree: &Path, worker_uid: u32) {
 #[test]
 #[ignore = "privileged hosted diagnostic"]
 fn hosted_protected_worker_controller_and_cleanup() {
+    fd_observer_controls();
     let (dir, repo, handle) = fixture();
     let launcher = ProtectedLauncher::new(config()).expect("hosted admission must succeed");
     let admission = launcher.admit(&handle, &repo).expect("custody");
@@ -524,6 +716,12 @@ fn hosted_protected_worker_controller_and_cleanup() {
     std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
     std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Admission uses the same kernel capability bound and refuses values above 63.
+    std::fs::write(
+        probe.join("cap_last_cap"),
+        launcher.cap_last_cap_for_test().to_string(),
+    )
+    .unwrap();
     // Cgroup paths the probes must be unable to migrate into: the delegated
     // root, a real sibling, and the worker's own cgroup.
     let sibling = hosted_cgroup().join("receipts-sibling");
@@ -547,6 +745,10 @@ fn hosted_protected_worker_controller_and_cleanup() {
             &policy(),
         )
         .expect("worker launch");
+    assert!(
+        observe_child(&lines[2]),
+        "worker FD observation unavailable or unsealed"
+    );
     let outcome = protected
         .attempt()
         .wait_collect()
@@ -570,7 +772,6 @@ fn hosted_protected_worker_controller_and_cleanup() {
             "payload_edit=true",
             "private_payload=true",
             "escapee_spawned=true",
-            "fds_sealed=true",
             "unshare_filtered=true",
             "setns_filtered=true",
             "pidfd_getfd_filtered=true",
@@ -724,6 +925,22 @@ fn hosted_protected_worker_controller_and_cleanup() {
         launch.customization().expect("controller customization"),
     )
     .expect("controller probe start");
+    let prefix = format!("receipts-{}-ctl-", credentials.attempt_id);
+    let candidates: Vec<_> = std::fs::read_dir(hosted_cgroup())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(&prefix)
+        })
+        .collect();
+    assert_eq!(candidates.len(), 1, "controller cgroup unavailable");
+    assert!(
+        observe_child(&candidates[0]),
+        "controller FD observation unavailable or unsealed"
+    );
     let outcome = attempt.wait_collect().expect("controller probe cleanup");
     let stdout = String::from_utf8_lossy(outcome.stdout().head()).into_owned();
     println!("{stdout}");
@@ -735,7 +952,6 @@ fn hosted_protected_worker_controller_and_cleanup() {
             "sentinel_visible=true",
             "proc_root_outside_denied=true",
             "uid_exact=true gid_exact=true no_groups=true caps_exact=true nnp=true seccomp_filter=true",
-            "fds_sealed=true",
             "open_by_handle_filtered=true",
             "setns_filtered=true",
             "unshare_filtered=true",
@@ -938,4 +1154,67 @@ fn hosted_exclusive_custody_and_linked_target_refusals() {
         before
     );
     assert!(!marker.exists());
+}
+
+/// Independent real repositories share the host domain even when their worktrees nest.
+#[test]
+#[ignore = "privileged hosted diagnostic"]
+fn hosted_cross_repository_nested_custody_refuses_without_transfer() {
+    let (_outer_dir, outer_repo, outer) = fixture();
+    let (_inner_dir, inner_repo, _unused_inner) = fixture();
+    let base = crate::test_support::stdout_trimmed(&git(&inner_repo, &["rev-parse", "HEAD"]));
+    let inner = WorkspaceProvisionRequest::new(
+        &inner_repo,
+        "ws-inner",
+        Some("task-inner"),
+        "task/inner",
+        outer.worktree_path().join("nested"),
+        &base,
+    )
+    .unwrap()
+    .provision()
+    .unwrap();
+    let common = [
+        std::fs::canonicalize(outer_repo.join(".git")).unwrap(),
+        std::fs::canonicalize(inner_repo.join(".git")).unwrap(),
+    ];
+    let handles = [&outer, &inner];
+    let repos = [&outer_repo, &inner_repo];
+    for (first, second) in [(0, 1), (1, 0)] {
+        let owner = ProtectedLauncher::new(config()).unwrap();
+        let contender = ProtectedLauncher::new(config()).unwrap();
+        let held = owner.admit(handles[first], repos[first]).unwrap();
+        assert_custody(
+            &common[first],
+            handles[first].worktree_path(),
+            held.worker_uid_for_test(),
+        );
+        let snapshot = || {
+            [
+                common[0].as_path(),
+                outer.worktree_path(),
+                common[1].as_path(),
+                inner.worktree_path(),
+            ]
+            .map(|path| {
+                (
+                    owner_mode(path),
+                    std::fs::read(path.join("receipts-custody.state")).ok(),
+                )
+            })
+        };
+        let before = snapshot();
+        assert!(matches!(
+            contender.admit(handles[second], repos[second]),
+            Err(ProtectedLaunchError::Custody(_))
+        ));
+        assert_eq!(
+            snapshot(),
+            before,
+            "losing admission changed either repository"
+        );
+        drop(held); // no worker existed; verified restoration must release the reservation
+        let next = contender.admit(handles[second], repos[second]).unwrap();
+        drop(next);
+    }
 }

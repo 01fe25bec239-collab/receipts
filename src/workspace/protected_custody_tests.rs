@@ -17,6 +17,7 @@ const SECRET: &str = "outside secret\n";
 struct Layout {
     _dir: TempDir,
     common: PathBuf,
+    registry: PathBuf,
     worktree: PathBuf,
     outside: PathBuf,
 }
@@ -31,6 +32,9 @@ fn layout() -> Layout {
     let dir = TempDir::new("custody");
     let base = std::fs::canonicalize(dir.path()).unwrap();
     let (common, worktree, outside) = (base.join("common"), base.join("wt"), base.join("outside"));
+    let registry = base.join("registry");
+    std::fs::create_dir(&registry).unwrap();
+    std::fs::write(registry.join("lock"), "").unwrap();
     for path in [
         &common,
         &common.join("objects/ab"),
@@ -54,6 +58,7 @@ fn layout() -> Layout {
     Layout {
         _dir: dir,
         common,
+        registry,
         worktree,
         outside,
     }
@@ -459,7 +464,7 @@ fn mount_topology_refuses_any_mount_strictly_inside_a_root() {
 // ---------------------------------------------------------------- reservation
 
 fn begin(layout: &Layout, attempt: &str) -> Result<Reservation, String> {
-    Reservation::begin(&layout.common, attempt, &layout.worktree)
+    Reservation::begin_for_test(&layout.registry, &layout.common, attempt, &layout.worktree)
 }
 
 fn marker(layout: &Layout) -> String {
@@ -478,10 +483,7 @@ fn one_reservation_per_common_directory_and_a_loser_changes_nothing() {
                 gid: 8,
                 worktree_mode: 0o755,
             },
-            RootIds {
-                common: (1, 2),
-                worktree: (3, 4),
-            },
+            open(&layout).ids(),
         )
         .unwrap();
     first.set_phase(Phase::Custody).unwrap();
@@ -515,9 +517,7 @@ fn process_exit_releases_only_the_lock_never_the_retained_state() {
     drop(crashed); // the fd closes: the flock is gone, the record is not
     let error = begin(&layout, "attempt-next").err().unwrap();
     assert!(
-        error.contains("attempt attempt-crash")
-            && error.contains("phase incomplete")
-            && error.contains("no live owner: retained state"),
+        error.contains("attempt attempt-crash") && error.contains("no live owner"),
         "{error}"
     );
     assert!(marker(&layout).contains("attempt=attempt-crash"));
@@ -561,14 +561,7 @@ fn persisted_original_owner_evidence_is_verified_not_assumed() {
         worktree_mode: 0o750,
     };
     reservation
-        .record_identity(
-            62001,
-            original,
-            RootIds {
-                common: (1, 1),
-                worktree: (2, 2),
-            },
-        )
+        .record_identity(62001, original, open(&layout).ids())
         .unwrap();
     reservation.verify_original(original).unwrap();
     assert!(
@@ -612,7 +605,14 @@ fn reservation_child_probe() {
     let Some(common) = std::env::var_os("RECEIPTS_CUSTODY_PROBE_COMMON") else {
         return;
     };
-    match Reservation::begin(Path::new(&common), "child-process", Path::new("/unused")) {
+    let registry = std::env::var_os("RECEIPTS_CUSTODY_PROBE_REGISTRY").unwrap();
+    let worktree = std::env::var_os("RECEIPTS_CUSTODY_PROBE_WORKTREE").unwrap();
+    match Reservation::begin_for_test(
+        Path::new(&registry),
+        Path::new(&common),
+        "child-process",
+        Path::new(&worktree),
+    ) {
         Ok(reservation) => {
             reservation.finish().unwrap();
             println!("CHILD ACQUIRED");
@@ -634,6 +634,8 @@ fn reservation_excludes_a_separate_process() {
                 "--test-threads=1",
             ])
             .env("RECEIPTS_CUSTODY_PROBE_COMMON", &layout.common)
+            .env("RECEIPTS_CUSTODY_PROBE_REGISTRY", &layout.registry)
+            .env("RECEIPTS_CUSTODY_PROBE_WORKTREE", &layout.worktree)
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
@@ -646,14 +648,241 @@ fn reservation_excludes_a_separate_process() {
     // Parent exit/drop without finish: the other process still refuses.
     drop(held);
     let after_crash = probe();
-    assert!(
-        after_crash.contains("no live owner: retained state"),
-        "{after_crash}"
-    );
+    assert!(after_crash.contains("no live owner"), "{after_crash}");
     // Only a verified finish frees the directory for the other process.
     std::fs::remove_file(layout.common.join("receipts-custody.state")).unwrap();
+    std::fs::remove_file(layout.registry.join("r-parent")).unwrap();
     let finished = begin(&layout, "parent-2").unwrap();
     finished.finish().unwrap();
     let after = probe();
     assert!(after.contains("CHILD ACQUIRED"), "{after}");
+}
+
+#[test]
+fn registry_refuses_every_root_pair_in_both_orders_and_allows_unrelated() {
+    for first_root in 0..2 {
+        for second_root in 0..2 {
+            for reverse in [false, true] {
+                let layout = layout();
+                let base = layout.common.parent().unwrap();
+                let outer = [base.join("a-common"), base.join("a-worktree")];
+                let mut inner = [base.join("b-common"), base.join("b-worktree")];
+                for path in &outer {
+                    std::fs::create_dir(path).unwrap();
+                }
+                inner[second_root] = outer[first_root].join("nested");
+                for path in &inner {
+                    std::fs::create_dir(path).unwrap();
+                }
+                let (first, second) = if reverse {
+                    (&inner, &outer)
+                } else {
+                    (&outer, &inner)
+                };
+                let held =
+                    Reservation::begin_for_test(&layout.registry, &first[0], "first", &first[1])
+                        .unwrap();
+                let error =
+                    Reservation::begin_for_test(&layout.registry, &second[0], "second", &second[1])
+                        .unwrap_err();
+                assert!(error.contains("overlap"), "{error}");
+                let unrelated = begin(&layout, "unrelated").unwrap();
+                unrelated.finish().unwrap();
+                held.finish().unwrap();
+                let again =
+                    Reservation::begin_for_test(&layout.registry, &second[0], "again", &second[1])
+                        .unwrap();
+                again.finish().unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn malformed_registry_and_replaced_ancestor_refuse() {
+    let layout = layout();
+    std::fs::write(layout.registry.join("r-partial"), b"receipts-registry-v1\n").unwrap();
+    assert!(begin(&layout, "refused").unwrap_err().contains("missing"));
+    std::fs::remove_file(layout.registry.join("r-partial")).unwrap();
+    let held = begin(&layout, "held").unwrap();
+    let moved = layout.worktree.with_file_name("moved");
+    std::fs::rename(&layout.worktree, &moved).unwrap();
+    std::fs::create_dir(&layout.worktree).unwrap();
+    assert!(held.revalidate().is_err());
+    std::fs::remove_dir(&layout.worktree).unwrap();
+    std::fs::rename(moved, &layout.worktree).unwrap();
+    held.finish().unwrap();
+}
+
+#[test]
+fn nested_real_git_worktrees_refuse_across_processes_in_both_orders() {
+    let layout = layout();
+    let base = layout.common.parent().unwrap();
+    let repos = [base.join("repo-a"), base.join("repo-b")];
+    let worktrees = [base.join("outer"), base.join("outer/nested")];
+    let git = |args: &[&std::ffi::OsStr]| {
+        let output = crate::git::prepared_command(base, "nested repository fixture", args)
+            .unwrap()
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    for (repo, worktree) in repos.iter().zip(&worktrees) {
+        git(&["init".as_ref(), "-q".as_ref(), repo.as_os_str()]);
+        git(&[
+            "-C".as_ref(),
+            repo.as_os_str(),
+            "-c".as_ref(),
+            "user.name=Test".as_ref(),
+            "-c".as_ref(),
+            "user.email=test@example.invalid".as_ref(),
+            "commit".as_ref(),
+            "--allow-empty".as_ref(),
+            "-qm".as_ref(),
+            "initial".as_ref(),
+        ]);
+        git(&[
+            "-C".as_ref(),
+            repo.as_os_str(),
+            "worktree".as_ref(),
+            "add".as_ref(),
+            "-q".as_ref(),
+            "-b".as_ref(),
+            "task".as_ref(),
+            worktree.as_os_str(),
+        ]);
+    }
+    let common = [repos[0].join(".git"), repos[1].join(".git")];
+    for (first, second) in [(0, 1), (1, 0)] {
+        let held = Reservation::begin_for_test(
+            &layout.registry,
+            &common[first],
+            "real-parent",
+            &worktrees[first],
+        )
+        .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "protected_custody::tests::reservation_child_probe",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("RECEIPTS_CUSTODY_PROBE_COMMON", &common[second])
+            .env("RECEIPTS_CUSTODY_PROBE_REGISTRY", &layout.registry)
+            .env("RECEIPTS_CUSTODY_PROBE_WORKTREE", &worktrees[second])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let result = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            result.contains("CHILD REFUSED")
+                && result.contains("overlap")
+                && result.contains("real-parent"),
+            "{result}"
+        );
+        held.finish().unwrap();
+        let next = Reservation::begin_for_test(
+            &layout.registry,
+            &common[second],
+            "real-next",
+            &worktrees[second],
+        )
+        .unwrap();
+        next.finish().unwrap();
+    }
+}
+
+#[test]
+fn corrupt_owned_record_cannot_be_released_or_overwritten() {
+    let layout = layout();
+    let reservation = begin(&layout, "corrupt").unwrap();
+    std::fs::write(layout.registry.join("r-corrupt"), b"partial").unwrap();
+    assert!(reservation.set_phase(Phase::Custody).is_err());
+    assert!(reservation.finish().is_err());
+    assert!(layout.registry.join("r-corrupt").exists());
+    assert!(begin(&layout, "next").is_err());
+}
+
+#[test]
+fn simultaneous_unrelated_reservations_both_succeed() {
+    let layout = layout();
+    let base = layout.common.parent().unwrap();
+    let roots: Vec<_> = (0..2)
+        .map(|i| {
+            let common = base.join(format!("parallel-common-{i}"));
+            let worktree = base.join(format!("parallel-worktree-{i}"));
+            std::fs::create_dir(&common).unwrap();
+            std::fs::create_dir(&worktree).unwrap();
+            (common, worktree)
+        })
+        .collect();
+    let barrier = Arc::new(Barrier::new(2));
+    let handles: Vec<_> = roots
+        .into_iter()
+        .enumerate()
+        .map(|(i, (common, worktree))| {
+            let registry = layout.registry.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                Reservation::begin_for_test(&registry, &common, &format!("parallel-{i}"), &worktree)
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap().unwrap().finish().unwrap();
+    }
+}
+
+#[test]
+fn retained_path_stays_reserved_after_object_replacement() {
+    let layout = layout();
+    let held = begin(&layout, "retained-path").unwrap();
+    let moved = layout.worktree.with_file_name("old-worktree");
+    std::fs::rename(&layout.worktree, &moved).unwrap();
+    std::fs::create_dir(&layout.worktree).unwrap();
+    let other_common = layout.common.with_file_name("other-common");
+    std::fs::create_dir(&other_common).unwrap();
+    assert!(
+        Reservation::begin_for_test(
+            &layout.registry,
+            &other_common,
+            "replacement",
+            &layout.worktree
+        )
+        .is_err()
+    );
+    assert!(held.revalidate().is_err());
+    std::fs::remove_dir(&layout.worktree).unwrap();
+    std::fs::rename(moved, &layout.worktree).unwrap();
+    held.finish().unwrap();
+}
+
+#[test]
+fn topology_requires_a_local_unaliased_filesystem_and_known_namespace_pins() {
+    let root = Path::new("/repo");
+    let ordinary = "1 0 8:1 / / rw - ext4 /dev/root rw\n";
+    assert!(refuse_alias_mounts_text(ordinary, &[root]).is_ok());
+    for fs in ["nfs", "overlay", "unknown"] {
+        assert!(refuse_alias_mounts_text(&ordinary.replace("ext4", fs), &[root]).is_err());
+    }
+    assert!(refuse_alias_mounts_text("malformed", &[root]).is_err());
+    for addition in [
+        "2 1 8:1 /repo /alias rw - ext4 /dev/root rw\n",
+        "2 1 0:7 / /repo/nested rw - tmpfs tmpfs rw\n",
+    ] {
+        assert!(refuse_alias_mounts_text(&format!("{ordinary}{addition}"), &[root]).is_err());
+    }
+    let anchor = Path::new("/var/lib/receipts/protected-custody");
+    let pins = format!(
+        "{ordinary}2 1 0:4 /pid /var/lib/receipts/protected-custody/host-pid rw - nsfs nsfs rw\n3 1 0:4 /mnt /var/lib/receipts/protected-custody/host-mnt rw - nsfs nsfs rw\n"
+    );
+    assert!(refuse_alias_mounts_text(&pins, &[anchor]).is_ok());
+    assert!(refuse_alias_mounts_text(&pins.replace("/host-mnt", "/other"), &[anchor]).is_err());
 }

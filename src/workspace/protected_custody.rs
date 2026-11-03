@@ -37,12 +37,14 @@ mod imp {
     use std::ffi::{CStr, CString, OsStr, OsString, c_char, c_int, c_uint};
     use std::fs::File;
     use std::io;
+    use std::io::Write;
     use std::mem::ManuallyDrop;
     use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, MutexGuard};
 
     mod sys {
         use std::ffi::{c_char, c_int, c_uint, c_void};
@@ -92,6 +94,7 @@ mod imp {
         pub(super) const ELOOP: i32 = 62;
         pub(super) const LOCK_EX: c_int = 2;
         pub(super) const LOCK_NB: c_int = 4;
+        pub(super) const LOCK_UN: c_int = 8;
         /// Offset of `d_name` in `struct dirent` (glibc / Darwin 64-bit inode).
         #[cfg(target_os = "linux")]
         pub(super) const DIRENT_NAME_OFFSET: usize = 19;
@@ -769,12 +772,590 @@ mod imp {
         }
     }
 
+    /// The two namespace handles are installed by trusted host administration.
+    /// A container-local PID 1 cannot establish their provenance.
+    fn production_registry() -> Result<Dir, String> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err("host custody registry requires Linux".into())
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let root = Path::new("/var/lib/receipts/protected-custody");
+            for path in root.ancestors() {
+                let meta = std::fs::symlink_metadata(path)
+                    .map_err(|e| format!("registry ancestor: {e}"))?;
+                if !meta.is_dir() || meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+                    return Err(format!("unsafe registry ancestor {}", path.display()));
+                }
+            }
+            let dir = Dir::open_absolute(root).map_err(|e| e.to_string())?;
+            if dir.meta.uid != 0 || dir.meta.mode != 0o700 {
+                return Err("unsafe custody registry directory".into());
+            }
+            let lock = dir.open_child(REGISTRY_LOCK).map_err(|e| e.to_string())?;
+            if lock.kind != Kind::File
+                || lock.meta.uid != 0
+                || lock.meta.mode != 0o600
+                || lock.meta.nlink != 1
+            {
+                return Err("unsafe custody registry lock".into());
+            }
+            let topology =
+                std::fs::read_to_string("/proc/self/mountinfo").map_err(|e| e.to_string())?;
+            for (anchor, namespace) in [("host-pid", "pid"), ("host-mnt", "mnt")] {
+                let anchor_path = root.join(anchor);
+                let found = topology.lines().any(|line| {
+                    let Some((left, right)) = line.split_once(" - ") else {
+                        return false;
+                    };
+                    let Some(mount) = left.split_whitespace().nth(4) else {
+                        return false;
+                    };
+                    OsString::from_vec(unescape_octal(mount)) == anchor_path.as_os_str()
+                        && right.split_whitespace().next() == Some("nsfs")
+                });
+                if !found {
+                    return Err(format!(
+                        "namespace anchor {anchor} is not a pinned nsfs mount"
+                    ));
+                }
+                let name = cstring(OsStr::new(anchor)).map_err(|e| e.to_string())?;
+                let fd = openat_raw(
+                    dir.fd.as_raw_fd(),
+                    &name,
+                    sys::O_RDONLY | sys::O_NOFOLLOW | sys::O_CLOEXEC,
+                    0,
+                )
+                .map_err(|e| e.to_string())?;
+                let pinned = meta_of(fd.as_raw_fd()).map_err(|e| e.to_string())?;
+                if pinned.uid != 0 {
+                    return Err("unsafe namespace anchor owner".into());
+                }
+                for process in ["self", "1"] {
+                    let actual = std::fs::metadata(format!("/proc/{process}/ns/{namespace}"))
+                        .map_err(|e| e.to_string())?;
+                    if (actual.dev(), actual.ino()) != (pinned.dev, pinned.ino) {
+                        return Err(format!("{namespace} namespace differs from host anchor"));
+                    }
+                }
+            }
+            refuse_alias_mounts(&[root])?;
+            Ok(dir)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn refuse_alias_mounts(roots: &[&Path]) -> Result<(), String> {
+        let text = std::fs::read_to_string("/proc/self/mountinfo").map_err(|e| e.to_string())?;
+        refuse_alias_mounts_text(&text, roots)
+    }
+
+    pub(crate) fn refuse_alias_mounts_text(text: &str, roots: &[&Path]) -> Result<(), String> {
+        let mut mounts = Vec::new();
+        for line in text.lines() {
+            let (left, right) = line.split_once(" - ").ok_or("malformed mountinfo")?;
+            let filesystem = right
+                .split_whitespace()
+                .next()
+                .ok_or("missing mount filesystem")?;
+            let fields: Vec<_> = left.split_whitespace().collect();
+            if fields.len() < 6 {
+                return Err("malformed mountinfo".into());
+            }
+            let mount = PathBuf::from(OsString::from_vec(unescape_octal(fields[4])));
+            let mount_root = PathBuf::from(OsString::from_vec(unescape_octal(fields[3])));
+            mounts.push((fields[2].to_owned(), mount_root, mount, filesystem));
+        }
+        for root in roots {
+            let containing = mounts
+                .iter()
+                .filter(|(_, _, mount, _)| root.starts_with(mount))
+                .max_by_key(|(_, _, mount, _)| mount.components().count())
+                .ok_or("mount topology missing root")?;
+            if !matches!(containing.3, "ext4" | "xfs" | "btrfs" | "tmpfs")
+                || containing.1 != Path::new("/")
+                || mounts
+                    .iter()
+                    .filter(|(dev, _, _, _)| *dev == containing.0)
+                    .count()
+                    != 1
+            {
+                return Err(format!(
+                    "aliasable or unverifiable mount topology at {}",
+                    root.display()
+                ));
+            }
+            if mounts.iter().any(|(_, _, mount, filesystem)| {
+                let host_anchor = *root == Path::new("/var/lib/receipts/protected-custody")
+                    && *filesystem == "nsfs"
+                    && [root.join("host-pid"), root.join("host-mnt")].contains(mount);
+                mount.starts_with(root) && mount != *root && !host_anchor
+            }) {
+                return Err(format!("nested mount at {}", root.display()));
+            }
+        }
+        Ok(())
+    }
+
+    const REGISTRY_LOCK: &CStr = c"lock";
+    const REGISTRY_FORMAT: &str = "receipts-registry-v1";
+
+    // Both roots are compared against the other's complete ancestor chain.
+    fn chain(path: &Path) -> Result<Vec<Identity>, String> {
+        let canonical = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
+        if canonical != path {
+            return Err("custody path is not canonical".into());
+        }
+        path.ancestors()
+            .map(|p| {
+                let dir = Dir::open_absolute(p).map_err(|e| e.to_string())?;
+                Ok((dir.meta.dev, dir.meta.ino))
+            })
+            .collect()
+    }
+
+    fn chain_text(chain: &[Identity]) -> String {
+        chain
+            .iter()
+            .map(|(dev, ino)| format!("{dev}:{ino}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn parse_chain(text: &str) -> Result<Vec<Identity>, String> {
+        let ids: Result<Vec<_>, _> = text
+            .split(',')
+            .map(|pair| {
+                let (dev, ino) = pair.split_once(':').ok_or("invalid registry identity")?;
+                Ok::<Identity, &str>((
+                    dev.parse().map_err(|_| "invalid registry device")?,
+                    ino.parse().map_err(|_| "invalid registry inode")?,
+                ))
+            })
+            .collect();
+        let ids = ids?;
+        if ids.is_empty() {
+            return Err("empty registry chain".into());
+        }
+        Ok(ids)
+    }
+
+    fn overlap(a: &[Identity], b: &[Identity]) -> bool {
+        a.contains(&b[0]) || b.contains(&a[0])
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn valid_hex(text: &str) -> bool {
+        !text.is_empty()
+            && text.len().is_multiple_of(2)
+            && text.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+
+    fn decode_hex(text: &str) -> Option<Vec<u8>> {
+        if !valid_hex(text) {
+            return None;
+        }
+        text.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let digit = |b: u8| (b as char).to_digit(16);
+                Some((digit(pair[0])? * 16 + digit(pair[1])?) as u8)
+            })
+            .collect()
+    }
+
+    fn valid_path(text: &str, chain: &[Identity]) -> bool {
+        let Some(bytes) = decode_hex(text) else {
+            return false;
+        };
+        let path = PathBuf::from(OsString::from_vec(bytes));
+        path.is_absolute() && path.ancestors().count() == chain.len()
+    }
+
+    fn valid_detail(detail: &str, phase: &str, name: &CStr) -> bool {
+        let Some(bytes) = decode_hex(detail) else {
+            return false;
+        };
+        let Ok(detail) = std::str::from_utf8(&bytes) else {
+            return false;
+        };
+        let mut lines = detail.lines();
+        let attempt = name.to_string_lossy();
+        if lines.next() != Some(FORMAT)
+            || lines.next() != Some(format!("attempt={}", &attempt[2..]).as_str())
+            || lines.next() != Some(format!("phase={phase}").as_str())
+            || !lines
+                .next()
+                .is_some_and(|line| line.starts_with("worktree="))
+        {
+            return false;
+        }
+        let fields: Vec<_> = lines.collect();
+        if fields.is_empty() {
+            return phase != "custody";
+        }
+        if fields.len() != 6 {
+            return false;
+        }
+        let number = |field: &str, key: &str| {
+            field
+                .strip_prefix(key)
+                .and_then(|value| value.parse::<u32>().ok())
+                .is_some()
+        };
+        let identity = |field: &str, key: &str| {
+            field
+                .strip_prefix(key)
+                .and_then(|value| parse_chain(value).ok())
+                .is_some_and(|ids| ids.len() == 1)
+        };
+        number(fields[0], "worker_uid=")
+            && number(fields[1], "original_uid=")
+            && number(fields[2], "original_gid=")
+            && fields[3]
+                .strip_prefix("original_worktree_mode=")
+                .and_then(|v| u32::from_str_radix(v, 8).ok())
+                .is_some()
+            && identity(fields[4], "common_identity=")
+            && identity(fields[5], "worktree_identity=")
+    }
+
+    #[derive(Debug)]
+    struct Registry {
+        dir: Dir,
+        lock: File,
+        name: CString,
+        common: Vec<Identity>,
+        worktree: Vec<Identity>,
+        common_path: PathBuf,
+        worktree_path: PathBuf,
+        local_lock: Mutex<()>,
+        production: bool,
+    }
+
+    struct RegistryGuard<'a> {
+        file: &'a File,
+        _local: MutexGuard<'a, ()>,
+    }
+    impl Drop for RegistryGuard<'_> {
+        fn drop(&mut self) {
+            // SAFETY: the file remains open throughout the guard's lifetime.
+            unsafe { sys::flock(self.file.as_raw_fd(), sys::LOCK_UN) };
+        }
+    }
+
+    impl Registry {
+        fn guard(&self) -> Result<RegistryGuard<'_>, String> {
+            let local = self
+                .local_lock
+                .lock()
+                .map_err(|_| "registry lock poisoned")?;
+            // SAFETY: the descriptor refers to the stable coordination lock.
+            check(unsafe { sys::flock(self.lock.as_raw_fd(), sys::LOCK_EX) })
+                .map_err(|e| format!("registry lock: {e}"))?;
+            let guard = RegistryGuard {
+                file: &self.lock,
+                _local: local,
+            };
+            if self.production {
+                let anchor = production_registry()?;
+                if (anchor.meta.dev, anchor.meta.ino) != (self.dir.meta.dev, self.dir.meta.ino) {
+                    return Err("custody registry anchor was replaced".into());
+                }
+            }
+            let current = self
+                .dir
+                .open_child(REGISTRY_LOCK)
+                .map_err(|e| e.to_string())?;
+            let held = meta_of(self.lock.as_raw_fd()).map_err(|e| e.to_string())?;
+            if current.kind != Kind::File || current.meta != held {
+                return Err("registry lock was replaced".into());
+            }
+            Ok(guard)
+        }
+
+        fn begin(
+            dir: Dir,
+            common: &Path,
+            worktree: &Path,
+            record: &Record,
+            production: bool,
+        ) -> Result<Self, String> {
+            let attempt = &record.attempt_id;
+            if attempt.is_empty()
+                || !attempt
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            {
+                return Err("invalid custody attempt".into());
+            }
+            let node = dir
+                .open_child(REGISTRY_LOCK)
+                .map_err(|e| format!("registry lock: {e}"))?;
+            if node.kind != Kind::File || node.meta.nlink != 1 {
+                return Err("invalid registry lock".into());
+            }
+            let lock = File::from(node.fd.ok_or("registry lock unavailable")?);
+            let name = CString::new(format!("r-{attempt}")).map_err(|e| e.to_string())?;
+            let registry = Self {
+                dir,
+                lock,
+                name,
+                common: chain(common)?,
+                worktree: chain(worktree)?,
+                common_path: common.to_path_buf(),
+                worktree_path: worktree.to_path_buf(),
+                local_lock: Mutex::new(()),
+                production,
+            };
+            if overlap(&registry.common, &registry.worktree) {
+                return Err("the worktree and the Git common directory overlap".into());
+            }
+            {
+                let _guard = registry.guard()?;
+                if chain(common)? != registry.common || chain(worktree)? != registry.worktree {
+                    return Err("custody root or ancestor changed during reservation".into());
+                }
+                for name in registry.dir.names().map_err(|e| e.to_string())? {
+                    if name == REGISTRY_LOCK || name == c"host-pid" || name == c"host-mnt" {
+                        continue;
+                    }
+                    if !name.to_bytes().starts_with(b"r-") {
+                        return Err("unknown custody registry entry".into());
+                    }
+                    let node = registry.dir.open_child(&name).map_err(|e| e.to_string())?;
+                    if node.kind != Kind::File || node.meta.nlink != 1 {
+                        return Err("invalid custody registry record".into());
+                    }
+                    let file = File::from(node.fd.ok_or("invalid custody registry record")?);
+                    let metadata = file.metadata().map_err(|e| e.to_string())?;
+                    if metadata.len() > 65536 {
+                        return Err("oversized custody registry record".into());
+                    }
+                    let mut bytes = vec![0; metadata.len() as usize];
+                    file.read_exact_at(&mut bytes, 0)
+                        .map_err(|e| e.to_string())?;
+                    let text = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
+                    let mut lines = text.lines();
+                    if lines.next() != Some(REGISTRY_FORMAT) {
+                        return Err("malformed custody registry record".into());
+                    }
+                    let a = parse_chain(lines.next().ok_or("missing common chain")?)?;
+                    let b = parse_chain(lines.next().ok_or("missing worktree chain")?)?;
+                    let common_path = lines.next().ok_or("missing registry common path")?;
+                    let worktree_path = lines.next().ok_or("missing registry worktree path")?;
+                    let phase = lines.next().ok_or("missing registry phase")?;
+                    let detail = lines.next().ok_or("missing registry detail")?;
+                    let end = lines.next().ok_or("missing registry terminator")?;
+                    if !valid_path(common_path, &a)
+                        || !valid_path(worktree_path, &b)
+                        || !valid_detail(detail, phase, &name)
+                        || !matches!(phase, "reserved" | "custody" | "releasing" | "incomplete")
+                        || end != "end"
+                        || !text.ends_with("end\n")
+                        || lines.next().is_some()
+                    {
+                        return Err("malformed custody registry record".into());
+                    }
+                    let retained_paths = [common_path, worktree_path].map(|text| {
+                        PathBuf::from(OsString::from_vec(
+                            decode_hex(text).expect("validated path"),
+                        ))
+                    });
+                    let path_overlap =
+                        [&registry.common_path, &registry.worktree_path]
+                            .iter()
+                            .any(|ours| {
+                                retained_paths
+                                    .iter()
+                                    .any(|other| ours.starts_with(other) || other.starts_with(ours))
+                            });
+                    if path_overlap
+                        || [&registry.common, &registry.worktree]
+                            .iter()
+                            .any(|ours| overlap(ours, &a) || overlap(ours, &b))
+                    {
+                        if registry.common[0] == a[0] {
+                            let common_dir =
+                                Dir::open_absolute(common).map_err(|e| e.to_string())?;
+                            return Err(Reservation::diagnose(&common_dir));
+                        }
+                        return Err(format!(
+                            "custody resources overlap retained attempt {}, phase {}",
+                            String::from_utf8_lossy(&name.to_bytes()[2..]),
+                            phase
+                        ));
+                    }
+                }
+                if chain_text(&registry.common).len()
+                    + chain_text(&registry.worktree).len()
+                    + 2 * (common.as_os_str().as_bytes().len()
+                        + worktree.as_os_str().as_bytes().len()
+                        + record.render().len()
+                        + 256)
+                    > 65536
+                {
+                    return Err("custody registry record would exceed its supported size".into());
+                }
+                let fd = openat_raw(
+                    registry.dir.fd.as_raw_fd(),
+                    &registry.name,
+                    sys::O_RDWR | sys::O_CREAT | sys::O_EXCL | sys::O_NOFOLLOW | sys::O_CLOEXEC,
+                    0o600,
+                )
+                .map_err(|e| format!("create registry reservation: {e}"))?;
+                let mut file = File::from(fd);
+                write!(
+                    file,
+                    "{REGISTRY_FORMAT}\n{}\n{}\n{}\n{}\nreserved\n{}\nend\n",
+                    chain_text(&registry.common),
+                    chain_text(&registry.worktree),
+                    hex(common.as_os_str().as_bytes()),
+                    hex(worktree.as_os_str().as_bytes()),
+                    hex(record.render().as_bytes())
+                )
+                .and_then(|()| file.sync_all())
+                .map_err(|e| format!("persist registry reservation: {e}"))?;
+                registry
+                    .dir
+                    .fd
+                    .try_clone()
+                    .map(File::from)
+                    .and_then(|f| f.sync_all())
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(registry)
+        }
+
+        fn update(
+            &self,
+            marker_dir: &Dir,
+            marker_file: &File,
+            previous: &Record,
+            record: &Record,
+        ) -> io::Result<()> {
+            let _guard = self.guard().map_err(io::Error::other)?;
+            self.verify_held(marker_dir, marker_file, previous)
+                .map_err(io::Error::other)?;
+            let fd = openat_raw(
+                self.dir.fd.as_raw_fd(),
+                &self.name,
+                sys::O_RDWR | sys::O_NOFOLLOW | sys::O_CLOEXEC,
+                0,
+            )?;
+            let meta = meta_of(fd.as_raw_fd())?;
+            if meta.kind != Kind::File || meta.nlink != 1 {
+                return Err(io::Error::other("invalid owned registry record"));
+            }
+            let file = File::from(fd);
+            let text = format!(
+                "{REGISTRY_FORMAT}\n{}\n{}\n{}\n{}\n{}\n{}\nend\n",
+                chain_text(&self.common),
+                chain_text(&self.worktree),
+                hex(self.common_path.as_os_str().as_bytes()),
+                hex(self.worktree_path.as_os_str().as_bytes()),
+                record.phase.as_str(),
+                hex(record.render().as_bytes())
+            );
+            file.set_len(0)?;
+            file.write_all_at(text.as_bytes(), 0)?;
+            file.sync_all()
+        }
+
+        fn verify_held(
+            &self,
+            marker_dir: &Dir,
+            marker_file: &File,
+            record: &Record,
+        ) -> Result<(), String> {
+            let registry_node = self.dir.open_child(&self.name).map_err(|e| e.to_string())?;
+            if registry_node.kind != Kind::File || registry_node.meta.nlink != 1 {
+                return Err("invalid owned registry record".into());
+            }
+            let registry_file = File::from(registry_node.fd.ok_or("missing registry record")?);
+            let expected = format!(
+                "{REGISTRY_FORMAT}\n{}\n{}\n{}\n{}\n{}\n{}\nend\n",
+                chain_text(&self.common),
+                chain_text(&self.worktree),
+                hex(self.common_path.as_os_str().as_bytes()),
+                hex(self.worktree_path.as_os_str().as_bytes()),
+                record.phase.as_str(),
+                hex(record.render().as_bytes())
+            );
+            let mut bytes = vec![0; expected.len()];
+            if registry_file.metadata().map_err(|e| e.to_string())?.len() != bytes.len() as u64
+                || registry_file.read_exact_at(&mut bytes, 0).is_err()
+                || bytes != expected.as_bytes()
+            {
+                return Err("owned registry record changed; retaining quarantine".into());
+            }
+            let marker = marker_dir.open_child(MARKER).map_err(|e| e.to_string())?;
+            let held = meta_of(marker_file.as_raw_fd()).map_err(|e| e.to_string())?;
+            if marker.kind != Kind::File
+                || marker.meta != held
+                || read_marker(marker_file) != record.render()
+            {
+                return Err("custody marker changed; retaining quarantine".into());
+            }
+            Ok(())
+        }
+
+        fn revalidate(
+            &self,
+            marker_dir: &Dir,
+            marker_file: &File,
+            record: &Record,
+        ) -> Result<(), String> {
+            let _guard = self.guard()?;
+            if chain(&self.common_path)? != self.common
+                || chain(&self.worktree_path)? != self.worktree
+            {
+                return Err("custody root or ancestor was replaced".into());
+            }
+            self.verify_held(marker_dir, marker_file, record)
+        }
+
+        fn remove(
+            &self,
+            marker_dir: &Dir,
+            marker_file: &File,
+            record: &Record,
+        ) -> Result<(), String> {
+            let _guard = self.guard()?;
+            #[cfg(target_os = "linux")]
+            if self.production {
+                refuse_alias_mounts(&[&self.common_path, &self.worktree_path])?;
+            }
+            self.verify_held(marker_dir, marker_file, record)?;
+            marker_dir.unlink(MARKER).map_err(|e| e.to_string())?;
+            marker_dir
+                .fd
+                .try_clone()
+                .map(File::from)
+                .and_then(|f| f.sync_all())
+                .map_err(|e| e.to_string())?;
+            self.dir.unlink(&self.name).map_err(|e| e.to_string())?;
+            self.dir
+                .fd
+                .try_clone()
+                .map(File::from)
+                .and_then(|f| f.sync_all())
+                .map_err(|e| e.to_string())
+        }
+    }
+
     /// Exclusive, attributable reservation of one Git common directory.
     #[derive(Debug)]
     pub(crate) struct Reservation {
         dir: Dir,
         file: File,
         record: Mutex<Record>,
+        registry: Registry,
+        uncertain: AtomicBool,
     }
 
     fn write_record(file: &File, record: &Record) -> io::Result<()> {
@@ -812,31 +1393,67 @@ mod imp {
             attempt_id: &str,
             worktree: &Path,
         ) -> Result<Self, String> {
+            let registry_dir = production_registry()?;
+            #[cfg(target_os = "linux")]
+            refuse_alias_mounts(&[common, worktree])?;
+            let anchor_chain = chain(Path::new("/var/lib/receipts/protected-custody"))?;
+            if overlap(&chain(common)?, &anchor_chain) || overlap(&chain(worktree)?, &anchor_chain)
+            {
+                return Err("custody roots overlap the host registry".into());
+            }
+            Self::begin_at(registry_dir, common, attempt_id, worktree, true)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn begin_for_test(
+            registry: &Path,
+            common: &Path,
+            attempt_id: &str,
+            worktree: &Path,
+        ) -> Result<Self, String> {
+            let dir = Dir::open_absolute(registry).map_err(|e| e.to_string())?;
+            Self::begin_at(dir, common, attempt_id, worktree, false)
+        }
+
+        fn begin_at(
+            registry_dir: Dir,
+            common: &Path,
+            attempt_id: &str,
+            worktree: &Path,
+            production: bool,
+        ) -> Result<Self, String> {
+            let record = Record {
+                attempt_id: attempt_id.to_owned(),
+                worktree: worktree.to_path_buf(),
+                phase: Phase::Reserved,
+                worker_uid: None,
+                original: None,
+                ids: None,
+            };
+            if record.render().len() + 256 > MARKER_READ_LIMIT {
+                return Err("custody marker would exceed its supported size".into());
+            }
+            let registry = Registry::begin(registry_dir, common, worktree, &record, production)?;
             let dir = Dir::open_absolute(common)
                 .map_err(|error| format!("common directory {}: {error}", common.display()))?;
             let flags = sys::O_RDWR | sys::O_CREAT | sys::O_EXCL | sys::O_NOFOLLOW | sys::O_CLOEXEC;
             match openat_raw(dir.fd.as_raw_fd(), MARKER, flags, 0o600) {
                 Ok(fd) => {
                     let file = File::from(fd);
-                    let record = Record {
-                        attempt_id: attempt_id.to_owned(),
-                        worktree: worktree.to_path_buf(),
-                        phase: Phase::Reserved,
-                        worker_uid: None,
-                        original: None,
-                        ids: None,
-                    };
                     let started = lock_exclusive(&file)
                         .and_then(|()| write_record(&file, &record))
                         .map_err(|error| error.to_string());
                     if let Err(error) = started {
-                        let _ = dir.unlink(MARKER);
-                        return Err(format!("custody reservation could not be started: {error}"));
+                        return Err(format!(
+                            "custody reservation could not be started; registry retained: {error}"
+                        ));
                     }
                     Ok(Self {
                         dir,
                         file,
                         record: Mutex::new(record),
+                        registry,
+                        uncertain: AtomicBool::new(false),
                     })
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -878,7 +1495,21 @@ mod imp {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut next = record.clone();
             change(&mut next);
-            write_record(&self.file, &next)?;
+            if next.phase == Phase::Custody
+                && (next.worker_uid.is_none() || next.original.is_none() || next.ids.is_none())
+            {
+                return Err(io::Error::other(
+                    "custody identity and original owner are required",
+                ));
+            }
+            if let Err(error) = self
+                .registry
+                .update(&self.dir, &self.file, &record, &next)
+                .and_then(|()| write_record(&self.file, &next))
+            {
+                self.uncertain.store(true, Ordering::SeqCst);
+                return Err(error);
+            }
             *record = next;
             Ok(())
         }
@@ -890,6 +1521,11 @@ mod imp {
             original: OriginalOwner,
             ids: RootIds,
         ) -> io::Result<()> {
+            if ids.common != self.registry.common[0] || ids.worktree != self.registry.worktree[0] {
+                return Err(io::Error::other(
+                    "custody roots differ from registry reservation",
+                ));
+            }
             self.update(|record| {
                 record.worker_uid = Some(worker_uid);
                 record.original = Some(original);
@@ -906,6 +1542,19 @@ mod imp {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .ids
+        }
+
+        pub(crate) fn revalidate(&self) -> Result<(), String> {
+            let record = self
+                .record
+                .lock()
+                .map_err(|_| "custody record lock poisoned")?;
+            self.registry.revalidate(&self.dir, &self.file, &record)?;
+            #[cfg(target_os = "linux")]
+            if self.registry.production {
+                refuse_alias_mounts(&[&self.registry.common_path, &self.registry.worktree_path])?;
+            }
+            Ok(())
         }
 
         /// The persisted evidence must still name this attempt and this
@@ -935,9 +1584,14 @@ mod imp {
         /// Deletes the marker. Only for a refused setup that mutated nothing,
         /// or a verified complete release.
         pub(crate) fn finish(&self) -> Result<(), String> {
-            self.dir
-                .unlink(MARKER)
-                .map_err(|error| format!("custody reservation could not be removed: {error}"))
+            if self.uncertain.load(Ordering::SeqCst) {
+                return Err("uncertain custody record remains quarantined".into());
+            }
+            let record = self
+                .record
+                .lock()
+                .map_err(|_| "custody record lock poisoned")?;
+            self.registry.remove(&self.dir, &self.file, &record)
         }
     }
 }
@@ -998,6 +1652,9 @@ mod stub {
             Err(std::io::Error::other(REFUSAL))
         }
         pub(crate) fn verify_original(&self, _: OriginalOwner) -> Result<(), String> {
+            Err(REFUSAL.into())
+        }
+        pub(crate) fn revalidate(&self) -> Result<(), String> {
             Err(REFUSAL.into())
         }
         pub(crate) fn finish(&self) -> Result<(), String> {

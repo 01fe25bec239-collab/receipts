@@ -443,7 +443,7 @@ fn reject_configured_filters(root: &Path) -> Result<(), E> {
             "--null",
             "--name-only",
             "--get-regexp",
-            "^filter\\.",
+            git::UNTRUSTED_CONFIG_PATTERN,
         ],
     ) {
         Err(E::GitCommandFailed {

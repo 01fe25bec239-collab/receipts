@@ -1466,3 +1466,56 @@ fn filter_marker_distinguishes_worker_preparation_from_controller_execution() {
     let tree = stdout_trimmed(&git(worktree, &["ls-tree", "-r", "HEAD"]));
     assert!(tree.contains("ok.txt") && !tree.contains("evil"), "{tree}");
 }
+
+#[test]
+fn controller_refuses_effective_target_configuration_for_every_content_operation() {
+    let launcher = ProtectedLauncher::unenforced_for_test(config());
+    let repo = TestRepo::new("controller-target-config");
+    repo.commit_file("f", "original\n");
+    let handle = provisioned(&repo, Some("target-config"));
+    let admission = launcher.admit(&handle, repo.path()).unwrap();
+    let protected = launcher
+        .launch(admission, &request(handle.worktree_path()), &policy())
+        .unwrap();
+    protected.attempt().wait_collect().unwrap();
+    // This test seam models a preexisting target-only configuration. Production
+    // metadata remains in custody through each confined child completion.
+    git(
+        repo.path(),
+        &["config", "extensions.worktreeConfig", "true"],
+    );
+    git(
+        handle.worktree_path(),
+        &[
+            "config",
+            "--worktree",
+            "filter.x.clean",
+            "/nonexistent/filter",
+        ],
+    );
+    for (sequence, operation) in [
+        ControllerOperation::Status,
+        ControllerOperation::Stage {
+            paths: vec!["f".into()],
+        },
+        ControllerOperation::Commit {
+            message: "refused".into(),
+        },
+        ControllerOperation::Checkpoint {
+            checkpoint_id: "refused".into(),
+            kind: crate::WorkspaceCheckpointKind::Progress,
+            captured_at: crate::WorkspaceDateTimeV1::try_new("2026-11-03T00:00:00Z").unwrap(),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(matches!(
+            send(protected.worker_channel(), sequence as u64, operation),
+            Err(ProtectedLaunchError::Workspace(
+                WorkspaceError::RepositoryConfigRefused { .. }
+            ))
+        ));
+    }
+    protected.release_custody().unwrap();
+}

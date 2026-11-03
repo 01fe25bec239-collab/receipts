@@ -12,8 +12,8 @@ exists only through an admitted protected launch.
   `core.untrackedCache=false`, `commit.gpgSign=false`, `tag.gpgSign=false`,
   `protocol.allow=never`, `core.splitIndex=false`.
 - Repositories declaring `filter.*`, `include.*` or `includeIf.*` are refused
-  before provisioning, teardown status, WorktreeCreate attach and protected
-  admission. All includes are refused, including ones inside custody.
+  for each actual Git target before provisioning status, teardown status,
+  WorktreeCreate attach and protected admission/controller operations. All includes are refused, including ones inside custody.
 - Every call runs through the existing bounded runner: dedicated process
   group, 120 s deadline, SIGTERM → 2 s grace → SIGKILL, verified reap, 1 MiB
   per-stream bounded capture. Timeout and oversize output are typed errors and
@@ -99,29 +99,26 @@ and `protected_hardlinks`/`protected_symlinks`. All other platforms refuse.
   controller-owned and not worker-writable (sticky allowed); worktree root
   controller:worker `01770`; `.git` pointer controller-owned; payload → fresh
   worker UID (monotonic, never reused by a launcher).
-- One custody owner per resource (`protected_custody`): before reading
-  ownership or changing anything, admission reserves the **actual Git common
-  directory** by creating `receipts-custody.state` there with
-  `O_CREAT|O_EXCL|O_NOFOLLOW` and holding `flock(LOCK_EX|LOCK_NB)`. A second
-  admission of the same worktree, of another linked worktree (they share the
-  common directory), through an alias path, from another launcher object or
-  from another process refuses with a typed `Custody` error before any ownership
-  or mode change and without consuming a worker identity. The record names the
-  attempt, phase (`reserved` → `custody` → `releasing` | `incomplete`), worker
-  UID, the true original owner (written once before any change) and the root
-  directory identities. Process exit releases only the lock: a leftover record
-  from a crash or incomplete setup/release is unknown prior custody and refuses
-  (`no live owner: retained state`); there is no automatic recovery, force
-  unlock or W3 recovery here. Only a refused setup that changed nothing, a
-  verified complete release, or an admission dropped/misdirected before any
-  worker existed (it gives custody straight back) deletes the record. A
-  repository whose owner already looks like the controller UID, a worker UID or
-  the worker GID is refused as prior custody. Limits: ONE protected attempt per
-  repository at a time (the serialization limit of this bounded
-  implementation); coordination among admitted trusted controllers on a local
-  filesystem, not protection against root/controller compromise; two
-  repositories whose worktrees are nested inside each other are not detected
-  beyond the existing ancestor-ownership check.
+- One host custody domain: `/var/lib/receipts/protected-custody`, root-owned
+  0700 beneath root-owned non-writable ancestors. Trusted host administration
+  must preinstall its mode-0600 single-link `lock` and nsfs bind mounts
+  `host-pid` and `host-mnt` pinned from the actual host initial namespaces.
+  A container's own PID 1 is insufficient provenance. The launcher does not
+  provision or infer these anchors: absent, unsafe or mismatched setup refuses.
+  Root/administrator replacement of this admission setup is outside the boundary.
+  Every privileged parent must share these anchors and filesystem view.
+- Before custody mutation or worker identity allocation, a brief shared flock
+  critical section reserves both actual common directory and worktree. All four
+  resource pairings compare their complete directory object ancestor chains.
+  Retained overlapping reservations refuse; unrelated repositories execute
+  concurrently after the registry lock is released. Unknown records refuse.
+  Linux topology checks admit only ext4/xfs/btrfs/tmpfs and refuse nested mounts, bind-root aliases
+  and devices with multiple mount views. Namespace mismatches refuse.
+- The shared registry persists paths, object chains, phase, attempt and original
+  ownership before transfer; the same-common `receipts-custody.state` marker
+  remains an additional persistent guard. Crash/partial state stays reserved.
+  Release removes only owned state after gate drain, proven cleanup and successful
+  restoration. There is no orphan recovery or force unlock.
 - Stable objects (`protected_custody`): both trees are walked and mutated only
   through directory descriptors (`openat(O_NOFOLLOW)`, `fchown`/`fchmod` on the
   object just opened, root identities recorded at admission and re-checked at
@@ -201,10 +198,14 @@ keep-caps.
 boundary: exact custody owners/modes/ancestors after admission; worker and
 controller real/effective/saved/fs IDs, groups, all five capability sets,
 no-new-privs and seccomp mode, observed by the probes through system calls
-(`getresuid`/`getresgid`/`setfsuid(-1)`/`getgroups`/`capget`/`prctl`/`fcntl`/
-`getrlimit`) because the controller's Landlock plan grants no `/proc` access and
-production access is not widened; only stdio open (every other descriptor
-number up to the limit answers `EBADF`);
+(`getresuid`/`getresgid`/`setfsuid(-1)`/`getgroups`/`capget`/`prctl`) because the controller's Landlock plan grants no `/proc` access and
+production access is not widened; only stdio open, observed by the privileged parent through the complete
+`/proc/<pid>/fd` directory while every child task is group-stopped. The parent
+binds the sole process in its exact attempt cgroup with a pidfd, checks lifetime
+and stopped state around observation, then resumes that same process. Missing
+observations fail. Controls retain FD 65536 and FD 128 above lowered soft/hard
+limits. Capability queries use the admitted kernel capability range; unexpected
+query errors preserve errno and cannot terminate a scan as an empty set;
 `unshare`/`setns`/`open_by_handle_at`/`pidfd_getfd`/`process_vm_readv` return
 `EPERM` where the unfiltered result would differ; root, sibling and own cgroup
 `cgroup.procs` cannot be opened for writing; metadata write, replace, rename and

@@ -98,7 +98,7 @@ mod imp {
 
     #[derive(Debug)]
     pub(crate) struct LinuxSupport {
-        cap_last_cap: u32,
+        pub(crate) cap_last_cap: u32,
         cgroup_root: PathBuf,
     }
 
@@ -217,6 +217,7 @@ mod imp {
             config.worker_gid,
         );
         let refused = EstablishError::Refused;
+        binding.reservation.revalidate().map_err(refused)?;
         let ids = binding
             .reservation
             .ids()
@@ -253,6 +254,7 @@ mod imp {
             return Err("a process still runs as the worker identity".into());
         }
         let original = binding.original;
+        binding.reservation.revalidate()?;
         let ids = binding
             .reservation
             .ids()

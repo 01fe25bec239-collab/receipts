@@ -15,6 +15,7 @@ cleanup_polls=50
 tests=(
   "protected_linux_tests::hosted_protected_worker_controller_and_cleanup"
   "protected_linux_tests::hosted_exclusive_custody_and_linked_target_refusals"
+  "protected_linux_tests::hosted_cross_repository_nested_custody_refuses_without_transfer"
 )
 
 prepare() {
@@ -180,6 +181,14 @@ finish() {
 hosted() {
   test "$(id -u)" = 0
   test "$(uname -m)" = x86_64
+  # Host administration must pin the actual initial namespaces here before
+  # this diagnostic; private PID 1 is never used to self-certify host origin.
+  local domain=/var/lib/receipts/protected-custody
+  if [ ! -d "$domain" ] || [ ! -f "$domain/lock" ] ||
+    ! mountpoint -q "$domain/host-pid" || ! mountpoint -q "$domain/host-mnt"; then
+    echo "FAIL host custody anchor unavailable" >"$out/result.txt"
+    exit 1
+  fi
   local binary
   binary="$(cat "$bin_record")"
   # Refuse occupied fixture identities instead of reusing them.

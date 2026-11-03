@@ -233,6 +233,10 @@ impl WorkspaceTeardownRequest {
         // Filters can run programs during status; refuse them (and includes)
         // before any content-comparing Git operation.
         git::refuse_untrusted_repository_config(root, "inspect repository configuration")?;
+        git::refuse_untrusted_repository_config(
+            &canonical_worktree,
+            "inspect target configuration",
+        )?;
 
         // Step 7: immediately before removal the worktree must be clean
         // per Git porcelain status, inspected from its canonical path. Any

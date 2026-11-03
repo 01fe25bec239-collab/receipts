@@ -475,6 +475,8 @@ pub(crate) fn capture(
     })
 }
 
+pub(crate) const UNTRUSTED_CONFIG_PATTERN: &str = "^(filter|include|includeif)\\.";
+
 /// Refuses repositories whose effective configuration declares content
 /// filters or configuration includes.
 ///
@@ -495,7 +497,7 @@ pub(crate) fn refuse_untrusted_repository_config(
             OsStr::new("--null"),
             OsStr::new("--name-only"),
             OsStr::new("--get-regexp"),
-            OsStr::new("^(filter|include|includeif)\\."),
+            OsStr::new(UNTRUSTED_CONFIG_PATTERN),
         ],
     )?;
     if listing.success {

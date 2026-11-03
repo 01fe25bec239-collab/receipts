@@ -274,6 +274,7 @@ impl WorktreeCreateRequest {
                 detail: format!("{:?}: {error}", target.display()),
             }
         })?;
+        git::refuse_untrusted_repository_config(&path, "inspect target configuration")?;
         let head = git::capture(
             &path,
             "read worktree HEAD",

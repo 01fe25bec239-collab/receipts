@@ -393,6 +393,17 @@ impl ProtectedLauncher {
         Self::with(config, Enforcement::Unenforced)
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn cap_last_cap_for_test(&self) -> u32 {
+        match &self.inner.enforcement {
+            #[cfg(target_arch = "x86_64")]
+            Enforcement::Linux(support) => support.cap_last_cap,
+            #[cfg(not(target_arch = "x86_64"))]
+            Enforcement::Linux(_) => panic!("requires an admitted Linux architecture"),
+            Enforcement::Unenforced => panic!("requires admitted Linux support"),
+        }
+    }
+
     /// Establishes custody and allocates a fresh attempt identity for one
     /// `PROVISIONED`/`CHECKPOINTED`/`RECOVERED` handle of `repository_root`.
     pub fn admit(
@@ -419,6 +430,7 @@ impl ProtectedLauncher {
         let worktree = std::fs::canonicalize(handle.worktree_path())
             .map_err(|error| ProtectedLaunchError::Custody(format!("worktree: {error}")))?;
         git::refuse_untrusted_repository_config(&repository, "inspect repository configuration")?;
+        git::refuse_untrusted_repository_config(&worktree, "inspect target configuration")?;
         let common_dir = git_path(&worktree, "--git-common-dir")?;
         let repository_common = git_path(&repository, "--git-common-dir")?;
         if common_dir != repository_common {
@@ -462,8 +474,33 @@ impl ProtectedLauncher {
         // One protected custody owner per actual Git common directory: reserve
         // it before reading ownership or changing anything. A loser mutates
         // nothing; a refused setup below deletes only its own reservation.
-        let reservation = custody::Reservation::begin(&common_dir, &attempt_id, &worktree)
-            .map_err(ProtectedLaunchError::Custody)?;
+        #[cfg(test)]
+        let reserve = match self.inner.enforcement {
+            Enforcement::Unenforced => {
+                thread_local! {
+                    static REGISTRY: crate::test_support::TempDir = {
+                        let dir = crate::test_support::TempDir::new("custody-registry");
+                        std::fs::write(dir.path().join("lock"), "").unwrap();
+                        dir
+                    };
+                }
+                REGISTRY.with(|dir| {
+                    custody::Reservation::begin_for_test(
+                        dir.path(),
+                        &common_dir,
+                        &attempt_id,
+                        &worktree,
+                    )
+                })
+            }
+            #[cfg(target_os = "linux")]
+            Enforcement::Linux(_) => {
+                custody::Reservation::begin(&common_dir, &attempt_id, &worktree)
+            }
+        };
+        #[cfg(not(test))]
+        let reserve = custody::Reservation::begin(&common_dir, &attempt_id, &worktree);
+        let reservation = reserve.map_err(ProtectedLaunchError::Custody)?;
         let cancel = |error: ProtectedLaunchError| {
             let _ = reservation.finish();
             error
@@ -1124,6 +1161,14 @@ impl ControllerChannel {
         use std::ffi::OsStr;
         let binding = &self.binding;
         let worktree = binding.worktree.as_path();
+        // Custody keeps the actual target's metadata protected through every
+        // child completion; root configuration alone does not cover config.worktree.
+        if !matches!(operation, ControllerOperation::Identity) {
+            git::refuse_untrusted_repository_config(
+                worktree,
+                "inspect controller target configuration",
+            )?;
+        }
         match operation {
             ControllerOperation::Identity => Ok(ControllerResponse::Identity {
                 attempt_id: binding.attempt_id.clone(),

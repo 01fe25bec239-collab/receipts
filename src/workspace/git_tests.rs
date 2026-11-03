@@ -168,3 +168,111 @@ fn version_floor_is_parsed_strictly() {
     assert_eq!(at_least("hub version 9", 2, 36), None);
     assert_eq!(at_least("git version x.y", 2, 36), None);
 }
+
+#[test]
+fn actual_target_worktree_configuration_refuses_before_content_operations() {
+    use crate::{WorkspaceTeardownRequest, WorktreeCreateRequest, WorktreeCreateTask};
+    let repo = TestRepo::new("target-config");
+    repo.commit_file("f", "original\n");
+    let base = repo.head_sha();
+    let target = repo.root.path().join("target");
+    let create = WorktreeCreateRequest::new(
+        repo.path(),
+        &target,
+        "task/target",
+        &base,
+        Some(WorktreeCreateTask {
+            workspace_id: "ws-target".into(),
+            task_id: "task-target".into(),
+        }),
+    )
+    .unwrap();
+    let first = create.create().unwrap();
+    let handle = first.handle().unwrap();
+    git(
+        repo.path(),
+        &["config", "extensions.worktreeConfig", "true"],
+    );
+    let marker = repo.root.path().join("FILTER_RAN");
+    let command = format!("{} {}", touch().display(), marker.display());
+    git(
+        &target,
+        &["config", "--worktree", "filter.x.clean", &command],
+    );
+    std::fs::write(target.join(".gitattributes"), "f filter=x\n").unwrap();
+    std::fs::write(target.join("f"), "modified\n").unwrap();
+    crate::git::refuse_untrusted_repository_config(repo.path(), "root control").unwrap();
+    assert!(matches!(
+        crate::git::refuse_untrusted_repository_config(&target, "target control"),
+        Err(WorkspaceError::RepositoryConfigRefused { .. })
+    ));
+    assert!(!marker.exists());
+    // A real unsafe status executes the configured filter; reset only this
+    // attributed positive control before exercising the product refusals.
+    git(&target, &["status", "--porcelain"]);
+    assert!(marker.exists());
+    std::fs::remove_file(&marker).unwrap();
+    assert!(matches!(
+        create.create(),
+        Err(WorkspaceError::RepositoryConfigRefused { .. })
+    ));
+    assert!(!marker.exists(), "attach executed the target filter");
+    assert!(matches!(
+        WorkspaceTeardownRequest::new(repo.path()).teardown(handle),
+        Err(WorkspaceError::RepositoryConfigRefused { .. })
+    ));
+    assert!(!marker.exists(), "teardown executed the target filter");
+    assert!(target.exists());
+    let launcher = crate::ProtectedLauncher::unenforced_for_test(
+        crate::ProtectedLaunchConfig::new(
+            61001,
+            61001,
+            61002,
+            62000..=62009,
+            "/sys/fs/cgroup/receipts",
+        )
+        .unwrap(),
+    );
+    assert!(matches!(
+        launcher.admit(handle, repo.path()),
+        Err(crate::ProtectedLaunchError::Workspace(
+            WorkspaceError::RepositoryConfigRefused { .. }
+        ))
+    ));
+    assert!(!marker.exists(), "admission executed the target filter");
+    assert!(matches!(
+        crate::checkpoint_evidence_capture::observe_state(&target),
+        Err(crate::WorkspaceCheckpointEvidenceCaptureError::UnsupportedConfiguredFilters)
+    ));
+    assert!(!marker.exists(), "checkpoint executed the target filter");
+    git(
+        &target,
+        &["config", "--worktree", "--unset", "filter.x.clean"],
+    );
+    git(
+        &target,
+        &[
+            "config",
+            "--worktree",
+            "include.path",
+            "/nonexistent/unsafe-config",
+        ],
+    );
+    assert!(crate::checkpoint_evidence_capture::observe_state(&target).is_err());
+    assert!(!marker.exists());
+    let config_path = crate::test_support::stdout_trimmed(&git(
+        &target,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "config.worktree",
+        ],
+    ));
+    std::fs::write(config_path, "[invalid\n").unwrap();
+    assert!(matches!(
+        crate::git::refuse_untrusted_repository_config(&target, "malformed target"),
+        Err(WorkspaceError::GitCommandFailed { .. })
+    ));
+    assert!(!marker.exists());
+}

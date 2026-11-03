@@ -269,6 +269,7 @@ impl WorkspaceProvisionRequest {
             });
         }
 
+        git::refuse_untrusted_repository_config(&created_worktree, "inspect target configuration")?;
         let status = git::capture(
             &created_worktree,
             "inspect worktree status",
@@ -494,15 +495,21 @@ fn rollback(
                     }
                     (1, false) => {
                         // Non-force: Git refuses to remove modified or untracked content.
-                        let removed = git::capture(
-                            root,
-                            "rollback: remove worktree",
-                            &[
-                                OsStr::new("worktree"),
-                                OsStr::new("remove"),
-                                OsStr::new(target.as_os_str()),
-                            ],
-                        );
+                        let removed = git::refuse_untrusted_repository_config(
+                            target,
+                            "rollback: inspect target configuration",
+                        )
+                        .and_then(|()| {
+                            git::capture(
+                                root,
+                                "rollback: remove worktree",
+                                &[
+                                    OsStr::new("worktree"),
+                                    OsStr::new("remove"),
+                                    OsStr::new(target.as_os_str()),
+                                ],
+                            )
+                        });
                         match removed {
                             Ok(capture) if capture.success => {}
                             Ok(capture) => problems
@@ -692,5 +699,71 @@ pub(crate) fn validate_worktree_path(path: &Path) -> Result<(), WorkspaceError> 
                 path.display()
             ),
         }),
+    }
+}
+
+#[cfg(test)]
+mod rollback_config_tests {
+    use super::*;
+    use crate::test_support::{TestRepo, git};
+
+    #[test]
+    fn rollback_retains_unsafe_target_without_executing_its_filter() {
+        let repo = TestRepo::new_nested("rollback-target-config", "repo");
+        repo.commit_file("f", "original\n");
+        let target = repo.root.path().join("target");
+        let handle = WorkspaceProvisionRequest::new(
+            repo.path(),
+            "ws-rollback",
+            None,
+            "task/rollback",
+            &target,
+            &repo.head_sha(),
+        )
+        .unwrap()
+        .provision()
+        .unwrap();
+        let target = handle.worktree_path().to_path_buf();
+        git(
+            repo.path(),
+            &["config", "extensions.worktreeConfig", "true"],
+        );
+        let marker = repo.root.path().join("FILTER_RAN");
+        let command = format!("/usr/bin/touch {}", marker.display());
+        git(
+            &target,
+            &["config", "--worktree", "filter.x.clean", &command],
+        );
+        std::fs::write(target.join(".gitattributes"), "f filter=x\n").unwrap();
+        std::fs::write(target.join("f"), "modified\n").unwrap();
+        git(&target, &["status", "--porcelain"]);
+        assert!(marker.exists(), "unsafe content query positive control");
+        std::fs::remove_file(&marker).unwrap();
+        let cause = git::refuse_untrusted_repository_config(&target, "inspect target").unwrap_err();
+        let error = rollback(
+            repo.path(),
+            &target,
+            handle.branch(),
+            handle.base_sha(),
+            Created {
+                branch: true,
+                worktree: true,
+                target_preexisted: false,
+            },
+            cause,
+        );
+        let WorkspaceError::ProvisionRollbackIncomplete { detail, .. } = &error else {
+            panic!("{error:?}")
+        };
+        assert!(
+            detail.contains("filter.x.clean"),
+            "rollback must report the target configuration refusal: {error:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "rollback executed the refused target filter"
+        );
+        assert!(target.exists());
+        assert!(crate::test_support::branch_exists(&repo, handle.branch()));
     }
 }
