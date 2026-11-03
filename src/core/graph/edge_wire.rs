@@ -32,7 +32,9 @@ const CONTROL_KINDS: [ControlKind; 6] = [
 
 impl GraphEdge {
     /// Decodes one edge from strict JSON; trailing input other than JSON
-    /// whitespace refuses. Errors never echo field values.
+    /// whitespace refuses. Constructor and enum refusals do not echo the
+    /// value, but serde's own errors may include malformed scalar values or
+    /// unknown field names; every such input is still refused.
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json)
     }

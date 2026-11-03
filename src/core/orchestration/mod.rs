@@ -16,7 +16,7 @@ pub use feature_capability_set::{
 };
 pub use json_value::{
     OrchestrationJsonNumberError, OrchestrationJsonNumberV1, OrchestrationJsonObjectV1,
-    OrchestrationJsonValueV1,
+    OrchestrationJsonParseError, OrchestrationJsonValueV1,
 };
 pub use remote_policy::{ProjectRemotePolicy, WorkspaceCompositionLevel};
 

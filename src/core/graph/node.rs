@@ -313,6 +313,13 @@ impl GraphNode {
         self
     }
 
+    /// Replaces the stored state; only the apply-v1 interpreter calls this,
+    /// after its transition oracle and evidence checks.
+    pub(crate) fn with_state(mut self, state: GraphNodeState) -> Self {
+        self.state = state;
+        self
+    }
+
     /// Sets `created_in_version`.
     pub fn with_created_in_version(mut self, created_in_version: GraphVersionV1) -> Self {
         self.created_in_version = Some(created_in_version);
