@@ -458,8 +458,18 @@ fn a_smuggled_repair_cannot_be_entered() {
 /// post-acceptance round.
 #[test]
 fn repair_review_round_completes_without_circular_acceptance() {
+    repair_round_lifecycle(false);
+    repair_round_lifecycle(true);
+}
+
+fn repair_round_lifecycle(equivalent: bool) {
     let (env, results) = rejected_review();
-    let (env, results) = ok(&env, &results, a2("w"), json!([round_expansion()]));
+    let ops = if equivalent {
+        equivalent_round(round_expansion())
+    } else {
+        vec![round_expansion()]
+    };
+    let (env, results) = ok(&env, &results, a2("w"), Value::Array(ops));
     assert!(!env.graph().has_precedence_cycle());
     assert_eq!(env.graph().node("i2").unwrap().parent_node_id(), Some("i1"));
     // The same rejected review cannot be expanded a second time.
@@ -937,8 +947,11 @@ fn acceptance_needs_the_admitted_pass_review() {
         op_err(&env, &none, a1(), json!([accept("p")])).1,
         O::Review(R::MissingRecord)
     );
-    // A review node's own verdict needs no outside review to be accepted.
-    ok(&env, &none, user(), json!([accept("rv")]));
+    // A seeded state has no admitted own verdict either.
+    assert_eq!(
+        op_err(&env, &none, user(), json!([accept("rv")])).1,
+        O::Attempt("node has no admitted attempt")
+    );
 }
 
 // --- code SHA binding ------------------------------------------------------
@@ -1329,12 +1342,36 @@ fn repaired_aggregate_is_judged_by_its_repairs_admitted_review() {
     // Round 1: s runs and independent review rejects it.
     let mut ops = run_as("s", "as1");
     ops.push(attach("s", "res-s", result("s", "as1", SHA)));
-    let (env, results) = ok(
-        &aggregate_env(S::Planned),
-        &none,
-        a2("w"),
-        Value::Array(ops),
+    let seeded = aggregate_env(S::Planned);
+    let initial = envelope(
+        seeded
+            .graph()
+            .nodes()
+            .filter(|n| !["c", "rn"].contains(&n.node_id()))
+            .cloned()
+            .collect(),
+        seeded
+            .graph()
+            .edges()
+            .filter(|e| e.edge_id() == "pr")
+            .cloned()
+            .collect(),
+        "1",
     );
+    let (env, results) = ok(
+        &initial,
+        &none,
+        a1(),
+        json!([expand(
+            "rj",
+            vec![
+                json!({"node_id":"c","graph_id":"g","kind":"REPAIR","state":"PLANNED","workstream_id":"w","parent_node_id":"s","attempt_number":2,"created_in_version":2}),
+                json!({"node_id":"rn","graph_id":"g","kind":"REVIEW","state":"PLANNED","workstream_id":"w","attempt_number":2,"created_in_version":2})
+            ],
+            vec![control_edge("oj", "rj", "c"), prec_edge("pn", "c", "rn")]
+        )]),
+    );
+    let (env, results) = ok(&env, &results, a2("w"), Value::Array(ops));
     dir.put(&Rec::new("rv-1", "s", "as1", SHA, "1").rejected());
     let (env, results) = ok_ev(
         &env,
@@ -1477,34 +1514,20 @@ fn a_repair_without_admitted_review_cannot_carry_its_aggregate() {
         json!([verdict_rv("s", "REJECTED", "s", "rv-1")]),
         rev(&dir),
     );
-    let (env, results) = ok(
-        &env,
-        &results,
-        a2("w"),
-        json!([
-            set(
-                "s",
-                "REJECTED",
-                "REPAIRING",
-                json!({"kind":"REPAIR_ENTRY","repair_node_id":"c"})
-            ),
-            set(
-                "s",
-                "REPAIRING",
-                "AWAITING_REVIEW",
-                json!({"kind":"REPAIR_SUBMITTED","repair_node_id":"c"})
-            )
-        ]),
-    );
     assert_eq!(
         op_err(
             &env,
             &results,
             a2("w"),
-            json!([verdict("s", "PASSED", "c")])
+            json!([set(
+                "s",
+                "REJECTED",
+                "REPAIRING",
+                json!({"kind":"REPAIR_ENTRY","repair_node_id":"c"})
+            )])
         )
         .1,
-        O::Review(R::MissingRecord)
+        O::Repair("missing operational creation evidence")
     );
     // An aggregate nobody has judged cannot borrow a repair's verdict either.
     let (env, results) = ok(
@@ -1534,4 +1557,186 @@ fn a_repair_without_admitted_review_cannot_carry_its_aggregate() {
         .1,
         O::EvidenceRefused("cited result is not the current round")
     );
+}
+
+/// The exact same construction through the other frozen operations.
+fn equivalent_round(expansion: Value) -> Vec<Value> {
+    let mut ops = Vec::new();
+    for node in expansion["detail"]["nodes"].as_array().unwrap() {
+        ops.push(json!({"op":"ADD_NODE","node_id":node["node_id"],"detail":{"node":node}}));
+    }
+    for edge in expansion["detail"]["edges"].as_array().unwrap() {
+        ops.push(json!({"op":"ADD_EDGE","edge_id":edge["edge_id"],"detail":{"edge":edge}}));
+    }
+    ops
+}
+
+#[test]
+fn equivalent_rounds_enforce_the_same_creation_bindings() {
+    let (env, ledger) = rejected_review();
+    for (field, value) in [
+        ("workstream_id", json!("foreign")),
+        ("created_in_version", Value::Null),
+        ("attempt_number", json!(1)),
+    ] {
+        for index in [0, 1] {
+            for equivalent in [false, true] {
+                let mut expansion = round_expansion();
+                if value.is_null() {
+                    expansion["detail"]["nodes"][index]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove(field);
+                } else {
+                    expansion["detail"]["nodes"][index][field] = value.clone();
+                }
+                let ops = if equivalent {
+                    equivalent_round(expansion)
+                } else {
+                    vec![expansion]
+                };
+                let before = (env.clone(), ledger.clone());
+                let (_, error) = op_err(&env, &ledger, a1(), Value::Array(ops));
+                assert!(
+                    matches!(error, O::Repair(_) | O::NewNode(_)),
+                    "{field} {index} {equivalent}: {error:?}"
+                );
+                assert_eq!((env.clone(), ledger.clone()), before);
+            }
+        }
+    }
+    // Creation in one call, edges in a later one: old creation versions stay valid.
+    let ops = equivalent_round(round_expansion());
+    let (env, ledger) = ok(&env, &ledger, a1(), Value::Array(ops[..2].to_vec()));
+    let (env, ledger) = ok(&env, &ledger, a1(), Value::Array(ops[2..].to_vec()));
+    let (env, _) = ok(
+        &env,
+        &ledger,
+        a1(),
+        Value::Array(run_as("i2", "fresh-attempt")),
+    );
+    assert_eq!(env.graph().node_state("i2"), Some(S::AwaitingReview));
+}
+
+#[test]
+fn self_judging_acceptance_requires_actual_own_verdict_across_calls() {
+    for kind in [GraphNodeKind::REVIEW, GraphNodeKind::DETERMINISTIC_CHECK] {
+        let accept = set(
+            "n",
+            "PASSED",
+            "ACCEPTED",
+            json!({"kind":"ACCEPTANCE","decision_id":"d"}),
+        );
+        let seeded = envelope(vec![node("n", kind.clone(), S::Passed)], vec![], "1");
+        assert_eq!(
+            op_err(
+                &seeded,
+                &GraphResultLedgerV1::new(),
+                a1(),
+                json!([accept.clone()])
+            )
+            .1,
+            O::Attempt("node has no admitted attempt")
+        );
+        for code in [false, true] {
+            let mut n = node("n", kind.clone(), S::Planned);
+            if code {
+                n = n.with_code_sha(SHA).unwrap();
+            }
+            let initial = envelope(vec![n], vec![], "1");
+            let mut ops = run_as("n", "an");
+            let submit_op = ops.pop().unwrap();
+            let (env, ledger) = ok(
+                &initial,
+                &GraphResultLedgerV1::new(),
+                a1(),
+                Value::Array(ops),
+            );
+            let ledger = if code {
+                ledger
+            } else {
+                ledger.admit_attempt_non_code("P", "g", "n", "an").unwrap()
+            };
+            let mut r = with_attempt(
+                super::mutation_interpreter_tests::result("n", "PASS", "own"),
+                "an",
+            );
+            if !code {
+                r = bare(r);
+            }
+            let (env, ledger) = ok(
+                &env,
+                &ledger,
+                a1(),
+                json!([submit_op, attach("n", "res-n", r)]),
+            );
+            // A graph state and attached PASS do not manufacture a verdict.
+            let fake = envelope(
+                vec![env.graph().node("n").unwrap().clone().with_state(S::Passed)],
+                vec![],
+                env.graph_version().as_str(),
+            );
+            assert_eq!(
+                op_err(&fake, &ledger, a1(), json!([accept.clone()])).1,
+                O::EvidenceUnavailable("admitted own-result verdict")
+            );
+            let before = ledger.clone();
+            assert!(matches!(
+                op_err(
+                    &env,
+                    &ledger,
+                    a1(),
+                    json!([verdict("n", "PASSED", "n"), {"op":"CANCEL_NODE","node_id":"ghost"}])
+                )
+                .1,
+                O::UnknownNode
+            ));
+            assert_eq!(ledger, before);
+            let (env, ledger) = ok(&env, &ledger, a1(), json!([verdict("n", "PASSED", "n")]));
+            let (env, _) = ok(&env, &ledger, user(), json!([accept]));
+            assert_eq!(env.graph().node_state("n"), Some(S::Accepted));
+        }
+    }
+}
+
+#[test]
+fn equivalent_construction_cannot_borrow_an_accepted_review() {
+    let (env, ledger) = rejected_review();
+    let mut nodes: Vec<_> = env.graph().nodes().cloned().collect();
+    nodes.push(node("used", GraphNodeKind::REVIEW, S::Accepted));
+    let seeded = envelope(
+        nodes,
+        env.graph().edges().cloned().collect(),
+        env.graph_version().as_str(),
+    );
+    for foreign in [false, true] {
+        let mut repair = repair_node();
+        if foreign {
+            repair["workstream_id"] = json!("foreign");
+            repair.as_object_mut().unwrap().remove("created_in_version");
+        }
+        let mut expansion = round_expansion();
+        expansion["detail"]["nodes"] = json!([repair]);
+        expansion["detail"]["edges"] = json!([
+            control_edge("c1", "r1", "i2"),
+            prec_edge("p1", "i2", "used")
+        ]);
+        let error = op_err(
+            &seeded,
+            &ledger,
+            a1(),
+            Value::Array(equivalent_round(expansion)),
+        )
+        .1;
+        assert_eq!(
+            error,
+            if foreign {
+                O::Repair("repair round workstream binding")
+            } else {
+                O::Repair("missing operational creation evidence")
+            }
+        );
+        assert_eq!(seeded.graph().node_state("used"), Some(S::Accepted));
+        assert!(seeded.graph().node("i2").is_none());
+    }
 }

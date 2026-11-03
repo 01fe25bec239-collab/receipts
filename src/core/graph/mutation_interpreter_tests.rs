@@ -780,16 +780,20 @@ fn rejected_review_verdict_is_retained() {
     ] {
         assert_eq!(op_err(&env, &none, a1(), json!([op])).1, O::RetainedVerdict);
     }
-    ok(
-        &env,
-        &none,
-        a1(),
-        json!([set(
-            "p",
-            "PASSED",
-            "ACCEPTED",
-            json!({"kind":"ACCEPTANCE","decision_id":"d"})
-        )]),
+    assert_eq!(
+        op_err(
+            &env,
+            &none,
+            a1(),
+            json!([set(
+                "p",
+                "PASSED",
+                "ACCEPTED",
+                json!({"kind":"ACCEPTANCE","decision_id":"d"})
+            )]),
+        )
+        .1,
+        O::Attempt("node has no admitted attempt")
     );
 }
 
@@ -1701,7 +1705,7 @@ fn interface_evidence_is_rechecked_at_resumption_admission_and_dispatch() {
 /// The frozen `03_repair_expansion` graph is the reference provenance shape:
 /// `i2.parent = i1` (the work `r1` reviewed), `r1 ON_REJECT i2`, `i2 → r2`.
 #[test]
-fn frozen_repair_fixture_shape_is_accepted_provenance() {
+fn frozen_repair_fixture_is_structural_not_operational_provenance() {
     let text = std::fs::read_to_string(format!(
         "{}/../../fixtures/graphs/03_repair_expansion.json",
         env!("CARGO_MANIFEST_DIR")
@@ -1730,9 +1734,10 @@ fn frozen_repair_fixture_shape_is_accepted_provenance() {
         json!({"kind":"REPAIR_ENTRY","repair_node_id":"i2"})
     )]);
     let none = GraphResultLedgerV1::new();
-    let (env, _) = ok(&rejected(&text), &none, a1(), enter.clone());
-    assert_eq!(env.graph().node_state("i1"), Some(S::Repairing));
-    assert_eq!(env.graph().node_state("r1"), Some(S::Rejected));
+    assert_eq!(
+        op_err(&rejected(&text), &none, a1(), enter.clone()).1,
+        O::Repair("missing operational creation evidence")
+    );
     // The repair's parent is the reviewed implementation, never the review.
     let wrong_parent = text.replace("\"parent_node_id\": \"i1\"", "\"parent_node_id\": \"r1\"");
     assert_ne!(wrong_parent, text);

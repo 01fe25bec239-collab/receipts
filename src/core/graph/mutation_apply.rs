@@ -177,6 +177,12 @@ struct RetainedReview {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GraphResultLedgerV1 {
     results: BTreeMap<String, GraphNodeResult>,
+    /// Successful own-result verdicts, bound to the admitted attempt and result.
+    own_verdicts: BTreeMap<(AttemptKey, String), (GraphNodeState, String)>,
+    /// Operational creation facts; graph seeds alone do not prove freshness.
+    created: BTreeMap<AttemptKey, GraphNode>,
+    /// Complete rounds admitted while both new nodes were operationally fresh.
+    repair_rounds: BTreeMap<AttemptKey, (String, String, String)>,
     /// The node's current admitted attempt (set by `DISPATCH`).
     current: BTreeMap<AttemptKey, AttemptBinding>,
     /// Every attempt id ever admitted, with its owner. Never reused.
@@ -474,6 +480,7 @@ pub fn apply_graph_mutation_with_evidence_v1(
         ledger: results.clone(),
         project_id: envelope.project_id(),
         added: BTreeSet::new(),
+        touched_repairs: BTreeSet::new(),
         actor: &scope.actor,
         parent: envelope.graph_version(),
         successor,
@@ -484,6 +491,43 @@ pub fn apply_graph_mutation_with_evidence_v1(
         batch
             .apply(operation)
             .map_err(|error| E::Operation { index, error })?;
+    }
+    for repair in batch
+        .graph
+        .nodes()
+        .filter(|n| n.kind() == &GraphNodeKind::REPAIR)
+        .cloned()
+        .collect::<Vec<_>>()
+    {
+        let sources: Vec<_> = batch
+            .graph
+            .control_edges()
+            .filter(|e| {
+                e.to_node() == repair.node_id() && e.control_kind() == Some(ControlKind::OnReject)
+            })
+            .map(|e| e.from_node().to_owned())
+            .collect();
+        if !sources.is_empty()
+            && (batch.added.contains(repair.node_id())
+                || batch.touched_repairs.contains(repair.node_id())
+                || batch
+                    .ledger
+                    .repair_rounds
+                    .contains_key(&batch.key_of(&repair)))
+        {
+            if sources.len() != 1 {
+                return Err(E::Operation {
+                    index: mutation.operations().len() - 1,
+                    error: GraphOperationError::Repair("repair needs exactly one ON_REJECT source"),
+                });
+            }
+            batch
+                .require_repair_round(&sources[0], &repair)
+                .map_err(|error| E::Operation {
+                    index: mutation.operations().len() - 1,
+                    error,
+                })?;
+        }
     }
     let envelope = envelope
         .successor(
@@ -508,6 +552,7 @@ struct Batch<'a> {
     ledger: GraphResultLedgerV1,
     project_id: &'a str,
     added: BTreeSet<String>,
+    touched_repairs: BTreeSet<String>,
     actor: &'a ScopedActorV1,
     parent: &'a GraphVersionV1,
     successor: GraphVersionV1,
@@ -652,7 +697,8 @@ impl Batch<'_> {
         }
         self.in_scope(&node)?;
         let node_id = node.node_id().to_owned();
-        self.graph.add_node(node)?;
+        self.graph.add_node(node.clone())?;
+        self.ledger.created.insert(self.key_of(&node), node);
         self.added.insert(node_id);
         Ok(())
     }
@@ -668,6 +714,15 @@ impl Batch<'_> {
         for endpoint in [edge.from_node(), edge.to_node()] {
             if let Some(node) = self.graph.node(endpoint) {
                 self.in_scope(node)?;
+            }
+        }
+        for endpoint in [edge.from_node(), edge.to_node()] {
+            if self
+                .graph
+                .node(endpoint)
+                .is_some_and(|n| n.kind() == &GraphNodeKind::REPAIR)
+            {
+                self.touched_repairs.insert(endpoint.to_owned());
             }
         }
         self.graph.add_edge(edge)?;
@@ -693,6 +748,7 @@ impl Batch<'_> {
         let cause = cause.as_map();
         let kind = cause_kind(text(cause, "kind")?)?;
         check_node_transition(from, to, kind)?;
+        self.require_repair_node(&node)?;
         self.verify_cause(&node, to, kind, cause)?;
         self.bind_attempt(&node, kind, cause)?;
         self.graph.replace_node(node.with_state(to));
@@ -842,17 +898,26 @@ impl Batch<'_> {
             C::ReviewVerdict => self.verify_verdict(node, to, cause),
             C::RepairEntry => {
                 let repair = self.repair_child(node, id(cause, "repair_node_id")?)?;
-                let mut sources = self.graph.control_edges().filter(|edge| {
-                    edge.to_node() == repair.node_id()
-                        && edge.control_kind() == Some(ControlKind::OnReject)
-                });
-                match (sources.next(), sources.next()) {
-                    (Some(edge), None) => repair_provenance(&self.graph, edge.from_node(), repair),
+                let repair = repair.clone();
+                let sources: Vec<_> = self
+                    .graph
+                    .control_edges()
+                    .filter(|edge| {
+                        edge.to_node() == repair.node_id()
+                            && edge.control_kind() == Some(ControlKind::OnReject)
+                    })
+                    .map(|e| e.from_node().to_owned())
+                    .collect();
+                match sources.as_slice() {
+                    [source] => self.require_repair_round(source, &repair),
                     _ => Err(E::Repair("repair needs exactly one ON_REJECT source")),
                 }
             }
             C::RepairSubmitted => {
-                let repair = self.repair_child(node, id(cause, "repair_node_id")?)?;
+                let repair = self
+                    .repair_child(node, id(cause, "repair_node_id")?)?
+                    .clone();
+                self.require_repair_node(&repair)?;
                 if !matches!(
                     repair.state(),
                     GraphNodeState::AwaitingReview
@@ -932,7 +997,13 @@ impl Batch<'_> {
         self.classified_binding(node)?;
         if !requires_independent_review(node) {
             let newest = self.newest_repair_child(node)?.cloned();
-            return self.verify_own_result_verdict(node, to, cited_id, newest.as_ref());
+            self.verify_own_result_verdict(node, to, cited_id, newest.as_ref())?;
+            let binding = self.classified_binding(node)?;
+            self.ledger.own_verdicts.insert(
+                (self.key_of(node), binding.attempt_id),
+                (to, cited_id.to_owned()),
+            );
+            return Ok(());
         }
         if self.retained_review(node).is_none() {
             if cited_id != node.node_id() {
@@ -1066,7 +1137,18 @@ impl Batch<'_> {
     fn require_review_for_acceptance(&self, node: &GraphNode) -> OpResult {
         use GraphOperationError as E;
         if !requires_independent_review(node) {
-            return Ok(());
+            let binding = self.classified_binding(node)?;
+            check_code_binding(node, &binding)?;
+            let (verdict, cited) = self
+                .ledger
+                .own_verdicts
+                .get(&(self.key_of(node), binding.attempt_id))
+                .ok_or(E::EvidenceUnavailable("admitted own-result verdict"))?;
+            if *verdict != GraphNodeState::Passed {
+                return Err(E::EvidenceRefused("own-result verdict is not PASS"));
+            }
+            let newest = self.newest_repair_child(node)?;
+            return self.verify_own_result_verdict(node, GraphNodeState::Passed, cited, newest);
         }
         // A node accepted on its own review is judged by it; one rejected
         // once is accepted on its newest repair's review.
@@ -1127,7 +1209,13 @@ impl Batch<'_> {
         if result.outcome() != expected || result.review_id().is_none() {
             return Err(E::EvidenceRefused("review result outcome"));
         }
-        if cited.code_sha().is_some() && result.code_sha() != cited.code_sha() {
+        let binding = self.classified_binding(cited)?;
+        check_code_binding(cited, &binding)?;
+        if result.node_id() != cited.node_id()
+            || result.graph_id() != self.graph.graph_id()
+            || result.attempt_id() != Some(binding.attempt_id.as_str())
+            || result.code_sha() != binding.domain.sha()
+        {
             return Err(E::EvidenceRefused("review result code_sha"));
         }
         Ok(())
@@ -1153,7 +1241,12 @@ impl Batch<'_> {
             [.., a, b] if key(a) == key(b) => Err(GraphOperationError::EvidenceRefused(
                 "ambiguous repair round",
             )),
-            [.., last] => Ok(Some(last)),
+            [.., last] => {
+                if !self.ledger.repair_rounds.contains_key(&self.key_of(last)) {
+                    return Err(GraphOperationError::Repair("missing admitted repair round"));
+                }
+                Ok(Some(last))
+            }
         }
     }
 
@@ -1166,6 +1259,7 @@ impl Batch<'_> {
         }
         let result = graph_node_result_from_value(&map["result"])?;
         let node = self.existing(op)?;
+        self.require_repair_node(&node)?;
         if node.result_ref().is_some() || self.ledger.get(result_ref).is_some() {
             return Err(E::ResultSlotOccupied);
         }
@@ -1217,6 +1311,117 @@ impl Batch<'_> {
         Ok(())
     }
 
+    fn require_repair_node(&mut self, node: &GraphNode) -> OpResult {
+        if node.kind() != &GraphNodeKind::REPAIR {
+            return Ok(());
+        }
+        let sources: Vec<_> = self
+            .graph
+            .control_edges()
+            .filter(|e| {
+                e.to_node() == node.node_id() && e.control_kind() == Some(ControlKind::OnReject)
+            })
+            .map(|e| e.from_node().to_owned())
+            .collect();
+        match sources.as_slice() {
+            [source] => self.require_repair_round(source, node),
+            _ => Err(GraphOperationError::Repair(
+                "repair needs exactly one ON_REJECT source",
+            )),
+        }
+    }
+
+    fn require_repair_round(&mut self, source_id: &str, repair: &GraphNode) -> OpResult {
+        use GraphOperationError as E;
+        repair_provenance(&self.graph, source_id, repair)?;
+        let source = self.graph.node(source_id).expect("provenance checked");
+        let subject = reviewed_subject(&self.graph, source_id)?;
+        let review = self
+            .graph
+            .precedence_edges()
+            .filter(|e| e.from_node() == repair.node_id())
+            .filter_map(|e| self.graph.node(e.to_node()))
+            .find(|n| is_review(n))
+            .expect("provenance checked");
+        if reviewed_subject(&self.graph, review.node_id())?.node_id() != repair.node_id() {
+            return Err(E::Repair("new review must judge exactly the repair"));
+        }
+        if repair.workstream_id() != subject.workstream_id()
+            || review.workstream_id() != repair.workstream_id()
+        {
+            return Err(E::Repair("repair round workstream binding"));
+        }
+        let round = |n: &GraphNode| n.attempt_number().map(|a| a.as_str().to_owned());
+        let later = |new: Option<String>, old: Option<String>| match (new, old) {
+            (Some(new), Some(old)) => (new.len(), new) > (old.len(), old),
+            _ => true,
+        };
+        if round(repair)
+            .zip(round(review))
+            .is_some_and(|(a, b)| a != b)
+            || !later(round(repair), round(subject))
+            || !later(round(review), round(source))
+        {
+            return Err(E::Repair("repair round ordinals"));
+        }
+        let sources: Vec<_> = self
+            .graph
+            .control_edges()
+            .filter(|e| {
+                e.control_kind() == Some(ControlKind::OnReject)
+                    && (e.to_node() == repair.node_id() || e.from_node() == source_id)
+            })
+            .collect();
+        if sources.len() != 1 {
+            return Err(E::Repair("repair needs exactly one ON_REJECT source"));
+        }
+        for node in [repair, review] {
+            let created = self
+                .ledger
+                .created
+                .get(&self.key_of(node))
+                .ok_or(E::Repair("missing operational creation evidence"))?;
+            if created.state() != GraphNodeState::Planned
+                || created.created_in_version().is_none()
+                || created.created_in_version() != node.created_in_version()
+                || created.kind() != node.kind()
+                || created.parent_node_id() != node.parent_node_id()
+                || created.workstream_id() != node.workstream_id()
+                || created.attempt_number() != node.attempt_number()
+            {
+                return Err(E::Repair("repair round creation binding"));
+            }
+        }
+        if repair.created_in_version() != review.created_in_version() {
+            return Err(E::Repair("repair round creation binding"));
+        }
+        let key = self.key_of(repair);
+        let facts = (
+            source_id.to_owned(),
+            subject.node_id().to_owned(),
+            review.node_id().to_owned(),
+        );
+        match self.ledger.repair_rounds.get(&key) {
+            Some(old) if old != &facts => return Err(E::Repair("repair round provenance changed")),
+            Some(_) => return Ok(()),
+            None => {}
+        }
+        if [repair, review].iter().any(|n| {
+            n.state() != GraphNodeState::Planned
+                || n.result_ref().is_some()
+                || self.binding(n).is_some()
+        }) || self
+            .ledger
+            .repair_rounds
+            .values()
+            .any(|(_, _, fresh)| fresh == review.node_id())
+        {
+            return Err(E::Repair("repair needs operationally fresh nodes"));
+        }
+        self.ledger.repair_rounds.insert(key, facts);
+        Ok(())
+    }
+
     /// Expands a retained `REJECTED` REVIEW into a fresh repair round: one
     /// `REPAIR` (parent = the implementation that review judged), one
     /// distinct fresh `REVIEW` after it, the review's `ON_REJECT` control edge
@@ -1260,21 +1465,6 @@ impl Batch<'_> {
         {
             return Err(E::Repair("repair round workstream binding"));
         }
-        fn round(n: &GraphNode) -> Option<&str> {
-            n.attempt_number().map(GraphNodeAttemptNumber::as_str)
-        }
-        let later = |new: Option<&str>, old: Option<&str>| match (new, old) {
-            (Some(new), Some(old)) => (new.len(), new) > (old.len(), old),
-            _ => true,
-        };
-        if round(repair)
-            .zip(round(review))
-            .is_some_and(|(a, b)| a != b)
-            || !later(round(repair), round(subject))
-            || !later(round(review), round(&source))
-        {
-            return Err(E::Repair("repair round ordinals"));
-        }
         let new_ids: BTreeSet<&str> = nodes.iter().map(GraphNode::node_id).collect();
         if edges.iter().any(|edge| {
             edge.class() == EdgeClass::Precedence
@@ -1300,7 +1490,8 @@ impl Batch<'_> {
         // The staged result must carry the complete provenance, and the new
         // review must judge exactly this repair.
         let repair = self.graph.node(&repair_id).expect("staged");
-        repair_provenance(&self.graph, source_id, repair)?;
+        let repair = repair.clone();
+        self.require_repair_round(source_id, &repair)?;
         if reviewed_subject(&self.graph, &review_id)?.node_id() != repair_id {
             return Err(E::Repair("new review must judge exactly the repair"));
         }
