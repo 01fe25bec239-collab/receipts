@@ -1037,7 +1037,7 @@ impl ReadOnlyGraphReader {
         if head.is_some_and(|version| version < 0) {
             return Err(corrupt());
         }
-        if head != Some(17) {
+        if head != Some(18) {
             return Err(failure(Phase::Read, Code::UnsupportedSchema, None));
         }
         verify_current(&self.conn, Phase::Read)
@@ -1520,10 +1520,21 @@ pub(crate) fn verify_v16(conn: &Connection, phase: Phase) -> Result<(), StateErr
     verify_v16_objects(conn, phase)
 }
 /// Current stores retain all earlier checks and verify the new immutable definitions.
-pub(crate) fn verify_current(conn: &Connection, phase: Phase) -> Result<(), StateError> {
+pub(crate) fn verify_v17(conn: &Connection, phase: Phase) -> Result<(), StateError> {
     verify_ledger(conn, 17, phase)?;
     verify_v16_objects(conn, phase)?;
     if !migrations::v0017_decision_records::schema_matches(conn)
+        .map_err(|e| schema_error(phase, e))?
+    {
+        return Err(failure(phase, Code::CorruptStore, None));
+    }
+    Ok(())
+}
+pub(crate) fn verify_current(conn: &Connection, phase: Phase) -> Result<(), StateError> {
+    verify_graph_encoding(conn, phase)?;
+    verify_ledger(conn, 18, phase)?;
+    verify_v16_objects(conn, phase)?;
+    if !migrations::v0018_manifest_successors::schema_matches(conn)
         .map_err(|e| schema_error(phase, e))?
     {
         return Err(failure(phase, Code::CorruptStore, None));

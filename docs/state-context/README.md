@@ -2,9 +2,9 @@
 
 State stores what other owners define. It never routes, reviews, runs failover or decides acceptance. This page covers what the Wave 1 completion package added. Source of truth: `src/state/**`.
 
-## Schema version 17
+## Schema version 18
 
-Migration 17 (`decision_records`) adds three tables and immutable-event triggers. Migrations 1–16 are unchanged.
+Migration 17 (`decision_records`) adds three tables and immutable-event triggers. Migration 18 (`manifest_successors`) retains immutable historical manifests, seals their children and closes role/ownership duplicate-insert replacement paths. Migrations 1–17 are unchanged.
 
 | Table | What it holds | Immutability |
 | --- | --- | --- |
@@ -21,7 +21,7 @@ Version 17 also adds triggers on existing tables:
 
 Upgrades:
 
-- `SqliteStateRepository::migrate_existing_to_current` upgrades exact v11–v16 stores, verifying the v16 postcondition before it applies v17.
+- `SqliteStateRepository::migrate_existing_to_current` upgrades exact v11–v17 stores, verifying each intermediate postcondition, including exact v17 before v18. Existing v18 stores are verified idempotently.
 - Ordinary `open` refuses every non-current version.
 - v1–v10 stores and unknown versions get typed refusals and are never rewritten: `SchemaVersionMismatch` from `open`, and `UNSUPPORTED_SCHEMA` from explicit migration.
 
@@ -33,7 +33,7 @@ Upgrades:
 - no unknown property and every required property present (selection reason, score components, capability evidence and its source reference, alternatives, registry freshness, acceptance criteria, review policy, references, reviewer, findings, dimensions, reproduction checks, included tasks, attestations, check results, provenance entries);
 - each property's type, enum, identifier length (1–200), strict 40-hex SHA where the schema has the pattern, `minItems`, and exact integer and range rules.
 
-Open fields stay open: `ModelCapability.value` and `capability_evidence[].value` accept any JSON. Numbers stay raw tokens and are never converted through `f64`: `1.0`, `1e3` and `-0` are integers, huge integers and exponents are admitted, and `expected_rejection_probability` is compared with 0 and 1 exactly. `date-time` is an annotation, so those fields accept any string. Plain-string SHA-like fields (`merge_commit`, `acceptance_sha`, `integration_sha`) are not pattern-checked because the schemas do not say so. Stored records are re-admitted on every read, so damaged nested content fails closed even when the stored digest was recomputed. The `jsonschema` crate is a test-only oracle; the validators are small `serde`/`RawValue` tables with no new dependency.
+Open fields stay open: `ModelCapability.value` and `capability_evidence[].value` accept any JSON. Numbers stay raw tokens and are never converted through `f64`: `1.0`, `1e3` and `-0` are integers, huge integers and exponents are admitted, and `expected_rejection_probability` is compared with 0 and 1 exactly. `date-time` is an annotation, so those fields accept any string. Plain-string SHA-like fields (`merge_commit`, `acceptance_sha`, `integration_sha`) are not pattern-checked because the schemas do not say so. Stored records are re-admitted on every read and stored task/link/SHA metadata must match the decoded JSON exactly. Task filtering validates the project/family snapshot before applying the filter, so damaged extracted metadata cannot hide a matching record. Duplicate-key traversal uses a heap worklist, preserving raw values without recursive descent. Thus so damaged nested content fails closed even when the stored digest was recomputed. The `jsonschema` crate is a test-only oracle; the validators are small `serde`/`RawValue` tables with no new dependency.
 
 State stores registry and lifecycle observations as supplied. Lifecycle eligibility and transition policy belong to Model Routing; a stored row is never routing or dispatch authority.
 
@@ -58,9 +58,10 @@ Empty provenance, nonaccept outcomes and `REJECT` reviews are valid, readable, i
 | --- | --- |
 | `transition_logical_role_status` | Allowed: ACTIVE↔SUSPENDED and ACTIVE/SUSPENDED→RETIRED. RETIRED is terminal, and a change to the same status is refused. Retirement needs no binding pointer and no unreleased binding. |
 | `set_logical_role_active_binding` | Compare-and-set on the current pointer. A new binding must exist, belong to the role and be fully unreleased. A replaced or cleared binding must be fully released. Dangling or partial bindings are refused. |
+| `supersede_context_manifest` | Requires the expected epoch and an attached predecessor. Creates a distinct immutable snapshot and its ordered children, CAS-updates the pointer and appends history in one serialized transaction. Same-epoch replacement is allowed; changed epochs must exist in the same project. Failures leave no orphan snapshot. |
 | `set_logical_role_context` | Compare-and-set on the epoch and manifest. The epoch cannot go backwards. A changed epoch must exist in the project's history. A manifest must match the role, project and new epoch. A manifest pointer cannot be cleared. |
 
-Every refusal is a typed `RoleChangeRefusal` and writes nothing. The legacy create and release binding APIs do not touch role pointers.
+Lifecycle policy refusals use `RoleChangeRefusal`; manifest identity/shape failures retain their existing typed errors. Refusals write nothing. Legacy `create_context_manifest` remains create-only, refuses a second version for the role and has no pointer/history effects. Historical manifests remain readable by identity. Only the role pointer selects current authority. The legacy create and release binding APIs do not touch role pointers.
 
 ## Chronological event query
 

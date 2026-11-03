@@ -156,7 +156,7 @@ impl StateReader {
         if head.is_some_and(|v| v < 0) {
             return Err(graph_repository::corrupt());
         }
-        if head != Some(17) {
+        if head != Some(18) {
             return Err(StateError::GraphPersistence {
                 phase: GraphPhase::Read,
                 code: crate::error::GraphFailureCode::UnsupportedSchema,

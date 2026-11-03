@@ -2,6 +2,7 @@ use rusqlite::Connection;
 
 /// Rewinds a current store to the exact v16 image by dropping every v17 object.
 pub(crate) fn remove_v17(conn: &Connection) {
+    remove_v18(conn);
     let mut sql = String::new();
     for statement in crate::migrations::v0017_decision_records::SQL.split(";\n") {
         let mut words = statement.split_whitespace();
@@ -545,7 +546,7 @@ fn v16_store_migrates_to_v17_preserving_rows_and_rejects_partial_v17() {
     drop(conn);
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).unwrap(),
-        17
+        18
     );
     let repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
     assert_eq!(repo.count_table_rows("logical_role").unwrap(), 1);
@@ -556,4 +557,153 @@ fn v16_store_migrates_to_v17_preserving_rows_and_rejects_partial_v17() {
         .unwrap();
     drop(repo);
     assert!(SqliteStateRepository::open(tmp.db_path()).is_err());
+}
+
+#[test]
+fn stored_metadata_drift_is_corruption_before_task_filtering() {
+    for (kind, id, json) in fixtures() {
+        for column in ["task_id", "link_id", "subject_sha"] {
+            for value in [None, Some(A)] {
+                let tmp = TempDir::new("metadata-drift");
+                let mut repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
+                let admitted = record(kind, id, &json);
+                let original = match column {
+                    "task_id" => admitted.task_id(),
+                    "link_id" => admitted.link_id(),
+                    _ => admitted.subject_sha(),
+                };
+                if original == value {
+                    continue;
+                }
+                repo.append_decision_record(&admitted).unwrap();
+                let guard: String = repo
+                    .connection()
+                    .query_row(
+                        "SELECT sql FROM sqlite_master WHERE name='decision_records_no_update'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                repo.connection()
+                    .execute_batch("DROP TRIGGER decision_records_no_update")
+                    .unwrap();
+                repo.connection()
+                    .execute(&format!("UPDATE decision_records SET {column}=?1"), [value])
+                    .unwrap();
+                repo.connection().execute_batch(&guard).unwrap();
+                let writes = repo.connection().total_changes();
+                assert_eq!(
+                    refused(repo.find_decision_record("p", kind, id)),
+                    Code::CorruptStore
+                );
+                for filter in [None, Some("t-1"), Some(A), Some("absent")] {
+                    assert_eq!(
+                        refused(repo.list_decision_records("p", kind, filter)),
+                        Code::CorruptStore
+                    );
+                }
+                assert!(
+                    repo.list_decision_records("q", kind, None)
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(repo.connection().total_changes(), writes);
+            }
+        }
+    }
+}
+
+#[test]
+fn deep_duplicate_validation_subprocess() {
+    const CHILD: &str = "RECEIPTS_DEEP_KEYS_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let arrays = format!("{}0{}", "[".repeat(20_000), "]".repeat(20_000));
+        let mixed = format!(
+            "{}{}{}",
+            "{\"x\":[".repeat(4_000),
+            r#"{"a":1e400}"#,
+            "]}".repeat(4_000)
+        );
+        for nested in [&arrays, &mixed] {
+            let raw = serde_json::value::RawValue::from_string(nested.clone()).unwrap();
+            crate::decision_records::unique_keys(&raw).unwrap();
+            let json = format!(
+                r#"{{"subject_kind":"MODEL","capability":"c","value":{nested},"confidence":"UNVERIFIED","observed_at":"t"}}"#
+            );
+            assert_eq!(
+                DecisionRecordV1::parse("p", K::RegistryCapability, "c", &json)
+                    .unwrap()
+                    .record_json(),
+                json
+            );
+            let json = format!(
+                r#"{{"manifest_id":"m","role_id":"r","epoch":0,"sources":[{{"ref":{{"ref_type":"URL","target":"x"}},"source_class":"REFERENCE"}}],"derived_state":{{"x":{nested}}}}}"#
+            );
+            let wire = crate::wire::ContextManifestWireV1::parse_json(&json).unwrap();
+            assert!(wire.to_json().unwrap().contains(nested));
+        }
+        let duplicate = format!(
+            "{}{}{}",
+            "[".repeat(20_000),
+            r#"{"a":1,"\u0061":2}"#,
+            "]".repeat(20_000)
+        );
+        let raw = serde_json::value::RawValue::from_string(duplicate).unwrap();
+        assert!(crate::decision_records::unique_keys(&raw).is_err());
+        return;
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "decision_records_tests::deep_duplicate_validation_subprocess",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "deep validation child: {status}");
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("deep validation timeout");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Test-only rewind, used solely on stores with the legacy one-version shape.
+pub(crate) fn remove_v18(conn: &Connection) {
+    let head: i64 = conn
+        .query_row("SELECT MAX(version) FROM state_schema_version", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    if head < 18 {
+        return;
+    }
+    conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+    for statement in crate::migrations::v0018_manifest_successors::SQL.split(";\n") {
+        let mut words = statement.split_whitespace();
+        if let (Some("CREATE"), Some(kind @ ("TRIGGER" | "INDEX")), Some(name)) =
+            (words.next(), words.next(), words.next())
+        {
+            conn.execute_batch(&format!("DROP {kind} {name}")).unwrap();
+        }
+    }
+    conn.execute_batch("DROP TABLE context_manifest_seal")
+        .unwrap();
+    let create = crate::migrations::v0018_manifest_successors::SQL
+        .split(";\n")
+        .next()
+        .unwrap()
+        .replace(
+            "role_id TEXT NOT NULL REFERENCES",
+            "role_id TEXT NOT NULL UNIQUE REFERENCES",
+        );
+    conn.execute_batch(&format!("{create}; INSERT INTO context_manifest_v18 SELECT * FROM context_manifest; DROP TABLE context_manifest; ALTER TABLE context_manifest_v18 RENAME TO context_manifest; DELETE FROM state_schema_version WHERE version=18; PRAGMA foreign_keys=ON;")).unwrap();
 }

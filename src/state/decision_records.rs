@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use std::fmt;
 
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 
@@ -289,40 +289,41 @@ fn top_level(text: &str) -> Result<Vec<(String, Box<RawValue>)>, StateError> {
 
 /// Refuses duplicate decoded object keys anywhere inside `raw`.
 pub(crate) fn unique_keys(raw: &RawValue) -> Result<(), serde_json::Error> {
-    struct Walk;
-    impl<'de> DeserializeSeed<'de> for Walk {
-        type Value = ();
-        fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
-            let raw = Box::<RawValue>::deserialize(d)?;
-            unique_keys(&raw).map_err(de::Error::custom)
-        }
-    }
-    impl<'de> Visitor<'de> for Walk {
-        type Value = ();
+    struct Children;
+    impl<'de> Visitor<'de> for Children {
+        type Value = Vec<&'de RawValue>;
         fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.write_str("JSON container")
         }
-        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
             let mut seen = HashSet::new();
+            let mut children = Vec::new();
             while let Some(key) = map.next_key::<String>()? {
                 if !seen.insert(key) {
                     return Err(de::Error::custom("duplicate key"));
                 }
-                map.next_value_seed(Walk)?;
+                children.push(map.next_value::<&RawValue>()?);
             }
-            Ok(())
+            Ok(children)
         }
-        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
-            while seq.next_element_seed(Walk)?.is_some() {}
-            Ok(())
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut children = Vec::new();
+            while let Some(child) = seq.next_element::<&RawValue>()? {
+                children.push(child);
+            }
+            Ok(children)
         }
     }
-    use serde::Deserialize;
-    match raw.get().as_bytes().first() {
-        Some(b'{') => raw.deserialize_map(Walk),
-        Some(b'[') => raw.deserialize_seq(Walk),
-        _ => Ok(()),
+    let mut pending = vec![raw];
+    while let Some(value) = pending.pop() {
+        let children = match value.get().as_bytes().first() {
+            Some(b'{') => value.deserialize_map(Children)?,
+            Some(b'[') => value.deserialize_seq(Children)?,
+            _ => continue,
+        };
+        pending.extend(children);
     }
+    Ok(())
 }
 
 /// The closed provenance link kinds, in chain order.
@@ -489,11 +490,11 @@ impl SqliteStateRepository {
         let records = {
             let mut statement = tx
                 .prepare(&format!(
-                    "{SELECT_RECORD} WHERE project_id=?1 AND record_kind=?2 AND (?3 IS NULL OR task_id=?3) ORDER BY record_id COLLATE BINARY"
+                    "{SELECT_RECORD} WHERE project_id=?1 AND record_kind=?2 ORDER BY record_id COLLATE BINARY"
                 ))
                 .map_err(|e| sql_failure(e, RECORD))?;
             statement
-                .query_map(params![project_id, kind.as_str(), task_id], raw_record)
+                .query_map(params![project_id, kind.as_str()], raw_record)
                 .map_err(|e| sql_failure(e, RECORD))?
                 .map(|row| {
                     row.map_err(|e| sql_failure(e, RECORD))
@@ -502,7 +503,10 @@ impl SqliteStateRepository {
                 .collect::<Result<Vec<_>, _>>()?
         };
         tx.commit().map_err(|e| sql_failure(e, RECORD))?;
-        Ok(records)
+        Ok(records
+            .into_iter()
+            .filter(|record| task_id.is_none_or(|task| record.task_id() == Some(task)))
+            .collect())
     }
 
     /// Appends one immutable provenance link. SHA kinds require strict
@@ -696,8 +700,7 @@ struct AcceptanceEntry {
     review_sha: String,
 }
 
-const SELECT_RECORD: &str =
-    "SELECT project_id,record_kind,record_id,record_json,record_sha256 FROM decision_records";
+const SELECT_RECORD: &str = "SELECT project_id,record_kind,record_id,record_json,record_sha256,task_id,link_id,subject_sha FROM decision_records";
 
 fn read_record(
     conn: &Connection,
@@ -716,19 +719,41 @@ fn read_record(
     .transpose()
 }
 
-type RawRecord = (String, String, String, String, String);
+type RawRecord = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 fn raw_record(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawRecord> {
-    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+        r.get(6)?,
+        r.get(7)?,
+    ))
 }
 
 /// Re-admits stored bytes and re-derives metadata; any drift is corruption.
 fn decode_record(
-    (project_id, kind, record_id, json, digest): RawRecord,
+    (project_id, kind, record_id, json, digest, task, link, sha): RawRecord,
 ) -> Result<DecisionRecordV1, StateError> {
     let kind = DecisionRecordKind::from_storage(&kind)?;
     let record = DecisionRecordV1::parse(&project_id, kind, &record_id, &json)
         .map_err(|_| failure(Code::CorruptStore, RECORD))?;
-    if record.record_sha256 != digest {
+    if record.record_sha256 != digest
+        || record.task_id != task
+        || record.link_id != link
+        || record.subject_sha != sha
+    {
         return Err(failure(Code::CorruptStore, RECORD));
     }
     Ok(record)

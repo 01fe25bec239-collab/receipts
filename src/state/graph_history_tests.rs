@@ -286,7 +286,7 @@ fn late_children_and_all_history_mutation_matrix() {
             assert!(SqliteStateRepository::open(&path).is_err());
             assert_eq!(
                 SqliteStateRepository::migrate_existing_to_current(&path).unwrap(),
-                17
+                18
             );
             repo = SqliteStateRepository::open(&path).unwrap();
             let legacy: i64 = repo
@@ -484,7 +484,7 @@ fn migration_preserves_attempts_and_failure_leaves_exact_v14() {
     drop(conn);
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(&path).unwrap(),
-        17
+        18
     );
     let repo = SqliteStateRepository::open(&path).unwrap();
     assert!(repo.find_attempt(&aid).unwrap().is_some());

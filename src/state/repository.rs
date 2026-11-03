@@ -69,7 +69,7 @@ impl SqliteStateRepository {
         Ok(repo)
     }
 
-    /// Explicitly upgrades an exact v11–v16 State database to v17.
+    /// Explicitly upgrades an exact v11–v17 State database to v18.
     pub fn migrate_existing_to_current(path: impl AsRef<Path>) -> Result<u32, StateError> {
         let mut conn =
             Connection::open_with_flags(path.as_ref(), OpenFlags::SQLITE_OPEN_READ_WRITE)
@@ -97,9 +97,10 @@ impl SqliteStateRepository {
             Some(14) => graph_repository::verify_v14(&conn, GraphPhase::Migration)?,
             Some(15) => graph_repository::verify_v15(&conn, GraphPhase::Migration)?,
             Some(16) => graph_repository::verify_v16(&conn, GraphPhase::Migration)?,
-            Some(17) => {
+            Some(17) => graph_repository::verify_v17(&conn, GraphPhase::Migration)?,
+            Some(18) => {
                 graph_repository::verify_current(&conn, GraphPhase::Migration)?;
-                return Ok(17);
+                return Ok(18);
             }
             // v1–v10 and unknown heads are typed unsupported legacy: no
             // automatic migration and no corruption misclassification.
@@ -114,7 +115,7 @@ impl SqliteStateRepository {
         if found.is_some_and(|version| version < 15) {
             graph_repository::migrate_history_store(&conn)?;
         }
-        if found != Some(16) {
+        if found.is_some_and(|v| v < 16) {
             graph_repository::migrate_step(&conn, |conn| {
                 graph_repository::verify_v15(conn, GraphPhase::Migration)?;
                 conn.execute_batch(migrations::v0016_checkpoint_refs::SQL)
@@ -122,13 +123,16 @@ impl SqliteStateRepository {
                 graph_repository::verify_v16(conn, GraphPhase::Migration)
             })?;
         }
-        graph_repository::migrate_step(&conn, |conn| {
-            graph_repository::verify_v16(conn, GraphPhase::Migration)?;
-            conn.execute_batch(migrations::v0017_decision_records::SQL)
-                .map_err(|e| graph_repository::sqlite_error(GraphPhase::Migration, e))?;
-            graph_repository::verify_current(conn, GraphPhase::Migration)
-        })?;
-        Ok(17)
+        if found.is_some_and(|v| v < 17) {
+            graph_repository::migrate_step(&conn, |conn| {
+                graph_repository::verify_v16(conn, GraphPhase::Migration)?;
+                conn.execute_batch(migrations::v0017_decision_records::SQL)
+                    .map_err(|e| graph_repository::sqlite_error(GraphPhase::Migration, e))?;
+                graph_repository::verify_v17(conn, GraphPhase::Migration)
+            })?;
+        }
+        migrations::v0018_manifest_successors::apply(&conn)?;
+        Ok(18)
     }
 
     /// Version-reconciliation core of [`Self::open`], parameterized by the
@@ -548,6 +552,10 @@ fn bootstrap(conn: &mut Connection, chain: &[Migration]) -> Result<(), StateErro
     for migration in chain {
         if migration.version == 12 && migration.name == "context_epoch_unbounded" {
             migrations::v0012_context_epoch_unbounded::apply(conn)?;
+            continue;
+        }
+        if migration.version == 18 && migration.name == "manifest_successors" {
+            migrations::v0018_manifest_successors::apply(conn)?;
             continue;
         }
         let tx = conn

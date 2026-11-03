@@ -543,17 +543,16 @@ pub enum StateError {
     },
     /// Creating a ContextManifest for a role that already owns one.
     ///
-    /// Each durable role has exactly one authoritative ContextManifest, so
-    /// at most one manifest per `role_id` may persist. The existing
-    /// manifest is never replaced, deleted, updated, or silently chosen
-    /// over: the refusal names the existing manifest instead. This is
+    /// Legacy create admits only the first manifest for a role. Historical
+    /// versions may be added by the explicit successor operation; this
+    /// refusal names a stored version, not the current authority. This is
     /// deliberately distinct from
     /// [`StateError::ContextManifestAlreadyExists`], which keeps reporting
     /// duplicate durable `manifest_id` alone.
     ContextManifestRoleAlreadyHasManifest {
         /// The `role_id` that already owns a manifest.
         role_id: String,
-        /// The `manifest_id` of the existing authoritative manifest.
+        /// The `manifest_id` of an existing stored manifest.
         existing_manifest_id: String,
     },
     /// Writing a ContextManifest failed at the storage layer.
@@ -953,7 +952,7 @@ impl fmt::Display for StateError {
             } => {
                 write!(
                     f,
-                    "role_id {role_id:?} already owns authoritative manifest {existing_manifest_id:?}; a role may have at most one manifest, and the existing manifest is never replaced, updated, or deleted by conflict handling"
+                    "role_id {role_id:?} already owns manifest {existing_manifest_id:?}; legacy creation refuses a second manifest and preserves existing versions"
                 )
             }
             StateError::ContextManifestWriteFailed { detail } => {

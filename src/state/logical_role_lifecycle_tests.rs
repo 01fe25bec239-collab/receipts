@@ -457,3 +457,441 @@ fn storage_backstop_requires_matching_history_for_pointer_updates() {
     );
     assert_eq!(repo.list_logical_role_history(ROLE).unwrap().len(), 1);
 }
+
+#[test]
+fn intact_guards_refuse_role_and_ownership_replace_with_recursive_triggers_off() {
+    let (tmp, repo) = seeded("role-replace-guards");
+    let before = image(&repo);
+    assert_eq!(repo.pragma_integer_value("recursive_triggers").unwrap(), 0);
+    assert_eq!(repo.pragma_integer_value("foreign_keys").unwrap(), 1);
+    for sql in [
+        "REPLACE INTO logical_role(role_id,project_id,role_type,status,current_context_epoch) VALUES ('role-a2','p','RUNTIME_A1','RETIRED','99')",
+        "INSERT OR REPLACE INTO logical_role SELECT * FROM logical_role WHERE role_id='role-a2'",
+        "INSERT INTO logical_role SELECT * FROM logical_role WHERE role_id='role-a2' ON CONFLICT(role_id) DO UPDATE SET status='RETIRED'",
+        "REPLACE INTO logical_role_ownership_path VALUES ('role-a2',0,'replaced')",
+        "INSERT OR REPLACE INTO logical_role_ownership_path SELECT * FROM logical_role_ownership_path",
+        "INSERT INTO logical_role_ownership_path VALUES ('role-a2',0,'replaced') ON CONFLICT DO UPDATE SET path='replaced'",
+    ] {
+        assert!(repo.connection().execute_batch(sql).is_err(), "{sql}");
+        assert_eq!(image(&repo), before);
+    }
+    drop(repo);
+    let repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
+    assert_eq!(image(&repo), before);
+}
+
+#[test]
+fn manifest_successor_is_atomic_and_preserves_history() {
+    let (tmp, mut repo) = seeded("manifest-successor");
+    let mut m0 = manifest("m0", ROLE, "p", 0);
+    m0.sources[0].r#ref.target = "opaque\0target".into();
+    m0.sources[0].required_for = vec![crate::RequiredFor::Dispatch, crate::RequiredFor::Dispatch];
+    repo.create_context_manifest(m0.clone()).unwrap();
+    repo.set_logical_role_context(
+        ROLE,
+        &state_epoch(0),
+        None,
+        &state_epoch(0),
+        Some("m0"),
+        &evidence(),
+    )
+    .unwrap();
+    repo.append_context_epoch(ContextEpoch {
+        project_id: "p".into(),
+        epoch: state_epoch(0),
+        advanced_at: "t".into(),
+        trigger: ContextEpochTrigger::A1Init,
+    })
+    .unwrap();
+    // Historical rehydration reference fixture: no source contents are accessed.
+    repo.connection().execute_batch("INSERT INTO context_rehydration_attempt(project_id,rehydration_attempt_id,durable_role_id,context_manifest_id,context_epoch_id,trigger_kind,requested_by_actor_kind,started_at,completed_at,status,failure_code) VALUES ('p','prior','role-a2','m0','0','A1_INIT','SYSTEM','start','end','FAILED','SOURCE_MISSING')").unwrap();
+    repo.append_context_epoch(ContextEpoch {
+        project_id: "p".into(),
+        epoch: state_epoch(1),
+        advanced_at: "t".into(),
+        trigger: ContextEpochTrigger::NewWave,
+    })
+    .unwrap();
+    let m1 = manifest("m1", ROLE, "p", 1);
+    repo.supersede_context_manifest(ROLE, &state_epoch(0), "m0", m1.clone(), &evidence())
+        .unwrap();
+    let m2 = manifest("m2", ROLE, "p", 1);
+    repo.supersede_context_manifest(ROLE, &state_epoch(1), "m1", m2.clone(), &evidence())
+        .unwrap();
+    assert!(matches!(
+        repo.create_context_manifest(manifest("legacy", ROLE, "p", 1)),
+        Err(StateError::ContextManifestRoleAlreadyHasManifest { .. })
+    ));
+    let before = image(&repo);
+    for (expected, predecessor, next, want) in [
+        (
+            0,
+            "m0",
+            manifest("stale", ROLE, "p", 1),
+            R::StaleExpectation,
+        ),
+        (
+            0,
+            "m2",
+            manifest("stale-epoch", ROLE, "p", 1),
+            R::StaleExpectation,
+        ),
+        (
+            1,
+            "missing",
+            manifest("missing", ROLE, "p", 1),
+            R::StaleExpectation,
+        ),
+        (
+            1,
+            "m2",
+            manifest("foreign-role", "role-other", "p", 1),
+            R::ManifestMismatch,
+        ),
+        (
+            1,
+            "m2",
+            manifest("foreign-project", ROLE, "q", 1),
+            R::ManifestMismatch,
+        ),
+        (
+            1,
+            "m2",
+            manifest("regression", ROLE, "p", 0),
+            R::EpochRegression,
+        ),
+        (1, "m2", manifest("unknown", ROLE, "p", 9), R::EpochUnknown),
+    ] {
+        let id = next.manifest_id.clone();
+        assert_eq!(
+            refusal(repo.supersede_context_manifest(
+                ROLE,
+                &state_epoch(expected),
+                predecessor,
+                next,
+                &evidence()
+            )),
+            want
+        );
+        assert!(repo.find_context_manifest(&id).unwrap().is_none());
+        assert_eq!(image(&repo), before);
+    }
+    assert!(matches!(
+        repo.supersede_context_manifest(ROLE, &state_epoch(1), "m2", m1.clone(), &evidence()),
+        Err(StateError::ContextManifestAlreadyExists { .. })
+    ));
+    for table in [
+        "context_manifest",
+        "context_manifest_source",
+        "context_manifest_source_required_for",
+    ] {
+        for sql in [
+            format!("DELETE FROM {table}"),
+            format!("UPDATE {table} SET manifest_id=manifest_id"),
+            format!("INSERT OR REPLACE INTO {table} SELECT * FROM {table}"),
+        ] {
+            assert!(repo.connection().execute_batch(&sql).is_err(), "{sql}");
+        }
+    }
+    for (name, sql) in [
+        (
+            "fail-child",
+            "CREATE TRIGGER fail_successor BEFORE INSERT ON context_manifest_source BEGIN SELECT RAISE(ABORT,'injected'); END;",
+        ),
+        (
+            "fail-history",
+            "CREATE TRIGGER fail_successor BEFORE INSERT ON logical_role_history BEGIN SELECT RAISE(ABORT,'injected'); END;",
+        ),
+        (
+            "fail-pointer",
+            "CREATE TRIGGER fail_successor BEFORE UPDATE ON logical_role BEGIN SELECT RAISE(ABORT,'injected'); END;",
+        ),
+    ] {
+        repo.connection().execute_batch(sql).unwrap();
+        assert!(
+            repo.supersede_context_manifest(
+                ROLE,
+                &state_epoch(1),
+                "m2",
+                manifest(name, ROLE, "p", 1),
+                &evidence()
+            )
+            .is_err()
+        );
+        repo.connection()
+            .execute_batch("DROP TRIGGER fail_successor")
+            .unwrap();
+        assert!(repo.find_context_manifest(name).unwrap().is_none());
+        assert_eq!(image(&repo), before);
+    }
+    drop(repo);
+    let repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
+    for snapshot in [m0, m1, m2] {
+        assert_eq!(
+            repo.find_context_manifest(&snapshot.manifest_id).unwrap(),
+            Some(snapshot)
+        );
+    }
+    assert_eq!(image(&repo), before);
+    let prior: (String,String)=repo.connection().query_row("SELECT context_manifest_id,context_epoch_id FROM context_rehydration_attempt WHERE rehydration_attempt_id='prior'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert_eq!(prior, ("m0".into(), "0".into()));
+    assert_eq!(before.1, 3);
+    assert_eq!(before.0.context_manifest_id.as_deref(), Some("m2"));
+}
+
+#[test]
+fn competing_manifest_successors_leave_one_version_and_typed_loser() {
+    use std::sync::{Arc, Barrier};
+    let (tmp, mut repo) = seeded("successor-writers");
+    repo.create_context_manifest(manifest("m0", ROLE, "p", 0))
+        .unwrap();
+    repo.set_logical_role_context(
+        ROLE,
+        &state_epoch(0),
+        None,
+        &state_epoch(0),
+        Some("m0"),
+        &evidence(),
+    )
+    .unwrap();
+    drop(repo);
+    let barrier = Arc::new(Barrier::new(2));
+    let handles: Vec<_> = ["left", "right"]
+        .into_iter()
+        .map(|id| {
+            let path = tmp.db_path();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let mut repo = SqliteStateRepository::open(path).unwrap();
+                barrier.wait();
+                (
+                    id,
+                    repo.supersede_context_manifest(
+                        ROLE,
+                        &state_epoch(0),
+                        "m0",
+                        manifest(id, ROLE, "p", 0),
+                        &evidence(),
+                    ),
+                )
+            })
+        })
+        .collect();
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|(_, r)| r.is_ok()).count(), 1);
+    let repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
+    for (id, result) in results {
+        if result.is_ok() {
+            assert!(repo.find_context_manifest(id).unwrap().is_some());
+        } else {
+            assert_eq!(refusal(result), R::StaleExpectation);
+            assert!(repo.find_context_manifest(id).unwrap().is_none());
+        }
+    }
+    assert_eq!(repo.count_table_rows("context_manifest").unwrap(), 2);
+    assert_eq!(repo.list_logical_role_history(ROLE).unwrap().len(), 2);
+}
+
+#[test]
+fn migration18_rolls_back_and_restores_pragmas_then_preserves_exact17() {
+    let tmp = TempDir::new("v18-rollback");
+    let mut repo = SqliteStateRepository::open_with_migrations(
+        tmp.db_path(),
+        &crate::migrations::registered()[..17],
+    )
+    .unwrap();
+    repo.create_logical_role(role(ROLE, "p")).unwrap();
+    let snapshot = manifest("old", ROLE, "p", 0);
+    repo.create_context_manifest(snapshot.clone()).unwrap();
+    repo.connection().execute_batch("CREATE TRIGGER fail_v18 BEFORE INSERT ON state_schema_version WHEN NEW.version=18 BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+    assert!(crate::migrations::v0018_manifest_successors::apply(repo.connection()).is_err());
+    assert_eq!(repo.pragma_integer_value("foreign_keys").unwrap(), 1);
+    assert_eq!(repo.schema_version().unwrap(), 17);
+    assert_eq!(
+        repo.find_context_manifest("old").unwrap(),
+        Some(snapshot.clone())
+    );
+    crate::graph_repository::verify_v17(repo.connection(), crate::GraphPhase::Migration).unwrap();
+    repo.connection()
+        .execute_batch("DROP TRIGGER fail_v18")
+        .unwrap();
+    drop(repo);
+    assert!(matches!(
+        SqliteStateRepository::open(tmp.db_path()),
+        Err(StateError::SchemaVersionMismatch {
+            found: 17,
+            supported: 18
+        })
+    ));
+    assert_eq!(
+        SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).unwrap(),
+        18
+    );
+    assert_eq!(
+        SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).unwrap(),
+        18
+    );
+    let repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
+    assert_eq!(repo.find_context_manifest("old").unwrap(), Some(snapshot));
+    assert_eq!(repo.pragma_integer_value("foreign_keys").unwrap(), 1);
+}
+
+#[test]
+fn legacy_manifest_creation_remains_serialized_and_create_only() {
+    use std::sync::{Arc, Barrier};
+    let (tmp, repo) = seeded("legacy-manifest-writers");
+    drop(repo);
+    let barrier = Arc::new(Barrier::new(2));
+    let jobs: Vec<_> = ["a", "b"]
+        .into_iter()
+        .map(|id| {
+            let path = tmp.db_path();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let mut repo = SqliteStateRepository::open(path).unwrap();
+                barrier.wait();
+                repo.create_context_manifest(manifest(id, ROLE, "p", 0))
+            })
+        })
+        .collect();
+    let results: Vec<_> = jobs.into_iter().map(|j| j.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    assert!(results.iter().any(|r| matches!(
+        r,
+        Err(StateError::ContextManifestRoleAlreadyHasManifest { .. })
+    )));
+    let repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
+    assert_eq!(repo.count_table_rows("context_manifest").unwrap(), 1);
+    assert!(repo.list_logical_role_history(ROLE).unwrap().is_empty());
+    assert!(
+        repo.find_logical_role(ROLE)
+            .unwrap()
+            .unwrap()
+            .context_manifest_id
+            .is_none()
+    );
+}
+
+#[test]
+fn every_supported_legacy_head_explicitly_upgrades_to18() {
+    for head in 11..=17 {
+        let tmp = TempDir::new(&format!("to18-{head}"));
+        let mut repo = SqliteStateRepository::open_with_migrations(
+            tmp.db_path(),
+            &crate::migrations::registered()[..head],
+        )
+        .unwrap();
+        repo.create_logical_role(role(ROLE, "p")).unwrap();
+        let mut snapshot = manifest("old", ROLE, "p", 0);
+        snapshot.sources[0].required_for =
+            vec![crate::RequiredFor::Dispatch, crate::RequiredFor::Dispatch];
+        snapshot.sources[0].digest = "opaque\0digest".into();
+        repo.create_context_manifest(snapshot.clone()).unwrap();
+        drop(repo);
+        assert!(SqliteStateRepository::open(tmp.db_path()).is_err());
+        assert_eq!(
+            SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).unwrap(),
+            18
+        );
+        let repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
+        assert_eq!(repo.find_context_manifest("old").unwrap(), Some(snapshot));
+        assert_eq!(repo.count_table_rows("state_schema_version").unwrap(), 18);
+    }
+}
+
+#[test]
+fn sealed_manifest_refuses_additional_children() {
+    let (_tmp, mut repo) = seeded("sealed-manifest");
+    repo.create_context_manifest(manifest("m0", ROLE, "p", 0))
+        .unwrap();
+    for sql in [
+        "INSERT INTO context_manifest_source SELECT manifest_id,1,ref_type,ref_target,source_class,digest,last_read_at FROM context_manifest_source WHERE manifest_id='m0'",
+        "INSERT INTO context_manifest_source_required_for VALUES ('m0',0,0,'DISPATCH')",
+        "DELETE FROM context_manifest_seal",
+        "INSERT OR REPLACE INTO context_manifest_seal SELECT * FROM context_manifest_seal",
+    ] {
+        assert!(repo.connection().execute_batch(sql).is_err(), "{sql}");
+    }
+    assert_eq!(
+        repo.find_context_manifest("m0").unwrap(),
+        Some(manifest("m0", ROLE, "p", 0))
+    );
+}
+
+#[test]
+fn v18_guard_tampering_is_detected_on_reopen() {
+    for name in [
+        "logical_role_no_replace",
+        "logical_role_ownership_path_no_replace",
+        "context_manifest_no_replace",
+        "context_manifest_source_sealed",
+        "context_manifest_seal_no_delete",
+    ] {
+        let (tmp, repo) = seeded("v18-guard-tamper");
+        repo.connection()
+            .execute_batch(&format!("DROP TRIGGER {name}"))
+            .unwrap();
+        drop(repo);
+        assert!(matches!(
+            SqliteStateRepository::open(tmp.db_path()),
+            Err(StateError::GraphPersistence {
+                code: crate::GraphFailureCode::CorruptStore,
+                ..
+            })
+        ));
+        assert!(crate::StateReader::open_existing(tmp.db_path()).is_err());
+        assert!(SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).is_err());
+    }
+}
+
+#[test]
+fn successor_requires_attached_existing_predecessor_and_nonretired_role() {
+    let (_tmp, mut repo) = seeded("successor-predecessor");
+    assert_eq!(
+        refusal(repo.supersede_context_manifest(
+            ROLE,
+            &state_epoch(0),
+            "m0",
+            manifest("next", ROLE, "p", 0),
+            &evidence()
+        )),
+        R::StaleExpectation
+    );
+    let mut dangling = role("dangling", "p");
+    dangling.context_manifest_id = Some("ghost".into());
+    repo.create_logical_role(dangling).unwrap();
+    assert_eq!(
+        refusal(repo.supersede_context_manifest(
+            "dangling",
+            &state_epoch(0),
+            "ghost",
+            manifest("next", "dangling", "p", 0),
+            &evidence()
+        )),
+        R::ManifestNotFound
+    );
+    repo.create_context_manifest(manifest("m0", ROLE, "p", 0))
+        .unwrap();
+    repo.set_logical_role_context(
+        ROLE,
+        &state_epoch(0),
+        None,
+        &state_epoch(0),
+        Some("m0"),
+        &evidence(),
+    )
+    .unwrap();
+    repo.transition_logical_role_status(ROLE, S::Active, S::Retired, &evidence())
+        .unwrap();
+    assert_eq!(
+        refusal(repo.supersede_context_manifest(
+            ROLE,
+            &state_epoch(0),
+            "m0",
+            manifest("next", ROLE, "p", 0),
+            &evidence()
+        )),
+        R::RoleRetired
+    );
+    assert!(repo.find_context_manifest("next").unwrap().is_none());
+}

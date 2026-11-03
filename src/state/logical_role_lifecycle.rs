@@ -253,38 +253,63 @@ impl SqliteStateRepository {
         }
         self.run_serialized_transaction(|uow| {
             let conn = uow.tx();
+            change_context(
+                conn,
+                role_id,
+                expected_epoch,
+                expected_manifest_id,
+                new_epoch,
+                new_manifest_id,
+                evidence,
+            )
+        })
+    }
+
+    /// Creates an immutable successor and switches the attached manifest by CAS.
+    /// The snapshot, ordered children, role pointer and history commit together.
+    /// The predecessor must be attached; same-epoch replacement is permitted.
+    pub fn supersede_context_manifest(
+        &mut self,
+        role_id: &str,
+        expected_epoch: &StateEpochValueV1,
+        expected_manifest_id: &str,
+        manifest: crate::ContextManifest,
+        evidence: &RoleChangeEvidenceV1,
+    ) -> Result<(), StateError> {
+        validate_input(role_id, evidence)?;
+        ensure_identifier("context_manifest_id", expected_manifest_id)?;
+        crate::context_manifest::validate_for_create(&manifest)?;
+        self.run_serialized_transaction(|uow| {
+            let conn = uow.tx();
             let role = current_role_any(conn, role_id)?;
             if &role.current_context_epoch != expected_epoch
-                || role.context_manifest_id.as_deref() != expected_manifest_id
+                || role.context_manifest_id.as_deref() != Some(expected_manifest_id)
             {
                 return Err(refused(role_id, RoleChangeRefusal::StaleExpectation));
             }
-            if role.status == LogicalRoleStatus::Retired {
-                return Err(refused(role_id, RoleChangeRefusal::RoleRetired));
+            let predecessor = manifest_identity(conn, expected_manifest_id)?
+                .ok_or_else(|| refused(role_id, RoleChangeRefusal::ManifestNotFound))?;
+            if predecessor
+                != (
+                    role.role_id.clone(),
+                    role.project_id.clone(),
+                    expected_epoch.clone(),
+                )
+                || manifest.role_id != role_id
+                || manifest.project_id != role.project_id
+            {
+                return Err(refused(role_id, RoleChangeRefusal::ManifestMismatch));
             }
-            if new_epoch == expected_epoch && new_manifest_id == expected_manifest_id {
-                return Err(refused(role_id, RoleChangeRefusal::NoChange));
-            }
-            if new_epoch < expected_epoch {
-                return Err(refused(role_id, RoleChangeRefusal::EpochRegression));
-            }
-            if expected_manifest_id.is_some() && new_manifest_id.is_none() {
-                return Err(refused(role_id, RoleChangeRefusal::ManifestClear));
-            }
-            if new_epoch != expected_epoch && !epoch_exists(conn, &role.project_id, new_epoch)? {
-                return Err(refused(role_id, RoleChangeRefusal::EpochUnknown));
-            }
-            if let Some(manifest_id) = new_manifest_id {
-                let (owner, project, epoch) = manifest_identity(conn, manifest_id)?
-                    .ok_or_else(|| refused(role_id, RoleChangeRefusal::ManifestNotFound))?;
-                if owner != role_id || project != role.project_id || &epoch != new_epoch {
-                    return Err(refused(role_id, RoleChangeRefusal::ManifestMismatch));
-                }
-            }
-            let mut next = pointers(&role);
-            next.epoch = new_epoch.clone();
-            next.manifest = new_manifest_id.map(str::to_string);
-            apply(conn, &role, RoleChangeKind::Context, next, evidence)
+            crate::context_manifest::insert_context_manifest(conn, &manifest, false)?;
+            change_context(
+                conn,
+                role_id,
+                expected_epoch,
+                Some(expected_manifest_id),
+                &manifest.epoch,
+                Some(&manifest.manifest_id),
+                evidence,
+            )
         })
     }
 
@@ -519,4 +544,47 @@ fn query_failure(error: rusqlite::Error) -> StateError {
     StateError::InternalQueryFailed {
         detail: error.to_string(),
     }
+}
+
+fn change_context(
+    conn: &Connection,
+    role_id: &str,
+    expected_epoch: &StateEpochValueV1,
+    expected_manifest_id: Option<&str>,
+    new_epoch: &StateEpochValueV1,
+    new_manifest_id: Option<&str>,
+    evidence: &RoleChangeEvidenceV1,
+) -> Result<(), StateError> {
+    let role = current_role_any(conn, role_id)?;
+    if &role.current_context_epoch != expected_epoch
+        || role.context_manifest_id.as_deref() != expected_manifest_id
+    {
+        return Err(refused(role_id, RoleChangeRefusal::StaleExpectation));
+    }
+    if role.status == LogicalRoleStatus::Retired {
+        return Err(refused(role_id, RoleChangeRefusal::RoleRetired));
+    }
+    if new_epoch == expected_epoch && new_manifest_id == expected_manifest_id {
+        return Err(refused(role_id, RoleChangeRefusal::NoChange));
+    }
+    if new_epoch < expected_epoch {
+        return Err(refused(role_id, RoleChangeRefusal::EpochRegression));
+    }
+    if expected_manifest_id.is_some() && new_manifest_id.is_none() {
+        return Err(refused(role_id, RoleChangeRefusal::ManifestClear));
+    }
+    if new_epoch != expected_epoch && !epoch_exists(conn, &role.project_id, new_epoch)? {
+        return Err(refused(role_id, RoleChangeRefusal::EpochUnknown));
+    }
+    if let Some(manifest_id) = new_manifest_id {
+        let (owner, project, epoch) = manifest_identity(conn, manifest_id)?
+            .ok_or_else(|| refused(role_id, RoleChangeRefusal::ManifestNotFound))?;
+        if owner != role_id || project != role.project_id || &epoch != new_epoch {
+            return Err(refused(role_id, RoleChangeRefusal::ManifestMismatch));
+        }
+    }
+    let mut next = pointers(&role);
+    next.epoch = new_epoch.clone();
+    next.manifest = new_manifest_id.map(str::to_string);
+    apply(conn, &role, RoleChangeKind::Context, next, evidence)
 }
