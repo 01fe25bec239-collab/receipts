@@ -131,11 +131,24 @@ pub(crate) fn resolved_git_executable() -> Result<&'static Path, WorkspaceError>
 /// Locates the first executable regular-file `git` among the candidate
 /// locations and returns its canonical absolute path, if any.
 fn resolve_git_executable() -> Option<PathBuf> {
+    resolve_git_from_path(std::env::var_os("PATH").as_deref(), &FALLBACK_GIT_LOCATIONS)
+}
+
+pub(super) fn resolve_git_from_path(
+    path_value: Option<&OsStr>,
+    fallbacks: &[&str],
+) -> Option<PathBuf> {
     let mut candidates = Vec::new();
-    if let Some(path_value) = std::env::var_os("PATH") {
-        candidates.extend(std::env::split_paths(&path_value).map(|entry| entry.join("git")));
+    if let Some(path_value) = path_value {
+        // Admit the entry before any filesystem lookup, including on platforms
+        // where a rooted or drive-relative path is not absolute.
+        candidates.extend(
+            std::env::split_paths(path_value)
+                .filter(|entry| entry.is_absolute())
+                .map(|entry| entry.join("git")),
+        );
     }
-    candidates.extend(FALLBACK_GIT_LOCATIONS.iter().map(PathBuf::from));
+    candidates.extend(fallbacks.iter().map(PathBuf::from));
 
     for candidate in candidates {
         if !is_executable_file(&candidate) {

@@ -276,3 +276,71 @@ fn actual_target_worktree_configuration_refuses_before_content_operations() {
     ));
     assert!(!marker.exists());
 }
+
+#[test]
+fn relative_path_git_never_used() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = crate::test_support::TempDir::new("resolver-inert");
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let file = root.join("git");
+    std::fs::write(&file, b"inert fixture; never execute").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // An existing cwd-relative candidate, without changing process cwd/PATH.
+    let cwd = std::env::current_dir().unwrap();
+    let mut relative = std::path::PathBuf::new();
+    for _ in cwd.components().skip(1) {
+        relative.push("..");
+    }
+    relative.push(root.strip_prefix("/").unwrap());
+    assert!(relative.join("git").is_file());
+    let resolve = crate::git::resolve_git_from_path;
+    for invalid in [
+        OsStr::new(""),
+        OsStr::new("."),
+        OsStr::new(".."),
+        relative.as_os_str(),
+    ] {
+        assert_eq!(resolve(Some(invalid), &[]), None, "{invalid:?}");
+        let mixed = std::env::join_paths([invalid, root.as_os_str()]).unwrap();
+        assert_eq!(resolve(Some(&mixed), &[]), Some(file.clone()));
+    }
+    for path in [None, Some(OsStr::new(""))] {
+        assert_eq!(resolve(path, &[file.to_str().unwrap()]), Some(file.clone()));
+    }
+    assert_eq!(resolve(None, &[]), None);
+    let second = root.join("second");
+    std::fs::create_dir(&second).unwrap();
+    let second_git = second.join("git");
+    std::fs::write(&second_git, b"inert second candidate").unwrap();
+    std::fs::set_permissions(&second_git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let ordered = std::env::join_paths([&second, &root]).unwrap();
+    assert_eq!(
+        resolve(Some(&ordered), &[file.to_str().unwrap()]),
+        Some(second_git)
+    );
+    // Nonexecutables, directories and dangling links do not hide a valid fallback.
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(resolve(Some(root.as_os_str()), &[]), None);
+    std::fs::remove_file(&file).unwrap();
+    std::fs::create_dir(&file).unwrap();
+    assert_eq!(resolve(Some(root.as_os_str()), &[]), None);
+    std::fs::remove_dir(&file).unwrap();
+    std::os::unix::fs::symlink(root.join("absent"), &file).unwrap();
+    assert_eq!(resolve(Some(root.as_os_str()), &[]), None);
+    let real = root.join("real");
+    std::fs::write(&real, b"inert").unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::remove_file(&file).unwrap();
+    std::os::unix::fs::symlink(&real, &file).unwrap();
+    assert_eq!(resolve(Some(root.as_os_str()), &[]), Some(real.clone()));
+    assert_eq!(
+        resolve(
+            None,
+            &[
+                root.join("absent").to_str().unwrap(),
+                real.to_str().unwrap()
+            ]
+        ),
+        Some(real)
+    );
+}
