@@ -184,15 +184,18 @@ fn immutable_sql_and_failed_transaction_preserve_head() {
             assert!(repo.connection().execute_batch(&sql).is_err(), "{sql}");
         }
     }
-    repo.connection().execute_batch("CREATE TRIGGER fail_mutation BEFORE INSERT ON graph_mutations BEGIN SELECT RAISE(ABORT,'test'); END;").unwrap();
-    assert!(
+    repo.connection().execute_batch("CREATE TEMP TRIGGER fail_mutation BEFORE INSERT ON graph_mutations BEGIN SELECT RAISE(ABORT,'test'); END;").unwrap();
+    assert!(matches!(
         repo.append_graph_mutation_v1(
             &Clock,
             mutation("1", "2"),
             StateGraphSnapshotV1::new("2".into(), "1".into(), content("p", None)).unwrap()
-        )
-        .is_err()
-    );
+        ),
+        Err(StateError::GraphPersistence {
+            code: Code::StorageFailure,
+            ..
+        })
+    ));
     assert_eq!(
         repo.load_current_graph_v1("p", "g")
             .unwrap()
@@ -395,8 +398,8 @@ impl TrustedClockV1 for LaterClock {
 #[test]
 fn later_clock_child_and_commit_failures_rollback_everything() {
     for trigger in [
-        "CREATE TRIGGER fail_child BEFORE INSERT ON graph_nodes WHEN NEW.graph_version='2' BEGIN SELECT RAISE(ABORT,'child failure'); END;",
-        "CREATE TRIGGER fail_commit AFTER INSERT ON graph_mutations BEGIN UPDATE graphs SET current_version='missing'; END;",
+        "CREATE TEMP TRIGGER fail_child BEFORE INSERT ON graph_nodes WHEN NEW.graph_version='2' BEGIN SELECT RAISE(ABORT,'child failure'); END;",
+        "CREATE TEMP TRIGGER fail_commit AFTER INSERT ON graph_mutations BEGIN UPDATE graphs SET current_version='missing'; END;",
     ] {
         let path = db();
         let mut repo = SqliteStateRepository::open(&path).unwrap();
@@ -404,14 +407,17 @@ fn later_clock_child_and_commit_failures_rollback_everything() {
             .unwrap();
         let before:String=repo.connection().query_row("SELECT last_accepted_trusted_time FROM trusted_time_watermark WHERE project_id='p'",[],|r|r.get(0)).unwrap();
         repo.connection().execute_batch(trigger).unwrap();
-        assert!(
+        assert!(matches!(
             repo.append_graph_mutation_v1(
                 &LaterClock,
                 mutation("1", "2"),
                 StateGraphSnapshotV1::new("2".into(), "1".into(), content("p", None)).unwrap()
-            )
-            .is_err()
-        );
+            ),
+            Err(StateError::GraphPersistence {
+                code: Code::StorageFailure,
+                ..
+            })
+        ));
         let after:String=repo.connection().query_row("SELECT last_accepted_trusted_time FROM trusted_time_watermark WHERE project_id='p'",[],|r|r.get(0)).unwrap();
         assert_eq!(before, after);
         assert_eq!(
