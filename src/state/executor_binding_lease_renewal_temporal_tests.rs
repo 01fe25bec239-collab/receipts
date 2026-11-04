@@ -329,7 +329,7 @@ fn v10_store_open_reports_unsupported_legacy_schema() {
         let bytes = std::fs::read(tmp.db_path()).unwrap();
         assert!(matches!(
             crate::repository::SqliteStateRepository::open(tmp.db_path()),
-            Err(StateError::SchemaVersionMismatch { found, supported: 18 }) if found as usize == version
+            Err(StateError::SchemaVersionMismatch { found, supported: 19 }) if found as usize == version
         ));
         assert!(matches!(
             crate::repository::SqliteStateRepository::migrate_existing_to_current(tmp.db_path()),

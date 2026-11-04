@@ -202,3 +202,6 @@ pub use output_ref::OutputRef;
 mod checkpoint_ref_tests;
 #[cfg(test)]
 mod output_ref_tests;
+
+#[cfg(test)]
+mod row_identity_tests;

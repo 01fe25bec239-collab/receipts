@@ -507,7 +507,9 @@ pub(crate) fn insert_context_manifest(
                 .map_err(write_failure)?;
         }
     }
-    if crate::graph_repository::schema_head(conn, crate::GraphPhase::Write)? == Some(18) {
+    if crate::graph_repository::schema_head(conn, crate::GraphPhase::Write)?
+        .is_some_and(|head| head >= 18)
+    {
         conn.execute(
             "INSERT INTO context_manifest_seal(manifest_id) VALUES (?1)",
             [&manifest.manifest_id],
@@ -572,7 +574,9 @@ pub(crate) fn read_context_manifest(
     else {
         return Ok(None);
     };
-    if crate::graph_repository::schema_head(conn, crate::GraphPhase::Read)? == Some(18) {
+    if crate::graph_repository::schema_head(conn, crate::GraphPhase::Read)?
+        .is_some_and(|head| head >= 18)
+    {
         let sealed = conn
             .query_row(
                 "SELECT 1 FROM context_manifest_seal WHERE manifest_id=?1",

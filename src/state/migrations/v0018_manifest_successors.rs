@@ -110,7 +110,7 @@ pub(crate) fn apply(conn: &Connection) -> Result<(), StateError> {
         }
         conn.execute_batch(SQL)
             .map_err(|e| graph::sqlite_error(phase, e))?;
-        graph::verify_current(conn, phase)
+        graph::verify_v18(conn, phase)
     });
     let restored = conn
         .execute_batch("PRAGMA foreign_keys=ON")

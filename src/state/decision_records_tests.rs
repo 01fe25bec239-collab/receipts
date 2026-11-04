@@ -546,7 +546,7 @@ fn v16_store_migrates_to_v17_preserving_rows_and_rejects_partial_v17() {
     drop(conn);
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).unwrap(),
-        18
+        19
     );
     let repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
     assert_eq!(repo.count_table_rows("logical_role").unwrap(), 1);
@@ -678,6 +678,7 @@ fn deep_duplicate_validation_subprocess() {
 
 /// Test-only rewind, used solely on stores with the legacy one-version shape.
 pub(crate) fn remove_v18(conn: &Connection) {
+    remove_v19(conn);
     let head: i64 = conn
         .query_row("SELECT MAX(version) FROM state_schema_version", [], |r| {
             r.get(0)
@@ -706,4 +707,59 @@ pub(crate) fn remove_v18(conn: &Connection) {
             "role_id TEXT NOT NULL UNIQUE REFERENCES",
         );
     conn.execute_batch(&format!("{create}; INSERT INTO context_manifest_v18 SELECT * FROM context_manifest; DROP TABLE context_manifest; ALTER TABLE context_manifest_v18 RENAME TO context_manifest; DELETE FROM state_schema_version WHERE version=18; PRAGMA foreign_keys=ON;")).unwrap();
+}
+
+pub(crate) fn remove_v19(conn: &Connection) {
+    let head: i64 = conn
+        .query_row("SELECT MAX(version) FROM state_schema_version", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    if head < 19 {
+        return;
+    }
+    conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+    let mut deps = Vec::new();
+    let mut defs = Vec::new();
+    for table in crate::migrations::v0019_row_identity::TABLES {
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |r| r.get(0),
+            )
+            .unwrap();
+        defs.push((*table, sql));
+        let mut stmt=conn.prepare("SELECT type,name,sql FROM sqlite_master WHERE tbl_name=?1 AND type IN ('trigger','index') AND sql IS NOT NULL").unwrap();
+        deps.extend(
+            stmt.query_map([table], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .map(Result::unwrap),
+        );
+    }
+    for (kind, name, _) in &deps {
+        conn.execute_batch(&format!("DROP {kind} {name}")).unwrap();
+    }
+    for (table, sql) in defs {
+        let tail = sql[sql.find('(').unwrap()..]
+            .trim_end_matches(" WITHOUT ROWID")
+            .trim_end_matches(',');
+        let name = if table == "context_manifest" {
+            format!("\"{table}\"")
+        } else {
+            table.to_owned()
+        };
+        conn.execute_batch(&format!("CREATE TABLE rewind19 {tail}; INSERT INTO rewind19 SELECT * FROM {table}; DROP TABLE {table}; CREATE TABLE {name} {tail}; INSERT INTO {table} SELECT * FROM rewind19; DROP TABLE rewind19;")).unwrap();
+    }
+    for (_, _, sql) in deps {
+        conn.execute_batch(&sql).unwrap();
+    }
+    conn.execute_batch("DELETE FROM state_schema_version WHERE version=19; PRAGMA foreign_keys=ON")
+        .unwrap();
 }

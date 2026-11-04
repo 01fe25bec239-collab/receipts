@@ -934,7 +934,14 @@ pub(crate) fn verify_schema(
                 )
                 .optional()
                 .map_err(|e| schema_error(phase, e))?;
-            if stored.as_deref() != Some(statement.trim()) {
+            if !migrations::v0019_row_identity::definition_matches(
+                conn,
+                name,
+                stored.as_deref(),
+                statement.trim(),
+            )
+            .map_err(|e| schema_error(phase, e))?
+            {
                 return Err(failure(phase, Code::CorruptStore, None));
             }
         }
@@ -1037,7 +1044,7 @@ impl ReadOnlyGraphReader {
         if head.is_some_and(|version| version < 0) {
             return Err(corrupt());
         }
-        if head != Some(18) {
+        if head != Some(19) {
             return Err(failure(Phase::Read, Code::UnsupportedSchema, None));
         }
         verify_current(&self.conn, Phase::Read)
@@ -1530,7 +1537,7 @@ pub(crate) fn verify_v17(conn: &Connection, phase: Phase) -> Result<(), StateErr
     }
     Ok(())
 }
-pub(crate) fn verify_current(conn: &Connection, phase: Phase) -> Result<(), StateError> {
+pub(crate) fn verify_v18(conn: &Connection, phase: Phase) -> Result<(), StateError> {
     verify_graph_encoding(conn, phase)?;
     verify_ledger(conn, 18, phase)?;
     verify_v16_objects(conn, phase)?;
@@ -1538,6 +1545,30 @@ pub(crate) fn verify_current(conn: &Connection, phase: Phase) -> Result<(), Stat
         .map_err(|e| schema_error(phase, e))?
     {
         return Err(failure(phase, Code::CorruptStore, None));
+    }
+    Ok(())
+}
+pub(crate) fn verify_current(conn: &Connection, phase: Phase) -> Result<(), StateError> {
+    verify_graph_encoding(conn, phase)?;
+    verify_ledger(conn, 19, phase)?;
+    verify_v16_objects(conn, phase)?;
+    if !migrations::v0019_row_identity::objects_match(conn).map_err(|e| schema_error(phase, e))? {
+        return Err(failure(phase, Code::CorruptStore, None));
+    }
+    if !migrations::v0019_row_identity::tables_match(conn).map_err(|e| schema_error(phase, e))? {
+        return Err(failure(phase, Code::CorruptStore, None));
+    }
+    for table in migrations::v0019_row_identity::TABLES {
+        let wr: i64 = conn
+            .query_row(
+                "SELECT wr FROM pragma_table_list WHERE schema='main' AND name=?1",
+                [table],
+                |r| r.get(0),
+            )
+            .map_err(|e| schema_error(phase, e))?;
+        if wr != 1 {
+            return Err(failure(phase, Code::CorruptStore, None));
+        }
     }
     Ok(())
 }

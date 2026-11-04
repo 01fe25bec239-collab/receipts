@@ -2,9 +2,9 @@
 
 State stores what other owners define. It never routes, reviews, runs failover or decides acceptance. This page covers what the Wave 1 completion package added. Source of truth: `src/state/**`.
 
-## Schema version 18
+## Schema version 19
 
-Migration 17 (`decision_records`) adds three tables and immutable-event triggers. Migration 18 (`manifest_successors`) retains immutable historical manifests, seals their children and closes role/ownership duplicate-insert replacement paths. Migrations 1–17 are unchanged.
+Migration 17 (`decision_records`) adds three tables and immutable-event triggers. Migration 18 (`manifest_successors`) retains immutable historical manifests, seals their children and closes role/ownership duplicate-insert replacement paths. Migrations 1–17 and migration18 SQL are unchanged. Migration19 (`row_identity`) rebuilds the 23 protected tables WITHOUT ROWID, preserving logical keys, values, children, indexes, seals, history and CAS pointer protocols. Hidden SQLite row identities are unavailable; no public rowid API is provided.
 
 | Table | What it holds | Immutability |
 | --- | --- | --- |
@@ -21,7 +21,7 @@ Version 17 also adds triggers on existing tables:
 
 Upgrades:
 
-- `SqliteStateRepository::migrate_existing_to_current` upgrades exact v11–v17 stores, verifying each intermediate postcondition, including exact v17 before v18. Existing v18 stores are verified idempotently.
+- `SqliteStateRepository::migrate_existing_to_current` upgrades exact v11–v18 stores, verifying each intermediate postcondition, including exact v17 and v18 intermediate heads. Existing v19 stores are verified idempotently.
 - Ordinary `open` refuses every non-current version.
 - v1–v10 stores and unknown versions get typed refusals and are never rewritten: `SchemaVersionMismatch` from `open`, and `UNSUPPORTED_SCHEMA` from explicit migration.
 

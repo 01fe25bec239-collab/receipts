@@ -152,11 +152,11 @@ fn explicit_migration_and_missing_store() {
     drop(repo);
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
-        18
+        19
     );
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
-        18
+        19
     );
     assert!(
         ReadOnlyGraphReader::open_existing(&db.0)
@@ -360,7 +360,10 @@ fn v11_graph_maintenance_preserves_typed_busy_and_durable_state() {
         let mut rows = Vec::new();
         for table in tables {
             let mut stmt = conn
-                .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                .prepare(&format!(
+                    "SELECT * FROM {table} ORDER BY {}",
+                    crate::tests::logical_column_order(&conn, &table)
+                ))
                 .unwrap();
             let width = stmt.column_count();
             let values = stmt
@@ -416,7 +419,7 @@ fn v11_graph_maintenance_preserves_typed_busy_and_durable_state() {
         drop(blocker);
         assert_eq!(
             SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
-            18
+            19
         );
     }
 }
@@ -517,7 +520,10 @@ fn migration_image(path: &std::path::Path) -> (Vec<String>, Vec<String>, String,
     let mut rows = Vec::new();
     for table in tables {
         let mut stmt = conn
-            .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+            .prepare(&format!(
+                "SELECT * FROM {table} ORDER BY {}",
+                crate::tests::logical_column_order(&conn, &table)
+            ))
             .unwrap();
         let width = stmt.column_count();
         let values = stmt
@@ -628,9 +634,9 @@ fn stale_v11_graph_step_refuses_valid_advanced_store_without_rebuild() {
             );
             assert_eq!(
                 SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
-                18
+                19
             );
-            assert_eq!(migration_ledger(&db.0).len(), 18);
+            assert_eq!(migration_ledger(&db.0).len(), 19);
             drop(SqliteStateRepository::open(&db.0).unwrap());
         }
     }
@@ -721,7 +727,7 @@ fn simultaneous_public_v11_maintenance_keeps_one_exact_ledger() {
     barrier.wait();
     for result in handles.into_iter().map(|handle| handle.join().unwrap()) {
         match result {
-            Ok(18) => (),
+            Ok(19) => (),
             Err(StateError::GraphPersistence {
                 phase: Phase::Migration,
                 code: Code::StoreBusy | Code::UnsupportedSchema | Code::CorruptStore,
@@ -732,7 +738,7 @@ fn simultaneous_public_v11_maintenance_keeps_one_exact_ledger() {
     }
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
-        18
+        19
     );
     let expected: Vec<_> = crate::migrations::registered()
         .iter()
@@ -783,7 +789,7 @@ fn graph_v11_commit_busy_rolls_back_and_restores_foreign_keys() {
     reader.execute_batch("ROLLBACK").unwrap();
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
-        18
+        19
     );
 }
 

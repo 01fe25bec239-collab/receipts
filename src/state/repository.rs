@@ -69,7 +69,7 @@ impl SqliteStateRepository {
         Ok(repo)
     }
 
-    /// Explicitly upgrades an exact v11–v17 State database to v18.
+    /// Explicitly upgrades an exact v11–v18 State database to v19.
     pub fn migrate_existing_to_current(path: impl AsRef<Path>) -> Result<u32, StateError> {
         let mut conn =
             Connection::open_with_flags(path.as_ref(), OpenFlags::SQLITE_OPEN_READ_WRITE)
@@ -98,9 +98,10 @@ impl SqliteStateRepository {
             Some(15) => graph_repository::verify_v15(&conn, GraphPhase::Migration)?,
             Some(16) => graph_repository::verify_v16(&conn, GraphPhase::Migration)?,
             Some(17) => graph_repository::verify_v17(&conn, GraphPhase::Migration)?,
-            Some(18) => {
+            Some(18) => graph_repository::verify_v18(&conn, GraphPhase::Migration)?,
+            Some(19) => {
                 graph_repository::verify_current(&conn, GraphPhase::Migration)?;
-                return Ok(18);
+                return Ok(19);
             }
             // v1–v10 and unknown heads are typed unsupported legacy: no
             // automatic migration and no corruption misclassification.
@@ -131,8 +132,11 @@ impl SqliteStateRepository {
                 graph_repository::verify_v17(conn, GraphPhase::Migration)
             })?;
         }
-        migrations::v0018_manifest_successors::apply(&conn)?;
-        Ok(18)
+        if found.is_some_and(|v| v < 18) {
+            migrations::v0018_manifest_successors::apply(&conn)?;
+        }
+        migrations::v0019_row_identity::apply(&conn)?;
+        Ok(19)
     }
 
     /// Version-reconciliation core of [`Self::open`], parameterized by the
@@ -556,6 +560,10 @@ fn bootstrap(conn: &mut Connection, chain: &[Migration]) -> Result<(), StateErro
         }
         if migration.version == 18 && migration.name == "manifest_successors" {
             migrations::v0018_manifest_successors::apply(conn)?;
+            continue;
+        }
+        if migration.version == 19 && migration.name == "row_identity" {
+            migrations::v0019_row_identity::apply(conn)?;
             continue;
         }
         let tx = conn
