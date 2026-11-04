@@ -150,8 +150,8 @@ pub use handle_wire::{
     WorkspaceHandleExportError, WorkspaceHandleWire, WorkspaceHandleWireIsolation,
 };
 pub use lifecycle::{
-    WorkspaceCheckpointLifecycleInput, WorkspaceLifecycleError, checkpoint_workspace,
-    orphan_workspace, start_workspace_attempt,
+    WorkspaceAttempt, WorkspaceCheckpointLifecycleInput, WorkspaceCollectionFailure,
+    WorkspaceLifecycleError, checkpoint_workspace, orphan_workspace, start_workspace_attempt,
 };
 pub use protected::{
     ControllerChannel, ControllerCredentials, ControllerOperation, ControllerRequest,

@@ -249,3 +249,16 @@ diagnostic (`.github/workflows/we-w1-completion-linux.yml`) is prepared and
 NOT RUN; it needs A1 inspection and independent static review before
 USER-authorized execution. Root/controller compromise, kernel bugs and
 non-filesystem Landlock scope are outside admission assumptions.
+
+Lifecycle start returns a WorkspaceAttempt facade retaining its own ACTIVE handle.
+Only its actual collection can construct WorkspaceCollectionFailure. Orphaning
+consumes that opaque carrier and uses its retained handle; caller-built Execution
+errors and caller-selected handles supply no provenance. Repeated collection and
+capture-only failures cannot supply orphan authority. Execution and Runtime APIs
+remain unchanged.
+
+Hosted conflict checks distinguish early Git dubious-ownership refusal from
+reservation enforcement. They separately call the production reservation path
+using fixture roots recorded before transfer, and require the held attempt in its
+refusal. Neither control disables Git ownership safety. Native execution remains
+NOT RUN.

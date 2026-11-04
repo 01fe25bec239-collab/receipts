@@ -794,3 +794,11 @@ fn live_claim_authority_rejects_every_later_cause() {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) fn inject_collection_failure_for_test() {
+    CONTROLLER_FAULTS.set(
+        super::runner::CAPTURE_TEST_FORCE_COMPLETION_BARRIER
+            | super::runner::TEST_FAIL_POST_REAP_GROUP_EMPTY,
+    );
+}

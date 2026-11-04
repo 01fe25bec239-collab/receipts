@@ -1008,6 +1008,35 @@ fn hosted_protected_worker_controller_and_cleanup() {
     assert!(leftovers.is_empty(), "owned cgroups remain: {leftovers:?}");
 }
 
+// Public discovery may stop safely before reservation after ownership transfer.
+fn assert_admission_boundary(
+    result: Result<crate::ProtectedAdmission, ProtectedLaunchError>,
+    held: &str,
+) {
+    match result {
+        Err(ProtectedLaunchError::Workspace(WorkspaceError::GitCommandFailed {
+            detail, ..
+        })) => {
+            assert!(
+                detail.contains("dubious ownership"),
+                "unexpected Git refusal: {detail}"
+            );
+        }
+        Err(ProtectedLaunchError::Custody(detail)) => assert!(detail.contains(held), "{detail}"),
+        other => panic!("expected attributed ownership or custody refusal: {other:?}"),
+    }
+}
+
+fn assert_production_reservation(common: &Path, worktree: &Path, held: &str) {
+    let error =
+        crate::protected_custody::Reservation::begin(common, "hosted-conflict-control", worktree)
+            .unwrap_err();
+    assert!(
+        error.contains(held),
+        "production reservation did not name owner: {error}"
+    );
+}
+
 fn owner_mode(path: &Path) -> (u32, u32, u32) {
     let metadata = std::fs::symlink_metadata(path).unwrap();
     (metadata.uid(), metadata.gid(), metadata.mode() & 0o7777)
@@ -1056,12 +1085,8 @@ fn hosted_exclusive_custody_and_linked_target_refusals() {
         (&launcher_b, &second_handle, repo.clone()),
         (&launcher_b, &second_handle, first_root.clone()),
     ] {
-        match launcher.admit(handle, &root) {
-            Err(ProtectedLaunchError::Custody(detail)) => {
-                assert!(detail.contains(admission.attempt_id()), "{detail}");
-            }
-            other => panic!("second owner must refuse: {other:?}"),
-        }
+        assert_admission_boundary(launcher.admit(handle, &root), admission.attempt_id());
+        assert_production_reservation(&common, handle.worktree_path(), admission.attempt_id());
     }
     assert_eq!(std::fs::read(&marker).unwrap(), record);
     assert_eq!(owner_mode(&common), common_after_first);
@@ -1204,10 +1229,15 @@ fn hosted_cross_repository_nested_custody_refuses_without_transfer() {
             })
         };
         let before = snapshot();
-        assert!(matches!(
+        assert_admission_boundary(
             contender.admit(handles[second], repos[second]),
-            Err(ProtectedLaunchError::Custody(_))
-        ));
+            held.attempt_id(),
+        );
+        assert_production_reservation(
+            &common[second],
+            handles[second].worktree_path(),
+            held.attempt_id(),
+        );
         assert_eq!(
             snapshot(),
             before,

@@ -81,7 +81,7 @@ pub fn start_workspace_attempt(
     handle: &WorkspaceHandle,
     request: &ProcessRunRequest,
     policy: &ProcessTimeoutPolicy,
-) -> Result<(WorkspaceHandle, LiveProcessAttempt), WorkspaceLifecycleError> {
+) -> Result<(WorkspaceHandle, WorkspaceAttempt), WorkspaceLifecycleError> {
     checked(handle, WorkspaceState::Active)?;
     let canonical = |path: &std::path::Path| std::fs::canonicalize(path).ok();
     match (
@@ -96,7 +96,7 @@ pub fn start_workspace_attempt(
     let active = handle
         .transitioned(WorkspaceState::Active, None)
         .expect("transition was checked before start");
-    Ok((active, attempt))
+    Ok((active.clone(), WorkspaceAttempt { active, attempt }))
 }
 
 /// Caller-supplied inert checkpoint metadata; Git state is always observed.
@@ -141,18 +141,69 @@ pub fn checkpoint_workspace(
     Ok((next, checkpoint))
 }
 
-/// Marks the handle `ORPHANED` from a collected attempt failure whose process
-/// cleanup was not proven (controller failure or a process-control error).
-/// Capture-only or validation failures prove nothing about orphaning and are
-/// refused.
-pub fn orphan_workspace(
-    handle: &WorkspaceHandle,
-    failure: &LiveProcessAttemptError,
-) -> Result<WorkspaceHandle, WorkspaceLifecycleError> {
-    checked(handle, WorkspaceState::Orphaned)?;
-    if !cleanup_unknown(failure) {
-        return Err(WorkspaceLifecycleError::NotOrphanEvidence);
+/// Owns the attempt and its observed ACTIVE handle. Collection cannot be bypassed.
+#[derive(Debug)]
+pub struct WorkspaceAttempt {
+    active: WorkspaceHandle,
+    attempt: LiveProcessAttempt,
+}
+
+/// An actual owning collection failure. Fields are private; diagnostics alone
+/// cannot construct lifecycle authority.
+#[derive(Debug)]
+pub struct WorkspaceCollectionFailure {
+    error: LiveProcessAttemptError,
+    orphan: Option<Box<WorkspaceHandle>>,
+}
+impl WorkspaceCollectionFailure {
+    pub fn error(&self) -> &LiveProcessAttemptError {
+        &self.error
     }
+}
+impl fmt::Display for WorkspaceCollectionFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(f)
+    }
+}
+impl std::error::Error for WorkspaceCollectionFailure {}
+
+impl WorkspaceAttempt {
+    pub fn snapshot_output(&self) -> Result<crate::execution::LiveProcessOutput, ExecutionError> {
+        self.attempt.snapshot_output()
+    }
+    pub fn cancel(&self) -> crate::execution::LiveProcessCancelAcceptance {
+        self.attempt.cancel()
+    }
+    pub fn terminal_cause(&self) -> Option<crate::execution::LiveProcessTerminalCause> {
+        self.attempt.terminal_cause()
+    }
+    pub fn wait_collect(
+        &self,
+    ) -> Result<crate::execution::LiveProcessOutcome, WorkspaceCollectionFailure> {
+        self.attempt.wait_collect().map_err(|error| {
+            let orphan = cleanup_unknown(&error).then(|| Box::new(self.active.clone()));
+            WorkspaceCollectionFailure { error, orphan }
+        })
+    }
+}
+
+/// Uses only the handle retained by the failed owning collection. No caller
+/// handle, path or identifier can substitute for it.
+///
+/// ```compile_fail
+/// use receipts_workspace_execution::{orphan_workspace, WorkspaceHandle};
+/// use receipts_workspace_execution::execution::LiveProcessAttemptError;
+/// fn fabricate(handle: &WorkspaceHandle) {
+///     orphan_workspace(handle, &LiveProcessAttemptError::ControllerFailed);
+/// }
+/// ```
+pub fn orphan_workspace(
+    failure: WorkspaceCollectionFailure,
+) -> Result<WorkspaceHandle, WorkspaceLifecycleError> {
+    let handle = failure
+        .orphan
+        .ok_or(WorkspaceLifecycleError::NotOrphanEvidence)?;
+    checked(&handle, WorkspaceState::Orphaned)?;
     handle
         .transitioned(WorkspaceState::Orphaned, None)
         .map_err(WorkspaceLifecycleError::Transition)
