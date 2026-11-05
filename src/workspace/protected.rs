@@ -860,8 +860,14 @@ pub(crate) type ChannelHook = Arc<dyn Fn(ControllerRole) + Send + Sync>;
 pub(crate) struct CgroupNameSeam {
     pub(crate) root: PathBuf,
     /// Runs after each successful reservation, while its directory exists.
-    pub(crate) reserved: Arc<dyn Fn(ControllerRole, &Path) + Send + Sync>,
+    pub(crate) reserved: ReservedHook,
 }
+
+#[cfg(test)]
+pub(crate) type ReservedHook = Arc<dyn Fn(ControllerRole, &Path) + Send + Sync>;
+
+#[cfg(test)]
+type CustodyHook = Box<dyn Fn(&str)>;
 
 #[cfg(test)]
 struct SeamController {
@@ -901,7 +907,7 @@ impl git::ControllerLaunch for SeamController {
 #[cfg(test)]
 thread_local! {
     static CUSTODY_TRACE: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
-    static CUSTODY_HOOK: std::cell::RefCell<Option<Box<dyn Fn(&str)>>> = const { std::cell::RefCell::new(None) };
+    static CUSTODY_HOOK: std::cell::RefCell<Option<CustodyHook>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Records one admission/reservation phase event of this thread and runs
