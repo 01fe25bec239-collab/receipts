@@ -14,7 +14,6 @@ mod imp {
     use std::os::unix::fs::OpenOptionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     use crate::execution::{AttemptContainment, LaunchCustomization};
@@ -274,6 +273,10 @@ mod imp {
     fn create_cgroup(root: &Path, name: &str) -> Result<(Cgroup, OwnedFd), String> {
         let dir = root.join(name);
         std::fs::create_dir(&dir).map_err(|error| format!("create cgroup {name}: {error}"))?;
+        open_cgroup(dir)
+    }
+
+    fn open_cgroup(dir: PathBuf) -> Result<(Cgroup, OwnedFd), String> {
         let procs = std::fs::OpenOptions::new()
             .write(true)
             .open(dir.join("cgroup.procs"))
@@ -525,7 +528,7 @@ mod imp {
         gid: u32,
         cap_last_cap: u32,
         plan: Vec<(PathBuf, u64)>,
-        counter: AtomicU64,
+        /// Shared by both channels; also allocates noncolliding cgroup names.
         gate: Arc<Gate>,
     }
 
@@ -547,10 +550,9 @@ mod imp {
                     Err(error) => return Err(format!("{}: {error}", path.display())),
                 }
             }
-            let index = self.counter.fetch_add(1, Ordering::Relaxed);
-            let (cgroup, procs) = create_cgroup(
-                &self.cgroup_root,
-                &format!("receipts-{}-ctl-{index}", self.attempt_id),
+            let (cgroup, procs) = open_cgroup(
+                self.gate
+                    .create_controller_cgroup(&self.cgroup_root, &self.attempt_id)?,
             )?;
             let hook = Hook {
                 procs,
@@ -576,7 +578,6 @@ mod imp {
             gid: config.controller_gid,
             cap_last_cap: support.cap_last_cap,
             plan: controller_landlock_plan(binding),
-            counter: AtomicU64::new(0),
             gate: binding.gate.clone(),
         }))
     }

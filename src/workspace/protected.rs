@@ -64,7 +64,7 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::execution::{
@@ -200,6 +200,9 @@ pub(crate) struct Gate {
     changed: Condvar,
     /// A confined controller run whose cleanup was not proven.
     controller_unproven: AtomicBool,
+    /// Next controller cgroup index of this admission, shared by both
+    /// channels and every controller launch (see `create_controller_cgroup`).
+    controller_cgroups: AtomicU64,
 }
 
 /// An admitted controller operation; dropping it ends the operation.
@@ -224,7 +227,31 @@ impl Gate {
             }),
             changed: Condvar::new(),
             controller_unproven: AtomicBool::new(false),
+            controller_cgroups: AtomicU64::new(0),
         }
+    }
+
+    /// Creates the next controller cgroup `receipts-<attempt>-ctl-<index>`
+    /// under `root`. The index comes from this admission-wide counter, so
+    /// overlapping Git calls on either channel never choose the same name.
+    /// An index is consumed even when creation fails and is never reused;
+    /// exhaustion refuses instead of wrapping. An existing directory refuses:
+    /// it is never adopted or cleaned up here.
+    pub(crate) fn create_controller_cgroup(
+        &self,
+        root: &Path,
+        attempt_id: &str,
+    ) -> Result<PathBuf, String> {
+        let index = self
+            .controller_cgroups
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |index| {
+                index.checked_add(1)
+            })
+            .map_err(|_| "controller cgroup identifiers exhausted".to_owned())?;
+        let name = format!("receipts-{attempt_id}-ctl-{index}");
+        let dir = root.join(&name);
+        std::fs::create_dir(&dir).map_err(|error| format!("create cgroup {name}: {error}"))?;
+        Ok(dir)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, GateState> {
@@ -474,33 +501,43 @@ impl ProtectedLauncher {
         // One protected custody owner per actual Git common directory: reserve
         // it before reading ownership or changing anything. A loser mutates
         // nothing; a refused setup below deletes only its own reservation.
+        // The test registry is per contender thread, and each reservation
+        // keeps its registry alive (it outlives the thread that admitted it).
         #[cfg(test)]
-        let reserve = match self.inner.enforcement {
+        let (reserve, test_registry) = match self.inner.enforcement {
             Enforcement::Unenforced => {
                 thread_local! {
-                    static REGISTRY: crate::test_support::TempDir = {
+                    static REGISTRY: Arc<crate::test_support::TempDir> = {
                         let dir = crate::test_support::TempDir::new("custody-registry");
                         std::fs::write(dir.path().join("lock"), "").unwrap();
-                        dir
+                        Arc::new(dir)
                     };
                 }
-                REGISTRY.with(|dir| {
-                    custody::Reservation::begin_for_test(
-                        dir.path(),
-                        &common_dir,
-                        &attempt_id,
-                        &worktree,
-                    )
-                })
+                custody_event_for_test("pre-reservation checks passed".into());
+                let registry = REGISTRY.with(Arc::clone);
+                custody_event_for_test(format!("registry {}", registry.path().display()));
+                let reserve = custody::Reservation::begin_for_test(
+                    registry.path(),
+                    &common_dir,
+                    &attempt_id,
+                    &worktree,
+                );
+                (
+                    reserve,
+                    Some(registry as Arc<dyn std::any::Any + Send + Sync>),
+                )
             }
             #[cfg(target_os = "linux")]
-            Enforcement::Linux(_) => {
-                custody::Reservation::begin(&common_dir, &attempt_id, &worktree)
-            }
+            Enforcement::Linux(_) => (
+                custody::Reservation::begin(&common_dir, &attempt_id, &worktree),
+                None,
+            ),
         };
         #[cfg(not(test))]
         let reserve = custody::Reservation::begin(&common_dir, &attempt_id, &worktree);
         let reservation = reserve.map_err(ProtectedLaunchError::Custody)?;
+        #[cfg(test)]
+        custody_event_for_test("reserved".into());
         let cancel = |error: ProtectedLaunchError| {
             let _ = reservation.finish();
             error
@@ -517,6 +554,8 @@ impl ProtectedLauncher {
                     "custody record could not be written: {error}"
                 )))
             })?;
+        #[cfg(test)]
+        custody_event_for_test("identity recorded".into());
         let binding = Binding {
             attempt_id,
             task_id,
@@ -531,6 +570,8 @@ impl ProtectedLauncher {
             handle: handle.clone(),
             #[cfg(test)]
             hooks: TestHooks::default(),
+            #[cfg(test)]
+            _test_registry: test_registry,
         };
         match &self.inner.enforcement {
             #[cfg(target_os = "linux")]
@@ -569,6 +610,8 @@ impl ProtectedLauncher {
                     })?;
             }
         }
+        #[cfg(test)]
+        custody_event_for_test("custody".into());
         Ok(ProtectedAdmission {
             binding: Arc::new(binding),
             launcher: self.clone(),
@@ -801,10 +844,87 @@ pub(crate) struct TestHooks {
     pub(crate) before: Mutex<Option<ChannelHook>>,
     pub(crate) after: Mutex<Option<ChannelHook>>,
     pub(crate) fail_restore: AtomicBool,
+    /// When set, unenforced controller operations take their per-call cgroup
+    /// names from the production allocator, see [`CgroupNameSeam`].
+    pub(crate) controller_cgroups: Mutex<Option<CgroupNameSeam>>,
 }
 
 #[cfg(test)]
 pub(crate) type ChannelHook = Arc<dyn Fn(ControllerRole) + Send + Sync>;
+
+/// Unprivileged filesystem stand-in for the delegated cgroup root. It proves
+/// only controller cgroup NAME reservation through [`Gate::create_controller_cgroup`]
+/// and the real confined-run path; no kernel cgroup or confinement exists.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct CgroupNameSeam {
+    pub(crate) root: PathBuf,
+    /// Runs after each successful reservation, while its directory exists.
+    pub(crate) reserved: Arc<dyn Fn(ControllerRole, &Path) + Send + Sync>,
+}
+
+#[cfg(test)]
+struct SeamController {
+    binding: Arc<Binding>,
+    role: ControllerRole,
+    seam: CgroupNameSeam,
+}
+
+#[cfg(test)]
+struct SeamCgroup(PathBuf);
+
+#[cfg(test)]
+impl crate::execution::AttemptContainment for SeamCgroup {
+    fn kill_and_verify_empty(&self) -> Result<(), String> {
+        std::fs::remove_dir(&self.0).map_err(|error| format!("{}: {error}", self.0.display()))
+    }
+}
+
+#[cfg(test)]
+impl git::ControllerLaunch for SeamController {
+    fn customization(&self) -> Result<crate::execution::LaunchCustomization, String> {
+        let dir = self
+            .binding
+            .gate
+            .create_controller_cgroup(&self.seam.root, &self.binding.attempt_id)?;
+        (self.seam.reserved)(self.role, &dir);
+        Ok(crate::execution::LaunchCustomization {
+            pre_exec: None,
+            containment: Some(Arc::new(SeamCgroup(dir))),
+        })
+    }
+    fn cleanup_unproven(&self) {
+        self.binding.gate.mark_controller_unproven();
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CUSTODY_TRACE: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    static CUSTODY_HOOK: std::cell::RefCell<Option<Box<dyn Fn(&str)>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Records one admission/reservation phase event of this thread and runs
+/// this thread's hook, if any, at that point.
+#[cfg(test)]
+pub(crate) fn custody_event_for_test(event: String) {
+    CUSTODY_TRACE.with(|trace| trace.borrow_mut().push(event.clone()));
+    CUSTODY_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(&event);
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn set_custody_hook_for_test(hook: impl Fn(&str) + 'static) {
+    CUSTODY_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+pub(crate) fn take_custody_trace_for_test() -> Vec<String> {
+    CUSTODY_TRACE.with(|trace| std::mem::take(&mut *trace.borrow_mut()))
+}
 
 #[cfg(test)]
 impl fmt::Debug for TestHooks {
@@ -843,6 +963,9 @@ pub(crate) struct Binding {
     handle: WorkspaceHandle,
     #[cfg(test)]
     pub(crate) hooks: TestHooks,
+    /// Keeps this admission's test registry alive while its reservation is.
+    #[cfg(test)]
+    _test_registry: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 /// A running protected attempt.
@@ -1150,7 +1273,27 @@ impl ControllerChannel {
             )
             .map(|launch| Some(git::ControllerScope::enter(launch)))
             .map_err(ProtectedLaunchError::Unsupported),
-            Enforcement::Unenforced => unenforced().map(|()| None),
+            Enforcement::Unenforced => {
+                unenforced()?;
+                #[cfg(test)]
+                if let Some(seam) = self
+                    .binding
+                    .hooks
+                    .controller_cgroups
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+                {
+                    return Ok(Some(git::ControllerScope::enter(Arc::new(
+                        SeamController {
+                            binding: self.binding.clone(),
+                            role: self.role,
+                            seam,
+                        },
+                    ))));
+                }
+                Ok(None)
+            }
         }
     }
 

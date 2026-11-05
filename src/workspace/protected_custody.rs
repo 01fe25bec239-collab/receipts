@@ -1437,12 +1437,20 @@ mod imp {
             let dir = Dir::open_absolute(common)
                 .map_err(|error| format!("common directory {}: {error}", common.display()))?;
             let flags = sys::O_RDWR | sys::O_CREAT | sys::O_EXCL | sys::O_NOFOLLOW | sys::O_CLOEXEC;
+            #[cfg(test)]
+            crate::protected::custody_event_for_test("registry record written".into());
             match openat_raw(dir.fd.as_raw_fd(), MARKER, flags, 0o600) {
                 Ok(fd) => {
                     let file = File::from(fd);
+                    #[cfg(test)]
+                    crate::protected::custody_event_for_test("marker created".into());
                     let started = lock_exclusive(&file)
                         .and_then(|()| write_record(&file, &record))
                         .map_err(|error| error.to_string());
+                    #[cfg(test)]
+                    crate::protected::custody_event_for_test(format!(
+                        "marker lock+record: {started:?}"
+                    ));
                     if let Err(error) = started {
                         return Err(format!(
                             "custody reservation could not be started; registry retained: {error}"
@@ -1457,6 +1465,8 @@ mod imp {
                     })
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    #[cfg(test)]
+                    crate::protected::custody_event_for_test("marker exists".into());
                     Err(Self::diagnose(&dir))
                 }
                 Err(error) => Err(format!("custody reservation: {error}")),
@@ -1471,20 +1481,26 @@ mod imp {
             };
             let file = File::from(fd);
             let text = read_marker(&file);
-            let live = match lock_exclusive(&file) {
-                Ok(()) => false,
-                Err(error) => error.kind() == io::ErrorKind::WouldBlock,
+            // An owner creates the marker, then locks it, then writes its
+            // record. Probing the lock of an empty marker could take it inside
+            // that window and refuse the only valid owner, so it is not probed.
+            let liveness = if text.is_empty() {
+                "owner starting or stopped before recording state"
+            } else {
+                match lock_exclusive(&file) {
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => "owner alive",
+                    _ => "no live owner: retained state",
+                }
             };
+            // Runs while this probe still holds `file` (and any lock it took).
+            #[cfg(test)]
+            crate::protected::custody_event_for_test(format!("probe marker {text:?}: {liveness}"));
             format!(
                 "Git common directory is already under custody (attempt {}, phase {}, {}); \
                  occupied or unknown prior custody refuses without recovery",
                 marker_field(&text, "attempt"),
                 marker_field(&text, "phase"),
-                if live {
-                    "owner alive"
-                } else {
-                    "no live owner: retained state"
-                }
+                liveness
             )
         }
 

@@ -117,6 +117,9 @@ and `protected_hardlinks`/`protected_symlinks`. All other platforms refuse.
 - The shared registry persists paths, object chains, phase, attempt and original
   ownership before transfer; the same-common `receipts-custody.state` marker
   remains an additional persistent guard. Crash/partial state stays reserved.
+  An owner creates the marker, then locks it, then records state; a losing
+  contender's diagnosis never lock-probes an empty marker, so it cannot take
+  the owner's lock inside that window and leave zero admissions.
   Release removes only owned state after gate drain, proven cleanup and successful
   restoration. There is no orphan recovery or force unlock.
 - Stable objects (`protected_custody`): both trees are walked and mutated only
@@ -144,7 +147,12 @@ and `protected_hardlinks`/`protected_symlinks`. All other platforms refuse.
 - Controller: fixed Git argv only, controller UID with only
   `CAP_DAC_READ_SEARCH` (reads worker `0600` payload without chmod/chown),
   Landlock (repository + worktree full, tool trees read/exec, named `/etc`
-  files, `/dev/null`), same seccomp, own cgroup per call.
+  files, `/dev/null`), same seccomp, own cgroup per call. Per-call cgroup names
+  `receipts-<attempt>-ctl-<n>` come from one counter shared by both channels
+  and every request of the admission: overlapping worker/reviewer Git calls
+  never collide. An index is consumed even when creation fails and is never
+  reused; an existing directory refuses (never adopted or cleaned); exhaustion
+  refuses instead of wrapping.
 - Cleanup: existing deadline/grace/reap lifecycle, then `cgroup.kill` and
   `populated 0` proof before reader verification. Unknown cleanup refuses
   success and retains the cgroup and identity.
@@ -240,6 +248,10 @@ non-Linux, including the reservation (threads and a separate process), the
 release barrier (barrier- and condition-coordinated, no sleeps), the descriptor
 engine against real symlink/hardlink/replacement fixtures with external
 sentinels, and the filter-marker phases with an unprivileged positive control.
+Controller cgroup NAME reservation is covered through the real channel and
+confined-run path with overlapping worker/reviewer reservations, using an
+unprivileged temporary directory as the cgroup root: a test seam proving names
+only, not kernel cgroups or confinement.
 Ownership changes to other users, `/proc/self/mountinfo` on a real bind mount,
 Landlock and cgroups need the hosted run. Linux enforcement code and the hosted tests were type-checked and
 Clippy-checked locally only in a throwaway copy with the Linux cfg gates

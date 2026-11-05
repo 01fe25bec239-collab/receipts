@@ -410,33 +410,145 @@ fn nonoverlapping_repositories_admit_independently() {
     assert!(marker_text(&repo_b).contains(second.attempt_id()));
 }
 
-/// Concurrent contenders with independent launchers: exactly one wins.
+/// The test registry directory an admission used, from its phase trace.
+fn traced_registry(trace: &[String]) -> Option<PathBuf> {
+    trace
+        .iter()
+        .find_map(|event| event.strip_prefix("registry "))
+        .map(PathBuf::from)
+}
+
+fn listing(dir: &Path) -> Vec<String> {
+    let mut names: Vec<_> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// Concurrent contenders with independent launchers: exactly one wins. Every
+/// typed outcome is kept with its admission phase trace, the contender's test
+/// registry entries and the marker it observed before its thread exited, so a
+/// failure reports all six results instead of only a count.
 #[test]
 fn concurrent_admissions_have_exactly_one_winner() {
     let repo = TestRepo::new("protected-race");
     let handle = provisioned(&repo, Some("task-1"));
     let barrier = Barrier::new(6);
-    let results: Vec<_> = std::thread::scope(|scope| {
+    let contenders: Vec<_> = std::thread::scope(|scope| {
         let workers: Vec<_> = (0..6)
             .map(|_| {
                 scope.spawn(|| {
                     let launcher = unenforced(62000..=62009);
                     barrier.wait();
-                    launcher.admit(&handle, repo.path())
+                    let result = launcher.admit(&handle, repo.path());
+                    let trace = take_custody_trace_for_test();
+                    let registry = traced_registry(&trace).map(|dir| (listing(&dir), dir));
+                    let marker = std::fs::read_to_string(marker_path(&repo));
+                    (result, trace, registry, marker)
                 })
             })
             .collect();
         workers.into_iter().map(|w| w.join().unwrap()).collect()
     });
-    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
-    let winner = results.iter().find_map(|r| r.as_ref().ok()).unwrap();
-    assert!(marker_text(&repo).contains(winner.attempt_id()));
-    for refused in results.iter().filter_map(|r| r.as_ref().err()) {
-        assert!(
-            matches!(refused, ProtectedLaunchError::Custody(_)),
-            "{refused:?}"
-        );
+    let report: Vec<String> = contenders
+        .iter()
+        .enumerate()
+        .map(|(index, (result, trace, registry, marker))| {
+            let outcome = match result {
+                Ok(admission) => format!("Ok(attempt {})", admission.attempt_id()),
+                Err(error) => format!("Err({error:?})"),
+            };
+            let registry_after_join = registry.as_ref().map(|(_, dir)| dir.exists());
+            format!(
+                "contender {index}: {outcome}\n  trace: {trace:?}\n  registry before exit: \
+                 {registry:?}\n  registry exists after join: {registry_after_join:?}\n  \
+                 marker before exit: {marker:?}"
+            )
+        })
+        .collect();
+    let report = report.join("\n");
+    eprintln!(
+        "{report}\nmarker after join: {:?}",
+        std::fs::read_to_string(marker_path(&repo))
+    );
+    let mut winners = Vec::new();
+    for (result, ..) in contenders {
+        match result {
+            Ok(admission) => winners.push(admission),
+            Err(ProtectedLaunchError::Custody(_)) => {}
+            Err(other) => panic!("non-custody refusal {other:?}\n{report}"),
+        }
     }
+    assert_eq!(winners.len(), 1, "{report}");
+    let winner = winners.pop().unwrap();
+    assert!(marker_text(&repo).contains(winner.attempt_id()), "{report}");
+    // The winner's reservation outlives its contender thread: its registry
+    // must too, or giving custody back cannot be verified.
+    drop(winner);
+    assert!(
+        !marker_path(&repo).exists(),
+        "the winner could not release its reservation\n{report}"
+    );
+}
+
+/// A losing contender's liveness probe runs while the owner has created the
+/// marker but not yet locked it. The probe must not take that lock and turn
+/// the only valid admission into a refusal (zero winners).
+#[test]
+fn a_losing_probe_inside_the_owner_create_lock_window_never_defeats_the_owner() {
+    let repo = TestRepo::new("protected-probe-window");
+    let handle = provisioned(&repo, Some("task-1"));
+    let (created, probed, owner_done) = (
+        Arc::new(Latch::default()),
+        Arc::new(Latch::default()),
+        Arc::new(Latch::default()),
+    );
+    let (owner, owner_trace, loser, loser_trace) = std::thread::scope(|scope| {
+        let owner = scope.spawn(|| {
+            let (created, probed) = (created.clone(), probed.clone());
+            set_custody_hook_for_test(move |event| {
+                if event == "marker created" {
+                    created.open();
+                    probed.wait();
+                }
+            });
+            let result = unenforced(62000..=62009).admit(&handle, repo.path());
+            (result, take_custody_trace_for_test())
+        });
+        let loser = scope.spawn(|| {
+            created.wait();
+            let (probed, owner_done) = (probed.clone(), owner_done.clone());
+            set_custody_hook_for_test(move |event| {
+                if event.starts_with("probe marker") {
+                    probed.open();
+                    owner_done.wait();
+                }
+            });
+            let result = unenforced(62000..=62009).admit(&handle, repo.path());
+            (result, take_custody_trace_for_test())
+        });
+        let (owner, owner_trace) = owner.join().unwrap();
+        owner_done.open();
+        let (loser, loser_trace) = loser.join().unwrap();
+        (owner, owner_trace, loser, loser_trace)
+    });
+    let report = format!(
+        "owner: {:?}\n  {owner_trace:?}\nloser: {loser:?}\n  {loser_trace:?}",
+        owner.as_ref().map(ProtectedAdmission::attempt_id)
+    );
+    let owner = owner.unwrap_or_else(|error| panic!("owner refused: {error:?}\n{report}"));
+    assert!(
+        matches!(loser, Err(ProtectedLaunchError::Custody(_))),
+        "{report}"
+    );
+    assert!(marker_text(&repo).contains(owner.attempt_id()), "{report}");
+    drop(owner);
+    assert!(!marker_path(&repo).exists(), "{report}");
 }
 
 /// A retained record from a crashed or incomplete owner is unknown prior
@@ -1518,4 +1630,182 @@ fn controller_refuses_effective_target_configuration_for_every_content_operation
         ));
     }
     protected.release_custody().unwrap();
+}
+
+// ------------------------------------------- FRESH-1: controller cgroup names
+
+fn ctl_index(dir: &Path, attempt: &str) -> u64 {
+    dir.file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .strip_prefix(&format!("receipts-{attempt}-ctl-"))
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+/// FRESH-1: worker and reviewer operations run on separate channels, each
+/// creating its own controller launch per request. The first Git call of each
+/// channel is held until the other channel's first reservation exists, so two
+/// reservations are live at once; every name stays distinct and indices keep
+/// increasing across later requests. The seam reserves names in a temporary
+/// directory through the production allocator only: no kernel cgroup exists.
+#[test]
+fn overlapping_channel_operations_reserve_distinct_controller_cgroups() {
+    let (_repo, _handle, protected) = started("protected-cgroup-names");
+    let (worker, reviewer) = (protected.worker_channel(), protected.reviewer_channel());
+    let attempt = worker.credentials().attempt_id;
+    let root = crate::test_support::TempDir::new("cgroup-seam");
+    let names: Arc<Mutex<Vec<(ControllerRole, PathBuf)>>> = Arc::default();
+    let overlap: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
+    let ready = Arc::new([Latch::default(), Latch::default()]);
+    let slot = |role: ControllerRole| usize::from(role == ControllerRole::Reviewer);
+    let seam = CgroupNameSeam {
+        root: root.path().to_path_buf(),
+        reserved: Arc::new({
+            let (names, overlap, ready) = (names.clone(), overlap.clone(), ready.clone());
+            let root = root.path().to_path_buf();
+            move |role, dir| {
+                let first = {
+                    let mut names = names.lock().unwrap();
+                    let first = !names.iter().any(|(seen, _)| *seen == role);
+                    names.push((role, dir.to_path_buf()));
+                    first
+                };
+                if first {
+                    ready[slot(role)].open();
+                    ready[1 - slot(role)].wait();
+                    overlap.lock().unwrap().push(listing(&root));
+                }
+            }
+        }),
+    };
+    // An operation that ends without reserving releases the other channel.
+    {
+        let ready = ready.clone();
+        set_hooks(&protected, |_| {}, move |role| ready[slot(role)].open());
+    }
+    *worker.binding.hooks.controller_cgroups.lock().unwrap() = Some(seam);
+
+    let (worked, reviewed) = std::thread::scope(|scope| {
+        let worked = scope.spawn(|| send(worker, 0, ControllerOperation::Status));
+        let reviewed = scope.spawn(|| send(reviewer, 0, ControllerOperation::Status));
+        (worked.join().unwrap(), reviewed.join().unwrap())
+    });
+    let report = format!("{worked:?}\n{reviewed:?}\n{:?}", names.lock().unwrap());
+    assert!(
+        matches!(worked, Ok(ControllerResponse::Status { .. })),
+        "{report}"
+    );
+    assert!(
+        matches!(reviewed, Ok(ControllerResponse::Status { .. })),
+        "{report}"
+    );
+    let first = |role| {
+        names
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(seen, _)| *seen == role)
+            .map(|(_, dir)| dir.file_name().unwrap().to_string_lossy().into_owned())
+            .unwrap()
+    };
+    let (worker_first, reviewer_first) = (
+        first(ControllerRole::Worker),
+        first(ControllerRole::Reviewer),
+    );
+    assert_ne!(worker_first, reviewer_first);
+    for snapshot in overlap.lock().unwrap().iter() {
+        assert!(
+            snapshot.contains(&worker_first) && snapshot.contains(&reviewer_first),
+            "both reservations were not live at once: {snapshot:?}"
+        );
+    }
+    assert_eq!(overlap.lock().unwrap().len(), 2);
+    let first_round = names.lock().unwrap().len();
+
+    // Later requests (several Git calls each) continue the same sequence.
+    send(worker, 1, ControllerOperation::Status).unwrap();
+    send(reviewer, 1, ControllerOperation::Status).unwrap();
+    let names = names.lock().unwrap();
+    assert!(names.len() > first_round);
+    let mut indices: Vec<u64> = names
+        .iter()
+        .map(|(_, dir)| ctl_index(dir, &attempt))
+        .collect();
+    let in_order = indices.clone();
+    indices.sort_unstable();
+    indices.dedup();
+    assert_eq!(
+        indices,
+        (0..names.len() as u64).collect::<Vec<_>>(),
+        "{names:?}"
+    );
+    assert!(
+        in_order[first_round..]
+            .iter()
+            .all(|index| *index >= first_round as u64),
+        "a later request reused an earlier index: {in_order:?}"
+    );
+    // Every reservation's containment removed exactly its own directory.
+    assert_eq!(listing(root.path()), Vec::<String>::new());
+    drop(names);
+    protected.release_custody().unwrap();
+}
+
+/// The allocator consumes an index even when creation fails, never adopts or
+/// cleans another directory, never reuses a retained or removed name and
+/// refuses at exhaustion instead of wrapping.
+#[test]
+fn controller_cgroup_indices_are_consumed_on_failure_never_reused_and_never_wrap() {
+    let root = crate::test_support::TempDir::new("cgroup-alloc");
+    let name = |index: u64| root.path().join(format!("receipts-a1-ctl-{index}"));
+    let gate = Gate::new();
+    // Another live or retained cgroup already holds index 1.
+    std::fs::create_dir(name(1)).unwrap();
+    std::fs::write(name(1).join("owned-elsewhere"), "x").unwrap();
+
+    assert_eq!(
+        gate.create_controller_cgroup(root.path(), "a1").unwrap(),
+        name(0)
+    );
+    let refused = gate
+        .create_controller_cgroup(root.path(), "a1")
+        .unwrap_err();
+    assert!(refused.contains("receipts-a1-ctl-1"), "{refused}");
+    assert!(
+        name(1).join("owned-elsewhere").exists(),
+        "collision cleaned a directory"
+    );
+    // ctl-0 is retained (unproven cleanup) and ctl-2 is removed: neither returns.
+    assert_eq!(
+        gate.create_controller_cgroup(root.path(), "a1").unwrap(),
+        name(2)
+    );
+    std::fs::remove_dir(name(2)).unwrap();
+    assert_eq!(
+        gate.create_controller_cgroup(root.path(), "a1").unwrap(),
+        name(3)
+    );
+
+    gate.controller_cgroups
+        .store(u64::MAX - 1, Ordering::SeqCst);
+    assert_eq!(
+        gate.create_controller_cgroup(root.path(), "a1").unwrap(),
+        name(u64::MAX - 1)
+    );
+    let before = listing(root.path());
+    for _ in 0..2 {
+        let exhausted = gate
+            .create_controller_cgroup(root.path(), "a1")
+            .unwrap_err();
+        assert!(exhausted.contains("exhausted"), "{exhausted}");
+    }
+    assert_eq!(
+        listing(root.path()),
+        before,
+        "exhaustion created or reused a name"
+    );
+    assert_eq!(gate.controller_cgroups.load(Ordering::SeqCst), u64::MAX);
 }
