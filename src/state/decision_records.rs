@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use std::fmt;
 
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 
@@ -288,40 +288,58 @@ fn top_level(text: &str) -> Result<Vec<(String, Box<RawValue>)>, StateError> {
 }
 
 /// Refuses duplicate decoded object keys anywhere inside `raw`.
+///
+/// One pass over the bytes with a heap stack of per-object key sets: stack-safe
+/// at any depth, and every byte is visited once. (Asking serde for each child
+/// `RawValue` at every level rescans nested suffixes, quadratic in depth.)
+/// `raw` is already valid JSON, so only structure is tracked; strings are
+/// skipped as whole tokens so delimiters inside them are data, and serde
+/// decodes each key so escaped spellings of one key compare equal.
 pub(crate) fn unique_keys(raw: &RawValue) -> Result<(), serde_json::Error> {
-    struct Children;
-    impl<'de> Visitor<'de> for Children {
-        type Value = Vec<&'de RawValue>;
-        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("JSON container")
-        }
-        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-            let mut seen = HashSet::new();
-            let mut children = Vec::new();
-            while let Some(key) = map.next_key::<String>()? {
-                if !seen.insert(key) {
+    enum Frame {
+        Array,
+        Object { keys: HashSet<String>, at_key: bool },
+    }
+    let text = raw.get();
+    let bytes = text.as_bytes();
+    let mut stack = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => stack.push(Frame::Object {
+                keys: HashSet::new(),
+                at_key: true,
+            }),
+            b'[' => stack.push(Frame::Array),
+            b'}' | b']' => {
+                stack.pop();
+            }
+            b',' => {
+                if let Some(Frame::Object { at_key, .. }) = stack.last_mut() {
+                    *at_key = true;
+                }
+            }
+            b'"' => {
+                let start = i;
+                loop {
+                    i += 1;
+                    match bytes.get(i) {
+                        Some(b'"') => break,
+                        Some(b'\\') => i += 1,
+                        Some(_) => {}
+                        None => return Err(de::Error::custom("unterminated string")),
+                    }
+                }
+                if let Some(Frame::Object { keys, at_key }) = stack.last_mut()
+                    && std::mem::take(at_key)
+                    && !keys.insert(serde_json::from_str(&text[start..=i])?)
+                {
                     return Err(de::Error::custom("duplicate key"));
                 }
-                children.push(map.next_value::<&RawValue>()?);
             }
-            Ok(children)
+            _ => {}
         }
-        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-            let mut children = Vec::new();
-            while let Some(child) = seq.next_element::<&RawValue>()? {
-                children.push(child);
-            }
-            Ok(children)
-        }
-    }
-    let mut pending = vec![raw];
-    while let Some(value) = pending.pop() {
-        let children = match value.get().as_bytes().first() {
-            Some(b'{') => value.deserialize_map(Children)?,
-            Some(b'[') => value.deserialize_seq(Children)?,
-            _ => continue,
-        };
-        pending.extend(children);
+        i += 1;
     }
     Ok(())
 }

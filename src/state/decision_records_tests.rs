@@ -676,6 +676,219 @@ fn deep_duplicate_validation_subprocess() {
     }
 }
 
+/// The pre-repair implementation, kept only as an independent oracle. It asks
+/// serde for every child `RawValue` at every level, so it rescans nested
+/// suffixes (quadratic in depth) but its semantics are serde's own.
+fn reference_unique_keys(raw: &serde_json::value::RawValue) -> bool {
+    use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
+    use serde_json::value::RawValue;
+    struct Children;
+    impl<'de> Visitor<'de> for Children {
+        type Value = Vec<&'de RawValue>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("JSON container")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut seen = std::collections::HashSet::new();
+            let mut children = Vec::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if !seen.insert(key) {
+                    return Err(de::Error::custom("duplicate key"));
+                }
+                children.push(map.next_value::<&RawValue>()?);
+            }
+            Ok(children)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut children = Vec::new();
+            while let Some(child) = seq.next_element::<&RawValue>()? {
+                children.push(child);
+            }
+            Ok(children)
+        }
+    }
+    let mut pending = vec![raw];
+    while let Some(value) = pending.pop() {
+        let children = match value.get().as_bytes().first() {
+            Some(b'{') => value.deserialize_map(Children),
+            Some(b'[') => value.deserialize_seq(Children),
+            _ => continue,
+        };
+        match children {
+            Ok(children) => pending.extend(children),
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+fn keys_ok(json: &str) -> bool {
+    let raw = serde_json::value::RawValue::from_string(json.to_string()).unwrap();
+    let verdict = crate::decision_records::unique_keys(&raw).is_ok();
+    assert_eq!(verdict, reference_unique_keys(&raw), "oracle: {json}");
+    verdict
+}
+
+#[test]
+fn unique_keys_refuses_exactly_same_object_decoded_duplicates() {
+    // (document, accepted)
+    for (json, accepted) in [
+        (r#"{"a":1,"a":2}"#, false),
+        (r#"{"a":1,"\u0061":2}"#, false),
+        (r#"{"\"":1,"\u0022":2}"#, false),
+        (r#"{"\\":1,"\u005c":2}"#, false),
+        (r#"{"é":1,"\u00e9":2}"#, false),
+        (r#"{"\ud83d\ude00":1,"😀":2}"#, false),
+        (r#"{"x":[{"k":1},{"k":2,"k":3}]}"#, false),
+        (r#"[[{"a":{"b":1,"b":1}}]]"#, false),
+        (r#"{"a":{"k":1},"b":{"k":2},"c":[{"k":3},{"k":4}]}"#, true),
+        (r#"{"a":{"a":{"a":1}}}"#, true),
+        (r#"{"a":[{"a":1},{"a":2}],"b":[[{"a":3}]]}"#, true),
+        (r#"{"a":"a","b":"a"}"#, true),
+        // Delimiters, quotes and backslashes inside strings are data.
+        (r#"{"a":"}],\"{[,:","b":"\\","c":"\\\\\"}"}"#, true),
+        (r#"{"a":"\"a\":1,\"a\":2"}"#, true),
+        (r#"{"}":1,"]":2,"{":3,"[":4,",":5,":":6}"#, true),
+        (r#"{"}":1,"}":2}"#, false),
+        (r#"{"a\\":{"a":1},"a":[]}"#, true),
+        (r#"{"a\\":1,"a\\":2}"#, false),
+        // Exact numbers and literals are not keys.
+        (
+            r#"{"a":1e400,"b":123456789012345678901234567890,"c":-0.0,"d":[null,true,false]}"#,
+            true,
+        ),
+        (r#"{"a":[1,2,3],"a":1e400}"#, false),
+        // Scalars and empty containers.
+        ("0", true),
+        ("-1.5e+10", true),
+        (r#""{""#, true),
+        ("[]", true),
+        ("{}", true),
+        (r#"{"":1,"":2}"#, false),
+        // A key serde cannot decode (lone surrogate) is refused, as before.
+        (r#"{"\ud800":1}"#, false),
+        (r#"{"a":"\ud800"}"#, true),
+        (r#"{"":{"":{}}}"#, true),
+    ] {
+        assert_eq!(keys_ok(json), accepted, "{json}");
+    }
+}
+
+#[test]
+fn unique_keys_matches_oracle_on_generated_documents() {
+    // Deterministic xorshift corpus: small documents over a tiny key alphabet
+    // (plain and escaped spellings of the same keys), so duplicates are common.
+    fn next(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+    fn value(state: &mut u64, depth: u32, out: &mut String) {
+        const KEYS: [&str; 6] = ["a", r"\u0061", "b", r#"\""#, r"\\", "}"];
+        const SCALARS: [&str; 6] = ["1", "1e400", r#""a""#, r#""}],\"""#, "null", "[]"];
+        match next(state) % if depth == 0 { 1 } else { 3 } {
+            0 => out.push_str(SCALARS[(next(state) % 6) as usize]),
+            1 => {
+                out.push('[');
+                for i in 0..next(state) % 4 {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    value(state, depth - 1, out);
+                }
+                out.push(']');
+            }
+            _ => {
+                out.push('{');
+                for i in 0..next(state) % 4 {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push('"');
+                    out.push_str(KEYS[(next(state) % 6) as usize]);
+                    out.push_str("\":");
+                    value(state, depth - 1, out);
+                }
+                out.push('}');
+            }
+        }
+    }
+    let (mut state, mut accepted, mut refused) = (0x9e37_79b9_7f4a_7c15_u64, 0, 0);
+    for _ in 0..3_000 {
+        let mut json = String::new();
+        value(&mut state, 5, &mut json);
+        if keys_ok(&json) {
+            accepted += 1;
+        } else {
+            refused += 1;
+        }
+    }
+    // The corpus must exercise both verdicts, or agreement proves nothing.
+    assert!(accepted > 300 && refused > 300, "{accepted}/{refused}");
+}
+
+#[test]
+fn unique_keys_work_is_linear_in_nesting_depth() {
+    // The repaired walk visits each byte once. Calibrate against serde's own
+    // single linear skip of the same text in the same process, so the check is
+    // about scaling and tolerates slow or loaded machines. The pre-repair
+    // path rescanned nested suffixes and was thousands of times slower here.
+    use std::time::Instant;
+    fn best_of(runs: u32, mut work: impl FnMut()) -> std::time::Duration {
+        (0..runs)
+            .map(|_| {
+                let start = Instant::now();
+                work();
+                start.elapsed()
+            })
+            .min()
+            .unwrap()
+    }
+    for nested in [
+        format!("{}0{}", "[".repeat(20_000), "]".repeat(20_000)),
+        format!(
+            "{}{}{}",
+            "{\"x\":[".repeat(4_000),
+            r#"{"a":1e400}"#,
+            "]}".repeat(4_000)
+        ),
+    ] {
+        let raw = serde_json::value::RawValue::from_string(nested).unwrap();
+        let linear = best_of(3, || {
+            serde_json::from_str::<serde::de::IgnoredAny>(raw.get()).unwrap();
+        });
+        let walk = best_of(3, || {
+            crate::decision_records::unique_keys(&raw).unwrap();
+        });
+        assert!(
+            walk < linear * 200 + std::time::Duration::from_millis(50),
+            "walk {walk:?} vs one serde pass {linear:?}"
+        );
+    }
+}
+
+#[test]
+fn nested_duplicate_in_open_fields_is_refused_by_both_callers() {
+    let open = r#"{"x":[{"k":1,"\u006b":2}]}"#;
+    let json = format!(
+        r#"{{"subject_kind":"MODEL","capability":"c","value":{open},"confidence":"UNVERIFIED","observed_at":"t"}}"#
+    );
+    assert_eq!(
+        refused(DecisionRecordV1::parse(
+            "p",
+            K::RegistryCapability,
+            "c",
+            &json
+        )),
+        Code::InvalidShape
+    );
+    let json = format!(
+        r#"{{"manifest_id":"m","role_id":"r","epoch":0,"sources":[{{"ref":{{"ref_type":"URL","target":"x"}},"source_class":"REFERENCE"}}],"derived_state":{open}}}"#
+    );
+    assert!(crate::wire::ContextManifestWireV1::parse_json(&json).is_err());
+}
+
 /// Test-only rewind, used solely on stores with the legacy one-version shape.
 pub(crate) fn remove_v18(conn: &Connection) {
     remove_v19(conn);
