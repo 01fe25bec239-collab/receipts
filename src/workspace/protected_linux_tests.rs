@@ -585,9 +585,6 @@ fn cgroup_migration_denied(paths: &[PathBuf]) -> bool {
     })
 }
 
-/// Worker-side probe (runs as the fresh worker UID inside the boundary).
-#[test]
-#[ignore = "hosted worker probe"]
 /// This process's descriptors (`fd->target`), excluding the one read_dir uses.
 fn own_fds() -> String {
     let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
@@ -608,6 +605,9 @@ fn own_fds() -> String {
     fds.join(",")
 }
 
+/// Worker-side probe (runs as the fresh worker UID inside the boundary).
+#[test]
+#[ignore = "hosted worker probe"]
 fn worker_probe() {
     let start_fds = own_fds();
     let Ok(worktree) = std::env::current_dir() else {
