@@ -376,6 +376,12 @@ fn fd_observer_controls() {
         unsafe {
             command.pre_exec(move || {
                 if let Some(fd) = target {
+                    // dup2 refuses a target at or above RLIMIT_NOFILE, so make
+                    // room for it first (root), then lower the limit below it.
+                    let room = [fd as u64 + 1, fd as u64 + 1];
+                    if syscall(160, 7i64, room.as_ptr()) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
                     if syscall(33, i64::from(source_fd), fd) < 0 {
                         return Err(std::io::Error::last_os_error());
                     }
@@ -387,7 +393,9 @@ fn fd_observer_controls() {
                 Ok(())
             });
         }
-        let mut child = command.spawn().expect("FD control must be supported");
+        let mut child = command
+            .spawn()
+            .unwrap_or_else(|error| panic!("FD control {target:?} must be supported: {error}"));
         std::thread::sleep(Duration::from_millis(100));
         let retained = target.map(|fd| std::fs::read_link(format!("/proc/{}/fd/{fd}", child.id())));
         let limits =

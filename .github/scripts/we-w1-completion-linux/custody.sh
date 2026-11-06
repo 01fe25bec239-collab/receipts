@@ -182,6 +182,7 @@ custody_facts() {
     echo "custody_runner=${RUNNER_ENVIRONMENT:-}/${RUNNER_OS:-}/${RUNNER_ARCH:-} image=${ImageOS:-}/${ImageVersion:-}"
     echo "custody_pid1_comm=$comm"
     echo "custody_boot_id=$(cu_boot_id 2>/dev/null || echo unavailable)"
+    echo "custody_nofile soft=$(ulimit -Sn) hard=$(ulimit -Hn) nr_open=$(cat /proc/sys/fs/nr_open 2>/dev/null || echo unavailable)"
     for ns in pid user mnt; do
       echo "custody_ns_$ns self=$(cu_ns_id "$ns" self 2>/dev/null || echo unavailable) pid1=$(cu_ns_id "$ns" 1 2>/dev/null || echo unavailable)"
     done
