@@ -105,6 +105,8 @@ and `protected_hardlinks`/`protected_symlinks`. All other platforms refuse.
   `host-pid` and `host-mnt` pinned from the actual host initial namespaces.
   A container's own PID 1 is insufficient provenance. The launcher does not
   provision or infer these anchors: absent, unsafe or mismatched setup refuses.
+  (The hosted diagnostic below supplies them from its own disposable VM, as
+  administration separate from admission.)
   Root/administrator replacement of this admission setup is outside the boundary.
   Every privileged parent must share these anchors and filesystem view.
 - Before custody mutation or worker identity allocation, a brief shared flock
@@ -233,13 +235,69 @@ chown: duplicate, linked-worktree, alias and second-launcher admission refusals
 that change nothing, safe re-admission after a complete release, and the
 external-symlink `.git` pointer and payload hardlink refusals with external
 owner/mode unchanged.
-`run.sh` records `test_status` and `cleanup_status` separately; PASS/exit 0
-requires both 0 (cgroup kill, emptiness, removal, no fixture-identity process,
-no fixture directory).
+`run.sh` records `setup_status`, `test_status` and `cleanup_status` separately
+(plus `custody_cleanup_status` and the first failure as `primary_failure`);
+PASS/exit 0 requires all of them 0 (verified host setup, tests, cgroup kill,
+emptiness, removal, no fixture-identity process, no fixture directory, verified
+removal of the owned host setup).
 Cleanup enumeration accepts regular `cgroup.*`/controller interface files of the
 delegated cgroup as kernel control files; any link (never followed), unexpected
 name, non-`receipts-*` directory or non-directory child is reported unowned. `run.sh self-check` is the unprivileged control for that
 verdict logic only.
+
+### Hosted host setup (administration, not admission)
+
+Trusted premise, external and only recorded here: the job is the existing
+same-repository, exact-head, branch-gated standard GitHub-hosted `ubuntu-24.04`
+job running directly on its fresh VM, with no job container, service container
+or self-hosted substitution (GitHub documents a fresh VM per job). A container's
+PID 1 or an environment flag alone does not establish host origin.
+
+`custody.sh` (sourced by `run.sh hosted`, before the unchanged admission checks)
+provides what `production_registry` requires: `/var/lib/receipts` (root `0755`)
+and `/var/lib/receipts/protected-custody` (root `0700`) under root-owned,
+non-link, non-group/other-writable ancestors; a root `0600` single-link `lock`;
+and nsfs bind mounts `host-pid` and `host-mnt` of PID 1's initial namespaces.
+No alternate registry, fake pin files, auto-provisioning inside the product or
+bypass of its topology/namespace checks exists.
+
+- Context refusal (nothing created): `RUNNER_ENVIRONMENT=github-hosted`,
+  `RUNNER_OS=Linux`, `RUNNER_ARCH=X64`, `ImageOS=ubuntu24` (read-only values
+  passed through the sanitized `env -i`) and an Ubuntu 24.04 `os-release`; no
+  `/.dockerenv` or `/run/.containerenv`; the PID namespace of this process and
+  of PID 1 is the kernel's fixed initial PID namespace (inode 4026531836) and
+  their user namespace the initial user namespace (4026531837); the mount
+  namespace equals PID 1's. Contradiction refuses, never guesses.
+- Existing/unknown resources refuse untouched: an existing or linked
+  `/var/lib/receipts`, any mount at or below it, an unsafe, linked or
+  non-root-owned ancestor. Nothing is adopted, overwritten, chmod/chowned or
+  unmounted. Objects are created exclusively (`mkdir`, noclobber inside the
+  freshly made private directory).
+- Verification before any test: owners/modes/link counts, exactly the three
+  entries, exactly one nsfs mount per anchor with nothing stacked or nested, and
+  anchor dev:inode equal to the namespaces of this process and of PID 1.
+  Observed runner/image/namespace/root-mount facts go to `provenance.txt`;
+  setup and cleanup events to `diagnostic.log` (`CUSTODY ...`).
+- Ownership: every object this run actually creates, including partial setup, is
+  recorded with its identity. After the tests and PROVEN worker/controller/cgroup
+  cleanup, only those verified objects are unmounted (never `-l`/`-f`/recursive),
+  removed (`rm`, `rmdir`, never recursive) in reverse order. A mount or object
+  that is not exactly what was created, an owned directory that was replaced,
+  a retained custody record or any unknown entry keeps EVERY owned resource in
+  place and fails the verdict; records are never read, deleted or recovered.
+  If worker/cgroup cleanup is not proven, custody is retained
+  (`custody_cleanup_status=skipped`).
+- Failure handling: an aborted setup or run still reaches the EXIT trap. Setup
+  that is refused or fails leaves tests `NOT RUN` (`test_status=unknown`,
+  `setup_status=refused|failed`), keeps the first failure in `primary_failure`,
+  and reports cleanup separately so cleanup success cannot hide it and cleanup
+  failure cannot be a pass. The four-file evidence allowlist is unchanged.
+
+`run.sh self-check` runs the cgroup verdict controls and the custody controls
+with fake mount/namespace operations over a real temporary directory (clean
+setup/teardown, each refusal, partial setup, tampered setup, retained records,
+foreign/replaced/aliased objects, cleanup failure, abort and the whole hosted
+sequence). They never mount or use root.
 
 ## Proof status
 
@@ -253,7 +311,12 @@ confined-run path with overlapping worker/reviewer reservations, using an
 unprivileged temporary directory as the cgroup root: a test seam proving names
 only, not kernel cgroups or confinement.
 Ownership changes to other users, `/proc/self/mountinfo` on a real bind mount,
-Landlock and cgroups need the hosted run. Linux enforcement code and the hosted tests were type-checked and
+Landlock and cgroups need the hosted run. The host setup likewise needs it:
+real nsfs bind mounts, root ownership, the fixed initial-namespace inode
+constants, the runner context values and the unchanged product admission
+(including its mount-alias check of `/`) are NOT proven by the fake-operation
+controls, which only show that unsupported, partial and failed states refuse,
+are tracked and are never reported as PASS. Linux enforcement code and the hosted tests were type-checked and
 Clippy-checked locally only in a throwaway copy with the Linux cfg gates
 retargeted to Darwin (no link, nothing committed from that copy); they have NOT
 been executed. The hosted

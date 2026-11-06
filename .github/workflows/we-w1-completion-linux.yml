@@ -44,10 +44,17 @@ jobs:
           fetch-depth: 1
       - name: Prepare unprivileged build and provenance
         run: .github/scripts/we-w1-completion-linux/run.sh prepare
+      # run.sh hosted administers the host custody anchors the product
+      # admission requires (custody.sh), runs the tests, then removes only what
+      # it created. The runner context values are read-only observations that
+      # run.sh checks against kernel facts; this job has no container or
+      # services and is never self-hosted.
       - name: Privileged disposable-VM diagnostic
         run: |
           sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
             DIAGNOSTIC_OUT="$DIAGNOSTIC_OUT" DIAGNOSTIC_HEAD="$DIAGNOSTIC_HEAD" \
+            RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" RUNNER_OS="$RUNNER_OS" RUNNER_ARCH="$RUNNER_ARCH" \
+            ImageOS="$ImageOS" ImageVersion="$ImageVersion" \
             .github/scripts/we-w1-completion-linux/run.sh hosted
       - name: Seal evidence, including failures
         if: always()

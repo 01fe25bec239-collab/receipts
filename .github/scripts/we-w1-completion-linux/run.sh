@@ -3,10 +3,16 @@
 # phase runs as root and creates/deletes only its own cgroup and temp fixture.
 # Never run `hosted` with sudo on a workstation.
 #
-# Result contract: the primary test status and the owned-cleanup status are
-# recorded separately in result.txt, and PASS/exit 0 requires BOTH to be 0.
-# A retained, unknown or unowned resource is a cleanup failure, never success.
+# Result contract: setup, primary test and owned-cleanup statuses are recorded
+# separately in result.txt (plus the first failure as primary_failure), and
+# PASS/exit 0 requires ALL of them to be 0. A retained, unknown or unowned
+# resource is a cleanup failure, never success. Host custody administration
+# (anchors the product admission requires) lives in custody.sh.
 set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=custody.sh
+. "$here/custody.sh"
 
 if [ "${1:-}" = self-check ]; then out=; else out="${DIAGNOSTIC_OUT:?}"; fi
 bin_record="$out/test-binary"
@@ -153,63 +159,103 @@ cleanup_owned() {
 
 test_status=unknown
 cleanup_status=unknown
+setup_status=unknown
+custody_cleanup_status=unknown
+primary_failure=
 finished=0
 
 # Runs owned cleanup exactly once and writes the verdict. Used for the normal
 # path and, through the EXIT trap, for any abort (where test_status stays
-# "unknown" and the verdict is therefore FAIL).
+# "unknown" and the verdict is therefore FAIL). Host custody is removed only
+# after worker/controller/cgroup cleanup is proven; otherwise it is retained
+# and reported. The primary failure is kept apart from cleanup results.
 finish() {
   [ "$finished" = 0 ] || return 0
   finished=1
   cleanup_status=0
+  custody_cleanup_status=n/a
   cleanup_owned || cleanup_status=$?
+  if [ "${#custody_owned_path[@]}" -gt 0 ]; then
+    if [ "$cleanup_status" = 0 ]; then
+      custody_cleanup_status=0
+      custody_cleanup || custody_cleanup_status=1
+    else
+      custody_cleanup_status=skipped
+      cu_log "RETAINED host custody setup: worker/controller/cgroup cleanup is not proven"
+    fi
+    [ "$custody_cleanup_status" = 0 ] || cleanup_status=1
+  fi
   local verdict=FAIL
-  if [ "$test_status" = 0 ] && [ "$cleanup_status" = 0 ]; then
+  if [ "$setup_status" = 0 ] && [ "$test_status" = 0 ] && [ "$cleanup_status" = 0 ]; then
     verdict=PASS
   fi
   {
     echo "$verdict"
     echo "test_status=$test_status"
     echo "cleanup_status=$cleanup_status"
+    echo "setup_status=$setup_status"
+    echo "custody_cleanup_status=$custody_cleanup_status"
+    [ -z "$primary_failure" ] || echo "primary_failure=$primary_failure"
   } >"$out/result.txt"
+  own_evidence
+  [ "$verdict" = PASS ]
+}
+
+# Evidence written by root stays readable and sealable by the runner user.
+own_evidence() {
   if [ "$(id -u)" = 0 ] && [ -e "$out/provenance.txt" ]; then
     chown -R "$(stat -c %u "$out/provenance.txt"):$(stat -c %g "$out/provenance.txt")" "$out"
   fi
-  [ "$verdict" = PASS ]
+}
+
+# One hosted test, bounded and with a sanitized environment (overridden only
+# by the unprivileged self-check).
+run_test() {
+  timeout --kill-after=10 300 env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    RECEIPTS_WE_HOSTED_CGROUP="$cgroup" \
+    "$1" "$2" --exact --ignored --nocapture --test-threads=1 \
+    >>"$out/diagnostic.log" 2>&1
+}
+
+# Everything after the guards. Order: refuse occupied/unsafe state (nothing
+# created yet) -> own the cgroup -> install the EXIT trap -> host custody setup
+# -> tests only if setup verified -> owned cleanup and verdict.
+hosted_sequence() {
+  if [ -e "$cgroup" ] || [ -L "$cgroup" ]; then
+    echo "FAIL cgroup occupied" >"$out/result.txt"
+    own_evidence
+    exit 1
+  fi
+  mkdir "$cgroup"
+  trap 'finish || exit 1' EXIT
+  if custody_setup; then
+    setup_status=0
+    test_status=0
+    for test in "${tests[@]}"; do
+      run_test "$1" "$test" || test_status=$?
+    done
+  else
+    setup_status="$custody_setup_state"
+    primary_failure="host custody setup $custody_setup_state: $custody_setup_failure"
+  fi
+  local verdict=0
+  finish || verdict=1
+  trap - EXIT
+  exit "$verdict"
 }
 
 hosted() {
   test "$(id -u)" = 0
   test "$(uname -m)" = x86_64
-  # Host administration must pin the actual initial namespaces here before
-  # this diagnostic; private PID 1 is never used to self-certify host origin.
-  local domain=/var/lib/receipts/protected-custody
-  if [ ! -d "$domain" ] || [ ! -f "$domain/lock" ] ||
-    ! mountpoint -q "$domain/host-pid" || ! mountpoint -q "$domain/host-mnt"; then
-    echo "FAIL host custody anchor unavailable" >"$out/result.txt"
-    exit 1
-  fi
   local binary
   binary="$(cat "$bin_record")"
   # Refuse occupied fixture identities instead of reusing them.
   if fixture_uid_in_use; then
     echo "FAIL identity occupied" >"$out/result.txt"
+    own_evidence
     exit 1
   fi
-  test ! -e "$cgroup"
-  mkdir "$cgroup"
-  trap 'finish || exit 1' EXIT
-  test_status=0
-  for test in "${tests[@]}"; do
-    timeout --kill-after=10 300 env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
-      RECEIPTS_WE_HOSTED_CGROUP="$cgroup" \
-      "$binary" "$test" --exact --ignored --nocapture --test-threads=1 \
-      >>"$out/diagnostic.log" 2>&1 || test_status=$?
-  done
-  local verdict=0
-  finish || verdict=1
-  trap - EXIT
-  exit "$verdict"
+  hosted_sequence "$binary"
 }
 
 seal() {
@@ -247,6 +293,9 @@ self_check() {
     "$setup"
     test_status="$status"
     cleanup_status=unknown
+    setup_status=0
+    custody_reset
+    primary_failure=
     finished=0
     if finish; then got=PASS; else got=FAIL; fi
     if [ "$got" != "$verdict" ] ||
@@ -315,7 +364,11 @@ self_check() {
   scenario aborted_before_tests unknown FAIL 0 setup_clean
   fixture_dirs_retained() { return 0; }
   scenario fixture_retained 0 FAIL 1 setup_clean
-  echo "self-check passed: cleanup failure never yields PASS; hosted cgroup behavior NOT RUN"
+  echo "cgroup self-check passed: cleanup failure never yields PASS; hosted cgroup behavior NOT RUN"
+  fixture_dirs_retained() { return 1; }
+  # shellcheck source=custody-self-check.sh
+  . "$here/custody-self-check.sh"
+  custody_self_check
 }
 
 case "${1:?prepare|hosted|seal|self-check}" in
