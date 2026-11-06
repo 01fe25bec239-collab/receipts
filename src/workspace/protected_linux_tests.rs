@@ -250,8 +250,11 @@ fn identity_receipt(uid: std::ops::RangeInclusive<u32>, gid: u32, caps: &str) ->
 
 /// Stop all probe threads until the privileged parent completes observation.
 fn pause_for_observation() {
-    // SAFETY: getpid and kill with SIGSTOP only stop this process.
-    assert_eq!(unsafe { syscall(62, syscall(39), 19i64) }, 0);
+    // tgkill to the calling thread: with kill(getpid()) another thread may
+    // take the process-directed SIGSTOP while this one runs on into the next
+    // statements (hosted run 42313201184 observed it mid-spawn).
+    // SAFETY: getpid, gettid and tgkill with SIGSTOP only stop this process.
+    assert_eq!(unsafe { syscall(234, syscall(39), syscall(186), 19i64) }, 0);
 }
 
 /// Enumerate the kernel's full descriptor table, including descriptors above
