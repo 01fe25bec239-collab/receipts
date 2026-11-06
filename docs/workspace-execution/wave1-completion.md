@@ -235,11 +235,20 @@ chown: duplicate, linked-worktree, alias and second-launcher admission refusals
 that change nothing, safe re-admission after a complete release, and the
 external-symlink `.git` pointer and payload hardlink refusals with external
 owner/mode unchanged.
-`run.sh` records `setup_status`, `test_status` and `cleanup_status` separately
-(plus `custody_cleanup_status` and the first failure as `primary_failure`);
-PASS/exit 0 requires all of them 0 (verified host setup, tests, cgroup kill,
-emptiness, removal, no fixture-identity process, no fixture directory, verified
-removal of the owned host setup).
+`run.sh` records `setup_status`, `test_status`, `cleanup_status`,
+`custody_cleanup_status`, `tests_completed`/`tests_total`, the FIRST failed test
+(`first_failed_test`, `first_failed_status`), any `interruption` and the
+highest-precedence failure as `primary_failure` (setup, then an abnormal end,
+then the first failed test). PASS/exit 0 requires verified host setup, ALL
+three tests completed with status 0 (`test_status` is the first failing status,
+0 only after every test ran, `unknown` before), cgroup kill, emptiness,
+removal, no fixture-identity process, no fixture directory, verified removal of
+the owned host setup, and no interruption. Nothing starts as success:
+`result.txt` is written `INCOMPLETE` first and replaced atomically by the final
+PASS/FAIL, so no kill, even SIGKILL, can leave PASS. SIGTERM/SIGINT/SIGHUP are
+recorded (`interruption=`), the owned cleanup still runs, and the process
+exits 128+n. SIGKILL or machine loss is NOT handled: it leaves `INCOMPLETE` and
+does not guarantee cleanup (the VM is disposable).
 Cleanup enumeration accepts regular `cgroup.*`/controller interface files of the
 delegated cgroup as kernel control files; any link (never followed), unexpected
 name, non-`receipts-*` directory or non-directory child is reported unowned. `run.sh self-check` is the unprivileged control for that
@@ -278,26 +287,45 @@ bypass of its topology/namespace checks exists.
   anchor dev:inode equal to the namespaces of this process and of PID 1.
   Observed runner/image/namespace/root-mount facts go to `provenance.txt`;
   setup and cleanup events to `diagnostic.log` (`CUSTODY ...`).
-- Ownership: every object this run actually creates, including partial setup, is
-  recorded with its identity. After the tests and PROVEN worker/controller/cgroup
-  cleanup, only those verified objects are unmounted (never `-l`/`-f`/recursive),
-  removed (`rm`, `rmdir`, never recursive) in reverse order. A mount or object
-  that is not exactly what was created, an owned directory that was replaced,
-  a retained custody record or any unknown entry keeps EVERY owned resource in
-  place and fails the verdict; records are never read, deleted or recovered.
-  If worker/cgroup cleanup is not proven, custody is retained
+- Ownership: intent is recorded BEFORE each side effect (directory, file,
+  mount, and the cgroup `mkdir`) as pending, because a command's return status
+  does not prove what exists. A create that returns 0 becomes owned with the
+  identity observed. One that fails or is interrupted and left NOTHING is
+  dropped; one that left something is `uncertain`: it is not provably ours, so it
+  is never adopted, removed or unmounted, and the run reports
+  `custody_cleanup_status=uncertain` (or an `UNCERTAIN` cgroup) and fails.
+- Cleanup has two phases. After the tests and PROVEN worker/controller/cgroup
+  cleanup, phase 1 changes nothing: it reconciles pending creations and verifies
+  the whole owned setup: directory/file identities and link counts, each mount's
+  type and identity, a SUCCESSFUL complete listing of every owned directory (a
+  failed listing is a failure, never "empty"), no custody record or unknown
+  entry, and no mount below the registry that this run did not create. Only
+  then does phase 2 unmount (never `-l`/`-f`/recursive) and remove (`rm`,
+  `rmdir`, never recursive) in reverse order, re-checking each object. Any
+  mismatch, unreadable state, replaced or aliased lock, unknown mount or record
+  keeps EVERY owned resource (anchors and lock) in place with zero unmounts and
+  fails; records are never read, deleted or recovered. A placeholder file under
+  an owned mount can only be checked after that mount is removed. If
+  worker/cgroup cleanup is not proven, custody is retained
   (`custody_cleanup_status=skipped`).
-- Failure handling: an aborted setup or run still reaches the EXIT trap. Setup
-  that is refused or fails leaves tests `NOT RUN` (`test_status=unknown`,
-  `setup_status=refused|failed`), keeps the first failure in `primary_failure`,
-  and reports cleanup separately so cleanup success cannot hide it and cleanup
-  failure cannot be a pass. The four-file evidence allowlist is unchanged.
+- Failure handling: an aborted setup or run still reaches the EXIT trap and
+  keeps its nonzero status. Setup that is refused or fails leaves tests
+  `NOT RUN` (`test_status=unknown`, `setup_status=refused|failed`), keeps the
+  first failure in `primary_failure`, and reports cleanup separately so cleanup
+  success cannot hide it and cleanup failure cannot be a pass. Later test
+  results never overwrite the first failed test. The four-file evidence
+  allowlist is unchanged.
 
 `run.sh self-check` runs the cgroup verdict controls and the custody controls
 with fake mount/namespace operations over a real temporary directory (clean
 setup/teardown, each refusal, partial setup, tampered setup, retained records,
 foreign/replaced/aliased objects, cleanup failure, abort and the whole hosted
-sequence). They never mount or use root.
+sequence) and the regressions for four review findings: SIGTERM/SIGINT/SIGHUP
+at the first test, last test, setup, cgroup removal and custody cleanup (and
+SIGKILL) never yield PASS; a failed listing, retained record, replaced or
+aliased lock or foreign mount causes zero unmounts; a create that fails or
+aborts after creating is retained as uncertain; test results 7,3,0 keep test 1
+and status 7. They never mount or use root.
 
 ## Proof status
 

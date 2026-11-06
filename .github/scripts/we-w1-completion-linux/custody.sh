@@ -16,10 +16,13 @@
 #     host-pid / host-mnt                          nsfs bind mounts of the
 #                                                  initial PID / mount namespace
 # It refuses anything pre-existing, linked, unexpected or mismatched without
-# touching it, records every object it actually creates (including partial
-# setup) and removes only those verified objects: no recursive removal, no lazy
-# or forced unmount, no chmod/chown, no adoption, no force-unlock or deletion
-# of retained custody records. Nothing is fabricated: a failed or unknown step
+# touching it and records intent BEFORE each side effect, because a command's
+# status does not prove what exists. Only objects whose creation succeeded (or
+# provably left nothing) are owned; a create that failed but left something is
+# retained as explicit uncertainty. Cleanup first verifies the WHOLE owned setup
+# without changing anything, then removes only those verified objects: no
+# recursive removal, no lazy or forced unmount, no chmod/chown, no adoption, no
+# force-unlock or deletion of retained custody records. Nothing is fabricated: a failed or unknown step
 # is a failure, never a pass.
 #
 # Every operation that needs the real kernel or root sits behind a small cu_*
@@ -42,6 +45,7 @@ custody_init_user_ino=4026531837
 custody_owned_kind=()
 custody_owned_path=()
 custody_owned_id=()
+custody_last=0
 custody_setup_failure=
 custody_setup_state=unknown
 
@@ -49,6 +53,7 @@ custody_reset() {
   custody_owned_kind=()
   custody_owned_path=()
   custody_owned_id=()
+  custody_last=0
   custody_setup_failure=
   custody_setup_state=unknown
 }
@@ -234,57 +239,136 @@ custody_preflight() {
   cu_log "preflight ok: initial namespaces, no container marker, $custody_parent absent"
 }
 
-# ---- creation (only what this run creates is ever recorded as owned) ----
+# ---- creation: intent is recorded BEFORE the side effect, then reconciled ----
+#
+# A command's return status is not proof of what exists: a create can leave its
+# object and still fail or be interrupted. Each record is therefore appended as
+# "pending" first. After the command (or, if the shell died, at cleanup):
+#   returned 0                    -> owned, with the identity actually observed
+#   failed/unknown, object ABSENT -> nothing was created: the record is dropped
+#   failed/unknown, object PRESENT-> "uncertain": it is not provably ours, so it
+#                                    is never adopted, removed or unmounted; it
+#                                    is retained and reported
+# Objects are only ever created where they were verified absent just before.
 
-custody_record() { # kind path
-  local id
-  if [ "$1" = mount ]; then
-    id="$(cu_anchor_id "$2")" || id=unknown
-  elif cu_read_meta "$2"; then
-    id="$m_kind|$m_id"
-  else
-    id=unknown
-  fi
+custody_pend() { # kind path -> index in custody_last
   custody_owned_kind+=("$1")
   custody_owned_path+=("$2")
-  custody_owned_id+=("$id")
-  cu_log "owned $1 $2 id=$id"
+  custody_owned_id+=(pending)
+  custody_last=$((${#custody_owned_path[@]} - 1))
 }
 
-# Exclusive creation: mkdir fails on any existing object; the file create uses
-# noclobber inside the directory this run just made (private, root-only).
+custody_drop() { # index
+  local i=0 k=() p=() d=()
+  while [ "$i" -lt "${#custody_owned_path[@]}" ]; do
+    if [ "$i" != "$1" ]; then
+      k+=("${custody_owned_kind[$i]}")
+      p+=("${custody_owned_path[$i]}")
+      d+=("${custody_owned_id[$i]}")
+    fi
+    i=$((i + 1))
+  done
+  custody_owned_kind=("${k[@]+"${k[@]}"}")
+  custody_owned_path=("${p[@]+"${p[@]}"}")
+  custody_owned_id=("${d[@]+"${d[@]}"}")
+}
+
+# A pending record: 0 = provably nothing was created (record dropped),
+# 1 = something is there and unproven (record becomes "uncertain").
+custody_reconcile() { # index
+  local path="${custody_owned_path[$1]}" lines
+  if [ "${custody_owned_kind[$1]}" = mount ]; then
+    if ! lines="$(cu_mounts_at "$path" 2>/dev/null)"; then
+      custody_owned_id[$1]=uncertain
+      cu_log "UNCERTAIN mount $path (mount table unreadable after a create attempt)"
+      return 1
+    fi
+    if [ -z "$lines" ]; then
+      custody_drop "$1"
+      return 0
+    fi
+  elif ! { [ -e "$path" ] || [ -L "$path" ]; }; then
+    custody_drop "$1"
+    return 0
+  fi
+  custody_owned_id[$1]=uncertain
+  cu_log "UNCERTAIN ${custody_owned_kind[$1]} $path (exists after a create attempt that did not report success; ownership unproven)"
+  return 1
+}
+
+custody_settle() { # index: the command reported success; record what is there
+  local path="${custody_owned_path[$1]}" id
+  if [ "${custody_owned_kind[$1]}" = mount ]; then
+    id="$(cu_anchor_id "$path")" || id=
+  elif cu_read_meta "$path"; then
+    id="$m_kind|$m_id"
+  else
+    id=
+  fi
+  if [ -z "$id" ]; then
+    custody_owned_id[$1]=uncertain
+    cu_log "UNCERTAIN ${custody_owned_kind[$1]} $path (reported created but not identifiable)"
+    return 1
+  fi
+  custody_owned_id[$1]="$id"
+  cu_log "owned ${custody_owned_kind[$1]} $path id=$id"
+}
+
+# Exclusive creation: refuses an object that already exists (never adopted);
+# mkdir fails on any existing object, the file create uses noclobber.
 custody_make() { # dir|file path mode
-  local error
+  local error rc=0 i
+  if [ -e "$2" ] || [ -L "$2" ]; then
+    cu_fail "$2 already exists; refusing to adopt it"
+    return 1
+  fi
+  custody_pend "$1" "$2"
+  i=$custody_last
   if [ "$1" = dir ]; then
     error="$(
       umask 077
       mkdir -m "$3" -- "$2" 2>&1
-    )" || {
-      cu_fail "cannot create $2: $error"
-      return 1
-    }
+    )" || rc=$?
   else
     error="$(
       umask 077
       set -C
       { : >"$2"; } 2>&1
-    )" || {
-      cu_fail "cannot create $2: $error"
+    )" || rc=$?
+  fi
+  if [ "$rc" = 0 ]; then
+    custody_settle "$i" || {
+      cu_fail "$2 was created but could not be identified (outcome uncertain; retained)"
       return 1
     }
+    return 0
   fi
-  custody_record "$1" "$2"
+  if custody_reconcile "$i"; then
+    cu_fail "cannot create $2 (nothing was created): $error"
+  else
+    cu_fail "cannot create $2: $error (outcome uncertain: it exists but is unproven; retained, not adopted)"
+  fi
+  return 1
 }
 
 custody_pin() { # namespace-name anchor-path
-  if ! cu_mount_bind "/proc/1/ns/$1" "$2"; then
-    # A failed bind should leave nothing. If a mount still appeared on this
-    # private, freshly created path, it is ours to verify and unwind.
-    if [ -n "$(cu_mounts_at "$2" 2>/dev/null)" ]; then custody_record mount "$2"; fi
-    cu_fail "bind mount of the $1 namespace failed"
-    return 1
+  local rc=0 i
+  custody_pend mount "$2"
+  i=$custody_last
+  cu_mount_bind "/proc/1/ns/$1" "$2" || rc=$?
+  if [ "$rc" = 0 ]; then
+    custody_settle "$i" || {
+      cu_fail "the $1 anchor mount could not be identified (outcome uncertain; retained)"
+      return 1
+    }
+    return 0
   fi
-  custody_record mount "$2"
+  if custody_reconcile "$i"; then
+    cu_fail "bind mount of the $1 namespace failed (nothing was mounted)"
+  else
+    cu_fail "bind mount of the $1 namespace failed and a mount may exist (outcome uncertain; retained, not unmounted)"
+  fi
+  return 1
 }
 
 # ---- verification of the finished setup, before the unchanged admission ----
@@ -378,8 +462,17 @@ custody_setup() {
 }
 
 # ---- owned cleanup ----
+#
+# Two phases. Phase 1 changes nothing: it reconciles pending creations and then
+# verifies the WHOLE owned setup (every directory, file and mount identity, link
+# counts, a successful complete enumeration of every owned directory, unknown
+# entries and records, mounts that are not ours). Only if all of it is certain
+# does phase 2 remove anything, in reverse order, still checking each object.
+# Anything uncertain or mismatched keeps EVERY owned resource (anchors and lock
+# included) in place and fails; nothing is dismantled to find out.
+# Return: 0 clean, 1 failed/retained, 2 retained with uncertain ownership.
 
-custody_unpin() { # path recorded-id
+custody_mount_intact() { # path recorded-id
   local lines
   lines="$(cu_mounts_at "$1")" || {
     cu_log "UNVERIFIED_MOUNT $1 (mount table unreadable)"
@@ -390,15 +483,6 @@ custody_unpin() { # path recorded-id
     cu_log "UNVERIFIED_MOUNT $1 (not the single nsfs mount created here; left in place)"
     return 1
   fi
-  cu_umount "$1" || {
-    cu_log "UNMOUNT_FAILED $1"
-    return 1
-  }
-  if [ -n "$(cu_mounts_at "$1")" ]; then
-    cu_log "STILL_MOUNTED $1"
-    return 1
-  fi
-  cu_log "unmounted $1"
 }
 
 custody_still_ours() { # path recorded-id (kind|dev:inode); never follows links
@@ -414,6 +498,93 @@ custody_still_ours() { # path recorded-id (kind|dev:inode); never follows links
     cu_log "STILL_MOUNTED $1"
     return 1
   fi
+}
+
+# Read-only. 0 = everything verified, 1 = mismatch/unknown, 2 = uncertain.
+custody_preverify() {
+  local i n bad=0 uncertain=0 path id listing entry owned_mounts=0 total
+  n=${#custody_owned_path[@]}
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    if [ "${custody_owned_id[$i]}" = uncertain ]; then
+      cu_log "UNCERTAIN ${custody_owned_kind[$i]} ${custody_owned_path[$i]} (creation outcome unknown; nothing will be removed)"
+      uncertain=1
+    fi
+    i=$((i + 1))
+  done
+  [ "$uncertain" = 0 ] || return 2
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    path="${custody_owned_path[$i]}"
+    id="${custody_owned_id[$i]}"
+    case "${custody_owned_kind[$i]}" in
+      dir)
+        if custody_still_ours "$path" "$id"; then
+          # A failed enumeration is NOT an empty one.
+          if ! listing="$(cu_list_dir "$path")"; then
+            cu_log "LIST_FAILED $path (cannot enumerate; every owned resource left in place)"
+            bad=1
+          else
+            while IFS= read -r entry; do
+              [ -n "$entry" ] || continue
+              if ! custody_owned_index "$path/$entry" >/dev/null; then
+                cu_log "RETAINED_ENTRY $entry in $path (custody record or unknown object; every owned resource left in place)"
+                bad=1
+              fi
+            done <<<"$listing"
+          fi
+        else
+          bad=1
+        fi
+        ;;
+      file)
+        # Under an owned mount the placeholder cannot be inspected; it is
+        # verified after that mount is removed.
+        if ! custody_owned_index "$path" mount >/dev/null; then
+          if ! custody_still_ours "$path" "$id"; then
+            bad=1
+          elif [ "$m_nlink" != 1 ]; then
+            cu_log "LINKED $path (more than one link; left in place)"
+            bad=1
+          fi
+        fi
+        ;;
+      mount)
+        custody_mount_intact "$path" "$id" || bad=1
+        ;;
+      *)
+        cu_log "UNKNOWN_KIND ${custody_owned_kind[$i]} $path"
+        bad=1
+        ;;
+    esac
+    i=$((i + 1))
+  done
+  # Mounts below the owned registry that this run did not create are unknown.
+  if custody_owned_index "$custody_root" dir >/dev/null; then
+    i=0
+    while [ "$i" -lt "$n" ]; do
+      case "${custody_owned_kind[$i]}:${custody_owned_path[$i]}" in "mount:$custody_root/"*) owned_mounts=$((owned_mounts + 1)) ;; esac
+      i=$((i + 1))
+    done
+    if ! total="$(cu_mounts_within "$custody_root")" || [ "$total" != "$owned_mounts" ]; then
+      cu_log "UNKNOWN_MOUNT below $custody_root (found ${total:-unreadable}, owned $owned_mounts; every owned resource left in place)"
+      bad=1
+    fi
+  fi
+  return "$bad"
+}
+
+custody_unpin() { # path recorded-id
+  custody_mount_intact "$1" "$2" || return 1
+  cu_umount "$1" || {
+    cu_log "UNMOUNT_FAILED $1"
+    return 1
+  }
+  if [ -n "$(cu_mounts_at "$1")" ]; then
+    cu_log "STILL_MOUNTED $1"
+    return 1
+  fi
+  cu_log "unmounted $1"
 }
 
 custody_unlink() { # path recorded-id
@@ -438,32 +609,25 @@ custody_rmdir() { # path recorded-id
   cu_log "removed $1"
 }
 
-# Returns 0 only when everything this run created is verified and removed.
-# Any record, entry or mount that is not exactly an owned object keeps the
-# whole setup in place: custody uncertainty is preserved, never cleaned up.
 custody_cleanup() {
-  local failed=0 i entry
+  local failed=0 i rc
   [ "${#custody_owned_path[@]}" -gt 0 ] || return 0
-  if custody_owned_index "$custody_root" >/dev/null && [ -d "$custody_root" ] && [ ! -L "$custody_root" ]; then
-    while IFS= read -r entry; do
-      [ -n "$entry" ] || continue
-      if ! custody_owned_index "$custody_root/$entry" >/dev/null; then
-        cu_log "RETAINED_ENTRY $entry in $custody_root (custody record or unknown object; every owned resource left in place)"
-        return 1
-      fi
-    done <<<"$(cu_list_dir "$custody_root")"
-  fi
-  # Never act through a swapped directory: every owned directory must still be
-  # the object created here before anything beneath it is touched.
-  i=0
-  while [ "$i" -lt "${#custody_owned_path[@]}" ]; do
-    if [ "${custody_owned_kind[$i]}" = dir ] &&
-      ! custody_still_ours "${custody_owned_path[$i]}" "${custody_owned_id[$i]}"; then
-      cu_log "owned directory ${custody_owned_path[$i]} is not intact; every owned resource left in place"
-      return 1
-    fi
-    i=$((i + 1))
+  # Pending creations that never reported (an abort or signal in the middle).
+  i=${#custody_owned_path[@]}
+  while [ "$i" -gt 0 ]; do
+    i=$((i - 1))
+    if [ "${custody_owned_id[$i]}" = pending ]; then custody_reconcile "$i" || true; fi
   done
+  if [ "${#custody_owned_path[@]}" = 0 ]; then
+    cu_log "cleanup verified: nothing was created"
+    return 0
+  fi
+  rc=0
+  custody_preverify || rc=$?
+  if [ "$rc" != 0 ]; then
+    cu_log "cleanup refused: owned setup is not fully verified (status $rc); nothing was removed"
+    return "$rc"
+  fi
   i=${#custody_owned_path[@]}
   while [ "$i" -gt 0 ]; do
     i=$((i - 1))
@@ -471,10 +635,6 @@ custody_cleanup() {
       mount) custody_unpin "${custody_owned_path[$i]}" "${custody_owned_id[$i]}" || failed=1 ;;
       file) custody_unlink "${custody_owned_path[$i]}" "${custody_owned_id[$i]}" || failed=1 ;;
       dir) custody_rmdir "${custody_owned_path[$i]}" "${custody_owned_id[$i]}" || failed=1 ;;
-      *)
-        cu_log "UNKNOWN_KIND ${custody_owned_kind[$i]} ${custody_owned_path[$i]}"
-        failed=1
-        ;;
     esac
   done
   [ "$failed" = 0 ] || return 1

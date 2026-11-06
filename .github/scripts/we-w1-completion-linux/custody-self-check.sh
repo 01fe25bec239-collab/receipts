@@ -38,14 +38,18 @@ custody_self_check() {
   cu_mount_bind() {
     local ns=${1##*/} name=${2##*/} id
     echo "bind $1 $2" >>"$fake/calls"
+    [ "${fake_sig_at:-}" != bind ] || fake_signal
     [ ! -e "$fake/bind-fails-$name" ] || return 1
     id="$(cu_ns_id "$ns" 1)"
     [ ! -e "$fake/bind-wrong-$name" ] || id=9:999
     printf '%s\n' "$id" >"$fake/id.$(fake_key "$2")"
     echo "100 1 0:4 $ns:[1] $2 rw - nsfs nsfs rw" >>"$fake/mounts"
+    # the mount exists although the command reports failure
+    [ ! -e "$fake/bind-after-mount-fails-$name" ] || return 1
   }
   cu_umount() {
     echo "umount $1" >>"$fake/calls"
+    [ "${fake_sig_at:-}" != umount ] || fake_signal
     [ ! -e "$fake/umount-fails" ] || return 1
     awk -v p="$1" '$5 != p' "$fake/mounts" >"$fake/mounts.new"
     mv "$fake/mounts.new" "$fake/mounts"
@@ -90,8 +94,10 @@ custody_self_check() {
     f_self_mnt=4:4026532500 f_pid1_mnt=4:4026532500
     custody_reset
     test_status=unknown cleanup_status=unknown setup_status=unknown
-    custody_cleanup_status=unknown primary_failure= finished=0
-    fake_test_rc=0
+    custody_cleanup_status=unknown primary_failure= finished=0 finalized=0
+    tests_completed=0 first_failed_test= first_failed_status= interrupted= cgroup_pending=0
+    fake_test_rc=0 fake_rcs= fake_sig= fake_sig_at=
+    rm -f "$fake/n" "$fake/tests-run"
   }
   snap() { # kind, owner, mode and identity of every sandbox object
     local p
@@ -119,6 +125,303 @@ custody_self_check() {
     for f in "$@"; do ! { [ -e "$f" ] || [ -L "$f" ]; } || return 1; done
   }
   result_lacks() { ! result_prefix "$1"; }
+  result_not() { ! result_has "$1"; }
+
+  # ---- fake hosted-sequence runner: per-test results and injected signals ----
+  # fake_rcs: space-separated return codes, one per test (default: fake_test_rc).
+  # fake_sig/fake_sig_at: signal delivered to the sequence's own process at
+  # test1|test2|test3, bind (during setup), cgroup (cgroup removal) or umount
+  # (custody cleanup).
+  fake_signal() {
+    [ -z "${fake_sig:-}" ] || kill -"$fake_sig" "$(cat "$fake/pid")"
+  }
+  run_test() {
+    local n
+    n=$(($(cat "$fake/n" 2>/dev/null || echo 0) + 1))
+    echo "$n" >"$fake/n"
+    echo "$2" >>"$fake/tests-run"
+    [ "${fake_sig_at:-}" != "test$n" ] || fake_signal
+    if [ -n "${fake_rcs:-}" ]; then
+      return "$(echo "$fake_rcs" | cut -d' ' -f"$n")"
+    fi
+    return "$fake_test_rc"
+  }
+  remove_cgroup_dir() {
+    [ "${fake_sig_at:-}" != cgroup ] || fake_signal
+    rm -rf "$1"
+  }
+  seq_run() { # sets rc; the subshell keeps set -e and its own EXIT/signal traps
+    set +e
+    (
+      set -e
+      sh -c 'echo $PPID' >"$fake/pid" # this subshell's own pid, for signals
+      "${seq_prologue:-:}"
+      hosted_sequence "$fake/binary"
+    )
+    rc=$?
+    set -e
+  }
+  ran() { cu_count_lines "$(cat "$fake/tests-run" 2>/dev/null || true)"; }
+  res() { sed -n "s/^$1=//p" "$out/result.txt" | head -1; }
+  not_pass() { ! grep -q '^PASS' "$out/result.txt"; }
+
+  # ---- regressions for the four A3 findings (PR203 host setup, subject 6c11) ----
+  # Each runs in its own subshell. CUSTODY_SELFCHECK_KEEP_GOING=1 counts failures
+  # instead of stopping, so the same controls can be run against older bytes.
+  reg_failures=0
+  run_reg() {
+    if ( "$@" ); then return 0; fi
+    reg_failures=$((reg_failures + 1))
+    [ -n "${CUSTODY_SELFCHECK_KEEP_GOING:-}" ] || exit 1
+  }
+
+  # Finding 1: an interrupted run must never leave PASS evidence and must keep
+  # its nonzero termination, whichever phase the signal lands in.
+  reg_interrupt() { # signal at expected-tests-started expected-tests-completed
+    local want
+    case $1 in TERM) want=143 ;; INT) want=130 ;; HUP) want=129 ;; esac
+    new_box "interrupt-$1-$2"
+    fake_sig=$1 fake_sig_at=$2 fake_rcs="0 0 0"
+    seq_run
+    check "$1 at $2 keeps a nonzero termination ($want)" [ "$rc" = "$want" ]
+    check "$1 at $2 leaves a result artifact" [ -f "$out/result.txt" ]
+    check "$1 at $2 is never PASS" not_pass
+    check "$1 at $2 started $3 tests" [ "$(ran)" = "$3" ]
+    check "$1 at $2 records exactly the completed tests" [ "$(res tests_completed)" = "$4" ]
+    echo "ok interrupt $1 at $2 -> exit $rc, no PASS artifact"
+  }
+  reg_interrupt_recorded() { # signal at: the handler had time to finish and record
+    new_box "interrupt-record-$1-$2"
+    fake_sig=$1 fake_sig_at=$2 fake_rcs="0 0 0"
+    seq_run
+    check "verdict FAIL" result_has FAIL
+    check "interruption recorded" result_has "interruption=$1"
+    check "primary failure names the interruption" result_prefix "primary_failure=interrupted by $1"
+    check "tests are not complete" [ "$(res test_status)" = unknown ]
+    echo "ok interrupt $1 at $2 -> FAIL with interruption recorded"
+  }
+  reg_interrupt_cleaned() { # setup/tests phases: owned cleanup still ran
+    new_box "interrupt-clean-$1-$2"
+    fake_sig=$1 fake_sig_at=$2 fake_rcs="0 0 0"
+    seq_run
+    check "owned custody removed after $2 interruption" exist_none "$custody_parent"
+    check "no mounts remain" [ "$(mounts)" = 0 ]
+    check "cleanup verified" result_has cleanup_status=0
+    echo "ok interrupt $1 at $2 -> owned cleanup verified"
+  }
+  for sig in TERM INT HUP; do
+    run_reg reg_interrupt "$sig" test1 1 0
+    run_reg reg_interrupt "$sig" test3 3 2
+    run_reg reg_interrupt "$sig" bind 0 0
+    run_reg reg_interrupt "$sig" cgroup 3 3
+    run_reg reg_interrupt "$sig" umount 3 3
+  done
+  run_reg reg_interrupt_recorded TERM test1
+  run_reg reg_interrupt_recorded TERM test3
+  run_reg reg_interrupt_recorded TERM bind
+  run_reg reg_interrupt_cleaned TERM test1
+  run_reg reg_interrupt_cleaned INT test3
+  run_reg reg_interrupt_cleaned HUP bind
+  # A signal during finalization must not erase what is still owned.
+  reg_interrupt_finalization() {
+    new_box interrupt-umount
+    fake_sig=TERM fake_sig_at=umount fake_rcs="0 0 0"
+    seq_run
+    check "cleanup is not claimed complete" [ "$(res cleanup_status)" != 0 ]
+    check "interruption recorded" result_has interruption=TERM
+    check "the interrupted unmount left the mounts in place" [ "$(mounts)" = 2 ]
+    echo "ok interrupt during custody cleanup -> cleanup not claimed"
+  }
+  run_reg reg_interrupt_finalization
+  reg_kill() { # SIGKILL cannot be handled: the pre-written INCOMPLETE stays; cleanup is NOT claimed
+    new_box kill-test2
+    fake_sig=KILL fake_sig_at=test2 fake_rcs="0 0 0"
+    seq_run
+    check "killed (137)" [ "$rc" = 137 ]
+    check "artifact is INCOMPLETE, not PASS" result_has INCOMPLETE
+    check "never PASS" not_pass
+    check "no claim of cleanup" result_has cleanup_status=unknown
+    echo "ok SIGKILL at test2 -> INCOMPLETE artifact, cleanup not claimed"
+  }
+  run_reg reg_kill
+
+  # Finding 2: a failed enumeration or any mismatched owned object retains the
+  # anchors AND the lock; nothing is unmounted before everything is verified.
+  reg_retain() { # name mutator
+    new_box "retain-$1"
+    setup_rc
+    check "$1 baseline setup" [ "$rc" = 0 ]
+    "$2"
+    mounts_before="$(mounts)"
+    rc=0
+    custody_cleanup || rc=$?
+    check "$1 cleanup fails" [ "$rc" != 0 ]
+    check "$1 unmounted nothing" [ "$(calls umount)" = 0 ]
+    check "$1 kept every mount in place" [ "$(mounts)" = "$mounts_before" ]
+    check "$1 kept the lock and anchor files" exist_all "$custody_root/lock" "$custody_root/host-pid" "$custody_root/host-mnt"
+    check "$1 kept the directories" exist_all "$custody_root" "$custody_parent"
+    echo "ok retain $1 -> zero unmounts, anchors and lock kept"
+  }
+  g_listing_fails() { # A3 probe listing_failure.sh
+    printf retained >"$custody_root/r-retained"
+    cu_list_dir() { return 1; }
+  }
+  g_listing_fails_clean() {
+    cu_list_dir() { return 1; }
+  }
+  g_lock_replaced() { # A3 probe replaced_lock.sh
+    : >"$custody_root/lock.new"
+    rm "$custody_root/lock"
+    mv "$custody_root/lock.new" "$custody_root/lock"
+  }
+  g_lock_aliased() { ln "$custody_root/lock" "$sb/alias"; }
+  g_pid_mount_foreign() { # the FIRST anchor is wrong; the last would be unmounted first
+    sed 's/ nsfs nsfs / tmpfs tmpfs /' "$fake/mounts" >"$fake/m" && mv "$fake/m" "$fake/mounts"
+  }
+  g_unknown_mount() { echo "102 1 0:5 / $custody_root/x rw - tmpfs tmpfs rw" >>"$fake/mounts"; }
+  g_stray_entry() { : >"$custody_root/stray"; }
+  g_record() { printf 'receipts-registry-v1\n' >"$custody_root/r-attempt"; }
+  g_parent_listing_extra() { : >"$custody_parent/stray"; }
+  g_anchor_id_changed() { echo 9:999 >"$fake/id.$(fake_key "$custody_root/host-pid")"; }
+  for case_name in listing_fails listing_fails_clean lock_replaced lock_aliased pid_mount_foreign unknown_mount stray_entry record parent_listing_extra anchor_id_changed; do
+    run_reg reg_retain "$case_name" "g_$case_name"
+  done
+
+  # Finding 3: creation is accounted before the command returns. A failed or
+  # aborted create that left something is retained as explicit uncertainty,
+  # never reported as nothing created or as a clean cleanup.
+  reg_create_abort() { # A3 probe creation-before-record.sh
+    new_box create-abort
+    seq_prologue=create_exit9
+    create_exit9() { mkdir() { command mkdir "$@"; case "${1:-}" in -m) exit 9 ;; esac; }; }
+    seq_run
+    seq_prologue=:
+    check "abort fails" [ "$rc" != 0 ]
+    check "no test ran" [ "$(ran)" = 0 ]
+    check "the created directory was NOT removed (unproven ownership)" exist_all "$custody_parent"
+    check "never reported as refused/nothing created" result_not setup_status=refused
+    check "uncertainty reported" result_has custody_cleanup_status=uncertain
+    check "cleanup is not claimed clean" result_has cleanup_status=1
+    check "FAIL" result_has FAIL
+    check "uncertain object named in the log" log_has "UNCERTAIN"
+    echo "ok create-then-abort -> retained and reported uncertain"
+  }
+  run_reg reg_create_abort
+  reg_create_nonzero() { # the create command fails after creating
+    new_box create-nonzero
+    create_then_fail() { mkdir() { command mkdir "$@"; case "${1:-}" in -m) return 9 ;; esac; }; }
+    create_then_fail
+    custody_reset
+    setup_rc
+    check "setup fails" [ "$rc" != 0 ]
+    check "not classified as refused" [ "$custody_setup_state" = failed ]
+    check "the failure says the outcome is uncertain" failure_has uncertain
+    rc=0
+    custody_cleanup || rc=$?
+    check "cleanup reports uncertainty (2)" [ "$rc" = 2 ]
+    check "object retained" exist_all "$custody_parent"
+    echo "ok create-then-nonzero -> failed, uncertain, retained"
+  }
+  run_reg reg_create_nonzero
+  reg_mount_created_then_failed() {
+    new_box mount-created-fail
+    : >"$fake/bind-after-mount-fails-host-pid"
+    setup_rc
+    check "setup fails" [ "$rc" != 0 ]
+    rc=0
+    custody_cleanup || rc=$?
+    check "cleanup reports uncertainty (2)" [ "$rc" = 2 ]
+    check "the mount was not unmounted (ownership unproven)" [ "$(calls umount)" = 0 ]
+    check "the mount remains" [ "$(mounts)" = 1 ]
+    check "uncertainty logged" log_has UNCERTAIN
+    echo "ok bind created a mount then failed -> retained uncertain"
+  }
+  run_reg reg_mount_created_then_failed
+  reg_mount_abort() {
+    new_box mount-abort
+    seq_prologue=bind_abort
+    bind_abort() { cu_mount_bind() { echo "100 1 0:4 pid:[1] $2 rw - nsfs nsfs rw" >>"$fake/mounts"; echo 4:4026531836 >"$fake/id.$(fake_key "$2")"; exit 9; }; }
+    seq_run
+    seq_prologue=:
+    check "abort fails" [ "$rc" != 0 ]
+    check "the half-created mount was not unmounted" [ "$(calls umount)" = 0 ]
+    check "uncertainty reported" result_has custody_cleanup_status=uncertain
+    check "cleanup not clean" result_has cleanup_status=1
+    echo "ok abort after mount -> retained uncertain"
+  }
+  run_reg reg_mount_abort
+  reg_cgroup_create_abort() { # same root cause in the cgroup/trap sequence
+    new_box cgroup-abort
+    seq_prologue=cgroup_exit9
+    cgroup_exit9() { mkdir() { command mkdir "$@"; case "${1:-}" in "$cgroup") exit 9 ;; esac; }; }
+    seq_run
+    seq_prologue=:
+    check "abort fails" [ "$rc" != 0 ]
+    check "a result was recorded" [ -f "$out/result.txt" ]
+    check "not PASS" not_pass
+    check "the cgroup directory was not adopted or removed" exist_all "$cgroup"
+    check "cleanup not claimed clean" result_has cleanup_status=1
+    check "uncertain cgroup logged" log_has UNCERTAIN
+    check "no test ran" [ "$(ran)" = 0 ]
+    echo "ok cgroup mkdir-then-abort -> retained, reported, not adopted"
+  }
+  run_reg reg_cgroup_create_abort
+
+  # Finding 4: the first failed test identity/status survives later results.
+  reg_first_failure() { # name rcs first-index first-status
+    new_box "first-$1"
+    fake_rcs="$2"
+    seq_run
+    check "$1 fails" [ "$rc" = 1 ]
+    check "$1 completed all three" result_has tests_completed=3
+    check "$1 aggregate test_status is the first failure" result_has "test_status=$4"
+    check "$1 first status" result_has "first_failed_status=$4"
+    check "$1 first identity" result_prefix "first_failed_test=protected_linux_tests::"
+    check "$1 identity is the right test" [ "$(res first_failed_test)" = "$(echo "protected_linux_tests::hosted_protected_worker_controller_and_cleanup protected_linux_tests::hosted_exclusive_custody_and_linked_target_refusals protected_linux_tests::hosted_cross_repository_nested_custody_refuses_without_transfer" | cut -d' ' -f"$3")" ]
+    check "$1 primary failure names it" result_prefix "primary_failure=test protected_linux_tests::"
+    check "$1 cleanup separate" result_has cleanup_status=0
+    echo "ok first failure $1 ($2) -> test $3 status $4"
+  }
+  run_reg reg_first_failure seven_three_zero "7 3 0" 1 7
+  run_reg reg_first_failure zero_five_nine "0 5 9" 2 5
+  run_reg reg_first_failure zero_zero_four "0 0 4" 3 4
+  run_reg reg_first_failure three_three_three "3 3 3" 1 3
+  reg_all_pass() {
+    new_box all-pass
+    fake_rcs="0 0 0"
+    seq_run
+    check "passes" [ "$rc" = 0 ]
+    check "PASS" result_has PASS
+    check "all completed" result_has tests_completed=3
+    check "aggregate 0" result_has test_status=0
+    check "no failed test recorded" result_lacks first_failed_test
+    check "no failure line" result_lacks primary_failure
+    echo "ok full completion -> PASS"
+  }
+  run_reg reg_all_pass
+  reg_precedence() {
+    new_box precedence-setup
+    RUNNER_ENVIRONMENT=self-hosted fake_rcs="7 3 0"
+    seq_run
+    check "setup refusal is the primary failure" result_prefix "primary_failure=host custody setup refused"
+    check "no test failure invented" result_lacks first_failed_test
+    new_box precedence-interrupt
+    fake_rcs="7 3 0" fake_sig=TERM fake_sig_at=test2
+    seq_run
+    check "first failure survives an interruption" result_has first_failed_status=7
+    check "the abnormal end takes precedence in the summary" result_prefix "primary_failure=interrupted by TERM"
+    check "never PASS" not_pass
+    echo "ok precedence: setup, then abnormal end, then first test failure"
+  }
+  run_reg reg_precedence
+  if [ "$reg_failures" != 0 ]; then
+    echo "REGRESSION CONTROLS FAILED: $reg_failures"
+    exit 1
+  fi
+  [ "${CUSTODY_SELFCHECK_ONLY:-}" != regress ] || {
+    echo "regression controls passed"
+    return 0
+  }
 
   # ---- clean setup and teardown ----
   new_box clean
@@ -333,6 +636,7 @@ custody_self_check() {
     check "$1 baseline setup ok" [ "$rc" = 0 ]
     setup_status=0
     test_status=0
+    tests_completed=${#tests[@]}
     [ -z "${5:-}" ] || : >"$fake/$5"
     if finish; then rc=PASS; else rc=FAIL; fi
     check "$1 verdict" [ "$rc" = "$2" ]
@@ -354,6 +658,13 @@ custody_self_check() {
   check "no unmount while worker cleanup is unproven" [ "$(calls umount)" = 0 ]
   check "retention is logged" log_has 'RETAINED host custody setup'
   ok "finish retains custody when worker/cgroup cleanup is unproven"
+  new_box finish-incomplete-tests
+  setup_status=0
+  test_status=0
+  tests_completed=2
+  if finish; then rc=PASS; else rc=FAIL; fi
+  check "test_status 0 with only 2 of 3 tests completed is FAIL" [ "$rc" = FAIL ]
+  ok "finish never passes with incomplete tests"
   new_box finish-unknown-setup
   test_status=0
   if finish; then rc=PASS; else rc=FAIL; fi
@@ -362,21 +673,6 @@ custody_self_check() {
   ok "an unknown setup status is never PASS"
 
   # ---- the hosted sequence, with fake test runs ----
-  run_test() {
-    echo "$2" >>"$fake/tests-run"
-    return "$fake_test_rc"
-  }
-  seq_run() { # sets rc; the subshell keeps set -e and its own EXIT trap
-    set +e
-    (
-      set -e
-      "${seq_prologue:-:}"
-      hosted_sequence "$fake/binary"
-    )
-    rc=$?
-    set -e
-  }
-  ran() { cu_count_lines "$(cat "$fake/tests-run" 2>/dev/null || true)"; }
   seq_prologue=:
   new_box seq-pass
   before="$(snap)"
@@ -454,7 +750,7 @@ custody_self_check() {
   before="$(snap)"
   seq_run
   seq_prologue=:
-  check "aborted sequence fails" [ "$rc" = 1 ]
+  check "aborted sequence keeps its real nonzero status (9)" [ "$rc" = 9 ]
   check "no test ran" [ "$(ran)" = 0 ]
   check "abort leaves setup unknown" result_has setup_status=unknown
   check "tests NOT RUN" result_has test_status=unknown

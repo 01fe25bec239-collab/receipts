@@ -3,11 +3,17 @@
 # phase runs as root and creates/deletes only its own cgroup and temp fixture.
 # Never run `hosted` with sudo on a workstation.
 #
-# Result contract: setup, primary test and owned-cleanup statuses are recorded
-# separately in result.txt (plus the first failure as primary_failure), and
-# PASS/exit 0 requires ALL of them to be 0. A retained, unknown or unowned
-# resource is a cleanup failure, never success. Host custody administration
-# (anchors the product admission requires) lives in custody.sh.
+# Result contract: setup, test and owned-cleanup statuses, the number of tests
+# that actually completed and the FIRST failed test (identity and status) are
+# recorded separately in result.txt, and PASS/exit 0 requires ALL of: setup 0,
+# every test completed with status 0, cleanup 0 and no interruption. Nothing is
+# initialized to success: result.txt starts as INCOMPLETE and becomes PASS or
+# FAIL only through one atomic write at the very end. A retained, unknown or
+# unowned resource (including an uncertain create) is a cleanup failure, never
+# success. SIGTERM/SIGINT/SIGHUP are recorded, cleaned up after and re-exited
+# with their 128+n status; SIGKILL or machine loss cannot be handled, leaves
+# INCOMPLETE (never PASS) and does NOT guarantee cleanup. Host custody
+# administration (anchors the product admission requires) lives in custody.sh.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -18,6 +24,7 @@ if [ "${1:-}" = self-check ]; then out=; else out="${DIAGNOSTIC_OUT:?}"; fi
 bin_record="$out/test-binary"
 cgroup="/sys/fs/cgroup/receipts-we-w1-diagnostic"
 cleanup_polls=50
+cgroup_pending=0 # 1 only while mkdir "$cgroup" may have created it without our knowing
 tests=(
   "protected_linux_tests::hosted_protected_worker_controller_and_cleanup"
   "protected_linux_tests::hosted_exclusive_custody_and_linked_target_refusals"
@@ -87,7 +94,12 @@ cgroup_control_file() {
 # logged and counted; nothing is masked.
 cleanup_owned() {
   local failed=0 entry empty
-  if [ -e "$cgroup" ]; then
+  if [ "$cgroup_pending" = 1 ] && { [ -e "$cgroup" ] || [ -L "$cgroup" ]; }; then
+    # mkdir was started but not known to have completed. It was absent just
+    # before, yet ownership is unproven: never adopt, kill or remove it.
+    log_cleanup "UNCERTAIN $cgroup (creation was interrupted; ownership unproven, retained)"
+    failed=1
+  elif [ -e "$cgroup" ]; then
     for entry in "$cgroup"/*; do
       # Unmatched glob: no entries. A dangling symlink still counts as an entry.
       [ -e "$entry" ] || [ -L "$entry" ] || continue
@@ -157,48 +169,99 @@ cleanup_owned() {
   return "$failed"
 }
 
-test_status=unknown
+test_status=unknown # first failed test's status, 0 only after ALL tests completed with 0
 cleanup_status=unknown
 setup_status=unknown
 custody_cleanup_status=unknown
 primary_failure=
+tests_completed=0
+first_failed_test=
+first_failed_status=
+interrupted=
 finished=0
+finalized=0
+result_verdict=FAIL
+
+# Atomically replaces result.txt (a killed writer leaves the previous file).
+publish_result() { # file-with-content
+  mv -f "$1" "$out/result.txt"
+}
+
+# Placeholder written before anything can fail: whatever kills the run later
+# (even SIGKILL) leaves INCOMPLETE, never a stale or success verdict.
+write_incomplete() {
+  printf 'INCOMPLETE\ntest_status=unknown\ncleanup_status=unknown\nsetup_status=unknown\ncustody_cleanup_status=unknown\ntests_completed=0\ntests_total=%s\n' "${#tests[@]}" >"$out/result.txt.tmp"
+  publish_result "$out/result.txt.tmp"
+}
+
+# Computes the verdict from recorded facts and writes result.txt once.
+# Lines 1-3 (verdict, test_status, cleanup_status) keep their positions. The
+# summary line names the highest-precedence failure: setup, then an abnormal
+# end, then the first failed test; each fact stays in its own field.
+write_result() {
+  local primary=$primary_failure
+  result_verdict=FAIL
+  if [ "$setup_status" = 0 ] && [ "$test_status" = 0 ] && [ "$tests_completed" = "${#tests[@]}" ] &&
+    [ "$cleanup_status" = 0 ] && [ -z "$interrupted" ]; then
+    result_verdict=PASS
+  fi
+  if [ -z "$primary" ] && [ -n "$interrupted" ]; then primary="interrupted by $interrupted"; fi
+  if [ -z "$primary" ] && [ -n "$first_failed_test" ]; then
+    primary="test $first_failed_test exited $first_failed_status"
+  fi
+  if [ -z "$primary" ] && [ "$result_verdict" = FAIL ] && [ "$test_status" = unknown ]; then
+    primary="run did not complete (setup_status=$setup_status tests_completed=$tests_completed/${#tests[@]})"
+  fi
+  {
+    echo "$result_verdict"
+    echo "test_status=$test_status"
+    echo "cleanup_status=$cleanup_status"
+    echo "setup_status=$setup_status"
+    echo "custody_cleanup_status=$custody_cleanup_status"
+    echo "tests_completed=$tests_completed"
+    echo "tests_total=${#tests[@]}"
+    [ -z "$first_failed_test" ] || echo "first_failed_test=$first_failed_test"
+    [ -z "$first_failed_test" ] || echo "first_failed_status=$first_failed_status"
+    [ -z "$interrupted" ] || echo "interruption=$interrupted"
+    [ -z "$primary" ] || echo "primary_failure=$primary"
+  } >"$out/result.txt.tmp"
+  publish_result "$out/result.txt.tmp"
+  finalized=1
+}
 
 # Runs owned cleanup exactly once and writes the verdict. Used for the normal
 # path and, through the EXIT trap, for any abort (where test_status stays
 # "unknown" and the verdict is therefore FAIL). Host custody is removed only
 # after worker/controller/cgroup cleanup is proven; otherwise it is retained
-# and reported. The primary failure is kept apart from cleanup results.
+# and reported. Statuses become known only when computed; the cancellation
+# signals are ignored for the last step so the verdict and the artifact cannot
+# disagree.
 finish() {
   [ "$finished" = 0 ] || return 0
   finished=1
-  cleanup_status=0
-  custody_cleanup_status=n/a
-  cleanup_owned || cleanup_status=$?
+  local cs=0 ccs=n/a rc
+  cleanup_owned || cs=$?
   if [ "${#custody_owned_path[@]}" -gt 0 ]; then
-    if [ "$cleanup_status" = 0 ]; then
-      custody_cleanup_status=0
-      custody_cleanup || custody_cleanup_status=1
+    if [ "$cs" = 0 ]; then
+      rc=0
+      custody_cleanup || rc=$?
+      case "$rc" in
+        0) ccs=0 ;;
+        2) ccs=uncertain ;;
+        *) ccs=1 ;;
+      esac
     else
-      custody_cleanup_status=skipped
+      ccs=skipped
       cu_log "RETAINED host custody setup: worker/controller/cgroup cleanup is not proven"
     fi
-    [ "$custody_cleanup_status" = 0 ] || cleanup_status=1
+    [ "$ccs" = 0 ] || cs=1
   fi
-  local verdict=FAIL
-  if [ "$setup_status" = 0 ] && [ "$test_status" = 0 ] && [ "$cleanup_status" = 0 ]; then
-    verdict=PASS
-  fi
-  {
-    echo "$verdict"
-    echo "test_status=$test_status"
-    echo "cleanup_status=$cleanup_status"
-    echo "setup_status=$setup_status"
-    echo "custody_cleanup_status=$custody_cleanup_status"
-    [ -z "$primary_failure" ] || echo "primary_failure=$primary_failure"
-  } >"$out/result.txt"
+  cleanup_status=$cs
+  custody_cleanup_status=$ccs
+  trap '' TERM INT HUP
+  write_result
   own_evidence
-  [ "$verdict" = PASS ]
+  [ "$result_verdict" = PASS ]
 }
 
 # Evidence written by root stays readable and sealable by the runner user.
@@ -206,6 +269,27 @@ own_evidence() {
   if [ "$(id -u)" = 0 ] && [ -e "$out/provenance.txt" ]; then
     chown -R "$(stat -c %u "$out/provenance.txt"):$(stat -c %g "$out/provenance.txt")" "$out"
   fi
+}
+
+# EXIT: finish if nothing has, keeping any nonzero status the run already had.
+on_exit() {
+  local rc=$?
+  if ! finish; then
+    [ "$rc" != 0 ] || rc=1
+  fi
+  exit "$rc"
+}
+
+# SIGTERM/SIGINT/SIGHUP (job cancel or timeout): record it, clean what is
+# owned if cleanup has not started, never write PASS, exit 128+n.
+on_signal() { # NAME NUMBER
+  trap '' TERM INT HUP
+  interrupted=$1
+  cu_log "INTERRUPTED by $1"
+  finish || true
+  if [ "$finalized" != 1 ]; then write_result; fi # cleanup was interrupted midway
+  trap - EXIT
+  exit $((128 + $2))
 }
 
 # One hosted test, bounded and with a sanitized environment (overridden only
@@ -217,31 +301,48 @@ run_test() {
     >>"$out/diagnostic.log" 2>&1
 }
 
-# Everything after the guards. Order: refuse occupied/unsafe state (nothing
-# created yet) -> own the cgroup -> install the EXIT trap -> host custody setup
-# -> tests only if setup verified -> owned cleanup and verdict.
+# Everything after the guards. Order: INCOMPLETE placeholder -> refuse an
+# occupied cgroup (nothing created yet) -> traps -> account for and create the
+# cgroup -> host custody setup -> tests only if setup verified -> owned cleanup
+# and verdict. test_status is set only after EVERY test has run.
 hosted_sequence() {
+  local name rc=0
+  write_incomplete
   if [ -e "$cgroup" ] || [ -L "$cgroup" ]; then
-    echo "FAIL cgroup occupied" >"$out/result.txt"
+    echo "FAIL cgroup occupied" >"$out/result.txt.tmp"
+    publish_result "$out/result.txt.tmp"
     own_evidence
     exit 1
   fi
+  trap on_exit EXIT
+  trap 'on_signal TERM 15' TERM
+  trap 'on_signal INT 2' INT
+  trap 'on_signal HUP 1' HUP
+  cgroup_pending=1 # recorded BEFORE the side effect
   mkdir "$cgroup"
-  trap 'finish || exit 1' EXIT
+  cgroup_pending=0
   if custody_setup; then
     setup_status=0
-    test_status=0
-    for test in "${tests[@]}"; do
-      run_test "$1" "$test" || test_status=$?
+    for name in "${tests[@]}"; do
+      rc=0
+      run_test "$1" "$name" || rc=$?
+      tests_completed=$((tests_completed + 1))
+      if [ "$rc" != 0 ] && [ -z "$first_failed_test" ]; then
+        first_failed_test=$name
+        first_failed_status=$rc
+      fi
     done
+    if [ -n "$first_failed_test" ]; then test_status=$first_failed_status; else test_status=0; fi
   else
     setup_status="$custody_setup_state"
     primary_failure="host custody setup $custody_setup_state: $custody_setup_failure"
   fi
-  local verdict=0
-  finish || verdict=1
+  rc=0
+  finish || rc=1
+  # finish() left the cancellation signals ignored: nothing can interrupt the
+  # process between a written verdict and its exit.
   trap - EXIT
-  exit "$verdict"
+  exit "$rc"
 }
 
 hosted() {
@@ -294,9 +395,15 @@ self_check() {
     test_status="$status"
     cleanup_status=unknown
     setup_status=0
+    tests_completed=${#tests[@]}
+    first_failed_test=
+    first_failed_status=
+    interrupted=
+    cgroup_pending=0
     custody_reset
     primary_failure=
     finished=0
+    finalized=0
     if finish; then got=PASS; else got=FAIL; fi
     if [ "$got" != "$verdict" ] ||
       [ "$(sed -n 1p "$out/result.txt")" != "$verdict" ] ||
