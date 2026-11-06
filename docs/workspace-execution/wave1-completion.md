@@ -101,8 +101,18 @@ and `protected_hardlinks`/`protected_symlinks`. All other platforms refuse.
   worker UID (monotonic, never reused by a launcher).
 - One host custody domain: `/var/lib/receipts/protected-custody`, root-owned
   0700 beneath root-owned non-writable ancestors. Trusted host administration
-  must preinstall its mode-0600 single-link `lock` and nsfs bind mounts
-  `host-pid` and `host-mnt` pinned from the actual host initial namespaces.
+  must preinstall its mode-0600 single-link `lock`, an nsfs bind mount
+  `host-pid` of the actual host initial PID namespace, and `host-mnt.identity`:
+  a root 0600 single-link record (`receipts-host-mnt-identity-v1`, then
+  `boot_id=`, `mnt_namespace=<dev>:<ino>`, `end`, nothing else) of the boot and
+  the host initial mount namespace. The kernel refuses an nsfs bind of a mount
+  namespace inside that same namespace, so the mount namespace is recorded, not
+  pinned. The record is an administrative assertion, not a kernel handle or an
+  attestation. Admission reads it descriptor-relative without following links,
+  bounded and fully parsed, and requires it to name the current boot and the
+  mount namespace of both the admitting process and PID 1. A missing,
+  malformed, extra, truncated, other-boot, wrong-owner/mode/link or mismatched
+  record refuses, as does the obsolete `host-mnt` entry or mount.
   A container's own PID 1 is insufficient provenance. The launcher does not
   provision or infer these anchors: absent, unsafe or mismatched setup refuses.
   (The hosted diagnostic below supplies them from its own disposable VM, as
@@ -273,8 +283,11 @@ PID 1 or an environment flag alone does not establish host origin.
 provides what `production_registry` requires: `/var/lib/receipts` (root `0755`)
 and `/var/lib/receipts/protected-custody` (root `0700`) under root-owned,
 non-link, non-group/other-writable ancestors; a root `0600` single-link `lock`;
-and nsfs bind mounts `host-pid` and `host-mnt` of PID 1's initial namespaces.
-No alternate registry, fake pin files, auto-provisioning inside the product or
+an nsfs bind mount `host-pid` of PID 1's initial PID namespace; and the
+root `0600` single-link `host-mnt.identity` record of this boot's
+`/proc/sys/kernel/random/boot_id` and PID 1's mount namespace dev:inode,
+computed from kernel observations during the read-only preflight and written
+by the same exclusive create. No alternate registry, fake pin files, auto-provisioning inside the product or
 bypass of its topology/namespace checks exists.
 
 - Context refusal (nothing created): `RUNNER_ENVIRONMENT=github-hosted`,
@@ -283,15 +296,18 @@ bypass of its topology/namespace checks exists.
   `/.dockerenv` or `/run/.containerenv`; the PID namespace of this process and
   of PID 1 is the kernel's fixed initial PID namespace (inode 4026531836) and
   their user namespace the initial user namespace (4026531837); the mount
-  namespace equals PID 1's. Contradiction refuses, never guesses.
+  namespace equals PID 1's; the boot id and mount namespace identity are
+  well-formed. Contradiction refuses, never guesses.
 - Existing/unknown resources refuse untouched: an existing or linked
   `/var/lib/receipts`, any mount at or below it, an unsafe, linked or
   non-root-owned ancestor. Nothing is adopted, overwritten, chmod/chowned or
   unmounted. Objects are created exclusively (`mkdir`, noclobber inside the
   freshly made private directory).
 - Verification before any test: owners/modes/link counts, exactly the three
-  entries, exactly one nsfs mount per anchor with nothing stacked or nested, and
-  anchor dev:inode equal to the namespaces of this process and of PID 1.
+  entries, the record is the object created here and byte-for-byte the current
+  boot and the mount namespace of this process and PID 1, exactly one nsfs mount
+  (`host-pid`) with nothing stacked or nested, and its dev:inode equal to the PID
+  namespace of this process and of PID 1.
   Observed runner/image/namespace/root-mount facts go to `provenance.txt`;
   setup and cleanup events to `diagnostic.log` (`CUSTODY ...`).
 - Ownership: intent is recorded BEFORE each side effect (directory, file,
@@ -324,7 +340,7 @@ bypass of its topology/namespace checks exists.
   allowlist is unchanged.
 
 `run.sh self-check` runs the cgroup verdict controls and the custody controls
-with fake mount/namespace operations over a real temporary directory (clean
+with fake mount/namespace/boot operations over a real temporary directory (clean
 setup/teardown, each refusal, partial setup, tampered setup, retained records,
 foreign/replaced/aliased objects, cleanup failure, abort and the whole hosted
 sequence) and the regressions for four review findings: SIGTERM/SIGINT/SIGHUP
@@ -349,7 +365,11 @@ sentinels, and the filter-marker phases with an unprivileged positive control.
 Controller cgroup NAME reservation is covered through the real channel and
 confined-run path with overlapping worker/reviewer reservations, using an
 unprivileged temporary directory as the cgroup root: a test seam proving names
-only, not kernel cgroups or confinement.
+only, not kernel cgroups or confinement. The host mount identity record parser
+and file checks run locally against real files owned by the invoking user
+(production requires root); the hosted exclusive-custody test also rewrites the
+real record in place (other boot, other namespace, extra line, mode 0644) and
+proves production admission refuses each before restoring it.
 Ownership changes to other users, `/proc/self/mountinfo` on a real bind mount,
 Landlock and cgroups need the hosted run. The host setup likewise needs it:
 real nsfs bind mounts, root ownership, the fixed initial-namespace inode
@@ -358,11 +378,13 @@ constants, the runner context values and the unchanged product admission
 controls, which only show that unsupported, partial and failed states refuse,
 are tracked and are never reported as PASS. Linux enforcement code and the hosted tests were type-checked and
 Clippy-checked locally only in a throwaway copy with the Linux cfg gates
-retargeted to Darwin (no link, nothing committed from that copy); they have NOT
-been executed. The hosted
-diagnostic (`.github/workflows/we-w1-completion-linux.yml`) is prepared and
-NOT RUN; it needs A1 inspection and independent static review before
-USER-authorized execution. Root/controller compromise, kernel bugs and
+retargeted to Darwin (no link, nothing committed from that copy). The later
+host mount identity record change in `production_registry` and the hosted
+record control were not type-checked locally on Linux; Repository CI compiles
+and Clippy-checks them on Linux. The hosted diagnostic
+(`.github/workflows/we-w1-completion-linux.yml`) runs only under USER
+authority; its results for each exact head are recorded with the PR, not in
+this file. Root/controller compromise, kernel bugs and
 non-filesystem Landlock scope are outside admission assumptions.
 
 Lifecycle start returns a WorkspaceAttempt facade retaining its own ACTIVE handle.

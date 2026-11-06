@@ -1,8 +1,8 @@
 # Unprivileged fake-operation controls for custody.sh and the hosted sequence
 # in run.sh. Sourced by `run.sh self-check`; not executable on its own.
 #
-# Kernel and root operations (mount, umount, mount table, namespace and anchor
-# identity) are replaced by fakes. Ordinary file operations (mkdir, exclusive
+# Kernel and root operations (mount, umount, mount table, boot, namespace and
+# anchor identity) are replaced by fakes. Ordinary file operations (mkdir, exclusive
 # create, rm, rmdir, stat, links) run for real inside a private temp sandbox,
 # so ownership tracking, refusal without touching external objects, retained
 # records and cleanup verification are exercised against real objects. These
@@ -25,6 +25,10 @@ custody_self_check() {
     }
   fi
   cu_mount_table() { cat "$fake/mounts"; }
+  cu_boot_id() {
+    [ ! -e "$fake/boot-fails" ] || return 1
+    printf '%s\n' "$f_boot"
+  }
   cu_ns_id() {
     local who=$2
     [ "$who" != 1 ] || who=pid1
@@ -92,6 +96,7 @@ custody_self_check() {
     f_self_pid=4:4026531836 f_pid1_pid=4:4026531836
     f_self_user=4:4026531837 f_pid1_user=4:4026531837
     f_self_mnt=4:4026532500 f_pid1_mnt=4:4026532500
+    f_boot=0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0
     custody_reset
     test_status=unknown cleanup_status=unknown setup_status=unknown
     custody_cleanup_status=unknown primary_failure= finished=0 finalized=0
@@ -229,7 +234,7 @@ custody_self_check() {
     seq_run
     check "cleanup is not claimed complete" [ "$(res cleanup_status)" != 0 ]
     check "interruption recorded" result_has interruption=TERM
-    check "the interrupted unmount left the mounts in place" [ "$(mounts)" = 2 ]
+    check "the interrupted unmount left the mount in place" [ "$(mounts)" = 1 ]
     echo "ok interrupt during custody cleanup -> cleanup not claimed"
   }
   run_reg reg_interrupt_finalization
@@ -258,7 +263,7 @@ custody_self_check() {
     check "$1 cleanup fails" [ "$rc" != 0 ]
     check "$1 unmounted nothing" [ "$(calls umount)" = 0 ]
     check "$1 kept every mount in place" [ "$(mounts)" = "$mounts_before" ]
-    check "$1 kept the lock and anchor files" exist_all "$custody_root/lock" "$custody_root/host-pid" "$custody_root/host-mnt"
+    check "$1 kept the lock and anchor files" exist_all "$custody_root/lock" "$custody_root/host-pid" "$custody_root/host-mnt.identity"
     check "$1 kept the directories" exist_all "$custody_root" "$custody_parent"
     echo "ok retain $1 -> zero unmounts, anchors and lock kept"
   }
@@ -515,20 +520,24 @@ custody_self_check() {
   setup_rc
   check "clean setup succeeds" [ "$rc" = 0 ]
   check "state is 0" [ "$custody_setup_state" = 0 ]
-  check "two nsfs mounts" [ "$(mounts)" = 2 ]
-  check "entries are lock, host-pid and host-mnt" [ "$(cu_list_dir "$custody_root")" = "$(printf 'host-mnt\nhost-pid\nlock')" ]
+  check "one nsfs mount" [ "$(mounts)" = 1 ]
+  check "entries are lock, host-pid and host-mnt.identity" [ "$(cu_list_dir "$custody_root")" = "$(printf 'host-mnt.identity\nhost-pid\nlock')" ]
+  check "no mount namespace bind was attempted" [ "$(calls "bind /proc/1/ns/mnt")" = 0 ]
+  cu_read_meta "$custody_root/host-mnt.identity"
+  check "identity record 0600 single-link file" [ "$m_kind|$m_mode|$m_nlink" = "file|600|1" ]
+  check "identity record names this boot and mnt namespace exactly" cmp -s "$custody_root/host-mnt.identity" <(printf 'receipts-host-mnt-identity-v1\nboot_id=%s\nmnt_namespace=%s\nend\n' "$f_boot" "$f_pid1_mnt")
   cu_read_meta "$custody_root"
   check "root mode 0700" [ "$m_mode" = 700 ]
   cu_read_meta "$custody_root/lock"
   check "lock 0600 single-link file" [ "$m_kind|$m_mode|$m_nlink" = "file|600|1" ]
-  check "seven owned resources (two directories, three files, two mounts)" [ "${#custody_owned_path[@]}" = 7 ]
+  check "six owned resources (two directories, three files, one mount)" [ "${#custody_owned_path[@]}" = 6 ]
   check "provenance carries observed namespace facts" grep -q '^custody_ns_pid self=4:4026531836 pid1=4:4026531836' "$out/provenance.txt"
   rc=0
   custody_cleanup || rc=$?
   check "clean cleanup succeeds" [ "$rc" = 0 ]
   check "sandbox restored exactly" [ "$(snap)" = "$before" ]
   check "no mounts remain" [ "$(mounts)" = 0 ]
-  check "exactly the owned anchors were unmounted" [ "$(calls umount)" = 2 ]
+  check "exactly the owned anchor was unmounted" [ "$(calls umount)" = 1 ]
   check "cleanup logged" log_has 'cleanup verified'
   ok "clean setup and teardown"
 
@@ -591,6 +600,15 @@ custody_self_check() {
   refuse_case private_user_namespace "initial user namespace" m_private_user_ns
   m_mnt_differs() { f_self_mnt=4:4026532501; }
   refuse_case mount_namespace_differs "mount namespace differs" m_mnt_differs
+  m_boot_unavailable() { : >"$fake/boot-fails"; }
+  refuse_case boot_unavailable "boot identity" m_boot_unavailable
+  m_boot_malformed() { f_boot="$f_boot
+extra"; }
+  refuse_case boot_malformed "boot identity" m_boot_malformed
+  m_boot_uppercase() { f_boot=0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0; }
+  refuse_case boot_uppercase "boot identity" m_boot_uppercase
+  m_mnt_malformed() { f_self_mnt=4:x f_pid1_mnt=4:x; }
+  refuse_case mount_namespace_malformed "mount namespace identity" m_mnt_malformed
 
   # ---- partial setup failure: every created object is tracked and unwound ----
   partial_case() { # name flag-file expected-failure-text expected-owned-count expected-umounts
@@ -612,8 +630,7 @@ custody_self_check() {
     ok "partial setup $1 unwinds"
   }
   partial_case bind_pid_fails bind-fails-host-pid "bind mount of the pid" 4 0
-  partial_case bind_mnt_fails bind-fails-host-mnt "bind mount of the mnt" 6 1
-  partial_case namespace_mismatch bind-wrong-host-mnt "does not match the mnt namespace" 7 2
+  partial_case namespace_mismatch bind-wrong-host-pid "does not match the pid namespace" 6 1
 
   # ---- verification catches a setup that is not exactly right ----
   tamper_case() { # name expected-failure-text mutator
@@ -647,8 +664,36 @@ custody_self_check() {
   tamper_case anchor_not_nsfs "not exactly one nsfs" t_foreign_fs
   t_stacked() { echo "101 1 0:4 pid:[1] $custody_root/host-pid rw - nsfs nsfs rw" >>"$fake/mounts"; }
   tamper_case anchor_stacked "not exactly one nsfs" t_stacked
-  t_id_mismatch() { echo 9:999 >"$fake/id.$(fake_key "$custody_root/host-mnt")"; }
-  tamper_case anchor_identity_mismatch "does not match the mnt namespace" t_id_mismatch
+  t_id_mismatch() { echo 9:999 >"$fake/id.$(fake_key "$custody_root/host-pid")"; }
+  tamper_case anchor_identity_mismatch "does not match the pid namespace" t_id_mismatch
+  rec="host-mnt.identity"
+  t_record_rebooted() { f_boot=1f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0; }
+  tamper_case record_other_boot "does not match this boot" t_record_rebooted
+  t_record_other_mnt() { f_self_mnt=4:4026532501 f_pid1_mnt=4:4026532501; }
+  tamper_case record_other_mnt "does not match this boot and the mnt" t_record_other_mnt
+  t_record_self_differs() { f_self_mnt=4:4026532501; }
+  tamper_case record_self_differs "differs from PID 1" t_record_self_differs
+  t_record_content() { echo extra >>"$custody_root/$rec"; }
+  tamper_case record_extra_line "does not match this boot" t_record_content
+  t_record_truncated() { printf 'receipts-host-mnt-identity-v1\n' >"$custody_root/$rec"; }
+  tamper_case record_truncated "does not match this boot" t_record_truncated
+  t_record_mode() { chmod 644 "$custody_root/$rec"; }
+  tamper_case record_mode "host-mnt.identity is not" t_record_mode
+  t_record_hardlink() { ln "$custody_root/$rec" "$sb/alias"; }
+  tamper_case record_hardlink "host-mnt.identity is not" t_record_hardlink
+  t_record_symlink() {
+    mv "$custody_root/$rec" "$sb/elsewhere"
+    ln -s "$sb/elsewhere" "$custody_root/$rec"
+  }
+  tamper_case record_symlink "host-mnt.identity is not" t_record_symlink
+  t_record_replaced() { # same bytes, different object
+    cp "$custody_root/$rec" "$sb/copy"
+    rm "$custody_root/$rec"
+    mv "$sb/copy" "$custody_root/$rec"
+  }
+  tamper_case record_replaced "not the record created here" t_record_replaced
+  t_obsolete_pin() { : >"$custody_root/host-mnt"; }
+  tamper_case obsolete_mnt_pin "unexpected entries" t_obsolete_pin
   t_nested_mount() { echo "102 1 0:5 / $custody_root/x rw - tmpfs tmpfs rw" >>"$fake/mounts"; }
   tamper_case nested_mount "unexpected mounts below" t_nested_mount
 
@@ -669,24 +714,24 @@ custody_self_check() {
   }
   cleanup_fail_case retained_record RETAINED_ENTRY c_record
   check "retained record intact" cmp -s "$custody_root/r-attempt" "$fake/record.copy"
-  check "retained record kept every anchor mounted" [ "$(mounts)" = 2 ]
-  check "retained record kept lock and files" exist_all "$custody_root/lock" "$custody_root/host-pid" "$custody_root/host-mnt"
+  check "retained record kept the anchor mounted" [ "$(mounts)" = 1 ]
+  check "retained record kept lock and files" exist_all "$custody_root/lock" "$custody_root/host-pid" "$custody_root/host-mnt.identity"
   check "retained record triggered no unmount" [ "$(calls umount)" = 0 ]
   ok "cleanup retains custody records and every owned resource"
   c_unmount_fails() { : >"$fake/umount-fails"; }
   cleanup_fail_case unmount_fails UNMOUNT_FAILED c_unmount_fails
-  check "failed unmount left the mount" [ "$(mounts)" = 2 ]
-  check "failed unmount kept the anchor files" exist_all "$custody_root/host-pid" "$custody_root/host-mnt"
+  check "failed unmount left the mount" [ "$(mounts)" = 1 ]
+  check "failed unmount kept the anchor file under the live mount" exist_all "$custody_root/host-pid"
   check "failed unmount kept the directories" exist_all "$custody_root" "$custody_parent"
   ok "cleanup reports an unmount failure and removes nothing under a live mount"
   c_foreign_mount() { sed 's/ nsfs nsfs / tmpfs tmpfs /' "$fake/mounts" >"$fake/m" && mv "$fake/m" "$fake/mounts"; }
   cleanup_fail_case foreign_mount UNVERIFIED_MOUNT c_foreign_mount
   check "foreign mounts were never unmounted" [ "$(calls umount)" = 0 ]
-  check "foreign mounts remain" [ "$(mounts)" = 2 ]
+  check "foreign mount remains" [ "$(mounts)" = 1 ]
   ok "cleanup refuses to unmount a mount that is not the owned nsfs mount"
-  c_mount_identity() { echo 9:999 >"$fake/id.$(fake_key "$custody_root/host-mnt")"; }
+  c_mount_identity() { echo 9:999 >"$fake/id.$(fake_key "$custody_root/host-pid")"; }
   cleanup_fail_case mount_identity UNVERIFIED_MOUNT c_mount_identity
-  check "changed mount identity was not unmounted" [ "$(calls "umount $custody_root/host-mnt")" = 0 ]
+  check "changed mount identity was not unmounted" [ "$(calls "umount $custody_root/host-pid")" = 0 ]
   ok "cleanup refuses a mount whose identity changed"
   c_mount_missing() {
     : >"$fake/mounts"
@@ -706,12 +751,26 @@ custody_self_check() {
   cleanup_fail_case lock_alias "LINKED .*/protected-custody/lock" c_lock_alias
   check "aliased lock and alias remain" exist_all "$custody_root/lock" "$sb/alias"
   ok "cleanup does not remove a multiply linked lock"
+  c_record_replaced() {
+    cp "$custody_root/host-mnt.identity" "$sb/copy"
+    rm "$custody_root/host-mnt.identity"
+    mv "$sb/copy" "$custody_root/host-mnt.identity"
+  }
+  cleanup_fail_case record_replaced "REPLACED .*/protected-custody/host-mnt.identity" c_record_replaced
+  check "replaced record left in place" exist_all "$custody_root/host-mnt.identity"
+  check "replaced record kept the anchor mounted" [ "$(mounts)" = 1 ]
+  check "replaced record triggered no unmount" [ "$(calls umount)" = 0 ]
+  ok "cleanup does not remove a replaced identity record or anything else"
+  c_record_alias() { ln "$custody_root/host-mnt.identity" "$sb/alias"; }
+  cleanup_fail_case record_alias "LINKED .*/protected-custody/host-mnt.identity" c_record_alias
+  check "aliased record and alias remain" exist_all "$custody_root/host-mnt.identity" "$sb/alias"
+  ok "cleanup does not remove a multiply linked identity record"
   c_root_swapped() {
     mv "$custody_root" "$sb/moved"
     ln -s "$sb/moved" "$custody_root"
   }
   cleanup_fail_case root_swapped "REPLACED .*/protected-custody (not the object" c_root_swapped
-  check "nothing removed through the swapped link" exist_all "$sb/moved/lock" "$sb/moved/host-pid" "$sb/moved/host-mnt"
+  check "nothing removed through the swapped link" exist_all "$sb/moved/lock" "$sb/moved/host-pid" "$sb/moved/host-mnt.identity"
   check "no unmount through the swapped link" [ "$(calls umount)" = 0 ]
   ok "cleanup never acts through a swapped directory link"
 
@@ -740,7 +799,7 @@ custody_self_check() {
   fixture_uid_in_use() { return 0; }
   finish_case worker_cleanup_unproven FAIL 1 skipped
   fixture_uid_in_use() { return 1; }
-  check "custody mounts retained while worker cleanup is unproven" [ "$(mounts)" = 2 ]
+  check "custody mount retained while worker cleanup is unproven" [ "$(mounts)" = 1 ]
   check "no unmount while worker cleanup is unproven" [ "$(calls umount)" = 0 ]
   check "retention is logged" log_has 'RETAINED host custody setup'
   ok "finish retains custody when worker/cgroup cleanup is unproven"
@@ -788,24 +847,24 @@ custody_self_check() {
   ok "sequence: unsupported context refuses, tests NOT RUN, evidence honest"
 
   new_box seq-partial
-  : >"$fake/bind-fails-host-mnt"
+  : >"$fake/bind-fails-host-pid"
   seq_run
   check "partial sequence fails" [ "$rc" = 1 ]
   check "no test ran after failed setup" [ "$(ran)" = 0 ]
   check "setup failed" result_has setup_status=failed
   check "partial setup was unwound" result_has cleanup_status=0
   check "partial cleanup recorded" result_has custody_cleanup_status=0
-  check "primary failure preserved" result_prefix 'primary_failure=host custody setup failed: bind mount of the mnt namespace failed'
+  check "primary failure preserved" result_prefix 'primary_failure=host custody setup failed: bind mount of the pid namespace failed'
   check "partial setup removed" exist_none "$custody_parent"
   check "partial setup mounts removed" [ "$(mounts)" = 0 ]
   ok "sequence: partial setup failure is unwound and the primary failure is kept"
 
   new_box seq-partial-cleanup-fails
-  : >"$fake/bind-fails-host-mnt"
+  : >"$fake/bind-wrong-host-pid"
   : >"$fake/umount-fails"
   seq_run
   check "double failure fails" [ "$rc" = 1 ]
-  check "primary failure still first" result_prefix 'primary_failure=host custody setup failed: bind mount of the mnt namespace failed'
+  check "primary failure still first" result_prefix "primary_failure=host custody setup failed: $custody_root/host-pid does not match the pid namespace"
   check "cleanup failure reported separately" result_has cleanup_status=1
   check "custody cleanup failure reported" result_has custody_cleanup_status=1
   check "partial state retained for evidence" [ "$(mounts)" = 1 ]
@@ -852,7 +911,7 @@ custody_self_check() {
   seq_prologue=:
   check "unproven worker cleanup fails" [ "$rc" = 1 ]
   check "custody retained" result_has custody_cleanup_status=skipped
-  check "mounts retained" [ "$(mounts)" = 2 ]
+  check "mount retained" [ "$(mounts)" = 1 ]
   check "nothing unmounted" [ "$(calls umount)" = 0 ]
   ok "sequence: custody is retained, not removed, while worker cleanup is unproven"
 
@@ -868,5 +927,5 @@ custody_self_check() {
   check "occupied cgroup is reported, not silent" result_has "FAIL cgroup occupied"
   ok "sequence: a pre-existing cgroup refuses before custody setup"
 
-  echo "custody self-check passed: setup, refusal, partial failure, retained records and cleanup failure never yield PASS; real nsfs/root/namespace behavior NOT RUN"
+  echo "custody self-check passed: setup, refusal, partial failure, retained records and cleanup failure never yield PASS; real nsfs/root/namespace/boot-record admission behavior NOT RUN"
 }

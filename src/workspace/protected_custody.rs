@@ -37,7 +37,7 @@ mod imp {
     use std::ffi::{CStr, CString, OsStr, OsString, c_char, c_int, c_uint};
     use std::fs::File;
     use std::io;
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::mem::ManuallyDrop;
     use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -772,8 +772,9 @@ mod imp {
         }
     }
 
-    /// The two namespace handles are installed by trusted host administration.
-    /// A container-local PID 1 cannot establish their provenance.
+    /// The PID namespace pin and the mount namespace identity record are
+    /// installed by trusted host administration. A container-local PID 1
+    /// cannot establish their provenance.
     fn production_registry() -> Result<Dir, String> {
         #[cfg(not(target_os = "linux"))]
         {
@@ -803,7 +804,8 @@ mod imp {
             }
             let topology =
                 std::fs::read_to_string("/proc/self/mountinfo").map_err(|e| e.to_string())?;
-            for (anchor, namespace) in [("host-pid", "pid"), ("host-mnt", "mnt")] {
+            {
+                let (anchor, namespace) = ("host-pid", "pid");
                 let anchor_path = root.join(anchor);
                 let found = topology.lines().any(|line| {
                     let Some((left, right)) = line.split_once(" - ") else {
@@ -840,9 +842,91 @@ mod imp {
                     }
                 }
             }
+            let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .map_err(|e| format!("boot identity: {e}"))?;
+            let mnt = |process: &str| {
+                std::fs::metadata(format!("/proc/{process}/ns/mnt"))
+                    .map(|m| (m.dev(), m.ino()))
+                    .map_err(|e| e.to_string())
+            };
+            admit_host_mnt(
+                &dir,
+                0,
+                boot.strip_suffix('\n').unwrap_or(boot.as_str()),
+                mnt("self")?,
+                mnt("1")?,
+            )?;
             refuse_alias_mounts(&[root])?;
             Ok(dir)
         }
+    }
+
+    const HOST_MNT_IDENTITY: &CStr = c"host-mnt.identity";
+    const HOST_MNT_FORMAT: &str = "receipts-host-mnt-identity-v1";
+    const HOST_MNT_LIMIT: u64 = 256;
+
+    /// Admits the administrator's record of the host initial mount namespace:
+    /// an administrative assertion, not a kernel handle (the kernel refuses an
+    /// nsfs bind of a mount namespace inside that same namespace). It must be
+    /// an `owner`-owned 0600 single-link regular file in the registry naming
+    /// exactly this boot and the mount namespace of both this process and
+    /// PID 1. Production passes owner 0 and kernel observations only.
+    pub(crate) fn admit_host_mnt(
+        dir: &Dir,
+        owner: u32,
+        boot: &str,
+        current: Identity,
+        init: Identity,
+    ) -> Result<(), String> {
+        let node = dir
+            .open_child(HOST_MNT_IDENTITY)
+            .map_err(|e| format!("host mount identity record: {e}"))?;
+        if node.kind != Kind::File
+            || node.meta.uid != owner
+            || node.meta.mode != 0o600
+            || node.meta.nlink != 1
+        {
+            return Err("unsafe host mount identity record".into());
+        }
+        let file = File::from(node.fd.ok_or("host mount identity record unavailable")?);
+        let mut bytes = Vec::new();
+        (&file)
+            .take(HOST_MNT_LIMIT + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("host mount identity record: {e}"))?;
+        let (recorded_boot, namespace) = std::str::from_utf8(&bytes)
+            .ok()
+            .filter(|_| bytes.len() as u64 <= HOST_MNT_LIMIT)
+            .and_then(parse_host_mnt)
+            .ok_or("malformed host mount identity record")?;
+        if recorded_boot != boot {
+            return Err("host mount identity record is from another boot".into());
+        }
+        if namespace != current || namespace != init {
+            return Err("mnt namespace differs from host identity record".into());
+        }
+        Ok(())
+    }
+
+    /// `FORMAT\nboot_id=<uuid>\nmnt_namespace=<dev>:<ino>\nend\n`, exactly.
+    fn parse_host_mnt(text: &str) -> Option<(&str, Identity)> {
+        let rest = text
+            .strip_prefix(HOST_MNT_FORMAT)?
+            .strip_prefix("\nboot_id=")?;
+        let (boot, rest) = rest.split_once("\nmnt_namespace=")?;
+        let (namespace, rest) = rest.split_once('\n')?;
+        let (dev, ino) = namespace.split_once(':')?;
+        let number = |t: &str| {
+            (!t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| t.parse::<u64>().ok())
+                .flatten()
+        };
+        let uuid = boot.len() == 36
+            && boot.bytes().enumerate().all(|(i, b)| match i {
+                8 | 13 | 18 | 23 => b == b'-',
+                _ => matches!(b, b'0'..=b'9' | b'a'..=b'f'),
+            });
+        (rest == "end\n" && uuid).then_some((boot, (number(dev)?, number(ino)?)))
     }
 
     #[cfg(target_os = "linux")]
@@ -889,7 +973,7 @@ mod imp {
             if mounts.iter().any(|(_, _, mount, filesystem)| {
                 let host_anchor = *root == Path::new("/var/lib/receipts/protected-custody")
                     && *filesystem == "nsfs"
-                    && [root.join("host-pid"), root.join("host-mnt")].contains(mount);
+                    && *mount == root.join("host-pid");
                 mount.starts_with(root) && mount != *root && !host_anchor
             }) {
                 return Err(format!("nested mount at {}", root.display()));
@@ -1121,7 +1205,7 @@ mod imp {
                     return Err("custody root or ancestor changed during reservation".into());
                 }
                 for name in registry.dir.names().map_err(|e| e.to_string())? {
-                    if name == REGISTRY_LOCK || name == c"host-pid" || name == c"host-mnt" {
+                    if name == REGISTRY_LOCK || name == c"host-pid" || name == HOST_MNT_IDENTITY {
                         continue;
                     }
                     if !name.to_bytes().starts_with(b"r-") {

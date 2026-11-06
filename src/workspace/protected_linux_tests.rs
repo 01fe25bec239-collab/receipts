@@ -1037,6 +1037,65 @@ fn assert_production_reservation(common: &Path, worktree: &Path, held: &str) {
     );
 }
 
+/// Production admission reads the real administrator record: another boot,
+/// another mount namespace, extra content or an unsafe mode refuses before any
+/// reservation. The record is rewritten in place (same object) and restored, so
+/// the owned host cleanup still recognizes it.
+fn assert_host_record_refusals(common: &Path, worktree: &Path) {
+    let path = Path::new("/var/lib/receipts/protected-custody/host-mnt.identity");
+    let original = std::fs::read_to_string(path).unwrap();
+    let field = |key: &str| {
+        original
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .unwrap()
+            .to_owned()
+    };
+    let (boot, mnt) = (field("boot_id="), field("mnt_namespace="));
+    let other_boot = format!(
+        "{}{}",
+        if boot.starts_with('0') { 1 } else { 0 },
+        &boot[1..]
+    );
+    let rewrite = |text: &str| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .unwrap();
+        file.write_all(text.as_bytes()).unwrap();
+    };
+    let attempt = || {
+        crate::protected_custody::Reservation::begin(common, "host-record-control", worktree)
+            .unwrap_err()
+    };
+    for (text, needle) in [
+        (original.replace(&boot, &other_boot), "another boot"),
+        (
+            original.replace(&mnt, &format!("{mnt}1")),
+            "mnt namespace differs from host identity record",
+        ),
+        (
+            format!("{original}extra\n"),
+            "malformed host mount identity record",
+        ),
+    ] {
+        rewrite(&text);
+        let error = attempt();
+        rewrite(&original);
+        assert!(error.contains(needle), "{needle}: {error}");
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let error = attempt();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(
+        error.contains("unsafe host mount identity record"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    assert!(!common.join(CUSTODY_MARKER).exists(), "refusal reserved");
+}
+
 fn owner_mode(path: &Path) -> (u32, u32, u32) {
     let metadata = std::fs::symlink_metadata(path).unwrap();
     (metadata.uid(), metadata.gid(), metadata.mode() & 0o7777)
@@ -1069,6 +1128,7 @@ fn hosted_exclusive_custody_and_linked_target_refusals() {
     let second_root = std::fs::canonicalize(second_handle.worktree_path()).unwrap();
     let marker = common.join(CUSTODY_MARKER);
     let second_before = owner_mode(&second_root);
+    assert_host_record_refusals(&common, first_handle.worktree_path());
 
     let admission = launcher_a
         .admit(&first_handle, &repo)

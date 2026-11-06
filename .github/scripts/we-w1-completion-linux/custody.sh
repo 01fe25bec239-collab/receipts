@@ -13,8 +13,16 @@
 #   /var/lib/receipts                              root 0755 (new, owned here)
 #   /var/lib/receipts/protected-custody            root 0700 (new, owned here)
 #     lock                                         root 0600 single-link file
-#     host-pid / host-mnt                          nsfs bind mounts of the
-#                                                  initial PID / mount namespace
+#     host-pid                                     nsfs bind mount of the
+#                                                  initial PID namespace
+#     host-mnt.identity                            root 0600 single-link file:
+#                                                  this boot's id and the
+#                                                  initial mount namespace
+# The mount namespace is recorded, not pinned: the kernel refuses an nsfs bind
+# of a mount namespace inside that same namespace (mnt_ns_loop). The record is
+# an administrative assertion made here from kernel observations, not a kernel
+# handle or attestation; production_registry compares it with the current boot
+# and the mount namespace of the admitting process and of PID 1.
 # It refuses anything pre-existing, linked, unexpected or mismatched without
 # touching it and records intent BEFORE each side effect, because a command's
 # status does not prove what exists. Only objects whose creation succeeded (or
@@ -79,6 +87,7 @@ cu_umount() { timeout 30 umount "$1"; } # never -l, -f or -R
 cu_ns_id() { stat -L -c '%d:%i' -- "/proc/$2/ns/$1"; }
 # dev:inode of the object an anchor path resolves to
 cu_anchor_id() { stat -L -c '%d:%i' -- "$1"; }
+cu_boot_id() { cat /proc/sys/kernel/random/boot_id; }
 
 # Object metadata WITHOUT following links: kind|uid|mode|nlink|dev:inode
 cu_meta_norm() {
@@ -172,6 +181,7 @@ custody_facts() {
   {
     echo "custody_runner=${RUNNER_ENVIRONMENT:-}/${RUNNER_OS:-}/${RUNNER_ARCH:-} image=${ImageOS:-}/${ImageVersion:-}"
     echo "custody_pid1_comm=$comm"
+    echo "custody_boot_id=$(cu_boot_id 2>/dev/null || echo unavailable)"
     for ns in pid user mnt; do
       echo "custody_ns_$ns self=$(cu_ns_id "$ns" self 2>/dev/null || echo unavailable) pid1=$(cu_ns_id "$ns" 1 2>/dev/null || echo unavailable)"
     done
@@ -219,10 +229,27 @@ custody_host_context() {
   }
 }
 
+# Sets custody_mnt_record to the exact host mount identity record (format of
+# admit_host_mnt in protected_custody.rs) from current kernel observations.
+custody_mnt_record=
+custody_host_mnt_record() {
+  local boot self init uuid='^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$' id='^[0-9]+:[0-9]+$'
+  boot="$(cu_boot_id)" && [[ $boot =~ $uuid ]] || {
+    cu_fail "boot identity is unavailable or malformed"
+    return 1
+  }
+  self="$(cu_ns_id mnt self)" && init="$(cu_ns_id mnt 1)" && [ "$self" = "$init" ] && [[ $init =~ $id ]] || {
+    cu_fail "mount namespace identity is unavailable, malformed or differs from PID 1"
+    return 1
+  }
+  printf -v custody_mnt_record 'receipts-host-mnt-identity-v1\nboot_id=%s\nmnt_namespace=%s\nend\n' "$boot" "$init"
+}
+
 # Read-only: refuses without creating or changing anything.
 custody_preflight() {
   local lines
   custody_host_context || return 1
+  custody_host_mnt_record || return 1
   cu_safe_chain "$custody_base" || return 1
   if [ -e "$custody_parent" ] || [ -L "$custody_parent" ]; then
     cu_fail "$custody_parent already exists; refusing to adopt it"
@@ -315,8 +342,9 @@ custody_settle() { # index: the command reported success; record what is there
 }
 
 # Exclusive creation: refuses an object that already exists (never adopted);
-# mkdir fails on any existing object, the file create uses noclobber.
-custody_make() { # dir|file path mode
+# mkdir fails on any existing object, the file create uses noclobber and
+# writes the optional content in the same command.
+custody_make() { # dir|file path mode [content]
   local error rc=0 i
   if [ -e "$2" ] || [ -L "$2" ]; then
     cu_fail "$2 already exists; refusing to adopt it"
@@ -333,7 +361,7 @@ custody_make() { # dir|file path mode
     error="$(
       umask 077
       set -C
-      { : >"$2"; } 2>&1
+      { printf '%s' "${4:-}" >"$2"; } 2>&1
     )" || rc=$?
   fi
   if [ "$rc" = 0 ]; then
@@ -385,12 +413,28 @@ custody_verify() {
     cu_fail "lock is not a root-owned 0600 single-link regular file"
     return 1
   }
-  expected="$(printf 'host-mnt\nhost-pid\nlock')"
+  expected="$(printf 'host-mnt.identity\nhost-pid\nlock')"
   [ "$(cu_list_dir "$custody_root")" = "$expected" ] || {
     cu_fail "unexpected entries in $custody_root"
     return 1
   }
-  for ns in pid mnt; do
+  path="$custody_root/host-mnt.identity"
+  cu_read_meta "$path" &&
+    [ "$m_kind" = file ] && [ "$m_uid" = "$custody_uid" ] && [ "$m_mode" = 600 ] && [ "$m_nlink" = 1 ] || {
+    cu_fail "host-mnt.identity is not a root-owned 0600 single-link regular file"
+    return 1
+  }
+  index="$(custody_owned_index "$path" file)" && [ "${custody_owned_id[$index]}" = "$m_kind|$m_id" ] || {
+    cu_fail "$path is not the record created here"
+    return 1
+  }
+  custody_host_mnt_record || return 1
+  cmp -s -- "$path" <(printf '%s' "$custody_mnt_record") || {
+    cu_fail "$path does not match this boot and the mnt namespace of this process and PID 1"
+    return 1
+  }
+  cu_log "verified $path records this boot and mnt namespace $(cu_ns_id mnt 1)"
+  for ns in pid; do
     path="$custody_root/host-$ns"
     lines="$(cu_mounts_at "$path")" || {
       cu_fail "mount table unreadable"
@@ -423,7 +467,7 @@ custody_verify() {
     }
     cu_log "verified $path nsfs id=$id equals self and PID 1"
   done
-  [ "$(cu_mounts_within "$custody_root")" = 2 ] || {
+  [ "$(cu_mounts_within "$custody_root")" = 1 ] || {
     cu_fail "unexpected mounts below $custody_root"
     return 1
   }
@@ -437,8 +481,7 @@ custody_setup_steps() {
   custody_make file "$custody_root/lock" 0600 || return 1
   custody_make file "$custody_root/host-pid" 0600 || return 1
   custody_pin pid "$custody_root/host-pid" || return 1
-  custody_make file "$custody_root/host-mnt" 0600 || return 1
-  custody_pin mnt "$custody_root/host-mnt" || return 1
+  custody_make file "$custody_root/host-mnt.identity" 0600 "$custody_mnt_record" || return 1
   custody_verify || return 1
 }
 

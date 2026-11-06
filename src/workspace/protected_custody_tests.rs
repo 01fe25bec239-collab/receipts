@@ -880,9 +880,126 @@ fn topology_requires_a_local_unaliased_filesystem_and_known_namespace_pins() {
         assert!(refuse_alias_mounts_text(&format!("{ordinary}{addition}"), &[root]).is_err());
     }
     let anchor = Path::new("/var/lib/receipts/protected-custody");
-    let pins = format!(
-        "{ordinary}2 1 0:4 /pid /var/lib/receipts/protected-custody/host-pid rw - nsfs nsfs rw\n3 1 0:4 /mnt /var/lib/receipts/protected-custody/host-mnt rw - nsfs nsfs rw\n"
+    let pin = format!(
+        "{ordinary}2 1 0:4 /pid /var/lib/receipts/protected-custody/host-pid rw - nsfs nsfs rw\n"
     );
-    assert!(refuse_alias_mounts_text(&pins, &[anchor]).is_ok());
-    assert!(refuse_alias_mounts_text(&pins.replace("/host-mnt", "/other"), &[anchor]).is_err());
+    assert!(refuse_alias_mounts_text(&pin, &[anchor]).is_ok());
+    assert!(refuse_alias_mounts_text(&pin.replace("/host-pid", "/other"), &[anchor]).is_err());
+    // The obsolete mount namespace pin is no longer an accepted anchor.
+    let mnt = "3 1 0:4 /mnt /var/lib/receipts/protected-custody/host-mnt rw - nsfs nsfs rw\n";
+    assert!(refuse_alias_mounts_text(&format!("{pin}{mnt}"), &[anchor]).is_err());
+}
+
+const BOOT: &str = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
+const MNT: Identity = (4, 4026531841);
+
+fn host_mnt_text(boot: &str, mnt: Identity) -> String {
+    format!(
+        "receipts-host-mnt-identity-v1\nboot_id={boot}\nmnt_namespace={}:{}\nend\n",
+        mnt.0, mnt.1
+    )
+}
+
+/// A registry holding a host mount identity record; returns it and its owner.
+fn host_mnt_registry(text: &str) -> (TempDir, PathBuf, u32) {
+    let dir = TempDir::new("host-mnt");
+    let registry = std::fs::canonicalize(dir.path()).unwrap();
+    write_mode(&registry.join("host-mnt.identity"), text, 0o600);
+    let owner = std::fs::metadata(&registry).unwrap().uid();
+    (dir, registry, owner)
+}
+
+fn admit(registry: &Path, owner: u32) -> Result<(), String> {
+    let dir = Dir::open_absolute(registry).unwrap();
+    admit_host_mnt(&dir, owner, BOOT, MNT, MNT)
+}
+
+#[test]
+fn host_mount_identity_record_admits_only_this_boot_and_namespace() {
+    let (_dir, registry, owner) = host_mnt_registry(&host_mnt_text(BOOT, MNT));
+    assert_eq!(admit(&registry, owner), Ok(()));
+    let dir = Dir::open_absolute(&registry).unwrap();
+    let other_boot = "1f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
+    let other = (MNT.0, MNT.1 + 1);
+    let refusals = [
+        (
+            admit_host_mnt(&dir, owner, other_boot, MNT, MNT),
+            "another boot",
+        ),
+        (admit_host_mnt(&dir, owner, BOOT, other, MNT), "differs"),
+        (admit_host_mnt(&dir, owner, BOOT, MNT, other), "differs"),
+        (admit_host_mnt(&dir, owner + 1, BOOT, MNT, MNT), "unsafe"),
+    ];
+    for (result, needle) in refusals {
+        assert!(result.as_ref().unwrap_err().contains(needle), "{result:?}");
+    }
+}
+
+#[test]
+fn malformed_host_mount_identity_records_refuse() {
+    let good = host_mnt_text(BOOT, MNT);
+    let mut cases = vec![
+        String::new(),
+        good.replace("-v1", "-v2"),
+        good.replace("\nend\n", "\n"),
+        good.replace("end\n", "end"),
+        format!("{good}extra\n"),
+        good.replace("boot_id=", "boot="),
+        good.replace(BOOT, &BOOT.to_uppercase()),
+        good.replace(BOOT, &BOOT[1..]),
+        good.replace("mnt_namespace=4:", "mnt_namespace=+4:"),
+        good.replace(":4026531841", ":"),
+        good.replace(":4026531841", ":4026531841:1"),
+        good.replace("\nmnt_namespace", "\nextra=1\nmnt_namespace"),
+        good.replace("\n", "\r\n"),
+    ];
+    // Oversized: a valid record followed by padding past the read bound.
+    cases.push(format!("{good}{}", " ".repeat(256)));
+    for text in cases {
+        let (_dir, registry, owner) = host_mnt_registry(&text);
+        let error = admit(&registry, owner).unwrap_err();
+        assert!(error.contains("malformed"), "{text:?}: {error}");
+    }
+}
+
+#[test]
+fn unsafe_or_missing_host_mount_identity_records_refuse() {
+    let good = host_mnt_text(BOOT, MNT);
+    let (_dir, registry, owner) = host_mnt_registry(&good);
+    let record = registry.join("host-mnt.identity");
+    for mode in [0o644, 0o400, 0o4600] {
+        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert!(admit(&registry, owner).unwrap_err().contains("unsafe"));
+    }
+    std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let alias = registry.join("alias");
+    std::fs::hard_link(&record, &alias).unwrap();
+    assert!(admit(&registry, owner).unwrap_err().contains("unsafe"));
+    std::fs::remove_file(&alias).unwrap();
+    assert_eq!(admit(&registry, owner), Ok(()));
+
+    // A symlink to a valid record is never followed.
+    let elsewhere = registry.join("elsewhere");
+    std::fs::rename(&record, &elsewhere).unwrap();
+    symlink(&elsewhere, &record).unwrap();
+    assert!(admit(&registry, owner).unwrap_err().contains("unsafe"));
+    std::fs::remove_file(&record).unwrap();
+    assert!(admit(&registry, owner).unwrap_err().contains("record"));
+    std::fs::create_dir(&record).unwrap();
+    assert!(admit(&registry, owner).unwrap_err().contains("unsafe"));
+}
+
+#[test]
+fn registry_admits_only_the_known_host_entries() {
+    let layout = layout();
+    std::fs::write(layout.registry.join("host-mnt.identity"), "").unwrap();
+    std::fs::write(layout.registry.join("host-pid"), "").unwrap();
+    begin(&layout, "known-host-entries")
+        .unwrap()
+        .finish()
+        .unwrap();
+    // The obsolete anchor name is unknown state, never silently accepted.
+    std::fs::write(layout.registry.join("host-mnt"), "").unwrap();
+    let error = begin(&layout, "obsolete-anchor").unwrap_err();
+    assert!(error.contains("unknown custody registry entry"), "{error}");
 }
