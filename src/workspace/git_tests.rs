@@ -1,6 +1,8 @@
-//! WE-W1-1 hardening tests. Hostile "programs" are symlinks to `touch`, so a
-//! hook/fsmonitor that runs leaves files named after its arguments; no shell
-//! script or shell string exists in these fixtures.
+//! WE-W1-1 hardening tests. Hostile "programs" are files whose interpreter is
+//! `touch` (`#!/usr/bin/touch`), so a hook/fsmonitor that runs leaves files
+//! named after its arguments; no shell script or shell string exists in these
+//! fixtures. (A symlink named after the hook fails on multicall coreutils such
+//! as uutils, which dispatch on the invoked name.)
 
 use std::ffi::OsStr;
 use std::path::Path;
@@ -19,10 +21,16 @@ fn touch() -> &'static Path {
     panic!("touch is required for hook fixtures")
 }
 
+fn touch_program(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, format!("#!{}\n", touch().display())).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 fn install_hook(repo: &TestRepo, name: &str) {
     let hooks = repo.path().join(".git/hooks");
     std::fs::create_dir_all(&hooks).unwrap();
-    std::os::unix::fs::symlink(touch(), hooks.join(name)).unwrap();
+    touch_program(&hooks.join(name));
 }
 
 fn request(repo: &TestRepo, name: &str) -> WorkspaceProvisionRequest {
@@ -60,7 +68,7 @@ fn repo_hook_does_not_run_on_provision() {
 fn fsmonitor_config_not_executed_on_status() {
     let repo = TestRepo::new("git-fsmonitor");
     let monitor = repo.root.path().join("monitor");
-    std::os::unix::fs::symlink(touch(), &monitor).unwrap();
+    touch_program(&monitor);
     git(
         repo.path(),
         &["config", "core.fsmonitor", monitor.to_str().unwrap()],

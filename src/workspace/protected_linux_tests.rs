@@ -290,9 +290,46 @@ fn descriptor_table_sealed(dir: &Path) -> std::io::Result<bool> {
     Ok(true)
 }
 
+/// Every task's descriptors as `task:fd=kind->target`, for failure reports.
+fn describe_fds(pid: u32) -> String {
+    use std::os::unix::fs::FileTypeExt;
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return "tasks unreadable".into();
+    };
+    let mut lines = Vec::new();
+    for task in tasks.filter_map(Result::ok) {
+        let Ok(fds) = std::fs::read_dir(task.path().join("fd")) else {
+            lines.push(format!("{:?}: fd table unreadable", task.file_name()));
+            continue;
+        };
+        for fd in fds.filter_map(Result::ok) {
+            let kind = std::fs::metadata(fd.path()).map(|m| m.file_type());
+            let kind = match kind {
+                Ok(k) if k.is_fifo() => "fifo",
+                Ok(k) if k.is_char_device() => "chardev",
+                Ok(k) if k.is_socket() => "socket",
+                Ok(k) if k.is_file() => "file",
+                Ok(k) if k.is_dir() => "dir",
+                Ok(_) => "other",
+                Err(_) => "unstattable",
+            };
+            let target = std::fs::read_link(fd.path())
+                .map_or_else(|e| format!("<{e}>"), |t| t.display().to_string());
+            lines.push(format!(
+                "{}:{}={kind}->{target}",
+                task.file_name().to_string_lossy(),
+                fd.file_name().to_string_lossy()
+            ));
+        }
+    }
+    lines.sort();
+    lines.join(", ")
+}
+
 /// Observe the sole stopped process in this attempt's cgroup, pinning its
-/// lifetime until it has been resumed through the same pidfd.
-fn observe_child(cgroup: &Path) -> bool {
+/// lifetime until it has been resumed through the same pidfd. An error names
+/// the first check that failed.
+fn observe_child(cgroup: &Path) -> Result<(), String> {
     use std::os::fd::{AsRawFd, FromRawFd};
     let deadline = Instant::now() + Duration::from_secs(15);
     let pid = loop {
@@ -305,14 +342,18 @@ fn observe_child(cgroup: &Path) -> bool {
             }
         }
         if Instant::now() >= deadline {
-            return false;
+            let procs = std::fs::read_to_string(cgroup.join("cgroup.procs"));
+            return Err(format!(
+                "no single process in {}: {procs:?}",
+                cgroup.display()
+            ));
         }
         std::thread::sleep(Duration::from_millis(10));
     };
     // SAFETY: pidfd_open takes a PID and zero flags.
     let fd = unsafe { syscall(434, i64::from(pid), 0i64) };
     if fd < 0 {
-        return false;
+        return Err(format!("pidfd_open({pid}) failed"));
     }
     // SAFETY: successful pidfd_open returns a new owned descriptor.
     let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) };
@@ -349,16 +390,21 @@ fn observe_child(cgroup: &Path) -> bool {
     while Instant::now() < deadline && matches() && !stopped().unwrap_or(false) {
         std::thread::sleep(Duration::from_millis(10));
     }
-    let sealed = alive()
-        && matches()
-        && stopped().unwrap_or(false)
-        && observed_fds_sealed(pid).unwrap_or(false)
-        && stopped().unwrap_or(false)
-        && matches()
-        && alive();
+    let check = |ok: bool, what: &str| if ok { Ok(()) } else { Err(what.to_owned()) };
+    let sealed = check(alive(), "not alive before observation")
+        .and_then(|()| check(matches(), "cgroup membership changed"))
+        .and_then(|()| check(stopped().unwrap_or(false), "not stopped"))
+        .and_then(|()| match observed_fds_sealed(pid) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(format!("descriptors not sealed: {}", describe_fds(pid))),
+            Err(error) => Err(format!("descriptor table unreadable: {error}")),
+        })
+        .and_then(|()| check(stopped().unwrap_or(false), "resumed during observation"))
+        .and_then(|()| check(matches(), "cgroup membership changed after observation"))
+        .and_then(|()| check(alive(), "exited during observation"));
     // SAFETY: pidfd_send_signal targets the pinned process, with SIGCONT and no siginfo.
     let resumed = unsafe { syscall(424, i64::from(pidfd.as_raw_fd()), 18i64, 0i64, 0i64) } == 0;
-    sealed && resumed
+    sealed.and_then(|()| check(resumed, "SIGCONT through the pidfd failed"))
 }
 
 fn fd_observer_controls() {
@@ -753,10 +799,9 @@ fn hosted_protected_worker_controller_and_cleanup() {
             &policy(),
         )
         .expect("worker launch");
-    assert!(
-        observe_child(&lines[2]),
-        "worker FD observation unavailable or unsealed"
-    );
+    if let Err(error) = observe_child(&lines[2]) {
+        panic!("worker FD observation unavailable or unsealed: {error}");
+    }
     let outcome = protected
         .attempt()
         .wait_collect()
@@ -945,10 +990,9 @@ fn hosted_protected_worker_controller_and_cleanup() {
         })
         .collect();
     assert_eq!(candidates.len(), 1, "controller cgroup unavailable");
-    assert!(
-        observe_child(&candidates[0]),
-        "controller FD observation unavailable or unsealed"
-    );
+    if let Err(error) = observe_child(&candidates[0]) {
+        panic!("controller FD observation unavailable or unsealed: {error}");
+    }
     let outcome = attempt.wait_collect().expect("controller probe cleanup");
     let stdout = String::from_utf8_lossy(outcome.stdout().head()).into_owned();
     println!("{stdout}");
