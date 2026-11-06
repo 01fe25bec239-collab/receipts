@@ -6,13 +6,19 @@
 # Result contract: setup, test and owned-cleanup statuses, the number of tests
 # that actually completed and the FIRST failed test (identity and status) are
 # recorded separately in result.txt, and PASS/exit 0 requires ALL of: setup 0,
-# every test completed with status 0, cleanup 0 and no interruption. Nothing is
-# initialized to success: result.txt starts as INCOMPLETE and becomes PASS or
-# FAIL only through one atomic write at the very end. A retained, unknown or
-# unowned resource (including an uncertain create) is a cleanup failure, never
-# success. SIGTERM/SIGINT/SIGHUP are recorded, cleaned up after and re-exited
-# with their 128+n status; SIGKILL or machine loss cannot be handled, leaves
-# INCOMPLETE (never PASS) and does NOT guarantee cleanup. Host custody
+# every test completed with status 0, cleanup 0, no interruption AND the final
+# result actually published. Nothing is initialized to success: result.txt
+# starts as INCOMPLETE (or the run stops before creating anything) and becomes
+# PASS or FAIL only through one atomic rename at the very end; a write or
+# rename failure exits nonzero and leaves the previous result. A retained,
+# unknown or unowned resource (including an uncertain create) is a cleanup
+# failure, never success. SIGTERM/SIGINT/SIGHUP received before the command
+# right after the final rename are recorded (a just-renamed PASS is
+# republished as FAIL), cleaned up after and re-exited with 128+n; after
+# that point they are ignored, so the exit status matches the published
+# verdict. SIGKILL or machine loss cannot be handled and does NOT guarantee
+# cleanup: before the final rename it leaves INCOMPLETE, after it the
+# published verdict stays (even PASS) with a killed exit status. Host custody
 # administration (anchors the product admission requires) lives in custody.sh.
 set -euo pipefail
 
@@ -182,7 +188,8 @@ finished=0
 finalized=0
 result_verdict=FAIL
 
-# Atomically replaces result.txt (a killed writer leaves the previous file).
+# Atomically replaces result.txt (a killed or failed rename leaves the
+# previous file). Callers check its status.
 publish_result() { # file-with-content
   mv -f "$1" "$out/result.txt"
 }
@@ -190,11 +197,14 @@ publish_result() { # file-with-content
 # Placeholder written before anything can fail: whatever kills the run later
 # (even SIGKILL) leaves INCOMPLETE, never a stale or success verdict.
 write_incomplete() {
-  printf 'INCOMPLETE\ntest_status=unknown\ncleanup_status=unknown\nsetup_status=unknown\ncustody_cleanup_status=unknown\ntests_completed=0\ntests_total=%s\n' "${#tests[@]}" >"$out/result.txt.tmp"
-  publish_result "$out/result.txt.tmp"
+  printf 'INCOMPLETE\ntest_status=unknown\ncleanup_status=unknown\nsetup_status=unknown\ncustody_cleanup_status=unknown\ntests_completed=0\ntests_total=%s\n' "${#tests[@]}" >"$out/result.txt.tmp" &&
+    publish_result "$out/result.txt.tmp"
 }
 
-# Computes the verdict from recorded facts and writes result.txt once.
+# Computes the verdict from recorded facts and publishes result.txt once.
+# Returns nonzero, with finalized=0 and the previous result.txt kept, when the
+# temporary file cannot be written or published. Explicit checks: callers run
+# it in conditional contexts where errexit does not apply.
 # Lines 1-3 (verdict, test_status, cleanup_status) keep their positions. The
 # summary line names the highest-precedence failure: setup, then an abnormal
 # end, then the first failed test; each fact stays in its own field.
@@ -212,20 +222,18 @@ write_result() {
   if [ -z "$primary" ] && [ "$result_verdict" = FAIL ] && [ "$test_status" = unknown ]; then
     primary="run did not complete (setup_status=$setup_status tests_completed=$tests_completed/${#tests[@]})"
   fi
-  {
-    echo "$result_verdict"
-    echo "test_status=$test_status"
-    echo "cleanup_status=$cleanup_status"
-    echo "setup_status=$setup_status"
-    echo "custody_cleanup_status=$custody_cleanup_status"
-    echo "tests_completed=$tests_completed"
-    echo "tests_total=${#tests[@]}"
-    [ -z "$first_failed_test" ] || echo "first_failed_test=$first_failed_test"
-    [ -z "$first_failed_test" ] || echo "first_failed_status=$first_failed_status"
-    [ -z "$interrupted" ] || echo "interruption=$interrupted"
-    [ -z "$primary" ] || echo "primary_failure=$primary"
-  } >"$out/result.txt.tmp"
-  publish_result "$out/result.txt.tmp"
+  local lines=("$result_verdict" "test_status=$test_status" "cleanup_status=$cleanup_status"
+    "setup_status=$setup_status" "custody_cleanup_status=$custody_cleanup_status"
+    "tests_completed=$tests_completed" "tests_total=${#tests[@]}")
+  [ -z "$first_failed_test" ] || lines+=("first_failed_test=$first_failed_test" "first_failed_status=$first_failed_status")
+  [ -z "$interrupted" ] || lines+=("interruption=$interrupted")
+  [ -z "$primary" ] || lines+=("primary_failure=$primary")
+  printf '%s\n' "${lines[@]}" >"$out/result.txt.tmp" || return 1
+  publish_result "$out/result.txt.tmp" || return 1
+  # The terminal boundary. A cancellation still pending from before this line
+  # runs on_signal first, which republishes FAIL. From here on cancellation is
+  # ignored so the exit status cannot contradict the published verdict.
+  trap '' TERM INT HUP
   finalized=1
 }
 
@@ -233,9 +241,9 @@ write_result() {
 # path and, through the EXIT trap, for any abort (where test_status stays
 # "unknown" and the verdict is therefore FAIL). Host custody is removed only
 # after worker/controller/cgroup cleanup is proven; otherwise it is retained
-# and reported. Statuses become known only when computed; the cancellation
-# signals are ignored for the last step so the verdict and the artifact cannot
-# disagree.
+# and reported. Statuses become known only when computed. Cancellation stays
+# live until write_result has published (see there); a result that could not be
+# published is a failure even when every test and cleanup passed.
 finish() {
   [ "$finished" = 0 ] || return 0
   finished=1
@@ -258,8 +266,10 @@ finish() {
   fi
   cleanup_status=$cs
   custody_cleanup_status=$ccs
-  trap '' TERM INT HUP
-  write_result
+  if ! write_result; then
+    echo "RESULT NOT PUBLISHED: result.txt keeps its previous content" >&2
+    return 1
+  fi
   own_evidence
   [ "$result_verdict" = PASS ]
 }
@@ -287,7 +297,9 @@ on_signal() { # NAME NUMBER
   interrupted=$1
   cu_log "INTERRUPTED by $1"
   finish || true
-  if [ "$finalized" != 1 ]; then write_result; fi # cleanup was interrupted midway
+  if [ "$finalized" != 1 ]; then # cleanup or publication was interrupted midway
+    write_result || echo "RESULT NOT PUBLISHED after $1: result.txt keeps its previous content" >&2
+  fi
   trap - EXIT
   exit $((128 + $2))
 }
@@ -307,7 +319,10 @@ run_test() {
 # and verdict. test_status is set only after EVERY test has run.
 hosted_sequence() {
   local name rc=0
-  write_incomplete
+  if ! write_incomplete; then
+    echo "FAIL could not publish the INCOMPLETE placeholder; nothing was created" >&2
+    exit 1
+  fi
   if [ -e "$cgroup" ] || [ -L "$cgroup" ]; then
     echo "FAIL cgroup occupied" >"$out/result.txt.tmp"
     publish_result "$out/result.txt.tmp"
@@ -339,8 +354,9 @@ hosted_sequence() {
   fi
   rc=0
   finish || rc=1
-  # finish() left the cancellation signals ignored: nothing can interrupt the
-  # process between a written verdict and its exit.
+  # After a successful publication cancellation is ignored: nothing changes
+  # the exit status between the published verdict and exit. If publication
+  # failed, a signal here still exits 128+n.
   trap - EXIT
   exit "$rc"
 }

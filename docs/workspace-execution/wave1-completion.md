@@ -243,12 +243,19 @@ then the first failed test). PASS/exit 0 requires verified host setup, ALL
 three tests completed with status 0 (`test_status` is the first failing status,
 0 only after every test ran, `unknown` before), cgroup kill, emptiness,
 removal, no fixture-identity process, no fixture directory, verified removal of
-the owned host setup, and no interruption. Nothing starts as success:
-`result.txt` is written `INCOMPLETE` first and replaced atomically by the final
-PASS/FAIL, so no kill, even SIGKILL, can leave PASS. SIGTERM/SIGINT/SIGHUP are
-recorded (`interruption=`), the owned cleanup still runs, and the process
-exits 128+n. SIGKILL or machine loss is NOT handled: it leaves `INCOMPLETE` and
-does not guarantee cleanup (the VM is disposable).
+the owned host setup, no interruption, and the final result actually
+published. Nothing starts as success: `result.txt` is written `INCOMPLETE`
+first (if that fails the run exits 1 before creating anything) and replaced
+by one atomic rename of the final PASS/FAIL. A failed write or rename of the
+final result exits 1 and leaves the previous `INCOMPLETE`, even when every
+test and cleanup passed. SIGTERM/SIGINT/SIGHUP stay live until the command right
+after the final rename: one received before that point (even
+just after the rename) is recorded (`interruption=`, FAIL republished), the
+owned cleanup still runs, and the process exits 128+n; after it they are
+ignored, so the exit status matches the published verdict. SIGKILL or machine
+loss is NOT handled and does not guarantee cleanup (the VM is disposable):
+before the final rename it leaves `INCOMPLETE`; after it the published verdict,
+even PASS, stays with a killed (nonzero) process status.
 Cleanup enumeration accepts regular `cgroup.*`/controller interface files of the
 delegated cgroup as kernel control files; any link (never followed), unexpected
 name, non-`receipts-*` directory or non-directory child is reported unowned. `run.sh self-check` is the unprivileged control for that
@@ -325,7 +332,12 @@ at the first test, last test, setup, cgroup removal and custody cleanup (and
 SIGKILL) never yield PASS; a failed listing, retained record, replaced or
 aliased lock or foreign mount causes zero unmounts; a create that fails or
 aborts after creating is retained as uncertain; test results 7,3,0 keep test 1
-and status 7. They never mount or use root.
+and status 7. Finalization regressions: a failed final publication or
+unwritable final temporary file exits 1 with `INCOMPLETE` retained and owned
+cleanup done; a failed `INCOMPLETE` placeholder exits 1 with nothing created;
+SIGTERM/SIGINT/SIGHUP just before or just after the final rename exit 128+n
+with FAIL and `interruption=`; SIGKILL before the rename leaves `INCOMPLETE`,
+after it the published PASS. They never mount or use root.
 
 ## Proof status
 

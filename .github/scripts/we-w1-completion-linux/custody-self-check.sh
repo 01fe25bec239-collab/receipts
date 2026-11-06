@@ -414,6 +414,92 @@ custody_self_check() {
     echo "ok precedence: setup, then abnormal end, then first test failure"
   }
   run_reg reg_precedence
+
+  # Finalization (PR203 host setup, subject 9d84): a result that was not
+  # published is never success, and a cancellation that lands before the final
+  # rename is never swallowed. Hooks are installed inside the sequence subshell.
+  final_file() { [ "$(sed -n 1p "$1")" != INCOMPLETE ]; }
+  publish_fails() { # A3 probe publish_failure.sh
+    publish_result() { if final_file "$1"; then return 9; fi; mv -f "$1" "$out/result.txt"; }
+  }
+  publish_always_fails() { publish_result() { return 9; }; }
+  final_tmp_unwritable() { # cleanup succeeds, then the final temp file cannot be written
+    remove_cgroup_dir() { rm -rf "$1"; mkdir -p "$out/result.txt.tmp"; }
+  }
+  sig_before_rename() { # A3 probe publication_term.sh, aimed at the sequence's own process
+    publish_result() { if final_file "$1"; then fake_signal; fi; mv -f "$1" "$out/result.txt"; }
+  }
+  sig_after_rename() {
+    publish_result() { mv -f "$1" "$out/result.txt" || return; if final_file "$out/result.txt"; then fake_signal; fi; }
+  }
+  reg_unpublished() { # name prologue: the final result cannot be published
+    new_box "unpublished-$1"
+    seq_prologue=$2 fake_rcs="0 0 0"
+    seq_run
+    check "$1 exits 1" [ "$rc" = 1 ]
+    check "$1 ran all tests" [ "$(ran)" = 3 ]
+    check "$1 retains the honest INCOMPLETE" result_has INCOMPLETE
+    check "$1 is never PASS" not_pass
+    check "$1 still cleaned owned custody" exist_none "$custody_parent"
+    echo "ok $1 -> exit $rc, INCOMPLETE retained"
+  }
+  run_reg reg_unpublished publish_fails publish_fails
+  run_reg reg_unpublished final_tmp_unwritable final_tmp_unwritable
+  reg_initial_unpublished() { # name prologue-or-empty: INCOMPLETE cannot be published
+    new_box "initial-$1"
+    seq_prologue=${2:-:} fake_rcs="0 0 0"
+    [ -n "$2" ] || mkdir "$out/result.txt.tmp"
+    seq_run
+    check "$1 fails" [ "$rc" = 1 ]
+    check "$1 ran no test" [ "$(ran)" = 0 ]
+    check "$1 created no cgroup" exist_none "$cgroup"
+    check "$1 created no custody" exist_none "$custody_parent"
+    check "$1 published nothing" exist_none "$out/result.txt"
+    echo "ok initial $1 -> exit $rc, nothing created"
+  }
+  run_reg reg_initial_unpublished tmp_unwritable ""
+  run_reg reg_initial_unpublished publish_fails publish_always_fails
+  reg_sig_publication() { # signal hook
+    local want
+    case $1 in TERM) want=143 ;; INT) want=130 ;; HUP) want=129 ;; esac
+    new_box "publication-$1-$2"
+    seq_prologue=$2 fake_sig=$1 fake_rcs="0 0 0"
+    seq_run
+    check "$1 $2 keeps its termination ($want)" [ "$rc" = "$want" ]
+    check "$1 $2 is FAIL" result_has FAIL
+    check "$1 $2 records the interruption" result_has "interruption=$1"
+    check "$1 $2 summary names it" result_has "primary_failure=interrupted by $1"
+    check "$1 $2 keeps the completed facts" result_has tests_completed=3
+    check "$1 $2 keeps the verified cleanup" result_has cleanup_status=0
+    echo "ok $1 $2 -> exit $rc, FAIL with interruption"
+  }
+  for sig in TERM INT HUP; do
+    run_reg reg_sig_publication "$sig" sig_before_rename
+    run_reg reg_sig_publication "$sig" sig_after_rename
+  done
+  reg_unpublished_interrupt() { # interrupted, then the result cannot be written
+    new_box unpublished-interrupt
+    seq_prologue=final_tmp_unwritable fake_sig=TERM fake_sig_at=test2 fake_rcs="0 0 0"
+    seq_run
+    check "keeps 143" [ "$rc" = 143 ]
+    check "retains INCOMPLETE" result_has INCOMPLETE
+    echo "ok TERM then unwritable result -> exit 143, INCOMPLETE retained"
+  }
+  run_reg reg_unpublished_interrupt
+  reg_kill_publication() { # SIGKILL: the rename is the boundary, in both directions
+    new_box publication-kill-before
+    seq_prologue=sig_before_rename fake_sig=KILL fake_rcs="0 0 0"
+    seq_run
+    check "killed before rename (137)" [ "$rc" = 137 ]
+    check "killed before rename leaves INCOMPLETE" result_has INCOMPLETE
+    new_box publication-kill-after
+    seq_prologue=sig_after_rename fake_sig=KILL fake_rcs="0 0 0"
+    seq_run
+    check "killed after rename (137)" [ "$rc" = 137 ]
+    check "killed after rename keeps the published verdict" result_has PASS
+    echo "ok SIGKILL before rename -> INCOMPLETE; after rename -> published PASS stays (documented limit)"
+  }
+  run_reg reg_kill_publication
   if [ "$reg_failures" != 0 ]; then
     echo "REGRESSION CONTROLS FAILED: $reg_failures"
     exit 1
