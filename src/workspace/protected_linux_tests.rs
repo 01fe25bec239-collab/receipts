@@ -588,7 +588,28 @@ fn cgroup_migration_denied(paths: &[PathBuf]) -> bool {
 /// Worker-side probe (runs as the fresh worker UID inside the boundary).
 #[test]
 #[ignore = "hosted worker probe"]
+/// This process's descriptors (`fd->target`), excluding the one read_dir uses.
+fn own_fds() -> String {
+    let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+        return "unreadable".into();
+    };
+    let mut fds: Vec<_> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let target = std::fs::read_link(entry.path()).ok()?;
+            Some(format!(
+                "{}->{}",
+                entry.file_name().to_string_lossy(),
+                target.display()
+            ))
+        })
+        .collect();
+    fds.sort();
+    fds.join(",")
+}
+
 fn worker_probe() {
+    let start_fds = own_fds();
     let Ok(worktree) = std::env::current_dir() else {
         return;
     };
@@ -653,6 +674,7 @@ fn worker_probe() {
         .and_then(|mut file| file.write_all(b"worker secret\n"))
         .is_ok();
     record("private_payload", wrote);
+    println!("WORKER_FDS start={start_fds} before_pause={}", own_fds());
     pause_for_observation();
     // Escape the process group; only cgroup containment can reach this.
     let escapee = std::process::Command::new("/usr/bin/sleep")
@@ -868,21 +890,24 @@ fn hosted_protected_worker_controller_and_cleanup() {
             &policy(),
         )
         .expect("worker launch");
-    if let Err(error) = observe_child(&lines[2]) {
-        panic!(
-            "worker FD observation unavailable or unsealed: {error}; unconfined baseline: {baseline}"
-        );
-    }
+    // A failed observation still fails the test, but only after the worker is
+    // collected and its own report printed, so the evidence names the cause.
+    let observed = observe_child(&lines[2]);
     let outcome = protected
         .attempt()
         .wait_collect()
         .expect("verified cleanup");
+    let stdout = String::from_utf8_lossy(outcome.stdout().head()).into_owned();
+    println!("{stdout}");
+    if let Err(error) = observed {
+        panic!(
+            "worker FD observation unavailable or unsealed: {error}; unconfined baseline: {baseline}"
+        );
+    }
     assert_eq!(
         outcome.terminal_cause(),
         LiveProcessTerminalCause::Completed
     );
-    let stdout = String::from_utf8_lossy(outcome.stdout().head()).into_owned();
-    println!("{stdout}");
     assert_receipts(
         &stdout,
         &[
