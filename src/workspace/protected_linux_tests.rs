@@ -315,8 +315,18 @@ fn describe_fds(pid: u32) -> String {
             };
             let target = std::fs::read_link(fd.path())
                 .map_or_else(|e| format!("<{e}>"), |t| t.display().to_string());
+            // Kernel open flags (octal, includes O_CLOEXEC) and mount id.
+            let info = std::fs::read_to_string(task.path().join("fdinfo").join(fd.file_name()))
+                .map(|text| {
+                    text.lines()
+                        .filter(|line| line.starts_with("flags:") || line.starts_with("mnt_id:"))
+                        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(""))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_else(|e| format!("<{e}>"));
             lines.push(format!(
-                "{}:{}={kind}->{target}",
+                "{}:{}={kind}->{target}[{info}]",
                 task.file_name().to_string_lossy(),
                 fd.file_name().to_string_lossy()
             ));
@@ -324,6 +334,63 @@ fn describe_fds(pid: u32) -> String {
     }
     lines.sort();
     lines.join(", ")
+}
+
+/// Runs the probe binary outside the launcher with the worker's stdio shape
+/// (stdin `/dev/null`, piped stdout/stderr) until it stops itself, and returns
+/// its descriptor table: what the binary opens on its own, for comparison with
+/// the confined worker. Observation only; it asserts nothing.
+fn baseline_fds(executable: &Path) -> String {
+    let mut child = match std::process::Command::new(executable)
+        .args([
+            "protected_linux_tests::baseline_probe",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("RECEIPTS_BASELINE_PROBE", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => return format!("baseline spawn failed: {error}"),
+    };
+    let pid = child.id();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let stopped = || {
+        std::fs::read_dir(format!("/proc/{pid}/task")).is_ok_and(|tasks| {
+            let states: Vec<_> = tasks
+                .filter_map(Result::ok)
+                .map(|task| std::fs::read_to_string(task.path().join("status")).unwrap_or_default())
+                .collect();
+            !states.is_empty()
+                && states
+                    .iter()
+                    .all(|status| status.lines().any(|line| line.starts_with("State:\tT")))
+        })
+    };
+    while !stopped() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let table = if stopped() {
+        describe_fds(pid)
+    } else {
+        "baseline never stopped".into()
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    table
+}
+
+#[test]
+#[ignore = "baseline helper; run only by baseline_fds"]
+fn baseline_probe() {
+    if std::env::var_os("RECEIPTS_BASELINE_PROBE").is_some() {
+        pause_for_observation();
+    }
 }
 
 /// Observe the sole stopped process in this attempt's cgroup, pinning its
@@ -792,6 +859,8 @@ fn hosted_protected_worker_controller_and_cleanup() {
     )
     .unwrap();
 
+    let baseline = baseline_fds(&executable);
+    println!("BASELINE unconfined probe descriptors: {baseline}");
     let protected = launcher
         .launch(
             admission,
@@ -800,7 +869,9 @@ fn hosted_protected_worker_controller_and_cleanup() {
         )
         .expect("worker launch");
     if let Err(error) = observe_child(&lines[2]) {
-        panic!("worker FD observation unavailable or unsealed: {error}");
+        panic!(
+            "worker FD observation unavailable or unsealed: {error}; unconfined baseline: {baseline}"
+        );
     }
     let outcome = protected
         .attempt()
