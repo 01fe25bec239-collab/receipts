@@ -28,11 +28,14 @@ jobs:
     timeout-minutes: 20
     env:
       DIAGNOSTIC_HEAD: ${{ github.event.pull_request.head.sha }}
-      DIAGNOSTIC_OUT: ${{ runner.temp }}/we-w1-evidence
     defaults:
       run:
         shell: bash
     steps:
+      # runner.* is unavailable in jobs.<job_id>.env, so the fixed evidence
+      # directory is exported here, before every consumer (including seal).
+      - name: Initialize fixed evidence directory
+        run: echo "DIAGNOSTIC_OUT=${RUNNER_TEMP:?}/we-w1-evidence" >>"$GITHUB_ENV"
       - name: Checkout exact PR head
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
