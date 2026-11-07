@@ -21,9 +21,12 @@
 //! Every failure mode — invalid SHA, missing commit, failed Git command,
 //! unexpected HEAD, dirty resulting worktree — surfaces as an explicit
 //! [`WorkspaceError`]. A failed or ambiguous operation is never converted
-//! into a successful handle. Failed provisioning leaves any partially
-//! created Git artifacts in place: orphan detection and crash recovery are
-//! later milestones outside this slice.
+//! into a successful handle. Preflight (Git version, refused filter/include
+//! configuration, free branch, unregistered target) runs before creation;
+//! a later failure runs owned rollback of only this attempt's resources,
+//! reporting rollback-incomplete instead of claiming retry cleanliness.
+//! Handles store canonical worktree paths and move only through the checked
+//! six-state lifecycle in [`lifecycle`].
 //!
 //! The teardown slice ([`WorkspaceTeardownRequest`]) performs the frozen
 //! cleanup contract for an accepted workspace: after full identity,
@@ -55,17 +58,26 @@ pub mod checkpoint_executed_check;
 pub mod checkpoint_json;
 pub mod checkpoint_reference;
 pub mod checkpoint_vocabulary;
+pub mod checkpoint_wire;
 pub mod date_time;
 pub mod error;
 pub mod git;
 pub mod handle;
 pub mod handle_wire;
+pub mod lifecycle;
+pub mod protected;
+mod protected_custody;
+#[cfg(target_os = "linux")]
+mod protected_linux;
 pub mod provision;
 pub mod recovery_preparation;
 pub mod remote_publish_policy;
 pub mod teardown;
+mod worktree_binding;
+pub mod worktree_create;
 pub mod write_path_pattern;
 pub mod write_scope;
+pub mod write_scope_case;
 
 /// Argv-only local process-runner foundation owned by the execution layer.
 ///
@@ -90,7 +102,11 @@ mod checkpoint_vocabulary_tests;
 #[cfg(test)]
 mod date_time_tests;
 #[cfg(test)]
+mod git_tests;
+#[cfg(test)]
 mod handle_wire_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod protected_linux_tests;
 #[cfg(test)]
 mod provision_tests;
 #[cfg(test)]
@@ -123,11 +139,24 @@ pub use checkpoint_reference::{WorkspaceCheckpointRef, WorkspaceCheckpointRefErr
 pub use checkpoint_vocabulary::{
     WorkspaceCheckpointCrashClassification, WorkspaceCheckpointKind, WorkspaceRecoveryDecision,
 };
+pub use checkpoint_wire::{
+    WorkspaceCheckpointWire, WorkspaceCheckpointWireConversionError,
+    WorkspaceCheckpointWireExitCode,
+};
 pub use date_time::{WorkspaceDateTimeError, WorkspaceDateTimeV1};
 pub use error::WorkspaceError;
 pub use handle::{CommitSha, WorkspaceHandle, WorkspaceIsolation, WorkspaceState};
 pub use handle_wire::{
     WorkspaceHandleExportError, WorkspaceHandleWire, WorkspaceHandleWireIsolation,
+};
+pub use lifecycle::{
+    WorkspaceAttempt, WorkspaceCheckpointLifecycleInput, WorkspaceCollectionFailure,
+    WorkspaceLifecycleError, checkpoint_workspace, orphan_workspace, start_workspace_attempt,
+};
+pub use protected::{
+    ControllerChannel, ControllerCredentials, ControllerOperation, ControllerRequest,
+    ControllerResponse, ControllerRole, ProtectedAdmission, ProtectedAttempt,
+    ProtectedLaunchConfig, ProtectedLaunchError, ProtectedLauncher,
 };
 pub use provision::{WorkspaceProvisionRequest, validate_branch_name};
 pub use recovery_preparation::{
@@ -146,6 +175,12 @@ pub use attempt_finalization::{
     WorkspaceAttemptFinalizationRequest, finalize_workspace_attempt,
 };
 
+pub use worktree_create::{
+    WorktreeCreateMode, WorktreeCreateRequest, WorktreeCreateResponse, WorktreeCreateTask,
+};
 pub use write_path_pattern::{
     WritePathIntersectionError, WritePathPattern, WritePathSet, intersects, validate_write_path,
+};
+pub use write_scope_case::{
+    CaseAliasCollision, FilesystemCaseSensitivity, WriteScopeCaseAliasCheck, probe_case_sensitivity,
 };

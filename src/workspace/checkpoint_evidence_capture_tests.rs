@@ -2,7 +2,6 @@ use super::*;
 use crate::test_support::{TempDir, TestRepo, git};
 use crate::{WorkspaceCheckpointCheckSource, WorkspaceCheckpointRefType};
 use std::fs;
-use std::io::Cursor;
 
 fn request(directory: &Path) -> WorkspaceCheckpointEvidenceCaptureRequest<'_> {
     WorkspaceCheckpointEvidenceCaptureRequest {
@@ -29,13 +28,9 @@ fn sorted(names: &[&str]) -> Vec<String> {
 }
 
 fn raw(bytes: &[u8]) -> RawStream {
-    drain(
-        Cursor::new(bytes),
-        RawStream::new(Observation::UntrackedPaths).unwrap(),
-        Observation::UntrackedPaths,
-        Stream::Stdout,
-    )
-    .unwrap()
+    // Mirrors bounded-runner admission: retained bytes are at most the limit.
+    let retained = bytes[..bytes.len().min(GIT_EVIDENCE_LIMIT_BYTES as usize)].to_vec();
+    RawStream::from_bounded(retained, bytes.len() as u64, false)
 }
 
 fn paths(bytes: &[u8]) -> Result<Vec<String>, E> {
@@ -481,13 +476,7 @@ fn assert_oversize(result: Result<Vec<String>, E>, observation: Observation, tot
 #[test]
 fn bound_one_over_and_much_larger_are_deterministic_typed_failures() {
     for length in [GIT_EVIDENCE_LIMIT_BYTES + 1, GIT_EVIDENCE_LIMIT_BYTES * 8] {
-        let retained = drain(
-            io::repeat(b'x').take(length),
-            RawStream::new(Observation::UntrackedPaths).unwrap(),
-            Observation::UntrackedPaths,
-            Stream::Stdout,
-        )
-        .unwrap();
+        let retained = raw(&vec![b'x'; length as usize]);
         assert_eq!(retained.bytes.len() as u64, GIT_EVIDENCE_LIMIT_BYTES);
         assert_eq!(retained.total_bytes, length);
         assert!(retained.truncated);
@@ -558,51 +547,16 @@ fn bound_valid_nul_paths_are_exact_and_bad_framing_or_utf8_fails() {
     ));
 }
 
+// Counter overflow and read-failure handling now belong to the shared bounded
+// runner (execution capture tests); its truncation flag is honored here.
 #[test]
-fn bound_checked_counter_overflow_fails_without_wrapping() {
-    for stream in [Stream::Stdout, Stream::Stderr] {
-        let mut retained = RawStream::new(Observation::UntrackedPaths).unwrap();
-        retained.total_bytes = u64::MAX;
-        assert!(
-            matches!(retained.push(b"x", Observation::UntrackedPaths, stream),
-            Err(E::StreamCountOverflow { counted: u64::MAX, chunk: 1, stream: actual, .. }) if actual == stream)
-        );
-        assert_eq!(retained.total_bytes, u64::MAX);
-        assert!(retained.bytes.is_empty());
-    }
-}
-
-#[test]
-fn bound_read_failure_is_typed_and_interrupted_reads_retry() {
-    struct Reader {
-        calls: usize,
-    }
-    impl Read for Reader {
-        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-            self.calls += 1;
-            match self.calls {
-                1 => Err(io::ErrorKind::Interrupted.into()),
-                2 => {
-                    buffer[0] = b'x';
-                    Ok(1)
-                }
-                _ => Err(io::Error::other("injected read failure")),
-            }
-        }
-    }
-    assert!(matches!(
-        drain(
-            Reader { calls: 0 },
-            RawStream::new(Observation::Head).unwrap(),
-            Observation::Head,
-            Stream::Stdout
-        ),
-        Err(E::StreamRead {
-            observation: Observation::Head,
-            stream: Stream::Stdout,
-            ..
-        })
-    ));
+fn runner_truncation_flag_alone_refuses_parsing() {
+    let retained = RawStream::from_bounded(b"a\0".to_vec(), 2, true);
+    assert_oversize(
+        parse_paths(retained, Observation::UntrackedPaths),
+        Observation::UntrackedPaths,
+        2,
+    );
 }
 
 #[test]
@@ -708,20 +662,6 @@ fn bound_real_git_large_stderr_is_separate_and_does_not_deadlock() {
             );
         }
         other => panic!("unexpected: {other:?}"),
-    }
-    // Independently exercise draining both stream labels past the exact limit;
-    // Git versions differ in how much invalid config they print.
-    for stream in [Stream::Stdout, Stream::Stderr] {
-        let retained = drain(
-            io::repeat(0xff).take(GIT_EVIDENCE_LIMIT_BYTES * 2),
-            RawStream::new(Observation::Head).unwrap(),
-            Observation::Head,
-            stream,
-        )
-        .unwrap();
-        assert_eq!(retained.bytes.len() as u64, GIT_EVIDENCE_LIMIT_BYTES);
-        assert_eq!(retained.total_bytes, GIT_EVIDENCE_LIMIT_BYTES * 2);
-        assert!(retained.truncated);
     }
 }
 
@@ -955,17 +895,24 @@ fn bounded_collector_dual_pipe_probe() {
 #[test]
 fn bound_shared_collector_drains_large_stdout_and_stderr_and_reaps() {
     for fail in [false, true] {
-        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-        command.env_clear().args([
+        let exe = std::env::current_exe().unwrap();
+        let dir = exe.parent().unwrap();
+        let args = [
             "checkpoint_evidence_capture::tests::bounded_collector_dual_pipe_probe",
             "--exact",
             "--ignored",
             "--nocapture",
-        ]);
-        if fail {
-            command.env("COLLECTOR_PROBE_FAIL", "1");
-        }
-        let result = collect_git(command, Observation::StagedPaths);
+        ];
+        let request = crate::execution::ProcessRunRequest::new(&exe, args, dir, dir).unwrap();
+        let request = if fail {
+            request.with_fixed_env(&[("COLLECTOR_PROBE_FAIL", "1")])
+        } else {
+            request
+        };
+        let result = collect(
+            crate::git::run_request(&request, "collector probe"),
+            Observation::StagedPaths,
+        );
         if fail {
             let E::GitCommandFailed {
                 status,

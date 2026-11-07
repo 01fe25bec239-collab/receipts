@@ -22,9 +22,12 @@ use crate::error::WorkspaceError;
 use crate::git;
 use crate::handle::{CommitSha, WorkspaceHandle};
 use crate::remote_publish_policy::WorkspaceRemotePublishPolicy;
+use crate::teardown::{list_registered_worktrees, record_matches};
 
-/// Maximum accepted length for caller-supplied identifiers, in bytes.
-pub(crate) const MAX_IDENTIFIER_LENGTH: usize = 256;
+/// Maximum accepted length for newly provisioned identifiers, in Unicode
+/// characters (the wire schema's `maxLength: 200`). Existing observed
+/// handles are never rewritten by this cap.
+pub(crate) const MAX_IDENTIFIER_CHARACTERS: usize = 200;
 
 /// Maximum accepted length for branch names, in bytes.
 pub(crate) const MAX_BRANCH_NAME_LENGTH: usize = 256;
@@ -154,16 +157,22 @@ impl WorkspaceProvisionRequest {
 
     /// Executes the provisioning flow and returns the typed handle.
     ///
-    /// Every step fails closed with a typed error. A failure after partial
-    /// creation (for example the branch exists but the worktree cannot be
-    /// added) leaves the already-created Git artifacts in place; teardown
-    /// and recovery are outside this slice's scope. A failed or ambiguous
-    /// operation is never converted into a successful handle.
+    /// Order: canonicalize the repository root and the target (canonical
+    /// existing parent plus final name); preflight (Git >= 2.36, no refused
+    /// filter/include configuration, base commit exists, branch free, target
+    /// not registered); create the branch; add the worktree; verify HEAD and
+    /// cleanliness from the canonical worktree. The handle stores the
+    /// canonical worktree path (N2).
+    ///
+    /// Any failure after creation starts runs owned rollback, which removes
+    /// only what this attempt demonstrably created: the clean registered
+    /// worktree it added (non-force) and its new branch, deleted only if it
+    /// still points at the base (conditional `update-ref -d`). Preexisting
+    /// targets, drift or unknown state are retained and reported as
+    /// [`WorkspaceError::ProvisionRollbackIncomplete`]. A complete rollback
+    /// returns the original cause and lets a retry with the same identity
+    /// succeed.
     pub fn provision(&self) -> Result<WorkspaceHandle, WorkspaceError> {
-        // Step 0: resolve the requested repository root to its canonical
-        // (realpath) filesystem location before any Git command runs, so
-        // every subprocess operates from the repository's true location
-        // rather than any caller-supplied alias. Failure fails closed.
         let root = std::fs::canonicalize(&self.repository_root).map_err(|error| {
             WorkspaceError::RepositoryRootUnresolvable {
                 detail: format!(
@@ -172,84 +181,76 @@ impl WorkspaceProvisionRequest {
                 ),
             }
         })?;
-        let root = &root;
+        let target = canonical_target(&self.worktree_path)?;
+        preflight(&root, &target, &self.branch, &self.base_sha)?;
 
-        // Step 1: the requested base must identify an existing Git commit.
-        // This also proves the repository root is a usable Git repository.
-        // The resolved object name must equal the requested SHA exactly;
-        // any other resolution fails closed.
-        let commitish = format!("{}^{{commit}}", self.base_sha.as_str());
-        let verified = git::capture(
-            root,
-            "verify base commit",
-            &[
-                OsStr::new("rev-parse"),
-                OsStr::new("--verify"),
-                OsStr::new(commitish.as_str()),
-            ],
-        )?;
-        if !verified.success {
-            return Err(WorkspaceError::BaseCommitVerificationFailed {
-                base_sha: self.base_sha.as_str().to_string(),
-                detail: format!(
-                    "{}; stderr: {}",
-                    verified.exit_status,
-                    verified.stderr.trim()
-                ),
-            });
+        let mut created = Created {
+            target_preexisted: target.exists(),
+            ..Created::default()
+        };
+        match self.create_and_verify(&root, &target, &mut created) {
+            Ok(handle) => Ok(handle),
+            Err(cause) => Err(rollback(
+                &root,
+                &target,
+                &self.branch,
+                &self.base_sha,
+                created,
+                cause,
+            )),
         }
-        let resolved = verified.stdout.trim();
-        if resolved != self.base_sha.as_str() {
-            return Err(WorkspaceError::BaseCommitVerificationFailed {
-                base_sha: self.base_sha.as_str().to_string(),
-                detail: format!("rev-parse resolved the base to {resolved:?} instead"),
-            });
-        }
+    }
 
-        // Step 2: create the task branch from that exact base commit. Git
-        // refuses to overwrite an existing branch, which surfaces here as a
-        // typed command failure rather than any overwrite or merge.
+    fn create_and_verify(
+        &self,
+        root: &Path,
+        target: &Path,
+        created: &mut Created,
+    ) -> Result<WorkspaceHandle, WorkspaceError> {
         git::capture(
             root,
             "create branch",
             &[
                 OsStr::new("branch"),
+                OsStr::new("--no-track"),
                 OsStr::new(self.branch.as_str()),
                 OsStr::new(self.base_sha.as_str()),
             ],
         )?
         .require_success("create branch")?;
+        created.branch = true;
+        test_fault(ProvisionFault::Branch)?;
 
-        // Step 3: create the worktree checking out the new branch. Paths
-        // travel as argv values, never through a shell.
+        created.worktree = true;
         git::capture(
             root,
             "add worktree",
             &[
                 OsStr::new("worktree"),
                 OsStr::new("add"),
-                OsStr::new(self.worktree_path.as_os_str()),
+                OsStr::new(target.as_os_str()),
                 OsStr::new(self.branch.as_str()),
             ],
         )?
         .require_success("add worktree")?;
+        test_fault(ProvisionFault::Worktree)?;
+        #[cfg(test)]
+        if PROVISION_FAULT.get() == Some(ProvisionFault::DirtyWorktree) {
+            std::fs::write(target.join("worker-data"), "keep").expect("fixture write");
+        }
+        test_fault(ProvisionFault::DirtyWorktree)?;
 
-        // Step 4: resolve the freshly created worktree directory to its
-        // canonical (realpath) location and run all subsequent verification
-        // from there, so HEAD/status inspection is anchored to the true
-        // filesystem target rather than any lexical alias of it. Failure
-        // fails closed and never yields a handle.
-        let created_worktree = std::fs::canonicalize(&self.worktree_path).map_err(|error| {
+        let created_worktree = std::fs::canonicalize(target).map_err(|error| {
             WorkspaceError::CreatedWorktreeUnresolvable {
-                detail: format!(
-                    "{:?} could not be canonicalized: {error}",
-                    self.worktree_path.display()
-                ),
+                detail: format!("{:?} could not be canonicalized: {error}", target.display()),
             }
         })?;
+        if created_worktree != target {
+            return Err(WorkspaceError::CreatedWorktreeUnresolvable {
+                detail: "created worktree resolved to a different canonical path".to_string(),
+            });
+        }
 
-        // Step 5: read the resulting worktree HEAD from its canonical path
-        // and require it to equal the requested base SHA exactly.
         let head = git::capture(
             &created_worktree,
             "read worktree HEAD",
@@ -268,30 +269,56 @@ impl WorkspaceProvisionRequest {
             });
         }
 
-        // Step 6: the newly provisioned worktree must be clean per Git
-        // porcelain status, inspected from its canonical path. Any output —
-        // including untracked entries — fails closed.
+        git::refuse_untrusted_repository_config(&created_worktree, "inspect target configuration")?;
         let status = git::capture(
             &created_worktree,
             "inspect worktree status",
-            &[OsStr::new("status"), OsStr::new("--porcelain")],
-        )?;
-        let status = status.require_success("inspect worktree status")?;
+            &[
+                OsStr::new("status"),
+                OsStr::new("--porcelain"),
+                OsStr::new("--untracked-files=all"),
+                OsStr::new("--ignore-submodules=none"),
+            ],
+        )?
+        .require_success("inspect worktree status")?;
         if !status.stdout.trim().is_empty() {
             return Err(WorkspaceError::WorktreeNotClean {
                 status: status.stdout.trim().to_string(),
             });
         }
 
-        // All validation succeeded; only now may a handle exist. The frozen
-        // handle contract carries the validated absolute path the caller
-        // requested; canonical (realpath) resolution above is an execution-
-        // boundary detail, not a change to observable handle semantics.
+        // A task-bound worktree records its exact identity in protected Git
+        // administrative metadata before any handle exists. `create_new`
+        // never overwrites a marker; failure rolls this attempt back.
+        if let Some(task_id) = &self.task_id {
+            test_fault(ProvisionFault::Binding)?;
+            #[cfg(test)]
+            if PROVISION_FAULT.get() == Some(ProvisionFault::BindingBlocked) {
+                use std::os::unix::fs::PermissionsExt;
+                PROVISION_FAULT.set(None);
+                let dir = crate::worktree_binding::admin_dir(root, &created_worktree)
+                    .expect("fixture admin dir");
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500))
+                    .expect("fixture chmod");
+            }
+            crate::worktree_binding::record(
+                root,
+                &crate::worktree_binding::TaskBinding {
+                    repository: root.to_path_buf(),
+                    worktree: created_worktree.clone(),
+                    branch: self.branch.clone(),
+                    base_sha: self.base_sha.clone(),
+                    workspace_id: self.workspace_id.clone(),
+                    task_id: task_id.clone(),
+                },
+            )?;
+        }
+
         Ok(WorkspaceHandle::provisioned(
             self.workspace_id.clone(),
             self.task_id.clone(),
             self.branch.clone(),
-            self.worktree_path.clone().into_boxed_path(),
+            created_worktree.into_boxed_path(),
             self.base_sha.clone(),
             self.remote_publish_policy,
             self.created_at.clone(),
@@ -299,14 +326,276 @@ impl WorkspaceProvisionRequest {
     }
 }
 
+/// Resources this provisioning attempt created (or attempted to create).
+#[derive(Debug, Default, Clone, Copy)]
+struct Created {
+    branch: bool,
+    worktree: bool,
+    target_preexisted: bool,
+}
+
+/// Canonical form of a not-yet-existing target: canonical parent + name.
+/// The parent must exist; `.`/`..` final components are refused.
+pub(crate) fn canonical_target(path: &Path) -> Result<PathBuf, WorkspaceError> {
+    let invalid = |detail: String| WorkspaceError::InvalidWorktreePath { detail };
+    let name = match path.components().next_back() {
+        Some(std::path::Component::Normal(name)) => name,
+        _ => {
+            return Err(invalid(format!(
+                "worktree path {:?} must end in a normal name",
+                path.display()
+            )));
+        }
+    };
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("worktree path has no parent".to_string()))?;
+    let parent = std::fs::canonicalize(parent).map_err(|error| {
+        invalid(format!(
+            "worktree parent {:?} could not be canonicalized: {error}",
+            parent.display()
+        ))
+    })?;
+    Ok(parent.join(name))
+}
+
+/// Minimum Git supporting `worktree list --porcelain -z` (teardown identity).
+pub(crate) const MIN_GIT_VERSION: (u32, u32) = (2, 36);
+
+/// Read-only preflight. Nothing is created and nothing is cleaned up here.
+pub(crate) fn preflight(
+    root: &Path,
+    target: &Path,
+    branch: &str,
+    base_sha: &CommitSha,
+) -> Result<(), WorkspaceError> {
+    let version = git::capture(root, "read git version", &[OsStr::new("version")])?
+        .require_success("read git version")?;
+    match git::git_version_at_least(&version.stdout, MIN_GIT_VERSION.0, MIN_GIT_VERSION.1) {
+        Some(true) => {}
+        _ => {
+            return Err(WorkspaceError::GitVersionUnsupported {
+                detail: format!(
+                    "{:?}; at least {}.{} is required",
+                    version.stdout.trim(),
+                    MIN_GIT_VERSION.0,
+                    MIN_GIT_VERSION.1
+                ),
+            });
+        }
+    }
+    git::refuse_untrusted_repository_config(root, "inspect repository configuration")?;
+
+    let commitish = format!("{}^{{commit}}", base_sha.as_str());
+    let verified = git::capture(
+        root,
+        "verify base commit",
+        &[
+            OsStr::new("rev-parse"),
+            OsStr::new("--verify"),
+            OsStr::new(commitish.as_str()),
+        ],
+    )?;
+    if !verified.success {
+        return Err(WorkspaceError::BaseCommitVerificationFailed {
+            base_sha: base_sha.as_str().to_string(),
+            detail: format!(
+                "{}; stderr: {}",
+                verified.exit_status,
+                verified.stderr.trim()
+            ),
+        });
+    }
+    let resolved = verified.stdout.trim();
+    if resolved != base_sha.as_str() {
+        return Err(WorkspaceError::BaseCommitVerificationFailed {
+            base_sha: base_sha.as_str().to_string(),
+            detail: format!("rev-parse resolved the base to {resolved:?} instead"),
+        });
+    }
+
+    if branch_target(root, branch)?.is_some() {
+        return Err(WorkspaceError::BranchAlreadyExists {
+            branch: branch.to_string(),
+        });
+    }
+
+    let registered = list_registered_worktrees(root, "list registered worktrees", |detail| {
+        WorkspaceError::InvalidWorktreePath { detail }
+    })?;
+    if registered
+        .iter()
+        .any(|record| record_matches(record, target))
+    {
+        return Err(WorkspaceError::InvalidWorktreePath {
+            detail: format!("{:?} is already a registered worktree", target.display()),
+        });
+    }
+    validate_worktree_path(target)
+}
+
+/// The exact commit `refs/heads/<branch>` points at, or `None` if absent.
+pub(crate) fn branch_target(root: &Path, branch: &str) -> Result<Option<String>, WorkspaceError> {
+    let reference = format!("refs/heads/{branch}");
+    let probe = git::capture(
+        root,
+        "inspect branch",
+        &[
+            OsStr::new("rev-parse"),
+            OsStr::new("--verify"),
+            OsStr::new("--quiet"),
+            OsStr::new(reference.as_str()),
+        ],
+    )?;
+    if probe.success {
+        return Ok(Some(probe.stdout.trim().to_string()));
+    }
+    if probe.exit_status == "exit status: 1" && probe.raw_stdout().is_empty() {
+        return Ok(None);
+    }
+    Err(WorkspaceError::GitCommandFailed {
+        operation: "inspect branch",
+        detail: format!("{}; stderr: {}", probe.exit_status, probe.stderr.trim()),
+    })
+}
+
+/// Owned rollback. Never forces, prunes, resets or deletes data it did not
+/// create; returns `cause` only when cleanup of every created resource is
+/// proven, otherwise [`WorkspaceError::ProvisionRollbackIncomplete`].
+fn rollback(
+    root: &Path,
+    target: &Path,
+    branch: &str,
+    base_sha: &CommitSha,
+    created: Created,
+    cause: WorkspaceError,
+) -> WorkspaceError {
+    let mut problems: Vec<String> = Vec::new();
+    if created.worktree {
+        match list_registered_worktrees(root, "rollback: list worktrees", |detail| {
+            WorkspaceError::InvalidWorktreePath { detail }
+        }) {
+            Err(error) => problems.push(format!("worktree registration unknown: {error}")),
+            Ok(records) => {
+                let matching = records
+                    .iter()
+                    .filter(|record| record_matches(record, target))
+                    .count();
+                match (matching, created.target_preexisted) {
+                    (0, true) => {}
+                    (0, false) => {
+                        // Git removes its own partial checkout on failed add; an
+                        // empty leftover directory is ours, anything else is kept.
+                        if target.exists() && std::fs::remove_dir(target).is_err() {
+                            problems.push("unregistered target directory retained".into());
+                        }
+                    }
+                    (1, true) => {
+                        problems.push("registered worktree at a preexisting target retained".into())
+                    }
+                    (1, false) => {
+                        // Non-force: Git refuses to remove modified or untracked content.
+                        let removed = git::refuse_untrusted_repository_config(
+                            target,
+                            "rollback: inspect target configuration",
+                        )
+                        .and_then(|()| {
+                            git::capture(
+                                root,
+                                "rollback: remove worktree",
+                                &[
+                                    OsStr::new("worktree"),
+                                    OsStr::new("remove"),
+                                    OsStr::new(target.as_os_str()),
+                                ],
+                            )
+                        });
+                        match removed {
+                            Ok(capture) if capture.success => {}
+                            Ok(capture) => problems
+                                .push(format!("worktree retained: {}", capture.stderr.trim())),
+                            Err(error) => problems.push(format!("worktree retained: {error}")),
+                        }
+                    }
+                    _ => problems.push("ambiguous worktree registration retained".into()),
+                }
+            }
+        }
+    }
+    if created.branch {
+        if !problems.is_empty() {
+            problems.push("branch retained because worktree cleanup is incomplete".into());
+        } else {
+            let reference = format!("refs/heads/{branch}");
+            match git::capture(
+                root,
+                "rollback: delete created branch",
+                &[
+                    OsStr::new("update-ref"),
+                    OsStr::new("-d"),
+                    OsStr::new(reference.as_str()),
+                    OsStr::new(base_sha.as_str()),
+                ],
+            ) {
+                Ok(capture) if capture.success => {}
+                Ok(capture) => problems.push(format!(
+                    "branch retained (moved or locked): {}",
+                    capture.stderr.trim()
+                )),
+                Err(error) => problems.push(format!("branch retained: {error}")),
+            }
+        }
+    }
+    if problems.is_empty() {
+        cause
+    } else {
+        WorkspaceError::ProvisionRollbackIncomplete {
+            cause: Box::new(cause),
+            detail: problems.join("; "),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProvisionFault {
+    Branch,
+    Worktree,
+    /// Also leaves an untracked file in the new worktree, which non-force
+    /// rollback must refuse to delete.
+    DirtyWorktree,
+    /// Fails before the task binding is written (clean rollback expected).
+    Binding,
+    /// Makes the worktree's administrative directory unwritable so the real
+    /// binding write fails and non-force rollback cannot remove it.
+    #[cfg(test)]
+    BindingBlocked,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PROVISION_FAULT: std::cell::Cell<Option<ProvisionFault>> = const { std::cell::Cell::new(None) };
+}
+
+fn test_fault(_point: ProvisionFault) -> Result<(), WorkspaceError> {
+    #[cfg(test)]
+    if PROVISION_FAULT.get() == Some(_point) {
+        PROVISION_FAULT.set(None);
+        return Err(WorkspaceError::GitCommandFailed {
+            operation: "injected provisioning fault",
+            detail: format!("{_point:?}"),
+        });
+    }
+    Ok(())
+}
+
 /// Validates a caller-supplied identifier (`workspace_id` / `task_id`).
-fn validate_identifier(field: &'static str, value: &str) -> Result<(), String> {
+pub(crate) fn validate_identifier(field: &'static str, value: &str) -> Result<(), String> {
     if value.is_empty() || value.trim().is_empty() {
         return Err(format!("{field} must not be empty"));
     }
-    if value.len() > MAX_IDENTIFIER_LENGTH {
+    if value.chars().count() > MAX_IDENTIFIER_CHARACTERS {
         return Err(format!(
-            "{field} exceeds the {MAX_IDENTIFIER_LENGTH}-byte maximum"
+            "{field} exceeds the {MAX_IDENTIFIER_CHARACTERS}-character maximum"
         ));
     }
     if value.chars().any(char::is_control) {
@@ -362,7 +651,7 @@ pub fn validate_branch_name(branch: &str) -> Result<(), &'static str> {
 /// Validates the worktree target path before any Git command runs: it must
 /// be absolute and must not collide with existing filesystem content (an
 /// existing empty directory is permitted, matching Git's own behavior).
-fn validate_worktree_path(path: &Path) -> Result<(), WorkspaceError> {
+pub(crate) fn validate_worktree_path(path: &Path) -> Result<(), WorkspaceError> {
     if !path.is_absolute() {
         return Err(WorkspaceError::InvalidWorktreePath {
             detail: format!(
@@ -410,5 +699,71 @@ fn validate_worktree_path(path: &Path) -> Result<(), WorkspaceError> {
                 path.display()
             ),
         }),
+    }
+}
+
+#[cfg(test)]
+mod rollback_config_tests {
+    use super::*;
+    use crate::test_support::{TestRepo, git};
+
+    #[test]
+    fn rollback_retains_unsafe_target_without_executing_its_filter() {
+        let repo = TestRepo::new_nested("rollback-target-config", "repo");
+        repo.commit_file("f", "original\n");
+        let target = repo.root.path().join("target");
+        let handle = WorkspaceProvisionRequest::new(
+            repo.path(),
+            "ws-rollback",
+            None,
+            "task/rollback",
+            &target,
+            &repo.head_sha(),
+        )
+        .unwrap()
+        .provision()
+        .unwrap();
+        let target = handle.worktree_path().to_path_buf();
+        git(
+            repo.path(),
+            &["config", "extensions.worktreeConfig", "true"],
+        );
+        let marker = repo.root.path().join("FILTER_RAN");
+        let command = format!("/usr/bin/touch {}", marker.display());
+        git(
+            &target,
+            &["config", "--worktree", "filter.x.clean", &command],
+        );
+        std::fs::write(target.join(".gitattributes"), "f filter=x\n").unwrap();
+        std::fs::write(target.join("f"), "modified\n").unwrap();
+        git(&target, &["status", "--porcelain"]);
+        assert!(marker.exists(), "unsafe content query positive control");
+        std::fs::remove_file(&marker).unwrap();
+        let cause = git::refuse_untrusted_repository_config(&target, "inspect target").unwrap_err();
+        let error = rollback(
+            repo.path(),
+            &target,
+            handle.branch(),
+            handle.base_sha(),
+            Created {
+                branch: true,
+                worktree: true,
+                target_preexisted: false,
+            },
+            cause,
+        );
+        let WorkspaceError::ProvisionRollbackIncomplete { detail, .. } = &error else {
+            panic!("{error:?}")
+        };
+        assert!(
+            detail.contains("filter.x.clean"),
+            "rollback must report the target configuration refusal: {error:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "rollback executed the refused target filter"
+        );
+        assert!(target.exists());
+        assert!(crate::test_support::branch_exists(&repo, handle.branch()));
     }
 }

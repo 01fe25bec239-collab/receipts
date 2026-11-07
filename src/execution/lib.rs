@@ -59,7 +59,8 @@
 //! spawned. [`run`] and [`run_with_timeout`] keep null stdout/stderr;
 //! capture is opt-in.
 //!
-//! Deliberately excluded here (later runner slices): output digests,
+//! Complete-stream SHA-256 is available only after successful EOF/reader completion.
+//! Live snapshots and failed drains have no digest. Deliberately excluded here:
 //! durable output storage, checkpoints, recovery. Also excluded by
 //! architecture: sandbox enforcement of any kind. The workspace boundary provides workspace
 //! isolation only — it is NOT a security sandbox; filesystem, network,
@@ -109,8 +110,17 @@ pub use live_attempt::{
     LiveProcessOutput, LiveProcessStartError, LiveProcessTerminalCause, start_live_process_attempt,
 };
 
+#[cfg(any(target_os = "linux", test))]
+pub(crate) use live_attempt::AttemptContainment;
+pub(crate) use live_attempt::{
+    LaunchCustomization, start_customized_attempt as live_attempt_start_customized,
+};
+
 #[cfg(all(test, unix))]
 mod live_attempt_tests;
 
 #[cfg(all(test, unix))]
 mod stdin_tests;
+
+#[cfg(test)]
+pub(crate) use live_attempt::inject_collection_failure_for_test;

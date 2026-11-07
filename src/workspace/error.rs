@@ -204,6 +204,41 @@ pub enum WorkspaceError {
         /// What the branch resolves to now.
         observed: String,
     },
+    /// A hardened Git operation exceeded its deadline; its process group was
+    /// terminated and reaped by the bounded runner.
+    GitTimedOut {
+        operation: &'static str,
+        timeout: std::time::Duration,
+    },
+    /// Git stdout exceeded the bounded capture limit; nothing was parsed.
+    GitOutputTooLarge {
+        operation: &'static str,
+        total_bytes: u64,
+    },
+    /// Repository configuration declares a filter or include that this
+    /// boundary refuses. Only the key name is reported, never its value.
+    RepositoryConfigRefused { key: String },
+    /// The resolved Git is older than the required version or unparseable.
+    GitVersionUnsupported { detail: String },
+    /// Preflight found the requested task branch already present.
+    BranchAlreadyExists { branch: String },
+    /// Provisioning failed and rollback could not prove that every resource
+    /// created by this attempt was removed. Attributable resources are
+    /// retained; this is never a successful provisioning or a clean retry.
+    ProvisionRollbackIncomplete {
+        cause: Box<WorkspaceError>,
+        detail: String,
+    },
+    /// A lifecycle transition outside the checked six-state machine.
+    IllegalStateTransition {
+        from: &'static str,
+        to: &'static str,
+    },
+    /// An existing worktree did not match an idempotent create request.
+    WorktreeCreateConflict { detail: String },
+    /// The persistent task binding could not be written during provisioning;
+    /// the attempt is rolled back (or reported rollback-incomplete).
+    WorktreeBindingFailed { detail: String },
 }
 
 impl fmt::Display for WorkspaceError {
@@ -311,6 +346,43 @@ impl fmt::Display for WorkspaceError {
                 f,
                 "retained branch {branch:?} resolves to {observed} instead of the verified commit {expected}"
             ),
+            WorkspaceError::GitTimedOut { operation, timeout } => write!(
+                f,
+                "git command for {operation} exceeded its {timeout:?} deadline and was terminated"
+            ),
+            WorkspaceError::GitOutputTooLarge {
+                operation,
+                total_bytes,
+            } => write!(
+                f,
+                "git output for {operation} ({total_bytes} bytes) exceeded the bounded capture limit"
+            ),
+            WorkspaceError::RepositoryConfigRefused { key } => write!(
+                f,
+                "repository configuration key {key:?} declares a filter or include; refused"
+            ),
+            WorkspaceError::GitVersionUnsupported { detail } => {
+                write!(f, "unsupported git version: {detail}")
+            }
+            WorkspaceError::BranchAlreadyExists { branch } => {
+                write!(f, "branch {branch:?} already exists; refusing to reuse it")
+            }
+            WorkspaceError::ProvisionRollbackIncomplete { cause, detail } => write!(
+                f,
+                "provisioning failed ({cause}) and rollback is incomplete: {detail}; attributable resources were retained"
+            ),
+            WorkspaceError::IllegalStateTransition { from, to } => {
+                write!(f, "illegal workspace transition {from} -> {to}")
+            }
+            WorkspaceError::WorktreeCreateConflict { detail } => {
+                write!(
+                    f,
+                    "existing worktree does not match the create request: {detail}"
+                )
+            }
+            WorkspaceError::WorktreeBindingFailed { detail } => {
+                write!(f, "worktree task binding could not be recorded: {detail}")
+            }
         }
     }
 }

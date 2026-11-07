@@ -1,0 +1,73 @@
+name: WE W1 completion Linux diagnostic (product protected launch)
+
+# Separate privileged diagnostic for the Workspace protected-launch boundary.
+# Requires A1 inspection and independent static review before USER-authorized
+# publication. ci.yml and the PR185 qualification workflow are unchanged.
+on:
+  pull_request:
+    types: [opened, reopened]
+    paths:
+      - src/workspace/**
+      - src/execution/**
+      - crates/receipts-workspace-execution/**
+      - .github/workflows/we-w1-completion-linux.yml
+      - .github/scripts/we-w1-completion-linux/**
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostic:
+    if: >-
+      github.repository == '01fe25bec239-collab/receipts' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.base.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'build/wave1-completion-workspace-clean' &&
+      github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      DIAGNOSTIC_HEAD: ${{ github.event.pull_request.head.sha }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # runner.* is unavailable in jobs.<job_id>.env, so the fixed evidence
+      # directory is exported here, before every consumer (including seal).
+      - name: Initialize fixed evidence directory
+        run: echo "DIAGNOSTIC_OUT=${RUNNER_TEMP:?}/we-w1-evidence" >>"$GITHUB_ENV"
+      - name: Checkout exact PR head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.DIAGNOSTIC_HEAD }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Prepare unprivileged build and provenance
+        run: .github/scripts/we-w1-completion-linux/run.sh prepare
+      # run.sh hosted administers the host custody anchors the product
+      # admission requires (custody.sh), runs the tests, then removes only what
+      # it created. The runner context values are read-only observations that
+      # run.sh checks against kernel facts; this job has no container or
+      # services and is never self-hosted.
+      - name: Privileged disposable-VM diagnostic
+        run: |
+          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+            DIAGNOSTIC_OUT="$DIAGNOSTIC_OUT" DIAGNOSTIC_HEAD="$DIAGNOSTIC_HEAD" \
+            RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" RUNNER_OS="$RUNNER_OS" RUNNER_ARCH="$RUNNER_ARCH" \
+            ImageOS="$ImageOS" ImageVersion="$ImageVersion" \
+            .github/scripts/we-w1-completion-linux/run.sh hosted
+      - name: Seal evidence, including failures
+        if: always()
+        run: .github/scripts/we-w1-completion-linux/run.sh seal
+      - name: Upload allowlisted evidence only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: we-w1-completion-linux-${{ github.run_id }}
+          retention-days: 3
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/we-w1-evidence/provenance.txt
+            ${{ runner.temp }}/we-w1-evidence/diagnostic.log
+            ${{ runner.temp }}/we-w1-evidence/result.txt
+            ${{ runner.temp }}/we-w1-evidence/SHA256SUMS

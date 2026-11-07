@@ -35,19 +35,24 @@
 //!   two fixed, non-sensitive entries are added back, each documented at
 //!   its construction site below.
 //!
-//! This boundary is deliberately Git-specific and minimal. It is not a
-//! generic process-runner facility: no timeouts, no terminate/kill
-//! handling, no streaming, and no output digests exist at this slice. The
-//! only capability provided is running one resolved-Git command inside one
-//! canonical directory and capturing its exit status plus its stdout/stderr
-//! text, with the exact stdout bytes retained for byte-exact parsers.
+//! Every operation is additionally hardened (WE-W1-1): fixed `-c` overrides
+//! disable hooks, fsmonitor, signing programs and transports
+//! ([`HARDENED_CONFIG`]); a fixed environment pins configuration sources and
+//! disables prompts ([`HARDENED_ENV`]); repositories declaring filters or
+//! includes are refused before content-touching operations; and every run
+//! goes through the crate's bounded runner with a deadline, process-group
+//! cleanup and bounded capture. Oversize output is a typed error, never
+//! parsed. This is Git-specific hardening, not a sandbox.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::process::Command;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use crate::error::WorkspaceError;
+use crate::execution::{ProcessRunRequest, ProcessTimeoutPolicy, run_with_timeout_and_capture};
 
 /// Process-wide cache of the resolved absolute canonical `git` executable.
 ///
@@ -126,11 +131,24 @@ pub(crate) fn resolved_git_executable() -> Result<&'static Path, WorkspaceError>
 /// Locates the first executable regular-file `git` among the candidate
 /// locations and returns its canonical absolute path, if any.
 fn resolve_git_executable() -> Option<PathBuf> {
+    resolve_git_from_path(std::env::var_os("PATH").as_deref(), &FALLBACK_GIT_LOCATIONS)
+}
+
+pub(super) fn resolve_git_from_path(
+    path_value: Option<&OsStr>,
+    fallbacks: &[&str],
+) -> Option<PathBuf> {
     let mut candidates = Vec::new();
-    if let Some(path_value) = std::env::var_os("PATH") {
-        candidates.extend(std::env::split_paths(&path_value).map(|entry| entry.join("git")));
+    if let Some(path_value) = path_value {
+        // Admit the entry before any filesystem lookup, including on platforms
+        // where a rooted or drive-relative path is not absolute.
+        candidates.extend(
+            std::env::split_paths(path_value)
+                .filter(|entry| entry.is_absolute())
+                .map(|entry| entry.join("git")),
+        );
     }
-    candidates.extend(FALLBACK_GIT_LOCATIONS.iter().map(PathBuf::from));
+    candidates.extend(fallbacks.iter().map(PathBuf::from));
 
     for candidate in candidates {
         if !is_executable_file(&candidate) {
@@ -186,16 +204,64 @@ pub(crate) fn subprocess_cwd(
     })
 }
 
-/// Builds the exact production child-Git [`Command`] for `operation`.
+/// Repository-independent configuration pinned on every Workspace Git call.
 ///
-/// The returned command runs the resolved absolute canonical `git`
-/// executable inside the canonicalized form of `directory`, with `args`
-/// appended verbatim as individual argv values, under the fixed allowlisted
-/// environment described below. Nothing here spawns a process; tests may
-/// inspect the fully configured command without executing it.
+/// Command-line `-c` entries outrank repository configuration, so repository
+/// hooks, fsmonitor daemons, signing programs and transports can never run
+/// inside an orchestrator-owned Git operation. Filters and includes cannot be
+/// neutralized without changing content semantics; they are refused by
+/// [`refuse_untrusted_repository_config`] instead.
+pub(crate) const HARDENED_CONFIG: [&str; 14] = [
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.untrackedCache=false",
+    "-c",
+    "commit.gpgSign=false",
+    "-c",
+    "tag.gpgSign=false",
+    "-c",
+    "protocol.allow=never",
+    "-c",
+    "core.splitIndex=false",
+];
+
+/// Fixed child environment; nothing is inherited from the parent.
 ///
-/// Exposed at crate visibility only, and only for this Git boundary — this
-/// is not a generic execution surface.
+/// * `GIT_CONFIG_NOSYSTEM`/`GIT_CONFIG_GLOBAL` — host and user configuration
+///   cannot alter repository operations (`HOME` is not inherited either).
+/// * `GIT_TERMINAL_PROMPT=0` — Git never waits for interactive input.
+/// * `GIT_NO_REPLACE_OBJECTS=1` — replace refs cannot substitute objects.
+pub(crate) const HARDENED_ENV: [(&str, &str); 4] = [
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GIT_NO_REPLACE_OBJECTS", "1"),
+];
+
+/// Deadline for one local Git operation. Local Workspace operations never
+/// fetch; exceeding this is a typed failure, never a partial success.
+pub(crate) const GIT_RUN_TIMEOUT: Duration = Duration::from_secs(120);
+/// Grace between group SIGTERM and SIGKILL for a timed-out Git operation.
+pub(crate) const GIT_TERMINATION_GRACE: Duration = Duration::from_secs(2);
+
+fn hardened_args(args: &[&OsStr]) -> Vec<OsString> {
+    HARDENED_CONFIG
+        .iter()
+        .map(OsString::from)
+        .chain(args.iter().map(|arg| arg.to_os_string()))
+        .collect()
+}
+
+/// Builds the exact hardened child-Git [`Command`] for `operation`.
+///
+/// The command runs the resolved absolute canonical `git` executable inside
+/// the canonicalized form of `directory`, with [`HARDENED_CONFIG`] followed
+/// by `args` as individual argv values, under [`HARDENED_ENV`] only. Nothing
+/// here spawns a process; tests use it to inspect and drive fixtures.
+#[cfg(test)]
 pub(crate) fn prepared_command(
     directory: &Path,
     operation: &'static str,
@@ -205,54 +271,272 @@ pub(crate) fn prepared_command(
     let cwd = subprocess_cwd(directory, operation)?;
 
     let mut command = Command::new(executable);
-    // The child inherits nothing: ambient Git-control variables (GIT_DIR,
-    // GIT_WORK_TREE, GIT_INDEX_FILE, GIT_OBJECT_DIRECTORY,
-    // GIT_ALTERNATE_OBJECT_DIRECTORIES, GIT_COMMON_DIR, GIT_CONFIG*,
-    // GIT_CEILING_DIRECTORIES, GIT_EXEC_PATH, GIT_SSH*, GIT_ASKPASS,
-    // GIT_TERMINAL_PROMPT) and arbitrary credential-related state must
-    // never influence this bounded local operation.
     command.env_clear();
-    // Fixed, non-sensitive allowlist entries required for deterministic
-    // local behavior across macOS/Linux hosts:
-    //
-    // * GIT_CONFIG_NOSYSTEM=1 — ignore the system-wide /etc/gitconfig so
-    //   ambient host configuration cannot alter provisioning behavior.
-    // * GIT_CONFIG_GLOBAL=/dev/null — pin global configuration lookup to an
-    //   empty source instead of depending on $HOME-derived paths (HOME is
-    //   intentionally not inherited either). Repository-local .git/config
-    //   still applies, as the repository being operated on.
-    command.env("GIT_CONFIG_NOSYSTEM", "1");
-    command.env("GIT_CONFIG_GLOBAL", "/dev/null");
+    command.envs(HARDENED_ENV);
     command.current_dir(cwd);
-    command.args(args);
+    command.args(hardened_args(args));
     Ok(command)
 }
 
-/// Runs one resolved-Git command whose working directory is the canonical
-/// form of `directory`, capturing its output.
+/// One completed hardened Git run with complete, bounded raw streams.
+#[derive(Debug)]
+pub(crate) struct GitRun {
+    pub(crate) success: bool,
+    pub(crate) code: Option<i32>,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+    pub(crate) stdout_total: u64,
+    pub(crate) stderr_total: u64,
+    pub(crate) stdout_truncated: bool,
+    pub(crate) stderr_truncated: bool,
+}
+
+/// Runs one hardened Git command through the crate's accepted bounded
+/// runner: dedicated process group, monotonic deadline, SIGTERM → grace →
+/// SIGKILL, verified reap/group emptiness and separate bounded capture.
 ///
-/// The program is the process-wide resolved absolute canonical Git binary;
-/// `args` are appended verbatim as individual argv values and never
-/// interpreted by any shell. Any preparation failure (unresolvable
-/// executable or uncanonicalizable working directory) fails closed before a
-/// child exists.
+/// A timeout is [`WorkspaceError::GitTimedOut`]; any other runner failure is
+/// [`WorkspaceError::GitSpawnFailed`]. Streams beyond the runner's retention
+/// bound are reported with `*_truncated` and must not be parsed.
+pub(crate) fn run(
+    directory: &Path,
+    operation: &'static str,
+    args: &[&OsStr],
+) -> Result<GitRun, WorkspaceError> {
+    let executable = resolved_git_executable()?;
+    let cwd = subprocess_cwd(directory, operation)?;
+    let request = ProcessRunRequest::new(executable, hardened_args(args), &cwd, &cwd)
+        .map_err(|error| WorkspaceError::GitSpawnFailed {
+            operation,
+            detail: error.to_string(),
+        })?
+        .with_fixed_env(&HARDENED_ENV);
+    run_request(&request, operation)
+}
+
+/// Supplies the confinement for Git run by the protected controller.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) trait ControllerLaunch: Send + Sync {
+    fn customization(&self) -> Result<crate::execution::LaunchCustomization, String>;
+
+    /// A confined run failed to start or to be collected, so its process
+    /// containment is not proven. The protected release must then retain
+    /// custody instead of returning ownership.
+    fn cleanup_unproven(&self) {}
+}
+
+thread_local! {
+    static CONTROLLER: std::cell::RefCell<Option<std::sync::Arc<dyn ControllerLaunch>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// While alive, every hardened Git call on this thread runs as the confined
+/// controller (fresh confinement and containment per call). Restores the
+/// previous scope on drop.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct ControllerScope(Option<std::sync::Arc<dyn ControllerLaunch>>);
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl ControllerScope {
+    pub(crate) fn enter(launch: std::sync::Arc<dyn ControllerLaunch>) -> Self {
+        Self(CONTROLLER.with(|slot| slot.borrow_mut().replace(launch)))
+    }
+}
+
+impl Drop for ControllerScope {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        CONTROLLER.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn run_confined(
+    request: &ProcessRunRequest,
+    operation: &'static str,
+    launch: &dyn ControllerLaunch,
+    policy: &ProcessTimeoutPolicy,
+) -> Result<GitRun, WorkspaceError> {
+    use crate::execution::LiveProcessTerminalCause;
+    let failed = |detail: String| WorkspaceError::GitSpawnFailed { operation, detail };
+    let customization = launch.customization().map_err(failed)?;
+    let attempt = crate::execution::live_attempt_start_customized(request, policy, customization)
+        .map_err(|error| {
+        launch.cleanup_unproven();
+        failed(error.to_string())
+    })?;
+    let outcome = attempt.wait_collect().map_err(|error| {
+        launch.cleanup_unproven();
+        failed(error.to_string())
+    })?;
+    if outcome.terminal_cause() == LiveProcessTerminalCause::TimedOut {
+        return Err(WorkspaceError::GitTimedOut {
+            operation,
+            timeout: policy.run_timeout(),
+        });
+    }
+    let joined = |stream: &crate::execution::CapturedStream| {
+        let mut bytes = stream.head().to_vec();
+        bytes.extend_from_slice(stream.tail());
+        bytes
+    };
+    Ok(GitRun {
+        success: outcome.success(),
+        code: outcome.exit_code(),
+        stdout: joined(outcome.stdout()),
+        stderr: joined(outcome.stderr()),
+        stdout_total: outcome.stdout().total_bytes(),
+        stderr_total: outcome.stderr().total_bytes(),
+        stdout_truncated: outcome.stdout().truncated(),
+        stderr_truncated: outcome.stderr().truncated(),
+    })
+}
+
+/// Runs one already-built request under the Git deadline policy.
+pub(crate) fn run_request(
+    request: &ProcessRunRequest,
+    operation: &'static str,
+) -> Result<GitRun, WorkspaceError> {
+    let failed = |error: crate::execution::ExecutionError| WorkspaceError::GitSpawnFailed {
+        operation,
+        detail: error.to_string(),
+    };
+    let policy =
+        ProcessTimeoutPolicy::new(git_run_timeout(), GIT_TERMINATION_GRACE).map_err(failed)?;
+    if let Some(launch) = CONTROLLER.with(|slot| slot.borrow().clone()) {
+        return run_confined(request, operation, launch.as_ref(), &policy);
+    }
+    let captured = run_with_timeout_and_capture(request, &policy).map_err(failed)?;
+    let outcome = captured.outcome();
+    if outcome.timed_out() {
+        return Err(WorkspaceError::GitTimedOut {
+            operation,
+            timeout: git_run_timeout(),
+        });
+    }
+    let joined = |stream: &crate::execution::CapturedStream| {
+        let mut bytes = stream.head().to_vec();
+        bytes.extend_from_slice(stream.tail());
+        bytes
+    };
+    Ok(GitRun {
+        success: outcome.success(),
+        code: outcome.exit_code(),
+        stdout: joined(captured.stdout()),
+        stderr: joined(captured.stderr()),
+        stdout_total: captured.stdout().total_bytes(),
+        stderr_total: captured.stderr().total_bytes(),
+        stdout_truncated: captured.stdout().truncated(),
+        stderr_truncated: captured.stderr().truncated(),
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_GIT_TIMEOUT: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct GitTimeoutGuard(Option<Duration>);
+
+#[cfg(test)]
+impl Drop for GitTimeoutGuard {
+    fn drop(&mut self) {
+        TEST_GIT_TIMEOUT.set(self.0);
+    }
+}
+
+/// Test-only deadline override for this thread.
+#[cfg(test)]
+pub(crate) fn override_git_timeout_for_test(timeout: Duration) -> GitTimeoutGuard {
+    GitTimeoutGuard(TEST_GIT_TIMEOUT.replace(Some(timeout)))
+}
+
+fn git_run_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(timeout) = TEST_GIT_TIMEOUT.get() {
+        return timeout;
+    }
+    GIT_RUN_TIMEOUT
+}
+
+/// Runs one hardened Git command and requires complete (untruncated) stdout,
+/// which parsers may then consume byte-exactly. Exit status is reported, not
+/// judged: callers decide what a nonzero exit means.
 pub(crate) fn capture(
     directory: &Path,
     operation: &'static str,
     args: &[&OsStr],
 ) -> Result<GitCapture, WorkspaceError> {
-    let mut command = prepared_command(directory, operation, args)?;
-    let output = command
-        .output()
-        .map_err(|error| WorkspaceError::GitSpawnFailed {
+    let run = run(directory, operation, args)?;
+    if run.stdout_truncated {
+        return Err(WorkspaceError::GitOutputTooLarge {
             operation,
-            detail: error.to_string(),
-        })?;
+            total_bytes: run.stdout_total,
+        });
+    }
+    let exit_status = match run.code {
+        Some(code) => format!("exit status: {code}"),
+        None => "terminated by signal".to_string(),
+    };
     Ok(GitCapture {
-        success: output.status.success(),
-        exit_status: output.status.to_string(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        raw_stdout: output.stdout,
+        success: run.success,
+        exit_status,
+        stdout: String::from_utf8_lossy(&run.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&run.stderr).into_owned(),
+        raw_stdout: run.stdout,
     })
+}
+
+pub(crate) const UNTRUSTED_CONFIG_PATTERN: &str = "^(filter|include|includeif)\\.";
+
+/// Refuses repositories whose effective configuration declares content
+/// filters or configuration includes.
+///
+/// Filters (`filter.*`) run arbitrary programs during checkout/status and
+/// cannot be disabled without changing content semantics. Includes
+/// (`include.*`, `includeIf.*`) can pull configuration from outside the
+/// protected repository metadata; this boundary refuses all of them rather
+/// than reasoning about include custody. Values are never read or echoed.
+pub(crate) fn refuse_untrusted_repository_config(
+    root: &Path,
+    operation: &'static str,
+) -> Result<(), WorkspaceError> {
+    let listing = capture(
+        root,
+        operation,
+        &[
+            OsStr::new("config"),
+            OsStr::new("--null"),
+            OsStr::new("--name-only"),
+            OsStr::new("--get-regexp"),
+            OsStr::new(UNTRUSTED_CONFIG_PATTERN),
+        ],
+    )?;
+    if listing.success {
+        let key = listing
+            .raw_stdout()
+            .split(|byte| *byte == 0)
+            .next()
+            .map(|key| String::from_utf8_lossy(key).into_owned())
+            .unwrap_or_default();
+        return Err(WorkspaceError::RepositoryConfigRefused { key });
+    }
+    // `git config --get-regexp` exits 1 exactly when nothing matched.
+    if listing.exit_status == "exit status: 1" && listing.raw_stdout().is_empty() {
+        return Ok(());
+    }
+    Err(WorkspaceError::GitCommandFailed {
+        operation,
+        detail: format!("{}; stderr: {}", listing.exit_status, listing.stderr.trim()),
+    })
+}
+
+/// Parses `git version` output and requires at least `major.minor`.
+pub(crate) fn git_version_at_least(output: &str, major: u32, minor: u32) -> Option<bool> {
+    let rest = output.trim().strip_prefix("git version ")?;
+    let mut parts = rest.split(|c: char| !c.is_ascii_digit());
+    let found_major: u32 = parts.next()?.parse().ok()?;
+    let found_minor: u32 = parts.next()?.parse().ok()?;
+    Some((found_major, found_minor) >= (major, minor))
 }

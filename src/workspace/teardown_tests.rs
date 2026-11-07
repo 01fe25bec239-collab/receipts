@@ -96,7 +96,10 @@ fn td01_successful_teardown_returns_torn_down_and_verifies_externally() {
     assert_eq!(torn.workspace_id(), "ws-teardown-ok");
     assert_eq!(torn.task_id(), Some("task-teardown"));
     assert_eq!(torn.branch(), "task/teardown-me");
-    assert_eq!(torn.worktree_path(), worktree_path);
+    assert_eq!(
+        torn.worktree_path(),
+        crate::provision::canonical_target(&worktree_path).unwrap()
+    );
     assert_eq!(torn.base_sha().as_str(), base_sha);
     assert_eq!(
         torn.head_sha().map(CommitSha::as_str),
@@ -525,7 +528,10 @@ fn explicit_remote_policies_are_preserved_without_remote_behavior() {
         assert_eq!(handle.workspace_id(), "ws-policy");
         assert_eq!(handle.task_id(), Some("task-policy"));
         assert_eq!(handle.branch(), "task/policy");
-        assert_eq!(handle.worktree_path(), worktree_path);
+        assert_eq!(
+            handle.worktree_path(),
+            crate::provision::canonical_target(&worktree_path).unwrap()
+        );
         assert_eq!(handle.base_sha().as_str(), base_sha);
         assert_eq!(handle.head_sha(), Some(handle.base_sha()));
         assert_eq!(handle.isolation(), WorkspaceIsolation::WorkspaceIsolation);

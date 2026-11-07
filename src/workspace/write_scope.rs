@@ -1,10 +1,21 @@
 //! Read-only post-hoc write-scope verification under A0 WRITE-PATH CONTRACT V1.
 //! Git path identities stay strict UTF-8 strings; no filesystem normalization
 //! or alternative glob dialect participates in matching.
+//!
+//! R9 evidence scope: the verified set is exactly the commit-to-commit tree
+//! diff. Changed tracked files are included even when ignore rules match
+//! them (ignore rules never apply to tracked content). Ignored *untracked*
+//! worktree content is never committed and is explicitly outside this
+//! evidence: it is not inspected and never reported as verified. Filesystem
+//! case aliases are checked separately ([`crate::write_scope_case`]); an
+//! alias or unestablished equivalence fails verification closed.
 
 use std::path::Path;
 
 use crate::write_path_pattern::{WritePathPattern, WritePathSet, validate_write_path};
+use crate::write_scope_case::{
+    FilesystemCaseSensitivity, WriteScopeCaseAliasCheck, analyze, probe_case_sensitivity,
+};
 
 use crate::checkpoint_evidence_capture::{RawStream, observe};
 use crate::{
@@ -52,9 +63,14 @@ pub struct WriteScopeVerification {
     changed_paths: Vec<String>,
     unauthorized_paths: Vec<String>,
     forbidden_matches: Vec<ForbiddenWriteMatch>,
+    case_alias: WriteScopeCaseAliasCheck,
 }
 
 impl WriteScopeVerification {
+    /// R9 filesystem case-alias outcome for the changed paths.
+    pub fn case_alias(&self) -> &WriteScopeCaseAliasCheck {
+        &self.case_alias
+    }
     pub fn verification(&self) -> WriteScopeVerificationStatus {
         self.verification
     }
@@ -216,11 +232,19 @@ pub fn verify_write_scope(
     unauthorized_paths.sort();
     forbidden_matches.sort();
     forbidden_matches.dedup();
-    let verification = if unauthorized_paths.is_empty() && forbidden_matches.is_empty() {
-        WriteScopeVerificationStatus::Pass
-    } else {
-        WriteScopeVerificationStatus::Fail
-    };
+    let case_alias = case_alias_check(
+        repository_root,
+        &[&baseline_sha, &candidate_sha],
+        &changed_paths,
+        &allowed,
+        &forbidden,
+    )?;
+    let verification =
+        if unauthorized_paths.is_empty() && forbidden_matches.is_empty() && case_alias.passes() {
+            WriteScopeVerificationStatus::Pass
+        } else {
+            WriteScopeVerificationStatus::Fail
+        };
     Ok(WriteScopeVerification {
         verification,
         baseline_sha,
@@ -228,7 +252,37 @@ pub fn verify_write_scope(
         changed_paths,
         unauthorized_paths,
         forbidden_matches,
+        case_alias,
     })
+}
+
+fn case_alias_check(
+    root: &Path,
+    commits: &[&CommitSha],
+    changed: &[String],
+    allowed: &WritePathSet,
+    forbidden: &WritePathSet,
+) -> Result<WriteScopeCaseAliasCheck, WriteScopeVerificationError> {
+    let filesystem = probe_case_sensitivity(root);
+    let mut tracked = std::collections::BTreeSet::new();
+    if filesystem != FilesystemCaseSensitivity::Sensitive && !changed.is_empty() {
+        for commit in commits {
+            let listing = run_git(
+                root,
+                WriteScopeGitOperation::ChangedPaths,
+                &[
+                    "ls-tree",
+                    "-r",
+                    "-z",
+                    "--name-only",
+                    "--full-tree",
+                    commit.as_str(),
+                ],
+            )?;
+            tracked.extend(parse_paths(listing)?);
+        }
+    }
+    Ok(analyze(filesystem, changed, &tracked, allowed, forbidden))
 }
 
 fn run_git(
