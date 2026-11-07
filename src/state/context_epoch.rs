@@ -222,7 +222,7 @@ impl ChangedSourceRefType {
         }
     }
 
-    fn from_storage(value: &str) -> Result<Self, StateError> {
+    pub(crate) fn from_storage(value: &str) -> Result<Self, StateError> {
         match value {
             "REPO_PATH" => Ok(Self::RepoPath),
             "STATE_QUERY" => Ok(Self::StateQuery),

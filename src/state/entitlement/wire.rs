@@ -107,7 +107,7 @@ impl<'de> Visitor<'de> for EntitlementVisitor<'_> {
     }
 }
 
-pub(super) fn parse(raw: &[u8]) -> Result<ProductEntitlement, Error> {
+pub(crate) fn parse(raw: &[u8]) -> Result<ProductEntitlement, Error> {
     if raw.len() > MAX_ENTITLEMENT_WIRE_BYTES {
         return Err(Error::DocumentTooLarge);
     }

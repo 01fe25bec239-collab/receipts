@@ -4,16 +4,14 @@
 //! role's authoritative context-source list: which references constitute
 //! the role's context, the content digest recorded for each source at last
 //! rehydration, and which execution phases each source is required for.
-//! Each durable role has exactly one authoritative manifest; this slice
-//! enforces that at the storage layer with a UNIQUE constraint over
-//! `context_manifest(role_id)` backed by a foreign key to the durable
-//! [`LogicalRole`](crate::logical_role::LogicalRole) identity.
+//! A role's context pointer selects one authoritative manifest from immutable
+//! historical versions. Legacy creation admits only the first version;
+//! `supersede_context_manifest` creates and attaches successors atomically.
 //!
 //! Scope of this slice: create + durable read only. A manifest is
 //! immutable once persisted — there is deliberately no public update,
-//! replace, upsert, delete, or per-field mutation path (including
-//! `last_rehydrated_at`); manifest mutation is a later orchestrator action
-//! requiring its own event/epoch semantics. Source order and
+//! upsert, delete, or per-field mutation path (including `last_rehydrated_at`).
+//! Successors receive distinct identities and preserve old snapshots. Source order and
 //! `required_for` order are persisted explicitly through contiguous
 //! ordinals and round-trip exactly: nothing is sorted, deduplicated,
 //! normalized, or defaulted.
@@ -280,7 +278,7 @@ impl SqliteStateRepository {
     /// * a `role_id` that already owns a different manifest fails with
     ///   [`StateError::ContextManifestRoleAlreadyHasManifest`] naming the
     ///   existing manifest, leaving it untouched — at most one
-    ///   authoritative manifest per role may persist, and the existing
+    ///   manifest per role may be created through this API, and the existing
     ///   manifest is never replaced, deleted, updated, or silently chosen
     ///   over;
     /// * an invalid input shape fails with
@@ -293,7 +291,7 @@ impl SqliteStateRepository {
     /// caller values reach SQL through bound parameters.
     pub fn create_context_manifest(&mut self, manifest: ContextManifest) -> Result<(), StateError> {
         validate_for_create(&manifest)?;
-        self.run_transaction(|uow| uow.insert_context_manifest(&manifest))
+        self.run_serialized_transaction(|uow| uow.insert_context_manifest(&manifest))
     }
 
     /// Reads one ContextManifest by durable identity.
@@ -334,7 +332,7 @@ impl UnitOfWork<'_> {
         &self,
         manifest: &ContextManifest,
     ) -> Result<(), StateError> {
-        insert_context_manifest(self.tx(), manifest)
+        insert_context_manifest(self.tx(), manifest, true)
     }
 }
 
@@ -413,9 +411,10 @@ ORDER BY required_for_ordinal";
 /// against a concurrent writer on the same database file). Check order
 /// preserves the contract precedence: duplicate `manifest_id` first, then
 /// role existence, then the one-manifest-per-role guard, then the inserts.
-fn insert_context_manifest(
+pub(crate) fn insert_context_manifest(
     conn: &Connection,
     manifest: &ContextManifest,
+    legacy: bool,
 ) -> Result<(), StateError> {
     let duplicate: Option<i64> = conn
         .query_row(MANIFEST_EXISTS_SQL, [&manifest.manifest_id], |row| {
@@ -441,7 +440,7 @@ fn insert_context_manifest(
         });
     }
 
-    if let Some(existing_manifest_id) = find_role_manifest(conn, &manifest.role_id)? {
+    if legacy && let Some(existing_manifest_id) = find_role_manifest(conn, &manifest.role_id)? {
         return Err(StateError::ContextManifestRoleAlreadyHasManifest {
             role_id: manifest.role_id.clone(),
             existing_manifest_id,
@@ -508,6 +507,15 @@ fn insert_context_manifest(
                 .map_err(write_failure)?;
         }
     }
+    if crate::graph_repository::schema_head(conn, crate::GraphPhase::Write)?
+        .is_some_and(|head| head >= 18)
+    {
+        conn.execute(
+            "INSERT INTO context_manifest_seal(manifest_id) VALUES (?1)",
+            [&manifest.manifest_id],
+        )
+        .map_err(write_failure)?;
+    }
     Ok(())
 }
 
@@ -555,7 +563,7 @@ fn role_conflict_from_backstop(
 
 /// Reads one manifest graph on the caller's snapshot and applies contract
 /// decoding, failing closed on any violation.
-fn read_context_manifest(
+pub(crate) fn read_context_manifest(
     conn: &Connection,
     manifest_id: &str,
 ) -> Result<Option<ContextManifest>, StateError> {
@@ -566,6 +574,23 @@ fn read_context_manifest(
     else {
         return Ok(None);
     };
+    if crate::graph_repository::schema_head(conn, crate::GraphPhase::Read)?
+        .is_some_and(|head| head >= 18)
+    {
+        let sealed = conn
+            .query_row(
+                "SELECT 1 FROM context_manifest_seal WHERE manifest_id=?1",
+                [manifest_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(internal_query_failure)?;
+        if sealed.is_none() {
+            return Err(StateError::ContextManifestDecodeFailed {
+                detail: "unsealed manifest".into(),
+            });
+        }
+    }
     let source_rows = read_source_rows(conn, manifest_id)?;
     row.into_context_manifest(conn, source_rows).map(Some)
 }
@@ -796,7 +821,7 @@ fn extract_source_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceRow> {
 /// value is accepted unchanged or rejected — never normalized, trimmed,
 /// hashed, rewritten, or regenerated. The closed enumerations are already
 /// restricted to their contract sets by their enum types.
-fn validate_for_create(manifest: &ContextManifest) -> Result<(), StateError> {
+pub(crate) fn validate_for_create(manifest: &ContextManifest) -> Result<(), StateError> {
     ensure_identifier("manifest_id", &manifest.manifest_id)?;
     ensure_identifier("role_id", &manifest.role_id)?;
     ensure_identifier("project_id", &manifest.project_id)?;

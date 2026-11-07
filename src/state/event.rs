@@ -29,8 +29,10 @@
 //!   behind an incomplete caller secret list).
 //!
 //! Events are immutable durable evidence: this module offers append and
-//! read-by-`event_id` only. There is no update, delete, replace, upsert,
-//! merge, rewrite, truncate, or clear capability, and a duplicate
+//! read-by-`event_id` only, and migration 17 adds storage triggers refusing
+//! UPDATE, DELETE and replacing INSERTs of an existing row. There is no
+//! update, delete, replace, upsert, merge, rewrite, truncate, or clear
+//! capability, and a duplicate
 //! `event_id` fails explicitly with the original row untouched. `event_id`
 //! is a canonical ULID (exactly 26 Crockford Base32 characters) validated
 //! structurally, without a new dependency. `occurred_at` is an opaque
@@ -40,6 +42,7 @@
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
+use crate::canonical_timestamp::CanonicalTimestampV1;
 use crate::epoch_value::StateEpochValueV1;
 use crate::error::StateError;
 use crate::repository::{SqliteStateRepository, UnitOfWork};
@@ -505,6 +508,37 @@ pub struct EventQuery {
     pub limit: u32,
 }
 
+/// A checked chronological selection over [`EventQuery`].
+///
+/// `since` is inclusive and `until` exclusive; both, when present, must be
+/// [`CanonicalTimestampV1`] spellings and `since` must not be after `until`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventTimeQueryV1 {
+    /// Exact project/subject/type selection and final limit.
+    pub selection: EventQuery,
+    pub since: Option<String>,
+    pub until: Option<String>,
+}
+
+/// Validates selection arguments; `None` means the selection is empty.
+fn validated_selection(query: &EventQuery) -> Result<Option<Option<Vec<EventType>>>, StateError> {
+    ensure_non_empty("project_id", &query.project_id)?;
+    if let Some(subject) = &query.subject {
+        ensure_non_empty("subject.id", &subject.id)?;
+    }
+    // Deduplicated, in contract order.
+    let types = query.event_types.as_ref().map(|requested| {
+        EventType::ALL
+            .into_iter()
+            .filter(|candidate| requested.contains(candidate))
+            .collect::<Vec<_>>()
+    });
+    if query.limit == 0 || types.as_ref().is_some_and(Vec::is_empty) {
+        return Ok(None);
+    }
+    Ok(Some(types))
+}
+
 impl SqliteStateRepository {
     /// Lists persisted events matching `query`, ordered by `event_id` in
     /// ascending byte order, from one SQLite read snapshot.
@@ -516,21 +550,77 @@ impl SqliteStateRepository {
     /// decoding fails the whole call; nothing partial is returned. The read
     /// writes nothing.
     pub fn list_events(&self, query: &EventQuery) -> Result<Vec<EventEnvelope>, StateError> {
-        ensure_non_empty("project_id", &query.project_id)?;
-        if let Some(subject) = &query.subject {
-            ensure_non_empty("subject.id", &subject.id)?;
-        }
-        // Deduplicated, in contract order.
-        let types = query.event_types.as_ref().map(|requested| {
-            EventType::ALL
-                .into_iter()
-                .filter(|candidate| requested.contains(candidate))
-                .collect::<Vec<_>>()
-        });
-        if query.limit == 0 || types.as_ref().is_some_and(Vec::is_empty) {
+        let Some(types) = validated_selection(query)? else {
             return Ok(Vec::new());
-        }
+        };
+        self.select_events(query, types.as_deref(), Some(query.limit))
+    }
 
+    /// Lists selected events in semantic time order.
+    ///
+    /// Exact project/subject/type selection runs first and every selected
+    /// row is decoded and its `occurred_at` validated as
+    /// [`CanonicalTimestampV1`] in one read snapshot. Any selected timestamp
+    /// outside that domain refuses the whole result with
+    /// [`StateError::EventTimestampOutsideQueryDomain`]; it is never dropped
+    /// or ordered by identity instead. Rows inside the inclusive `since` /
+    /// exclusive `until` bounds are sorted by timestamp, then binary
+    /// `event_id`, and `limit` applies last. Other projects and nonselected
+    /// subjects or types are never examined. The read writes nothing, and
+    /// legacy event admission is unchanged.
+    pub fn list_events_chronological(
+        &self,
+        query: &EventTimeQueryV1,
+    ) -> Result<Vec<EventEnvelope>, StateError> {
+        let parse = |bound: &Option<String>| {
+            bound
+                .as_deref()
+                .map(CanonicalTimestampV1::parse)
+                .transpose()
+                .map_err(|_| StateError::EventQueryInvalid {
+                    detail: "time bound is not a canonical timestamp",
+                })
+        };
+        let since = parse(&query.since)?;
+        let until = parse(&query.until)?;
+        if let (Some(since), Some(until)) = (&since, &until)
+            && since > until
+        {
+            return Err(StateError::EventQueryInvalid {
+                detail: "since is after until",
+            });
+        }
+        let Some(types) = validated_selection(&query.selection)? else {
+            return Ok(Vec::new());
+        };
+        let mut timed = Vec::new();
+        for event in self.select_events(&query.selection, types.as_deref(), None)? {
+            let Ok(at) = CanonicalTimestampV1::parse(&event.occurred_at) else {
+                return Err(StateError::EventTimestampOutsideQueryDomain {
+                    event_id: event.event_id,
+                });
+            };
+            if since.as_ref().is_none_or(|since| &at >= since)
+                && until.as_ref().is_none_or(|until| &at < until)
+            {
+                timed.push((at, event));
+            }
+        }
+        timed.sort_by(|(a, x), (b, y)| {
+            a.cmp(b)
+                .then_with(|| x.event_id.as_bytes().cmp(y.event_id.as_bytes()))
+        });
+        timed.truncate(usize::try_from(query.selection.limit).unwrap_or(usize::MAX));
+        Ok(timed.into_iter().map(|(_, event)| event).collect())
+    }
+
+    /// One read snapshot of selected, fully decoded rows in identity order.
+    fn select_events(
+        &self,
+        query: &EventQuery,
+        types: Option<&[EventType]>,
+        limit: Option<u32>,
+    ) -> Result<Vec<EventEnvelope>, StateError> {
         // Only fixed fragments and `?` placeholders are composed; every
         // caller value is bound as a parameter.
         let mut sql = String::from(LIST_EVENTS_SQL);
@@ -540,14 +630,17 @@ impl SqliteStateRepository {
             args.push(subject.kind.as_str().to_owned().into());
             args.push(subject.id.clone().into());
         }
-        if let Some(types) = &types {
+        if let Some(types) = types {
             sql.push_str(" AND event_type IN (");
             sql.push_str(&vec!["?"; types.len()].join(", "));
             sql.push(')');
             args.extend(types.iter().map(|t| Value::from(t.as_str().to_owned())));
         }
-        sql.push_str(" ORDER BY event_id COLLATE BINARY ASC LIMIT ?");
-        args.push(Value::Integer(i64::from(query.limit)));
+        sql.push_str(" ORDER BY event_id COLLATE BINARY ASC");
+        if let Some(limit) = limit {
+            sql.push_str(" LIMIT ?");
+            args.push(Value::Integer(i64::from(limit)));
+        }
 
         let tx = self
             .connection()

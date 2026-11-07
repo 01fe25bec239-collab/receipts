@@ -191,20 +191,20 @@ fn t01_fresh_database_bootstraps_to_schema_version_7() {
     let registered = migrations::registered();
     assert_eq!(
         registered.len(),
-        16,
-        "exactly sixteen registered migrations may exist"
+        19,
+        "exactly nineteen registered migrations may exist"
     );
     assert_eq!(
         registered.last().expect("chain is non-empty").version,
-        16,
-        "the registered chain must end at version 16"
+        19,
+        "the registered chain must end at version 19"
     );
     let tmp = TempDir::new("ce-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 16);
+    assert_eq!(repo.schema_version().expect("version read"), 19);
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        16,
+        19,
         "one metadata row per applied migration"
     );
 }
@@ -215,10 +215,10 @@ fn t02_version_7_database_reopens_idempotently() {
     let tmp = TempDir::new("ce-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 16);
+        assert_eq!(repo.schema_version().expect("version read"), 19);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            16,
+            19,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -241,7 +241,7 @@ fn t03_ordinary_open_of_version_6_fails_closed() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 6,
-                supported: 16
+                supported: 19
             }
         ),
         "unexpected error: {error}"
@@ -326,6 +326,7 @@ fn t04_migration_v7_creates_exactly_the_authorized_schema() {
         "executor_binding",
         "event",
         "context_manifest",
+        "context_manifest_seal",
         "context_manifest_source",
         "context_manifest_source_required_for",
         "context_epoch",
@@ -348,6 +349,9 @@ fn t04_migration_v7_creates_exactly_the_authorized_schema() {
         "graph_compiled_sources",
         "attempt_started",
         "attempt_finished",
+        "decision_records",
+        "provenance_links",
+        "logical_role_history",
     ];
     expected.sort_unstable();
     assert_eq!(
@@ -2002,10 +2006,10 @@ fn changed_sources_v10_to_v11_legacy_is_uncaptured_and_four_field_reads_survive(
     drop(repo);
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).expect("v11 -> v13"),
-        16
+        19
     );
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("v13 reopen");
-    assert_eq!(repo.schema_version().expect("version"), 16);
+    assert_eq!(repo.schema_version().expect("version"), 19);
     assert_eq!(
         repo.count_table_rows("context_epoch_changed_source")
             .expect("children"),

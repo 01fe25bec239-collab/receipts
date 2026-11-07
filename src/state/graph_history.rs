@@ -150,7 +150,12 @@ pub(crate) fn schema_matches(conn: &Connection) -> Result<bool, rusqlite::Error>
                 |r| r.get(0),
             )
             .optional()?;
-        if stored.as_deref() != Some(statement) {
+        if !crate::migrations::v0019_row_identity::definition_matches(
+            conn,
+            name,
+            stored.as_deref(),
+            statement,
+        )? {
             return Ok(false);
         }
     }

@@ -531,8 +531,11 @@ fn selected_malformed_row_fails_whole_result() {
             id: "task-1".to_string(),
         });
         assert!(repo.list_events(&subject).unwrap().is_empty());
-        repo.run_transaction(|uow| uow.execute("DELETE FROM event WHERE event_id = ?1", &[&good]))
-            .expect("remove planted row");
+        // Corruption fixture: the immutable-event guard is dropped only here.
+        crate::event_guard_tests::with_guard_disabled(&repo, "event_no_delete", |conn| {
+            conn.execute("DELETE FROM event WHERE event_id = ?1", [&good])
+        })
+        .expect("remove planted row");
     }
     // With the planted rows gone the partition decodes again.
     assert_eq!(

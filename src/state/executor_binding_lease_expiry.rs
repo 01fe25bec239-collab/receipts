@@ -73,14 +73,37 @@ impl SqliteStateRepository {
     }
 
     /// Renews only while trusted time is strictly before the current deadline.
+    ///
+    /// Eligibility, the canonical stored and new deadlines, clock continuity
+    /// and monotonicity, and a strictly later new deadline are all decided
+    /// in ONE serialized transaction that also commits the accepted trusted
+    /// time. Every refusal rolls back, leaving the prior watermark and
+    /// binding unchanged. An unsupported stored deadline is refused without
+    /// being rewritten.
     pub fn renew_executor_binding_lease(
         &mut self,
         clock: &dyn TrustedClockV1,
         binding_id: &str,
         lease_expires_at: &str,
     ) -> Result<(), StateError> {
-        let fenced = fence_binding_time(self, clock, binding_id)?;
-        apply_renewal_with_fenced_time(self, fenced, binding_id, lease_expires_at)
+        let (sample, timestamp) = validate_sample(clock.sample()?)?;
+        ensure_identifier("binding_id", binding_id)?;
+        self.run_serialized_transaction(|uow| {
+            let binding = require_binding(uow.tx(), binding_id)?;
+            let project_id = binding_project_id(uow.tx(), &binding)?;
+            accept_sample(uow.tx(), &project_id, &sample, &timestamp)?;
+            require_unreleased(&binding)?;
+            let current_deadline = CanonicalTimestampV1::parse(&binding.lease_expires_at)?;
+            let new_deadline = CanonicalTimestampV1::parse(lease_expires_at)?;
+            if timestamp >= current_deadline || new_deadline <= current_deadline {
+                return Err(StateError::ExecutorLeaseRenewalRefused {
+                    binding_id: binding_id.to_string(),
+                    trusted_now: sample.canonical_utc_timestamp.clone(),
+                    deadline: binding.lease_expires_at,
+                });
+            }
+            apply_lease_renewal(uow.tx(), binding_id, lease_expires_at)
+        })
     }
 }
 
@@ -104,6 +127,9 @@ pub(crate) fn fence_binding_time(
     })
 }
 
+/// Pre-fenced renewal helper retained for its stale-sample contract tests;
+/// the public renewal decides and fences in one transaction instead.
+#[cfg(test)]
 pub(crate) fn apply_renewal_with_fenced_time(
     repository: &mut SqliteStateRepository,
     fenced: FencedTrustedTimeV1,
@@ -325,6 +351,7 @@ fn binding_project_id(conn: &Connection, binding: &ExecutorBinding) -> Result<St
     })
 }
 
+#[cfg(test)]
 fn require_same_project(
     conn: &Connection,
     binding: &ExecutorBinding,

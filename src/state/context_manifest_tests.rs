@@ -102,8 +102,18 @@ fn seeded_repo(tag: &str) -> (TempDir, SqliteStateRepository) {
 /// Direct test-only SQL with bound parameters on the internal connection,
 /// mirroring the single-active-binding test convention.
 fn direct_exec(repo: &mut SqliteStateRepository, sql: &str, params: &[&dyn ToSql]) {
+    // Named corruption fixtures temporarily remove and then restore exact guards.
+    let guards: Vec<(String,String)> = repo.connection().prepare("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name LIKE 'context_manifest%'").unwrap().query_map([], |r| Ok((r.get(0)?,r.get(1)?))).unwrap().collect::<Result<_,_>>().unwrap();
+    for (name, _) in &guards {
+        repo.connection()
+            .execute_batch(&format!("DROP TRIGGER {name}"))
+            .unwrap();
+    }
     repo.run_transaction(|uow| uow.execute(sql, params))
         .expect("test corruption statement");
+    for (_, sql) in guards {
+        repo.connection().execute_batch(&sql).unwrap();
+    }
 }
 
 // T01 — a fresh version-0 database bootstraps through version 11,
@@ -114,20 +124,20 @@ fn t01_fresh_database_bootstraps_to_schema_version_7() {
     let registered = migrations::registered();
     assert_eq!(
         registered.len(),
-        16,
-        "exactly sixteen registered migrations may exist"
+        19,
+        "exactly nineteen registered migrations may exist"
     );
     assert_eq!(
         registered.last().expect("chain is non-empty").version,
-        16,
-        "the registered chain must end at version 16"
+        19,
+        "the registered chain must end at version 19"
     );
     let tmp = TempDir::new("cm-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 16);
+    assert_eq!(repo.schema_version().expect("version read"), 19);
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        16,
+        19,
         "one metadata row per applied migration"
     );
 }
@@ -138,10 +148,10 @@ fn t02_version_7_database_reopens_idempotently() {
     let tmp = TempDir::new("cm-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 16);
+        assert_eq!(repo.schema_version().expect("version read"), 19);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            16,
+            19,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -164,7 +174,7 @@ fn t03_ordinary_open_of_version_5_fails_closed() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 5,
-                supported: 16
+                supported: 19
             }
         ),
         "unexpected error: {error}"
@@ -186,7 +196,9 @@ fn t03_ordinary_open_of_version_5_fails_closed() {
 #[test]
 fn t04_migration_v6_creates_exactly_the_authorized_schema() {
     let tmp = TempDir::new("cm-t04");
-    let repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
+    let repo =
+        SqliteStateRepository::open_with_migrations(tmp.db_path(), &migrations::registered()[..6])
+            .expect("bootstrap");
     for table in [
         "context_manifest",
         "context_manifest_source",
@@ -1537,13 +1549,11 @@ fn t45_zero_source_rows_fail_closed() {
     let (_tmp, mut repo) = seeded_repo("cm-t45");
     repo.create_context_manifest(minimal_manifest("manifest-001", "role-1"))
         .expect("create");
-    repo.run_transaction(|uow| {
-        uow.execute(
-            "DELETE FROM context_manifest_source WHERE manifest_id = ?1",
-            &[&"manifest-001"],
-        )
-    })
-    .expect("test corruption delete");
+    direct_exec(
+        &mut repo,
+        "DELETE FROM context_manifest_source WHERE manifest_id=?1",
+        &[&"manifest-001"],
+    );
     let error = repo
         .find_context_manifest("manifest-001")
         .expect_err("a zero-source manifest must fail closed");
@@ -1716,7 +1726,11 @@ fn t49_failed_migration_leaves_no_partial_state() {
 // database itself.
 #[test]
 fn t50_role_uniqueness_backstop() {
-    let (_tmp, mut repo) = seeded_repo("cm-t50");
+    let tmp = TempDir::new("cm-t50");
+    let mut repo =
+        SqliteStateRepository::open_with_migrations(tmp.db_path(), &migrations::registered()[..17])
+            .unwrap();
+    repo.create_logical_role(minimal_role("role-1")).unwrap();
     repo.create_context_manifest(minimal_manifest("manifest-001", "role-1"))
         .expect("first manifest persists");
     let result = repo.run_transaction(|uow| {

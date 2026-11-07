@@ -10,7 +10,7 @@ mod product_entitlement_string_fields;
 mod product_entitlement_values;
 mod verification;
 mod vocabulary;
-mod wire;
+pub(crate) mod wire;
 
 pub use install_store::{
     InstallCachedEntitlement, InstallCachedEntitlementFailure, InstallEntitlementIngestOutcome,

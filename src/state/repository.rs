@@ -69,7 +69,7 @@ impl SqliteStateRepository {
         Ok(repo)
     }
 
-    /// Explicitly upgrades an exact v11–v15 State database to v16.
+    /// Explicitly upgrades an exact v11–v18 State database to v19.
     pub fn migrate_existing_to_current(path: impl AsRef<Path>) -> Result<u32, StateError> {
         let mut conn =
             Connection::open_with_flags(path.as_ref(), OpenFlags::SQLITE_OPEN_READ_WRITE)
@@ -96,10 +96,15 @@ impl SqliteStateRepository {
             Some(13) => graph_repository::migrate_attempt_store(&conn)?,
             Some(14) => graph_repository::verify_v14(&conn, GraphPhase::Migration)?,
             Some(15) => graph_repository::verify_v15(&conn, GraphPhase::Migration)?,
-            Some(16) => {
+            Some(16) => graph_repository::verify_v16(&conn, GraphPhase::Migration)?,
+            Some(17) => graph_repository::verify_v17(&conn, GraphPhase::Migration)?,
+            Some(18) => graph_repository::verify_v18(&conn, GraphPhase::Migration)?,
+            Some(19) => {
                 graph_repository::verify_current(&conn, GraphPhase::Migration)?;
-                return Ok(16);
+                return Ok(19);
             }
+            // v1–v10 and unknown heads are typed unsupported legacy: no
+            // automatic migration and no corruption misclassification.
             _ => {
                 return Err(StateError::GraphPersistence {
                     phase: GraphPhase::Migration,
@@ -108,16 +113,30 @@ impl SqliteStateRepository {
                 });
             }
         }
-        if found != Some(15) {
+        if found.is_some_and(|version| version < 15) {
             graph_repository::migrate_history_store(&conn)?;
         }
-        graph_repository::migrate_step(&conn, |conn| {
-            graph_repository::verify_v15(conn, GraphPhase::Migration)?;
-            conn.execute_batch(migrations::v0016_checkpoint_refs::SQL)
-                .map_err(|e| graph_repository::sqlite_error(GraphPhase::Migration, e))?;
-            graph_repository::verify_current(conn, GraphPhase::Migration)
-        })?;
-        Ok(16)
+        if found.is_some_and(|v| v < 16) {
+            graph_repository::migrate_step(&conn, |conn| {
+                graph_repository::verify_v15(conn, GraphPhase::Migration)?;
+                conn.execute_batch(migrations::v0016_checkpoint_refs::SQL)
+                    .map_err(|e| graph_repository::sqlite_error(GraphPhase::Migration, e))?;
+                graph_repository::verify_v16(conn, GraphPhase::Migration)
+            })?;
+        }
+        if found.is_some_and(|v| v < 17) {
+            graph_repository::migrate_step(&conn, |conn| {
+                graph_repository::verify_v16(conn, GraphPhase::Migration)?;
+                conn.execute_batch(migrations::v0017_decision_records::SQL)
+                    .map_err(|e| graph_repository::sqlite_error(GraphPhase::Migration, e))?;
+                graph_repository::verify_v17(conn, GraphPhase::Migration)
+            })?;
+        }
+        if found.is_some_and(|v| v < 18) {
+            migrations::v0018_manifest_successors::apply(&conn)?;
+        }
+        migrations::v0019_row_identity::apply(&conn)?;
+        Ok(19)
     }
 
     /// Version-reconciliation core of [`Self::open`], parameterized by the
@@ -148,6 +167,12 @@ impl SqliteStateRepository {
             }
             found => Err(StateError::SchemaVersionMismatch { found, supported }),
         }
+    }
+
+    /// Wraps an already configured connection; crate-private so only the
+    /// read-only [`crate::authority::StateReader`] can use it.
+    pub(crate) fn from_connection(conn: Connection) -> Self {
+        Self { conn }
     }
 
     /// The schema version durably recorded in this database.
@@ -531,6 +556,14 @@ fn bootstrap(conn: &mut Connection, chain: &[Migration]) -> Result<(), StateErro
     for migration in chain {
         if migration.version == 12 && migration.name == "context_epoch_unbounded" {
             migrations::v0012_context_epoch_unbounded::apply(conn)?;
+            continue;
+        }
+        if migration.version == 18 && migration.name == "manifest_successors" {
+            migrations::v0018_manifest_successors::apply(conn)?;
+            continue;
+        }
+        if migration.version == 19 && migration.name == "row_identity" {
+            migrations::v0019_row_identity::apply(conn)?;
             continue;
         }
         let tx = conn

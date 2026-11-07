@@ -6,11 +6,11 @@
 //! identities; `RUNTIME_A3` and `RUNTIME_A4` are ephemeral by contract and
 //! are not representable in [`LogicalRoleType`].
 //!
-//! Scope of this slice: create + durable read. There is deliberately no
-//! public mutation path (status, context epoch, active binding, retirement)
-//! and no deletion path. `context_manifest_id` and `active_binding_id` are
-//! stored as opaque nullable references: State does not create, validate,
-//! dereference, or assign behavior to ContextManifest or ExecutorBinding.
+//! Scope of this module: create + durable read. Status, context-epoch,
+//! manifest and active-binding changes live in
+//! [`crate::logical_role_lifecycle`] (checked CAS plus history); there is no
+//! deletion path. Creation stores `context_manifest_id` and
+//! `active_binding_id` as supplied opaque nullable references.
 //!
 //! State persists LogicalRole identity only; it does not decide when roles
 //! are created or how orchestration uses them.
@@ -319,7 +319,10 @@ fn insert_logical_role(conn: &Connection, role: &LogicalRole) -> Result<(), Stat
 
 /// Reads the main row and, if present, its ownership paths (ordered by
 /// stored position) on the caller's snapshot.
-fn read_logical_role(conn: &Connection, role_id: &str) -> Result<Option<LogicalRole>, StateError> {
+pub(crate) fn read_logical_role(
+    conn: &Connection,
+    role_id: &str,
+) -> Result<Option<LogicalRole>, StateError> {
     let Some(row) = conn
         .query_row(SELECT_ROLE_SQL, [role_id], extract_role_row)
         .optional()
@@ -418,7 +421,7 @@ fn validate_for_create(role: &LogicalRole) -> Result<(), StateError> {
     Ok(())
 }
 
-fn ensure_identifier(field: &str, value: &str) -> Result<(), StateError> {
+pub(crate) fn ensure_identifier(field: &str, value: &str) -> Result<(), StateError> {
     if value.is_empty() {
         return Err(StateError::LogicalRoleValidation {
             detail: format!("{field} must not be empty"),

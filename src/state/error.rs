@@ -543,17 +543,16 @@ pub enum StateError {
     },
     /// Creating a ContextManifest for a role that already owns one.
     ///
-    /// Each durable role has exactly one authoritative ContextManifest, so
-    /// at most one manifest per `role_id` may persist. The existing
-    /// manifest is never replaced, deleted, updated, or silently chosen
-    /// over: the refusal names the existing manifest instead. This is
+    /// Legacy create admits only the first manifest for a role. Historical
+    /// versions may be added by the explicit successor operation; this
+    /// refusal names a stored version, not the current authority. This is
     /// deliberately distinct from
     /// [`StateError::ContextManifestAlreadyExists`], which keeps reporting
     /// duplicate durable `manifest_id` alone.
     ContextManifestRoleAlreadyHasManifest {
         /// The `role_id` that already owns a manifest.
         role_id: String,
-        /// The `manifest_id` of the existing authoritative manifest.
+        /// The `manifest_id` of an existing stored manifest.
         existing_manifest_id: String,
     },
     /// Writing a ContextManifest failed at the storage layer.
@@ -671,6 +670,51 @@ pub enum StateError {
     ContextRehydrationWriteFailed { detail: String },
     /// Persisted attempt/evidence failed closed decoding.
     ContextRehydrationDecodeFailed { detail: String },
+    /// A LogicalRole status/binding/context change was refused; nothing was written.
+    LogicalRoleChangeRefused {
+        role_id: String,
+        reason: crate::logical_role_lifecycle::RoleChangeRefusal,
+    },
+    /// Chronological event-query arguments were invalid. Never echoes input.
+    EventQueryInvalid { detail: &'static str },
+    /// A selected event's opaque `occurred_at` is outside CanonicalTimestampV1;
+    /// the chronological result is refused rather than reordered or filtered.
+    EventTimestampOutsideQueryDomain { event_id: String },
+    /// Closed, content-free decision/provenance record diagnostic.
+    DecisionRecord {
+        code: RecordFailureCode,
+        kind: &'static str,
+    },
+    /// A State wire document was not admitted by its schema codec.
+    WireDecode { schema: &'static str },
+    /// An admitted wire value has no representation in the operational domain.
+    WireConversionUnsupported {
+        schema: &'static str,
+        field: &'static str,
+    },
+}
+
+/// Closed decision/provenance record failure reason. Never carries input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordFailureCode {
+    InvalidShape,
+    IdentityMismatch,
+    AlreadyExists,
+    StoreBusy,
+    CorruptStore,
+    StorageFailure,
+}
+impl RecordFailureCode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::InvalidShape => "INVALID_SHAPE",
+            Self::IdentityMismatch => "IDENTITY_MISMATCH",
+            Self::AlreadyExists => "ALREADY_EXISTS",
+            Self::StoreBusy => "STORE_BUSY",
+            Self::CorruptStore => "CORRUPT_STORE",
+            Self::StorageFailure => "STORAGE_FAILURE",
+        }
+    }
 }
 
 impl fmt::Display for StateError {
@@ -908,7 +952,7 @@ impl fmt::Display for StateError {
             } => {
                 write!(
                     f,
-                    "role_id {role_id:?} already owns authoritative manifest {existing_manifest_id:?}; a role may have at most one manifest, and the existing manifest is never replaced, updated, or deleted by conflict handling"
+                    "role_id {role_id:?} already owns manifest {existing_manifest_id:?}; legacy creation refuses a second manifest and preserves existing versions"
                 )
             }
             StateError::ContextManifestWriteFailed { detail } => {
@@ -1000,6 +1044,26 @@ impl fmt::Display for StateError {
             StateError::ContextRehydrationDecodeFailed { detail } => {
                 write!(f, "failed to decode ContextRehydrationAttempt: {detail}")
             }
+            StateError::LogicalRoleChangeRefused { role_id, reason } => write!(
+                f,
+                "LogicalRole {role_id:?} change refused: {}",
+                reason.as_str()
+            ),
+            StateError::EventQueryInvalid { detail } => {
+                write!(f, "invalid chronological event query: {detail}")
+            }
+            StateError::EventTimestampOutsideQueryDomain { event_id } => write!(
+                f,
+                "event {event_id:?} occurred_at is outside the chronological query time domain"
+            ),
+            StateError::DecisionRecord { code, kind } => {
+                write!(f, "decision record {kind} {}", code.label())
+            }
+            StateError::WireDecode { schema } => write!(f, "{schema} wire document refused"),
+            StateError::WireConversionUnsupported { schema, field } => write!(
+                f,
+                "{schema} wire field {field} is outside the operational domain"
+            ),
         }
     }
 }
