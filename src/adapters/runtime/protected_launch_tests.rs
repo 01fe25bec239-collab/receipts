@@ -359,17 +359,21 @@ impl Wake for Notify {
         self.changed.notify_all();
     }
 }
-/// No waker notification arrived within the limit after the last Pending.
+/// The total limit expired before the future was Ready: either no waker
+/// notification arrived, or notifications kept arriving without readiness.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct NoWakeup {
+pub(crate) struct Expired {
     pub(crate) polls: u32,
 }
 /// Repolls ONLY after an observed waker notification; there is no timer
-/// repoll. Expiry of `limit` (total) without one is a failure.
+/// repoll. `limit` is a total budget checked before every repoll whether or
+/// not a notification is pending, so continuous wakeups cannot extend it.
+/// A synchronous helper cannot preempt a `poll` that itself blocks; the bound
+/// applies between polls.
 pub(crate) fn poll_on_wakeups<T>(
     future: impl Future<Output = T>,
     limit: Duration,
-) -> Result<T, NoWakeup> {
+) -> Result<T, Expired> {
     let mut future = pin!(future);
     let notify = Arc::new(Notify::default());
     let waker = Waker::from(notify.clone());
@@ -382,10 +386,13 @@ pub(crate) fn poll_on_wakeups<T>(
             return Ok(result);
         }
         let mut woken = notify.woken.lock().unwrap();
-        while !*woken {
+        loop {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return Err(NoWakeup { polls });
+                return Err(Expired { polls });
+            }
+            if *woken {
+                break;
             }
             woken = notify.changed.wait_timeout(woken, left).unwrap().0;
         }
@@ -394,7 +401,7 @@ pub(crate) fn poll_on_wakeups<T>(
 }
 pub(crate) fn block_on<T>(future: impl Future<Output = T>) -> T {
     poll_on_wakeups(future, Duration::from_secs(30))
-        .unwrap_or_else(|e| panic!("no wakeup observed within 30 s: {e:?}"))
+        .unwrap_or_else(|e| panic!("not Ready within the 30 s wakeup bound: {e:?}"))
 }
 fn record(event: Option<DynAttemptEvent>) -> Vec<u8> {
     match event {
@@ -853,7 +860,7 @@ fn wakeup_helper_repolls_only_after_an_observed_notification() {
         }),
         Duration::from_millis(300),
     );
-    assert_eq!(never, Err(NoWakeup { polls: 1 }));
+    assert_eq!(never, Err(Expired { polls: 1 }));
     assert_eq!(polls, 1);
     assert!(start.elapsed() >= Duration::from_millis(300));
 
@@ -901,6 +908,36 @@ fn wakeup_helper_repolls_only_after_an_observed_notification() {
         start.elapsed() < Duration::from_secs(5),
         "racing wake was lost"
     );
+}
+
+#[test]
+fn wakeup_helper_total_deadline_holds_against_continuous_self_wakes() {
+    // Wakes itself during every poll and would become Ready only long after
+    // the 40 ms budget. Notifications may drive repolls inside the budget,
+    // but must not extend it: the result is a deadline failure, not the
+    // delayed success. Bounds are scheduler-tolerant (well under READY_AT).
+    const READY_AT: Duration = Duration::from_secs(2);
+    let start = Instant::now();
+    let mut polls = 0u64;
+    let result = poll_on_wakeups(
+        std::future::poll_fn(|cx| {
+            polls += 1;
+            if start.elapsed() >= READY_AT {
+                return Poll::Ready(());
+            }
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }),
+        Duration::from_millis(40),
+    );
+    let elapsed = start.elapsed();
+    let Err(expired) = result else {
+        panic!("self-waking future outlived the 40 ms bound: Ok after {elapsed:?}, {polls} polls");
+    };
+    assert!(polls > 1, "self-wakes must still drive repolls in budget");
+    assert_eq!(u64::from(expired.polls), polls);
+    assert!(elapsed >= Duration::from_millis(40));
+    assert!(elapsed < READY_AT / 2, "deadline overran: {elapsed:?}");
 }
 
 #[test]
