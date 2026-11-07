@@ -577,7 +577,11 @@ fn workspace_ownership_is_composed_without_runtime_control_authority() {
             "Runtime control authority: {forbidden}"
         );
     }
-    assert!(source.contains("attempt: LiveProcessAttempt"));
+    // The composed attempt is Workspace's own: ordinary or protected, nothing else.
+    assert!(source.contains("pub(crate) attempt: LiveProcess,"));
+    let composition = include_str!("protected_launch.rs");
+    assert!(composition.contains("Ordinary(LiveProcessAttempt),"));
+    assert!(composition.contains("attempt: Box<ProtectedAttempt>,"));
 }
 
 #[test]

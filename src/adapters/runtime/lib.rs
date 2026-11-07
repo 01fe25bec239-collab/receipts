@@ -6,6 +6,12 @@ pub use claude_adapter::{
     CancelReason, ClaudeAdapter, ClaudeAttemptHandle, ClaudeAttemptResult, RuntimeObservation,
 };
 pub use policy::RuntimeExecutionPolicy;
+#[cfg(all(test, unix))]
+mod live_tests;
+mod protected_launch;
+#[cfg(all(test, unix))]
+mod protected_launch_tests;
+pub use protected_launch::ProtectedLaunch;
 mod adapter;
 mod attempt;
 mod auth_status;

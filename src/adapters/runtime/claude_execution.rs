@@ -18,13 +18,14 @@
 //! environment remains unchanged; this foundation makes no claim that a native
 //! installation's credentials or configured model will be available in that environment.
 use crate::claude_stream_json::{contiguous_stdout, protocol};
+use crate::protected_launch::{LiveProcess, ProtectedLaunch};
 use crate::{ClaudeStreamJson, ClaudeStreamJsonError, FailureClass, RuntimeAuthStatus};
+use receipts_workspace_execution::WorkspaceHandle;
 use receipts_workspace_execution::execution::{
-    CapturedProcessRun, ChildEnvPolicy, ExecutionError, LiveProcessAttempt,
-    LiveProcessAttemptError, LiveProcessCancelAcceptance, LiveProcessOutcome, LiveProcessOutput,
-    LiveProcessStartError, LiveProcessTerminalCause, ProcessRunRequest, ProcessStdin,
-    ProcessTermination, ProcessTimeoutPolicy, run_with_timeout, run_with_timeout_and_capture,
-    start_live_process_attempt,
+    CapturedProcessRun, ChildEnvPolicy, ExecutionError, LiveProcessAttemptError,
+    LiveProcessCancelAcceptance, LiveProcessOutcome, LiveProcessOutput, LiveProcessStartError,
+    LiveProcessTerminalCause, ProcessRunRequest, ProcessStdin, ProcessTermination,
+    ProcessTimeoutPolicy, run_with_timeout, run_with_timeout_and_capture,
 };
 use std::{error::Error, fmt, mem::discriminant, path::PathBuf};
 
@@ -222,7 +223,7 @@ impl ClaudeLiveOutcome {
 }
 /// Thin non-cloneable composition. Workspace Drop owns cleanup before collection.
 pub struct ClaudeLiveAttempt {
-    attempt: LiveProcessAttempt,
+    pub(crate) attempt: LiveProcess,
 }
 impl ClaudeLiveAttempt {
     pub fn snapshot_output(&self) -> Result<ClaudeLiveOutputSnapshot, ExecutionError> {
@@ -250,8 +251,26 @@ pub fn start_claude_live_attempt(
     request: &ClaudeTaskExecutionRequest,
 ) -> Result<ClaudeLiveAttempt, ClaudeLiveStartError> {
     let process = build_claude_task_request(request).map_err(ClaudeLiveStartError::Request)?;
-    let attempt = start_live_process_attempt(&process, request.timeout_policy())
+    let attempt = LiveProcess::ordinary(&process, request.timeout_policy())
         .map_err(ClaudeLiveStartError::Workspace)?;
+    Ok(ClaudeLiveAttempt { attempt })
+}
+/// The same worker request bytes, launched only through Workspace protection.
+pub(crate) fn start_claude_protected_attempt(
+    request: &ClaudeTaskExecutionRequest,
+    launch: &ProtectedLaunch,
+    workspace: &WorkspaceHandle,
+    read_only: bool,
+) -> Result<ClaudeLiveAttempt, FailureClass> {
+    let process = build_claude_task_request(request)
+        .map_err(|e| crate::RawFailure::from(&e).classify_failure())?;
+    let attempt = LiveProcess::protected(
+        &process,
+        request.timeout_policy(),
+        launch,
+        workspace,
+        read_only,
+    )?;
     Ok(ClaudeLiveAttempt { attempt })
 }
 
