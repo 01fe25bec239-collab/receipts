@@ -55,15 +55,37 @@ payload writes.
 `.github/workflows/ra-w1-completion-linux.yml` on a disposable GitHub-hosted
 Ubuntu 24.04 x64 VM, through `.github/scripts/ra-w1-completion-linux/run.sh`.
 That script is the reviewed Workspace diagnostic with only the binary, test
-list, cgroup, fixture glob and environment name changed, and it sources the
-unchanged Workspace `custody.sh`. The tests cover, for both adapters:
+list, cgroup, fixture glob and environment names changed, plus an unprivileged
+`prepare` build of the synthetic native worker. It sources the unchanged
+Workspace `custody.sh`. Its `self-check` sources a Runtime-local
+`custody-self-check.sh`, the Workspace one adapted to this script's actual two
+tests (counts, last-test injection, first-failure identities, and a check that
+exactly those tests ran in order); the Workspace scripts stay byte-identical.
+The tests cover, for both adapters:
 collection, async event wakeup, ordinary-versus-protected stdin/argv/env
 equality, default-empty and explicit environments, worker identity, controller
 identity/status/stage, replay/forged/cross-task/reviewer refusals, refused
 early release, release and post-release refusal, accepted cancellation,
 uncollected Drop, and refused admissions that never start a worker.
 
-The worker is a synthetic shell CLI. A pass is Runtime integration evidence on
-that image only, not provider, other-platform or whole-system assurance.
+The worker is the synthetic native program `protected_launch_worker.rs`,
+built by `prepare` without privilege (root only copies it; portable tests
+compile it unprivileged and refuse to compile as root). It records its own
+initial exec environment, so the hosted cases compare the exact entries,
+independent of order: empty by default, otherwise exactly the admitted
+`ChildEnvPolicy` snapshot. No shell can add `PWD` or similar entries.
+
+Event delivery is awaited with a helper that repolls only after an observed
+waker notification (a wake that races ahead of `Pending` is kept) and fails at
+its bound; portable controls cover a never-woken future, a valid wake and the
+race. Worker PIDs are observed as `Absent`, `Zombie`, `Present` or `Unknown`;
+only `Absent` (after Workspace collection) is accepted, and read errors,
+zombies and hosts without procfs never count as absence. This is an
+observation, not cleanup authority: Workspace collection/cgroup proof and the
+diagnostic's fixture-identity check remain the cleanup barriers, and Runtime
+gains no PID signalling or reaping.
+
+A pass is Runtime integration evidence on that image only, not provider,
+other-platform or whole-system assurance.
 Publication and execution of this workflow need A1 disposition and
 independent review first.

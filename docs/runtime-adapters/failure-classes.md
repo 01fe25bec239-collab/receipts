@@ -43,6 +43,8 @@ CLI produces that condition in the same way.
 
 The shared JSONL reader rejects blank records. No recorded CLI output shows a
 blank line, so tolerance is not added. Only an applicable genuine
-version-bound recording can change this; the prepared live cases record a
-blank-segment count for that purpose. One capture would support at most that
-CLI version, not universal behavior.
+version-bound recording can change this; the prepared live cases record, for
+a complete capture, the number of records and of blank records separately from
+the trailing delimiter, and mark a truncated capture's blank-record evidence
+unavailable (its fragments are retained separately, never joined). One capture
+would support at most that CLI version, not universal behavior.

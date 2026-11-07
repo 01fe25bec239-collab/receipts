@@ -34,8 +34,20 @@ credential file, keychain item, token or value is inspected or copied.
 
 | Case | What | Expected record |
 | --- | --- | --- |
-| L1-success | Trivial read-only capsule in a fresh scratch Git worktree: reply OK, change nothing | terminal cause, exit, provider result / protocol termination, failure class, truncation, blank-segment count (N11), worktree changed or not |
-| L2-cancel | Long read-only capsule; cancel with `UserRequested` after the first event | `Cancelled`, `USER_CANCELLED`, same fields |
+| L1-success | Trivial read-only capsule in a fresh scratch Git worktree: reply OK, change nothing | PASS only for `Completed`, exit 0, no forced kill, no failure class, Claude `Success` / Codex `Completed`, no cancellation, successful Git inspection and an unchanged worktree at its base revision |
+| L2-cancel | Long read-only capsule; cancel with `UserRequested` after the first event | PASS only when the first event is a record, the cancellation was accepted (`UserRequested` reason), the cause is `Cancelled` and the class `USER_CANCELLED`, with successful Git inspection and an unchanged worktree. The provider's own termination of an intentional cancel is recorded, not asserted |
+
+Both cases always run once and the test fails if either verdict fails, so a
+silent exit, an unknown or invalid result, a missing first record, an
+unaccepted cancellation or a failed Git inspection is never a pass. Owned
+synthetic executables exercise exactly these verdicts in the ordinary suite
+(`live_tests::synthetic_*`); that is harness evidence only, never provider
+evidence. Each summary also records truncation, total and retained bytes and,
+for N11, `stdout_records` / `stdout_blank_records` / trailing-delimiter facts
+of a complete capture (empty output has zero records; the final newline is a
+delimiter, not a blank record). A truncated capture reports
+`stdout_blank_records=unavailable(truncated)`: its middle is missing, so head
+and tail are never joined or counted.
 
 Four provider runs at most (two per CLI). No failure is induced.
 
@@ -58,7 +70,8 @@ cargo test --locked -p receipts-runtime-adapters --lib \
 ## Output handling and cleanup
 
 Raw stdout/stderr go only to `<runtime>-<case>.{stdout,stderr}` (mode 0600,
-create-new) in the private evidence directory; the test refuses a directory
+create-new) in the private evidence directory; a truncated stream is kept as
+separate `.head` and `.tail` fragments instead; the test refuses a directory
 inside the repository. The `.summary` line carries no payload. Nothing is
 committed. A sanitized fixture may be proposed only after redaction (session,
 account, organization and request identifiers, home paths, any token-like

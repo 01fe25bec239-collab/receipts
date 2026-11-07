@@ -2,10 +2,13 @@
 # RA W1 Runtime-final hosted diagnostic: both concrete Runtime adapters through
 # the merged Workspace protected launch. Derived from the reviewed
 # we-w1-completion-linux/run.sh; only the test binary, test list, cgroup,
-# fixture glob and environment name differ (diff the two files). Host custody
-# administration is the UNCHANGED we-w1-completion-linux/custody.sh, sourced
-# from its reviewed location. Synthetic worker CLI only: no provider, secret or
-# network use, and no result here is Claude/Codex provider evidence.
+# fixture glob and environment names differ, `prepare` also builds the
+# synthetic native worker unprivileged, and self-check sources the
+# Runtime-local custody-self-check.sh adapted to this script's two tests
+# (diff the files). Host custody administration is the UNCHANGED
+# we-w1-completion-linux/custody.sh, sourced from its reviewed location.
+# Synthetic worker only: no provider, secret or network use, and no result
+# here is Claude/Codex provider evidence.
 # Disposable GitHub VM only: the hosted phase runs as root and creates/deletes
 # only its own cgroup and temp fixture. Never run `hosted` with sudo on a
 # workstation.
@@ -36,6 +39,7 @@ we="$here/../we-w1-completion-linux"
 
 if [ "${1:-}" = self-check ]; then out=; else out="${DIAGNOSTIC_OUT:?}"; fi
 bin_record="$out/test-binary"
+worker="$out/protected-worker"
 cgroup="/sys/fs/cgroup/receipts-ra-w1-diagnostic"
 cleanup_polls=50
 cgroup_pending=0 # 1 only while mkdir "$cgroup" may have created it without our knowing
@@ -66,6 +70,12 @@ prepare() {
     tail -n 1 >"$bin_record"
   test -x "$(cat "$bin_record")"
   sha256sum "$(cat "$bin_record")" >>"$out/provenance.txt"
+  # Unprivileged build of the synthetic native worker the hosted tests run:
+  # it observes its own initial exec environment (no shell adds PWD). The
+  # hosted phase only copies it; nothing is ever compiled as root.
+  rustc --edition=2024 src/adapters/runtime/protected_launch_worker.rs -o "$worker"
+  test -x "$worker"
+  sha256sum "$worker" >>"$out/provenance.txt"
 }
 
 # True when any live process runs as a fixture identity (controller, worker
@@ -315,7 +325,7 @@ on_signal() { # NAME NUMBER
 # by the unprivileged self-check).
 run_test() {
   timeout --kill-after=10 300 env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
-    RECEIPTS_RA_HOSTED_CGROUP="$cgroup" \
+    RECEIPTS_RA_HOSTED_CGROUP="$cgroup" RECEIPTS_RA_HOSTED_WORKER="$worker" \
     "$1" "$2" --exact --ignored --nocapture --test-threads=1 \
     >>"$out/diagnostic.log" 2>&1
 }
@@ -373,6 +383,7 @@ hosted() {
   test "$(uname -m)" = x86_64
   local binary
   binary="$(cat "$bin_record")"
+  test -x "$worker"
   # Refuse occupied fixture identities instead of reusing them.
   if fixture_uid_in_use; then
     echo "FAIL identity occupied" >"$out/result.txt"
@@ -496,8 +507,10 @@ self_check() {
   scenario fixture_retained 0 FAIL 1 setup_clean
   echo "cgroup self-check passed: cleanup failure never yields PASS; hosted cgroup behavior NOT RUN"
   fixture_dirs_retained() { return 1; }
-  # shellcheck source=../we-w1-completion-linux/custody-self-check.sh
-  . "$we/custody-self-check.sh"
+  # Runtime-local adaptation for this script's two tests; the Workspace
+  # custody-self-check.sh stays unchanged.
+  # shellcheck source=custody-self-check.sh
+  . "$here/custody-self-check.sh"
   custody_self_check
 }
 
