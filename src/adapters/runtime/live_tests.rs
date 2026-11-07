@@ -146,7 +146,7 @@ struct Observed {
     cancel: Option<CancelReason>,
     label: String,
 }
-fn observe<'a>(result: &'a DynAttemptResult) -> Result<(Observed, &'a LiveProcessOutcome), String> {
+fn observe(result: &DynAttemptResult) -> Result<(Observed, &LiveProcessOutcome), String> {
     let failure = result.failure();
     let obs = |p: &LiveProcessOutcome, provider_success, cancel, label| Observed {
         cause: p.terminal_cause(),
