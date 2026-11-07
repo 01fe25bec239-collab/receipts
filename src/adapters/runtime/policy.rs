@@ -1,6 +1,8 @@
 //! Explicit requirements, not admission or a claim of OS confinement.
 use receipts_workspace_execution::execution::ProcessTimeoutPolicy;
 
+use crate::ProtectedLaunch;
+
 /// `None` means no mandatory constraint on that axis. Unsupported mandatory
 /// requirements are refused, never translated into prompt-only enforcement.
 pub struct RuntimeExecutionPolicy {
@@ -11,6 +13,7 @@ pub struct RuntimeExecutionPolicy {
     pub filesystem_scope: Option<Vec<String>>,
     pub turn_budget: Option<u64>,
     pub structured_output_schema: Option<String>,
+    protected: Option<ProtectedLaunch>,
 }
 impl RuntimeExecutionPolicy {
     pub fn new(timeout: ProcessTimeoutPolicy, read_only: bool) -> Self {
@@ -22,7 +25,17 @@ impl RuntimeExecutionPolicy {
             filesystem_scope: None,
             turn_budget: None,
             structured_output_schema: None,
+            protected: None,
         }
+    }
+    /// Trusted composition only: every start under this policy is a Workspace
+    /// protected launch or a refusal, never an ordinary run.
+    pub fn with_protected_launch(mut self, launch: ProtectedLaunch) -> Self {
+        self.protected = Some(launch);
+        self
+    }
+    pub fn protected_launch(&self) -> Option<&ProtectedLaunch> {
+        self.protected.as_ref()
     }
     /// True only when no mandatory constraint beyond timeout/read-only is
     /// requested; adapters refuse otherwise instead of prompt-only enforcement.

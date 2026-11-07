@@ -4,11 +4,13 @@
 
 use std::{error::Error, fmt};
 
+use receipts_workspace_execution::WorkspaceHandle;
 use receipts_workspace_execution::execution::{
-    CapturedStream, ExecutionError, LiveProcessAttempt, LiveProcessAttemptError,
-    LiveProcessCancelAcceptance, LiveProcessOutcome, LiveProcessOutput, LiveProcessStartError,
-    LiveProcessTerminalCause, start_live_process_attempt,
+    CapturedStream, ExecutionError, LiveProcessAttemptError, LiveProcessCancelAcceptance,
+    LiveProcessOutcome, LiveProcessOutput, LiveProcessStartError, LiveProcessTerminalCause,
 };
+
+use crate::protected_launch::{LiveProcess, ProtectedLaunch};
 
 use crate::codex_jsonl::interpret_stdout;
 use crate::codex_task_execution::build_codex_task_request;
@@ -130,7 +132,7 @@ impl CodexLiveOutcome {
 /// Dropping it invokes the owned Workspace handle's bounded cleanup directly.
 /// Shared-reference methods preserve Workspace concurrent collection/cancel semantics.
 pub struct CodexLiveAttempt {
-    attempt: LiveProcessAttempt,
+    pub(crate) attempt: LiveProcess,
     sandbox_mode: CodexTaskSandboxMode,
 }
 impl CodexLiveAttempt {
@@ -171,8 +173,31 @@ pub fn start_codex_live_attempt(
     request: &CodexTaskExecutionRequest,
 ) -> Result<CodexLiveAttempt, CodexLiveStartError> {
     let process = build_codex_task_request(request).map_err(CodexLiveStartError::Request)?;
-    let attempt = start_live_process_attempt(&process, request.timeout_policy())
+    let attempt = LiveProcess::ordinary(&process, request.timeout_policy())
         .map_err(CodexLiveStartError::Workspace)?;
+    Ok(CodexLiveAttempt {
+        attempt,
+        sandbox_mode: request.sandbox_mode(),
+    })
+}
+
+/// The same worker request bytes, launched only through Workspace protection.
+/// The sandbox flag stays a provider request; it never selects protection.
+pub(crate) fn start_codex_protected_attempt(
+    request: &CodexTaskExecutionRequest,
+    launch: &ProtectedLaunch,
+    workspace: &WorkspaceHandle,
+    read_only: bool,
+) -> Result<CodexLiveAttempt, crate::FailureClass> {
+    let process = build_codex_task_request(request)
+        .map_err(|e| crate::RawFailure::from(&e).classify_failure())?;
+    let attempt = LiveProcess::protected(
+        &process,
+        request.timeout_policy(),
+        launch,
+        workspace,
+        read_only,
+    )?;
     Ok(CodexLiveAttempt {
         attempt,
         sandbox_mode: request.sandbox_mode(),
