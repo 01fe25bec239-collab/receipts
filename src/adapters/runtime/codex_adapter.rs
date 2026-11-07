@@ -5,7 +5,9 @@ use receipts_runtime_bindings::RuntimeCapsuleFamily;
 use receipts_workspace_execution::execution::{
     ChildEnvPolicy, LiveProcessCancelAcceptance, MAX_STDIN_BYTES,
 };
-use receipts_workspace_execution::{WorkspaceHandle, WorkspaceState};
+use receipts_workspace_execution::{
+    ControllerChannel, ProtectedLaunchError, WorkspaceHandle, WorkspaceState,
+};
 use std::{
     fmt::{self, Write},
     path::{Path, PathBuf},
@@ -44,6 +46,8 @@ pub struct CodexAttemptHandle {
     cancel: Mutex<Option<CancelReason>>,
 }
 impl Drop for CodexAttemptHandle {
+    /// Cancel, join collection, then release custody only if Workspace proved
+    /// collection and cleanup; any refusal keeps custody quarantined.
     fn drop(&mut self) {
         self.attempt.cancel();
         if let Some(worker) = self
@@ -54,12 +58,32 @@ impl Drop for CodexAttemptHandle {
         {
             let _ = worker.join();
         }
+        let _ = self.attempt.attempt.release_custody();
+    }
+}
+impl CodexAttemptHandle {
+    /// True only for a Workspace protected launch; ordinary attempts are
+    /// non-authoritative and hold no custody or controller channel.
+    pub fn protected(&self) -> bool {
+        self.attempt.attempt.protected_attempt()
+    }
+    /// Typed controller channel for the trusted owning caller: query-only
+    /// reviewer for read-only policies, worker otherwise. Its token is never
+    /// placed in prompts, the child environment, events or diagnostics.
+    pub fn controller_channel(&self) -> Option<&ControllerChannel> {
+        self.attempt.attempt.controller_channel()
+    }
+    /// Explicit release after collection; Workspace refuses without proven
+    /// cleanup and keeps custody. `None` for ordinary attempts.
+    pub fn release_custody(&self) -> Option<Result<(), ProtectedLaunchError>> {
+        self.attempt.attempt.release_custody()
     }
 }
 /// Collection errors are payload-free. Provider interpretation remains available
 /// through `outcome.protocol()` and does not establish Receipts acceptance.
 pub struct CodexAttemptResult {
     pub outcome: CodexLiveOutcome,
+    protected: bool,
     cancel: Option<CancelReason>,
 }
 impl CodexAttemptResult {
@@ -73,6 +97,10 @@ impl CodexAttemptResult {
     /// Accepted caller cancellation reason, if this attempt was cancelled by one.
     pub fn cancel_reason(&self) -> Option<CancelReason> {
         self.cancel
+    }
+    /// Collected from a Workspace protected launch; false is non-authoritative.
+    pub fn protected(&self) -> bool {
+        self.protected
     }
     pub fn failure(&self) -> Option<FailureClass> {
         use receipts_workspace_execution::execution::LiveProcessTerminalCause;
@@ -124,6 +152,7 @@ fn prompt(
     match task {
         RuntimeCapsuleFamily::Task(c) => {
             if Path::new(c.worktree()) != workspace.worktree_path()
+                || workspace.task_id().is_some_and(|task| task != c.task_id())
                 || c.branch() != workspace.branch()
                 || c.start_sha() != workspace.base_sha().as_str()
                 || c.turn_budget().is_some()
@@ -238,10 +267,17 @@ impl RuntimeAdapter for CodexAdapter {
             Some(env) => request.with_env_policy(env.clone()),
             None => request,
         };
-        let attempt = Arc::new(
-            start_codex_live_attempt(&request)
+        // Protection comes only from the trusted policy, never from --sandbox.
+        let attempt = Arc::new(match policy.protected_launch() {
+            None => start_codex_live_attempt(&request)
                 .map_err(|e| RawFailure::from(&e).classify_failure())?,
-        );
+            Some(launch) => codex_live_attempt::start_codex_protected_attempt(
+                &request,
+                launch,
+                workspace,
+                policy.read_only,
+            )?,
+        });
         let completed = Arc::new(AtomicU8::new(0));
         let (sender, receiver) = mpsc::sync_channel(1);
         let owned = attempt.clone();
@@ -291,6 +327,7 @@ impl RuntimeAdapter for CodexAdapter {
         }
         Ok(CodexAttemptResult {
             outcome: result.map_err(|e| e.classify_failure())?,
+            protected: handle.protected(),
             cancel: *handle.cancel.lock().unwrap_or_else(|e| e.into_inner()),
         })
     }

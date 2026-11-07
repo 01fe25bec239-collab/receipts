@@ -10,7 +10,9 @@ file using these public extension points:
    is false when a mandatory requirement is present, and that is
    `POLICY_BLOCKED`.
 2. Start processes only through the Workspace runner
-   (`start_live_process_attempt`). Workspace owns spawning, environment,
+   (`start_live_process_attempt`), or, for a protected request, only through
+   Workspace `ProtectedLauncher::admit`/`launch` with no ordinary fallback
+   (see `protected-launch.md`). Workspace owns spawning, environment,
    timeout, cancellation, collection and cleanup.
 3. Return capability observations as
    `RuntimeCapabilities::Extension(ExtensionCapabilityReport)`.
