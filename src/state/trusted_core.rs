@@ -2,9 +2,12 @@
 //!
 //! [`TrustedCoreStore`] is the only public way to obtain State write access.
 //! Every mutation consumes one [`StateWriteAdmission`]: a non-cloneable value
-//! that only the store's holder can mint, bound to this store's durable
-//! identity, one closed operation family, the project and, where the payload
-//! carries them, the graph, admitted source revision, compiler and policy.
+//! that only the store's holder can mint, bound to the issuing live store
+//! instance (a private per-open identity, so a copied database file or a
+//! closed and reopened store never accepts it) as well as this store's
+//! durable identity, one closed operation family, the project and, where the
+//! payload carries them, the graph, admitted source revision, compiler and
+//! policy.
 //! State re-checks each binding against the actual payload (or the durable
 //! record it targets) before writing; a mismatch writes nothing.
 //!
@@ -14,7 +17,10 @@
 //! exclude another process running with the same filesystem authority. Actual
 //! exclusion of lower-trust principals (separate identity, no access to the
 //! State directory, no inherited descriptor or writer channel) is a deployment
-//! requirement that these library checks cannot prove.
+//! requirement that these library checks cannot prove. The durable
+//! `store_id` (also written into event receipts) is copyable logical history,
+//! not a physical attestation: a copied file carries the same value, and
+//! receipts are local unsigned records.
 //!
 //! No legacy writer escapes the crate:
 //!
@@ -42,7 +48,7 @@
 //!
 //! ```compile_fail
 //! fn forge(s: receipts_state::StateWriteSubjectV1) -> receipts_state::StateWriteAdmission {
-//!     receipts_state::StateWriteAdmission { store_id: String::new(), subject: s }
+//!     receipts_state::StateWriteAdmission { store_id: String::new(), instance: 0, subject: s }
 //! }
 //! ```
 //!
@@ -61,7 +67,7 @@
 //! ```
 
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use crate::attempt::{AttemptFinish, AttemptStart};
@@ -113,7 +119,8 @@ pub enum StateWriteOperationV1 {
 /// Why State refused a write admission or an exclusive open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateWriteRefusalV1 {
-    /// The admission was minted by another store.
+    /// The admission was minted by another store or another open instance
+    /// of this store (including a copy sharing its durable identity).
     WrongStore,
     /// The durable store identity no longer matches the opened store.
     StoreIdentityChanged,
@@ -127,9 +134,12 @@ pub enum StateWriteRefusalV1 {
     UnknownSubject,
     /// Path is relative, a symlink, not a regular file/directory, or hard-linked.
     InsecurePath,
-    /// Directory or file is not owned by the effective user.
+    /// Directory or file is not owned by the effective user (ancestors: not
+    /// owned by the effective user or root).
     InsecureOwnership,
-    /// Directory or file is accessible to group/other.
+    /// Directory or file is accessible to group/other, or an ancestor
+    /// directory is writable by another principal without the sticky-bit
+    /// protection of an entry owned by this user or root.
     InsecureMode,
     /// Another holder has the exclusive writer lock.
     WriterLockHeld,
@@ -184,6 +194,7 @@ pub struct StateWriteSubjectV1 {
 /// State, consumed by the one mutation it authorizes.
 pub struct StateWriteAdmission {
     store_id: String,
+    instance: u64,
     subject: StateWriteSubjectV1,
 }
 
@@ -205,10 +216,21 @@ impl StateWriteAdmission {
 pub struct TrustedCoreStore {
     repo: SqliteStateRepository,
     store_id: String,
-    // Held for the store's lifetime: the cooperative exclusive-writer lock and
-    // the validated database object.
+    /// Process-unique identity of this open writer; never reused, never
+    /// persisted, so admissions cannot outlive or leave this instance.
+    instance: u64,
+    // Held for the store's lifetime: the cooperative exclusive-writer lock,
+    // the validated database object and its validated directory.
     _lock: File,
     _db: File,
+    _dir: File,
+}
+
+fn next_instance() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // ponytail: a process-local counter; admissions are in-memory only.
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 impl fmt::Debug for TrustedCoreStore {
@@ -225,34 +247,30 @@ impl TrustedCoreStore {
     /// writer lock and any swap between validation and open. Never repairs
     /// permissions and never upgrades an older schema.
     pub fn open_exclusive(path: impl AsRef<Path>) -> Result<Self, StateError> {
-        let (db_path, lock, db) = secure::prepare(path.as_ref(), true)?;
-        let repo = SqliteStateRepository::open(&db_path)?;
-        Self::finish(repo, &db_path, lock, db)
+        let held = secure::prepare(path.as_ref(), true)?;
+        let repo = SqliteStateRepository::open(&held.db_path)?;
+        Self::finish(repo, held)
     }
 
     /// Explicitly upgrades an existing v11–v19 store to the current schema and
     /// opens it, under the same ownership/lock checks. Returns the new head.
     pub fn migrate_exclusive(path: impl AsRef<Path>) -> Result<(Self, u32), StateError> {
-        let (db_path, lock, db) = secure::prepare(path.as_ref(), false)?;
-        let version = SqliteStateRepository::migrate_existing_to_current(&db_path)?;
-        let repo = SqliteStateRepository::open(&db_path)?;
-        Ok((Self::finish(repo, &db_path, lock, db)?, version))
+        let held = secure::prepare(path.as_ref(), false)?;
+        let version = SqliteStateRepository::migrate_existing_to_current(&held.db_path)?;
+        let repo = SqliteStateRepository::open(&held.db_path)?;
+        Ok((Self::finish(repo, held)?, version))
     }
 
-    fn finish(
-        repo: SqliteStateRepository,
-        db_path: &Path,
-        lock: File,
-        db: File,
-    ) -> Result<Self, StateError> {
-        secure::verify_same_object(db_path, &db)?;
-        secure::verify_sidecars(db_path)?;
+    fn finish(repo: SqliteStateRepository, held: secure::Held) -> Result<Self, StateError> {
+        secure::verify_after_open(&held)?;
         let store_id = repo.store_identity()?;
         Ok(Self {
             repo,
             store_id,
-            _lock: lock,
-            _db: db,
+            instance: next_instance(),
+            _lock: held.lock,
+            _db: held.db,
+            _dir: held.dir,
         })
     }
 
@@ -272,6 +290,7 @@ impl TrustedCoreStore {
     pub fn admit(&self, subject: StateWriteSubjectV1) -> StateWriteAdmission {
         StateWriteAdmission {
             store_id: self.store_id.clone(),
+            instance: self.instance,
             subject,
         }
     }
@@ -284,7 +303,9 @@ impl TrustedCoreStore {
     ) -> Result<(), StateError> {
         use StateWriteRefusalV1 as R;
         let subject = admission.subject;
-        if admission.store_id != self.store_id {
+        // Physical instance first: equal durable UUIDs (a copied file, or the
+        // same file reopened) never transfer an admission.
+        if admission.instance != self.instance || admission.store_id != self.store_id {
             return Err(refused(R::WrongStore));
         }
         if self.repo.store_identity()? != self.store_id {
@@ -829,23 +850,40 @@ impl<'a> Bound<'a> {
     }
 }
 
+/// Secure open, anchored on directory descriptors.
+///
+/// The State directory is reached by walking its canonical path from `/`
+/// with `openat(O_DIRECTORY|O_NOFOLLOW)`, validating each held directory
+/// descriptor: owned by root or the effective user, and not writable by
+/// group/other unless sticky with the next entry owned by root or this user.
+/// The State directory itself must be private and owned by this user. The
+/// lock, database and any pre-existing `-wal`/`-shm`/`-journal` sidecars are
+/// examined with `fstatat(AT_SYMLINK_NOFOLLOW)` relative to that descriptor
+/// before anything opens them, so a substituted FIFO/device/symlink is
+/// refused without being opened; regular files are then opened with
+/// `O_NOFOLLOW|O_NONBLOCK` and their identity re-compared. SQLite itself opens
+/// by pathname; that is safe only because the validated chain cannot be
+/// altered by other principals, and the directory and database identities
+/// plus the sidecars are re-checked after SQLite opens. Same-user hostile
+/// code is outside this model.
 #[cfg(unix)]
 mod secure {
-    use super::{File, OpenOptions, Path, PathBuf, StateError, StateWriteRefusalV1 as R, refused};
-    use std::os::raw::c_int;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    use std::os::unix::io::AsRawFd;
+    use super::{File, Path, PathBuf, StateError, StateWriteRefusalV1 as R, refused};
+    use std::ffi::{CString, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
 
-    unsafe extern "C" {
-        fn geteuid() -> u32;
-        fn flock(fd: c_int, operation: c_int) -> c_int;
+    pub(super) struct Held {
+        pub(super) db_path: PathBuf,
+        pub(super) lock: File,
+        pub(super) db: File,
+        pub(super) dir: File,
     }
-    const LOCK_EX: c_int = 2;
-    const LOCK_NB: c_int = 4;
 
     fn euid() -> u32 {
         // SAFETY: geteuid has no preconditions and cannot fail.
-        unsafe { geteuid() }
+        unsafe { libc::geteuid() }
     }
 
     fn io(error: std::io::Error) -> StateError {
@@ -854,120 +892,244 @@ mod secure {
         }
     }
 
-    fn private(meta: &std::fs::Metadata) -> Result<(), StateError> {
-        if meta.uid() != euid() {
+    fn name(component: &OsStr) -> Result<CString, StateError> {
+        CString::new(component.as_bytes()).map_err(|_| refused(R::InsecurePath))
+    }
+
+    /// The facts checked for every object, from `fstat` or `fstatat`.
+    #[derive(PartialEq)]
+    struct Facts {
+        kind: u32,
+        uid: u32,
+        mode: u32,
+        nlink: u64,
+        dev: u64,
+        ino: u64,
+    }
+
+    impl Facts {
+        fn of(file: &File) -> Result<Self, StateError> {
+            let m = file.metadata().map_err(io)?;
+            Ok(Self {
+                kind: m.mode() & libc::S_IFMT as u32,
+                uid: m.uid(),
+                mode: m.mode() & 0o7777,
+                nlink: m.nlink(),
+                dev: m.dev(),
+                ino: m.ino(),
+            })
+        }
+        fn regular(&self) -> bool {
+            self.kind == libc::S_IFREG as u32
+        }
+        fn same_object(&self, other: &Self) -> bool {
+            (self.dev, self.ino) == (other.dev, other.ino)
+        }
+        fn private(&self) -> Result<(), StateError> {
+            if self.uid != euid() {
+                return Err(refused(R::InsecureOwnership));
+            }
+            if self.mode & 0o077 != 0 {
+                return Err(refused(R::InsecureMode));
+            }
+            Ok(())
+        }
+        /// A private, singly linked regular file owned by this user.
+        fn private_regular(&self) -> Result<(), StateError> {
+            if !self.regular() || self.nlink != 1 {
+                return Err(refused(R::InsecurePath));
+            }
+            self.private()
+        }
+    }
+
+    /// `fstatat(dir, name, AT_SYMLINK_NOFOLLOW)`; `None` when absent.
+    fn stat_at(dir: &File, entry: &CString) -> Result<Option<Facts>, StateError> {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: valid descriptor, NUL-terminated name, writable stat buffer.
+        let rc = unsafe {
+            libc::fstatat(
+                dir.as_raw_fd(),
+                entry.as_ptr(),
+                st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
+            let error = std::io::Error::last_os_error();
+            return match error.kind() {
+                std::io::ErrorKind::NotFound => Ok(None),
+                _ => Err(io(error)),
+            };
+        }
+        // SAFETY: fstatat succeeded and initialised the buffer.
+        let st = unsafe { st.assume_init() };
+        Ok(Some(Facts {
+            kind: (st.st_mode & libc::S_IFMT) as u32,
+            uid: st.st_uid,
+            mode: (st.st_mode & 0o7777) as u32,
+            nlink: st.st_nlink as u64,
+            dev: st.st_dev as u64,
+            ino: st.st_ino as u64,
+        }))
+    }
+
+    fn open_at(
+        dir: Option<&File>,
+        entry: &CString,
+        flags: libc::c_int,
+    ) -> Result<File, StateError> {
+        let base = dir.map_or(libc::AT_FDCWD, AsRawFd::as_raw_fd);
+        // SAFETY: valid descriptor (or AT_FDCWD), NUL-terminated name; mode
+        // is used only with O_CREAT.
+        let fd = unsafe {
+            libc::openat(
+                base,
+                entry.as_ptr(),
+                flags | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600 as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            // ELOOP: the final component is a symlink.
+            return Err(match error.raw_os_error() {
+                Some(libc::ELOOP) | Some(libc::ENOTDIR) => refused(R::InsecurePath),
+                _ => io(error),
+            });
+        }
+        // SAFETY: fd is a freshly opened descriptor we now own.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    /// An ancestor may be shared only if no other principal can replace the
+    /// entry below it.
+    fn protected_ancestor(dir: &Facts, child: &Facts) -> Result<(), StateError> {
+        if dir.kind != libc::S_IFDIR as u32 {
+            return Err(refused(R::InsecurePath));
+        }
+        if dir.uid != 0 && dir.uid != euid() {
             return Err(refused(R::InsecureOwnership));
         }
-        if meta.mode() & 0o077 != 0 {
+        let sticky_protects = dir.mode & 0o1000 != 0 && (child.uid == 0 || child.uid == euid());
+        if dir.mode & 0o022 != 0 && !sticky_protects {
             return Err(refused(R::InsecureMode));
         }
         Ok(())
     }
 
-    /// Validates an existing private regular file at `path` and opens it,
-    /// proving the opened object is the validated one.
-    fn open_regular(path: &Path, write: bool) -> Result<File, StateError> {
-        let before = std::fs::symlink_metadata(path).map_err(io)?;
-        if !before.file_type().is_file() || before.nlink() != 1 {
+    fn walk(parent: &Path) -> Result<File, StateError> {
+        let mut dir = open_at(None, &name(OsStr::new("/"))?, libc::O_RDONLY | libc::O_DIRECTORY)?;
+        for component in parent.components().skip(1) {
+            let entry = name(component.as_os_str())?;
+            let child = open_at(Some(&dir), &entry, libc::O_RDONLY | libc::O_DIRECTORY)?;
+            protected_ancestor(&Facts::of(&dir)?, &Facts::of(&child)?)?;
+            dir = child;
+        }
+        let facts = Facts::of(&dir)?;
+        if facts.kind != libc::S_IFDIR as u32 {
             return Err(refused(R::InsecurePath));
         }
-        private(&before)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(write)
-            .open(path)
-            .map_err(io)?;
-        let opened = file.metadata().map_err(io)?;
-        if (opened.dev(), opened.ino()) != (before.dev(), before.ino()) {
-            return Err(refused(R::IdentityRace));
-        }
+        facts.private()?;
+        Ok(dir)
+    }
+
+    /// Opens (or, when `create`, exclusively creates) one private regular
+    /// file below `dir`, examining any existing entry before opening it.
+    fn open_file(dir: &File, entry: &CString, create: bool) -> Result<File, StateError> {
+        let flags = libc::O_RDWR | libc::O_NONBLOCK;
+        let file = match stat_at(dir, entry)? {
+            Some(before) => {
+                before.private_regular()?;
+                let file = open_at(Some(dir), entry, flags)?;
+                if !Facts::of(&file)?.same_object(&before) {
+                    return Err(refused(R::IdentityRace));
+                }
+                file
+            }
+            None if create => open_at(Some(dir), entry, flags | libc::O_CREAT | libc::O_EXCL)?,
+            None => {
+                return Err(io(std::io::Error::from(std::io::ErrorKind::NotFound)));
+            }
+        };
+        Facts::of(&file)?.private_regular()?;
         Ok(file)
     }
 
-    fn create_private(path: &Path) -> Result<File, StateError> {
-        // O_CREAT|O_EXCL never follows a symlink and fails if anything exists.
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(io)
-    }
-
-    fn open_or_create(path: &Path, create: bool) -> Result<File, StateError> {
-        match std::fs::symlink_metadata(path) {
-            Ok(_) => open_regular(path, true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && create => create_private(path),
-            Err(e) => Err(io(e)),
-        }
-    }
-
-    pub(super) fn prepare(path: &Path, create: bool) -> Result<(PathBuf, File, File), StateError> {
-        if !path.is_absolute() {
-            return Err(refused(R::InsecurePath));
-        }
-        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
-            return Err(refused(R::InsecurePath));
-        };
-        // Ancestors are resolved once; the State directory itself must be a
-        // private real directory owned by this user.
-        let parent = parent.canonicalize().map_err(io)?;
-        let dir = std::fs::symlink_metadata(&parent).map_err(io)?;
-        if !dir.file_type().is_dir() {
-            return Err(refused(R::InsecurePath));
-        }
-        private(&dir)?;
-        let db_path = parent.join(name);
-        let mut lock_name = name.to_os_string();
-        lock_name.push(".writer-lock");
-        let lock = open_or_create(&parent.join(lock_name), true)?;
-        // SAFETY: flock on an owned, open descriptor.
-        if unsafe { flock(lock.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
-            return Err(refused(R::WriterLockHeld));
-        }
-        let db = open_or_create(&db_path, create)?;
-        Ok((db_path, lock, db))
-    }
-
-    pub(super) fn verify_same_object(path: &Path, db: &File) -> Result<(), StateError> {
-        let now = std::fs::symlink_metadata(path).map_err(io)?;
-        let held = db.metadata().map_err(io)?;
-        if !now.file_type().is_file() || (now.dev(), now.ino()) != (held.dev(), held.ino()) {
-            return Err(refused(R::IdentityRace));
-        }
-        private(&now)
-    }
-
-    pub(super) fn verify_sidecars(path: &Path) -> Result<(), StateError> {
+    fn sidecars(dir: &File, entry: &OsStr) -> Result<(), StateError> {
         for suffix in ["-wal", "-shm", "-journal"] {
-            let mut name = path.as_os_str().to_os_string();
-            name.push(suffix);
-            match std::fs::symlink_metadata(PathBuf::from(name)) {
-                Ok(meta) => {
-                    if !meta.file_type().is_file() {
-                        return Err(refused(R::InsecurePath));
-                    }
-                    private(&meta)?;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(io(e)),
+            let mut sidecar = entry.to_os_string();
+            sidecar.push(suffix);
+            if let Some(facts) = stat_at(dir, &name(&sidecar)?)? {
+                facts.private_regular()?;
             }
         }
         Ok(())
+    }
+
+    pub(super) fn prepare(path: &Path, create: bool) -> Result<Held, StateError> {
+        if !path.is_absolute() {
+            return Err(refused(R::InsecurePath));
+        }
+        let (Some(parent), Some(entry)) = (path.parent(), path.file_name()) else {
+            return Err(refused(R::InsecurePath));
+        };
+        // Resolve legitimate system aliases (such as /var -> /private/var)
+        // once, then validate the real chain through held descriptors.
+        let parent = parent.canonicalize().map_err(io)?;
+        let dir = walk(&parent)?;
+        let mut lock_name = entry.to_os_string();
+        lock_name.push(".writer-lock");
+        let lock = open_file(&dir, &name(&lock_name)?, true)?;
+        // SAFETY: flock on an owned, open descriptor.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(refused(R::WriterLockHeld));
+        }
+        // Pre-existing sidecars are validated before SQLite can act on them.
+        sidecars(&dir, entry)?;
+        let db = open_file(&dir, &name(entry)?, create)?;
+        Ok(Held {
+            db_path: parent.join(entry),
+            lock,
+            db,
+            dir,
+        })
+    }
+
+    /// After SQLite opened the pathname: the directory and database are the
+    /// validated objects and every sidecar is still safe.
+    pub(super) fn verify_after_open(held: &Held) -> Result<(), StateError> {
+        let (Some(parent), Some(entry)) = (held.db_path.parent(), held.db_path.file_name()) else {
+            return Err(refused(R::InsecurePath));
+        };
+        let dir_now = std::fs::symlink_metadata(parent).map_err(io)?;
+        let dir_held = Facts::of(&held.dir)?;
+        if !dir_now.file_type().is_dir() || (dir_now.dev(), dir_now.ino()) != (dir_held.dev, dir_held.ino)
+        {
+            return Err(refused(R::IdentityRace));
+        }
+        let now = stat_at(&held.dir, &name(entry)?)?.ok_or_else(|| refused(R::IdentityRace))?;
+        if !now.same_object(&Facts::of(&held.db)?) {
+            return Err(refused(R::IdentityRace));
+        }
+        now.private_regular()?;
+        sidecars(&held.dir, entry)
     }
 }
 
 #[cfg(not(unix))]
 mod secure {
     use super::{File, Path, PathBuf, StateError, StateWriteRefusalV1 as R, refused};
-    pub(super) fn prepare(_: &Path, _: bool) -> Result<(PathBuf, File, File), StateError> {
+    pub(super) struct Held {
+        pub(super) db_path: PathBuf,
+        pub(super) lock: File,
+        pub(super) db: File,
+        pub(super) dir: File,
+    }
+    pub(super) fn prepare(_: &Path, _: bool) -> Result<Held, StateError> {
         Err(refused(R::UnsupportedPlatform))
     }
-    pub(super) fn verify_same_object(_: &Path, _: &File) -> Result<(), StateError> {
-        Err(refused(R::UnsupportedPlatform))
-    }
-    pub(super) fn verify_sidecars(_: &Path) -> Result<(), StateError> {
+    pub(super) fn verify_after_open(_: &Held) -> Result<(), StateError> {
         Err(refused(R::UnsupportedPlatform))
     }
 }

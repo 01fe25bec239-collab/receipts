@@ -231,6 +231,207 @@ fn an_admission_from_another_store_is_refused() {
     assert_eq!(graph_count(&store_b), 0);
 }
 
+fn provenance_count(store: &TrustedCoreStore) -> i64 {
+    store.reader().count_table_rows("provenance_links").unwrap()
+}
+
+fn link(
+    store: &mut TrustedCoreStore,
+    admission: crate::StateWriteAdmission,
+    task: &str,
+) -> Result<(), StateError> {
+    store.append_provenance_link(
+        admission,
+        "p",
+        task,
+        crate::ProvenanceLinkKind::ReviewSha,
+        "0123456789012345678901234567890123456789",
+    )
+}
+
+#[test]
+fn admissions_bind_the_issuing_live_writer_instance() {
+    let a = Dir::new("copy-a");
+    let b = Dir::new("copy-b");
+    drop(TrustedCoreStore::open_exclusive(a.db()).unwrap());
+    std::fs::copy(a.db(), b.db()).unwrap();
+    std::fs::set_permissions(b.db(), std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut store_a = TrustedCoreStore::open_exclusive(a.db()).unwrap();
+    let mut store_b = TrustedCoreStore::open_exclusive(b.db()).unwrap();
+    assert_eq!(store_a.store_id(), store_b.store_id(), "copy keeps the UUID");
+
+    // Same writer: success.
+    let own = store_a.admit(project_subject(Op::ProvenanceLink, "p"));
+    link(&mut store_a, own, "t1").unwrap();
+    assert_eq!(provenance_count(&store_a), 1);
+
+    // Copied A/B: A's admission is refused by B, B unchanged.
+    let from_a = store_a.admit(project_subject(Op::ProvenanceLink, "p"));
+    assert_eq!(refusal(link(&mut store_b, from_a, "t2").unwrap_err()), R::WrongStore);
+    assert_eq!(provenance_count(&store_b), 0);
+
+    // Old admission after close/reopen of the same file is refused.
+    let stale = store_a.admit(project_subject(Op::ProvenanceLink, "p"));
+    drop(store_a);
+    let mut reopened = TrustedCoreStore::open_exclusive(a.db()).unwrap();
+    assert_eq!(refusal(link(&mut reopened, stale, "t3").unwrap_err()), R::WrongStore);
+    assert_eq!(provenance_count(&reopened), 1);
+    // A newly minted admission after the legitimate reopen succeeds, once.
+    let fresh = reopened.admit(project_subject(Op::ProvenanceLink, "p"));
+    link(&mut reopened, fresh, "t3").unwrap();
+    assert_eq!(provenance_count(&reopened), 2);
+}
+
+/// Holds an extra directory whose mode the test controls.
+fn private_dir_below(parent: &std::path::Path, name: &str) -> PathBuf {
+    let path = parent.join(name);
+    std::fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+    path
+}
+
+#[test]
+fn protected_ancestry_is_required_and_never_repaired() {
+    let root = Dir::new("ancestry");
+    // Non-sticky world-writable ancestor: another principal could rename the
+    // private directory below it.
+    let shared = private_dir_below(&root.0, "shared");
+    let state = private_dir_below(&shared, "state");
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert_eq!(
+        refusal(TrustedCoreStore::open_exclusive(state.join("state.db")).unwrap_err()),
+        R::InsecureMode
+    );
+    assert!(!state.join("state.db").exists());
+    assert_eq!(
+        std::fs::metadata(&shared).unwrap().permissions().mode() & 0o7777,
+        0o777,
+        "never repaired"
+    );
+    // Group-writable ancestor is refused the same way.
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o770)).unwrap();
+    assert_eq!(
+        refusal(TrustedCoreStore::open_exclusive(state.join("state.db")).unwrap_err()),
+        R::InsecureMode
+    );
+    // Sticky shared parent with a private directory owned by this user: valid.
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    drop(TrustedCoreStore::open_exclusive(state.join("state.db")).unwrap());
+    // Protected non-private ancestors (0755, owned by this user) are valid.
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+    drop(TrustedCoreStore::open_exclusive(state.join("state.db")).unwrap());
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn a_symlinked_or_replaced_state_directory_is_refused() {
+    let root = Dir::new("dir-link");
+    let real = private_dir_below(&root.0, "real");
+    drop(TrustedCoreStore::open_exclusive(real.join("state.db")).unwrap());
+    // A symlink alias resolves to the real chain (validated as such) ...
+    std::os::unix::fs::symlink(&real, root.0.join("alias")).unwrap();
+    drop(TrustedCoreStore::open_exclusive(root.0.join("alias/state.db")).unwrap());
+    // ... but a symlink below a held, validated directory is never followed.
+    let below = private_dir_below(&real, "inner");
+    let target = private_dir_below(&root.0, "target");
+    std::fs::remove_dir(&below).unwrap();
+    std::os::unix::fs::symlink(&target, &below).unwrap();
+    let mut path = real.join("inner");
+    path.push("state.db");
+    // canonicalize follows the alias to `target`, which is valid itself; the
+    // refusal case is a symlinked database entry.
+    std::os::unix::fs::symlink(real.join("state.db"), target.join("state.db")).unwrap();
+    assert_eq!(
+        refusal(TrustedCoreStore::open_exclusive(&path).unwrap_err()),
+        R::InsecurePath
+    );
+    assert!(std::fs::symlink_metadata(target.join("state.db")).unwrap().file_type().is_symlink());
+}
+
+#[test]
+fn unsafe_pre_existing_sidecars_are_refused_before_sqlite_opens() {
+    use std::os::unix::fs::OpenOptionsExt;
+    let make = |tag: &str| {
+        let dir = Dir::new(tag);
+        drop(TrustedCoreStore::open_exclusive(dir.db()).unwrap());
+        dir
+    };
+    let sidecar = |dir: &Dir, suffix: &str| {
+        let mut name = dir.db().into_os_string();
+        name.push(suffix);
+        PathBuf::from(name)
+    };
+    // Missing sidecars and a valid private sidecar both open.
+    let ok = make("sidecar-ok");
+    drop(TrustedCoreStore::open_exclusive(ok.db()).unwrap());
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(sidecar(&ok, "-journal"))
+        .unwrap();
+    drop(TrustedCoreStore::open_exclusive(ok.db()).unwrap());
+
+    for suffix in ["-wal", "-shm", "-journal"] {
+        // Symlink sidecar pointing at a foreign object: refused, foreign
+        // object unchanged.
+        let dir = make("sidecar-link");
+        let foreign = dir.0.join("foreign");
+        std::fs::write(&foreign, b"foreign").unwrap();
+        std::os::unix::fs::symlink(&foreign, sidecar(&dir, suffix)).unwrap();
+        assert_eq!(
+            refusal(TrustedCoreStore::open_exclusive(dir.db()).unwrap_err()),
+            R::InsecurePath
+        );
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"foreign");
+
+        // FIFO sidecar: refused without opening (no blocking).
+        let dir = make("sidecar-fifo");
+        let fifo = sidecar(&dir, suffix);
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert_eq!(
+            refusal(TrustedCoreStore::open_exclusive(dir.db()).unwrap_err()),
+            R::InsecurePath
+        );
+
+        // Hard-linked sidecar: refused, both names retained.
+        let dir = make("sidecar-hard");
+        let other = dir.0.join("other");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&other)
+            .unwrap();
+        std::fs::hard_link(&other, sidecar(&dir, suffix)).unwrap();
+        assert_eq!(
+            refusal(TrustedCoreStore::open_exclusive(dir.db()).unwrap_err()),
+            R::InsecurePath
+        );
+        assert!(other.exists() && sidecar(&dir, suffix).exists());
+
+        // Group-readable sidecar: refused, mode not repaired.
+        let dir = make("sidecar-mode");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o640)
+            .open(sidecar(&dir, suffix))
+            .unwrap();
+        std::fs::set_permissions(sidecar(&dir, suffix), std::fs::Permissions::from_mode(0o640))
+            .unwrap();
+        assert_eq!(
+            refusal(TrustedCoreStore::open_exclusive(dir.db()).unwrap_err()),
+            R::InsecureMode
+        );
+        assert_eq!(
+            std::fs::metadata(sidecar(&dir, suffix)).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+}
+
 #[test]
 fn role_scoped_writes_resolve_the_target_project_and_refuse_unknown_subjects() {
     let dir = Dir::new("role");

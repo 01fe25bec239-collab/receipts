@@ -35,6 +35,9 @@ rusqlite = { version = "=0.40.1", features = ["bundled"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json_canonicalizer = "=0.3.2"
 sha2 = "=0.11.0"
+# Narrow secure-open primitives (openat/fstatat/flock) for the trusted-core
+# State writer; already locked, no default features.
+libc = { version = "=0.2.189", default-features = false }
 # Approved async substrate for later State/Context milestones; this foundation
 # slice is synchronous, so no Tokio features are enabled yet.
 tokio = { version = "~1.51", default-features = false }

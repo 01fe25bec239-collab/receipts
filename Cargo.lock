@@ -699,6 +699,7 @@ dependencies = [
  "base64",
  "ed25519-dalek",
  "jsonschema",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
