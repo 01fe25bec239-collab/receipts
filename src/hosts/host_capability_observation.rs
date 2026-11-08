@@ -5,6 +5,7 @@
 //! File settings cannot establish higher managed tiers, project trust, or
 //! Receipts hook ownership. Consequently they never authorize native hooks.
 
+use crate::host_probe_port::{HostObservationFingerprintV1, HostProbeProcessPort};
 use crate::{
     HostCapabilityHookCoverageClass, HostCapabilityModeOverride, HostCapabilityProbeStatus,
     HostCapabilityReportSelectionCompositionInputs, HostCapabilityStaleReason, HostId,
@@ -187,10 +188,33 @@ impl HostCapabilityObservation {
 }
 
 /// Performs only the internally enumerated, read-only Host observations.
+/// Observes through the admitted composition's probe port.
 pub fn observe_host_capabilities(
     request: &HostCapabilityObservationRequest,
+    port: &dyn HostProbeProcessPort,
 ) -> HostCapabilityObservation {
-    observe(request, &io::LocalSources)
+    observe_host_capabilities_with_fingerprint(request, port).0
+}
+
+/// Observes and returns the exact fingerprint of the same observation.
+pub fn observe_host_capabilities_with_fingerprint(
+    request: &HostCapabilityObservationRequest,
+    port: &dyn HostProbeProcessPort,
+) -> (HostCapabilityObservation, HostObservationFingerprintV1) {
+    let probes = request.host == HostId::ClaudeCode;
+    let executable = probes.then(|| port.executable());
+    let version =
+        probes.then(|| port.run(&io::probe_command(&request.project_root, &["--version"])));
+    let (observation, plugins, sources) = observe_material(request, &io::LocalSources(port));
+    let fingerprint = HostObservationFingerprintV1 {
+        host: request.host,
+        project_root: request.project_root.clone(),
+        executable,
+        version,
+        plugins,
+        sources,
+    };
+    (observation, fingerprint)
 }
 
 // Private injection boundary: a test double cannot become a public evidence API.
@@ -202,30 +226,47 @@ trait Sources {
     ) -> Vec<(Source, Result<Vec<u8>, Error>)>;
 }
 
+#[cfg(test)]
 fn observe(
     request: &HostCapabilityObservationRequest,
     sources: &impl Sources,
 ) -> HostCapabilityObservation {
-    let plugins = if request.host == HostId::ClaudeCode {
-        sources
-            .plugins(&request.project_root)
-            .and_then(|bytes| decode::claude_plugins(&bytes))
-    } else {
-        Err(Error::Unsupported)
+    observe_material(request, sources).0
+}
+
+type SourceMaterial = Vec<(Source, Result<Vec<u8>, Error>)>;
+
+fn observe_material(
+    request: &HostCapabilityObservationRequest,
+    sources: &impl Sources,
+) -> (
+    HostCapabilityObservation,
+    Option<Result<Vec<u8>, Error>>,
+    SourceMaterial,
+) {
+    let plugin_bytes =
+        (request.host == HostId::ClaudeCode).then(|| sources.plugins(&request.project_root));
+    let plugins = match &plugin_bytes {
+        Some(bytes) => bytes
+            .clone()
+            .and_then(|bytes| decode::claude_plugins(&bytes)),
+        None => Err(Error::Unsupported),
     };
     let (plugin_supported, plugin_installed) = match &plugins {
         Ok(entries) => (Value::Known(true), Value::Known(!entries.is_empty())),
         Err(_) => (Value::Unknown, Value::Unknown),
     };
-    let configurations = sources
-        .configurations(request)
-        .into_iter()
+    let material = sources.configurations(request);
+    let configurations = material
+        .iter()
         .map(|(source, bytes)| HostConfigurationObservation {
-            source,
-            result: bytes.and_then(|bytes| decode::configuration(source, &bytes)),
+            source: *source,
+            result: bytes
+                .clone()
+                .and_then(|bytes| decode::configuration(*source, &bytes)),
         })
         .collect();
-    HostCapabilityObservation {
+    let observation = HostCapabilityObservation {
         host: request.host,
         plugin_supported,
         plugin_installed,
@@ -242,5 +283,6 @@ fn observe(
         required_hook_coverage_satisfied: Value::Unknown,
         relevant_config_identity: Value::Unknown,
         configurations,
-    }
+    };
+    (observation, plugin_bytes, material)
 }

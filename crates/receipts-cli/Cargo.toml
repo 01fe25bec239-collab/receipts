@@ -1,0 +1,14 @@
+[package]
+name = "receipts-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+publish = false
+license = "Apache-2.0"
+
+# Host-owned (D2) composition layer. This step adds only the admitted Host
+# probe/process composition; no product commands or binary yet.
+[dependencies]
+receipts-host-integration = { path = "../receipts-host-integration" }
+receipts-workspace-execution = { path = "../receipts-workspace-execution" }
+sha2 = "=0.11.0"

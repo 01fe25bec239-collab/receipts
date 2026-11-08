@@ -64,6 +64,7 @@ fn request() -> HostSessionActivationRequest<'static> {
         project_root: "/unused-session-context".into(),
         mode_override: None,
         cached_report: None,
+        cached_fingerprint: None,
     }
 }
 
@@ -77,6 +78,7 @@ fn unknown(host: HostId) -> HostCapabilityObservation {
                 host: HostId::Headless,
                 project_root: request().project_root,
             },
+            &NoPort,
         )
     }
 }
@@ -89,6 +91,7 @@ fn refreshed(
     HostCapabilityReportRefreshOutcome {
         report_selection: compose_host_capability_report_selection(&inputs),
         observation,
+        fingerprint: None,
     }
 }
 
@@ -174,7 +177,7 @@ fn complete_detection_override_adapter_matrix_fails_before_refresh_and_is_determ
                         assert_eq!(calls.get(), 0);
                         // Exercise the actual public gate too, with no I/O reachable.
                         assert_eq!(
-                            prepare_host_session(&Adapter(adapter_host), &request),
+                            prepare_host_session(&Adapter(adapter_host), &request, &NoPort),
                             first
                         );
                     }
@@ -188,7 +191,7 @@ fn complete_detection_override_adapter_matrix_fails_before_refresh_and_is_determ
                         );
                         assert_eq!(calls.get(), 0);
                         assert_eq!(
-                            prepare_host_session(&Adapter(adapter_host), &request),
+                            prepare_host_session(&Adapter(adapter_host), &request, &NoPort),
                             first
                         );
                     }
@@ -214,11 +217,12 @@ fn identity_errors_are_typed_and_have_bounded_diagnostics() {
             detection_signals: HostDetectionSignals::BOTH,
             ..request()
         },
+        &NoPort,
     )
     .unwrap_err();
     assert!(std::error::Error::source(&error).is_some());
     assert!(error.to_string().contains("ambiguous"));
-    let mismatch = prepare_host_session(&Adapter(HostId::Codex), &request()).unwrap_err();
+    let mismatch = prepare_host_session(&Adapter(HostId::Codex), &request(), &NoPort).unwrap_err();
     assert!(std::error::Error::source(&mismatch).is_none());
     assert_eq!(
         mismatch.to_string(),
@@ -281,14 +285,17 @@ fn stale_embedded_never_survives_real_session_start_or_resume() {
         ..request()
     };
     for _ in 0..2 {
-        let result = prepare_host_session(&Adapter(HostId::Headless), &request).unwrap();
-        let expected = refresh_host_capability_report(&HostCapabilityReportRefreshRequest {
-            observation: HostCapabilityObservationRequest {
-                host: HostId::Headless,
-                project_root: request.project_root.clone(),
+        let result = prepare_host_session(&Adapter(HostId::Headless), &request, &NoPort).unwrap();
+        let expected = refresh_host_capability_report(
+            &HostCapabilityReportRefreshRequest {
+                observation: HostCapabilityObservationRequest {
+                    host: HostId::Headless,
+                    project_root: request.project_root.clone(),
+                },
+                mode_override: None,
             },
-            mode_override: None,
-        });
+            &NoPort,
+        );
         assert_eq!(result.capability_refresh, expected);
         assert_eq!(
             report(&result.capability_refresh).selected_mode(),
@@ -417,6 +424,7 @@ fn all_selection_outcomes_and_composition_errors_are_preserved() {
         let expected = HostCapabilityReportRefreshOutcome {
             observation: observation.clone(),
             report_selection,
+            fingerprint: None,
         };
         let outcome =
             prepare_with_refresh(&Adapter(HostId::Headless), &request(), |_| expected.clone())
@@ -442,6 +450,7 @@ fn hybrid_is_only_preserved_when_existing_selector_establishes_it() {
     let expected = HostCapabilityReportRefreshOutcome {
         observation: unknown(HostId::Headless),
         report_selection: compose_host_capability_report_selection(&inputs),
+        fingerprint: None,
     };
     assert_eq!(report(&expected).selected_mode(), Mode::Hybrid);
     let result =
@@ -453,16 +462,18 @@ fn hybrid_is_only_preserved_when_existing_selector_establishes_it() {
 fn production_is_only_identity_and_refresh_composition() {
     let source = include_str!("host_session_activation.rs");
     let body = source.split("pub fn prepare_host_session<").nth(1).unwrap();
-    assert!(
-        body.contains("prepare_with_refresh(adapter, request, refresh_host_capability_report)")
-    );
-    assert!(body.contains("freshness_disposition(false)"));
+    assert!(body.contains("refresh_host_capability_report(r, port)"));
+    // Reuse only via the exact fingerprint rule; the cached report's contents
+    // are never read and caller flags never count.
+    assert!(body.contains("current.permits_reuse_of(cached)"));
+    assert!(body.contains("freshness_disposition(reusable)"));
+    assert_eq!(body.matches("cached_report.").count(), 1);
+    assert!(body.contains("cached_report.is_some()"));
     assert!(body.find("resolve_host(").unwrap() < body.find("adapter.id()").unwrap());
     for forbidden in [
         "HostId::",
         "selected_mode",
         "inactive_reason",
-        "cached_report.",
         "report_selection_inputs(",
         "compose_host_capability_report_selection(",
         "select_host_capability_mode(",
@@ -574,5 +585,24 @@ fn fresh_support_and_healthy_partial_facts_never_grant_embedded() {
                 }
             }
         }
+    }
+}
+
+/// Probe port that must never be reached (Headless and refused paths do no probing).
+struct NoPort;
+impl crate::HostProbeProcessPort for NoPort {
+    fn executable(
+        &self,
+    ) -> Result<
+        crate::HostExecutableIdentityV1,
+        crate::host_capability_observation::HostCapabilityObservationError,
+    > {
+        panic!("no probe expected")
+    }
+    fn run(
+        &self,
+        _: &crate::HostProbeCommandV1,
+    ) -> Result<Vec<u8>, crate::host_capability_observation::HostCapabilityObservationError> {
+        panic!("no probe expected")
     }
 }

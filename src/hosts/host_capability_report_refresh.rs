@@ -9,8 +9,10 @@ use crate::{
     HostCapabilityReportSelectionCompositionOutcome, HostCapabilityStaleReason,
     compose_host_capability_report_selection,
     host_capability_observation::{
-        HostCapabilityObservation, HostCapabilityObservationRequest, observe_host_capabilities,
+        HostCapabilityObservation, HostCapabilityObservationRequest,
+        observe_host_capabilities_with_fingerprint,
     },
+    host_probe_port::{HostObservationFingerprintV1, HostProbeProcessPort},
 };
 
 /// Observation context and an optional existing, validated override only.
@@ -65,6 +67,9 @@ pub struct HostCapabilityReportRefreshOutcome {
         HostCapabilityReportSelectionCompositionOutcome,
         HostCapabilityReportSelectionCompositionError,
     >,
+    /// Exact fingerprint of this observation; `None` only for injected
+    /// test observers, which therefore can never justify cache reuse.
+    pub fingerprint: Option<HostObservationFingerprintV1>,
 }
 
 /// Performs the integrated observation on EVERY call, then delegates adaptation
@@ -75,8 +80,14 @@ pub struct HostCapabilityReportRefreshOutcome {
 /// ```
 pub fn refresh_host_capability_report(
     request: &HostCapabilityReportRefreshRequest,
+    port: &dyn HostProbeProcessPort,
 ) -> HostCapabilityReportRefreshOutcome {
-    refresh_with_observer(request, observe_host_capabilities)
+    let (observation, fingerprint) =
+        observe_host_capabilities_with_fingerprint(&request.observation, port);
+    HostCapabilityReportRefreshOutcome {
+        fingerprint: Some(fingerprint),
+        ..refresh_with_observer(request, |_| observation)
+    }
 }
 
 fn refresh_with_observer(
@@ -93,6 +104,7 @@ fn refresh_with_observer(
     HostCapabilityReportRefreshOutcome {
         observation,
         report_selection,
+        fingerprint: None,
     }
 }
 

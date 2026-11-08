@@ -1,27 +1,31 @@
-//! Fixed source paths and one read-only command; no settings writes or shell.
+//! Fixed source paths and port-run read-only probes; no settings writes or shell.
 use super::*;
+use crate::host_probe_port::{HostProbeCommandV1, HostProbeProcessPort};
 use std::{
     fs::{self, OpenOptions},
     io::Read,
     path::{Path, PathBuf},
 };
 
-pub(super) struct LocalSources;
-impl Sources for LocalSources {
+/// Reads fixed source paths itself; runs probes only through the admitted
+/// composition's port (no PATH lookup, no direct process spawn here).
+pub(super) struct LocalSources<'a>(pub(super) &'a dyn HostProbeProcessPort);
+
+/// The bounded read-only probe Host asks the composition to run.
+pub(super) fn probe_command(project_root: &Path, args: &[&str]) -> HostProbeCommandV1 {
+    HostProbeCommandV1 {
+        args: args.iter().map(|a| String::from(*a)).collect(),
+        current_dir: project_root.to_path_buf(),
+        timeout: HOST_PROBE_TIMEOUT,
+        stdout_max_bytes: HOST_PROBE_STDOUT_MAX_BYTES,
+        stderr_max_bytes: HOST_PROBE_STDERR_MAX_BYTES,
+    }
+}
+
+impl Sources for LocalSources<'_> {
     fn plugins(&self, project_root: &Path) -> Result<Vec<u8>, Error> {
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        {
-            let mut command = std::process::Command::new("claude");
-            command
-                .args(["plugin", "list", "--json"])
-                .current_dir(project_root);
-            process::capture(command, HOST_PROBE_TIMEOUT)
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            let _ = project_root;
-            Err(Error::Unsupported)
-        }
+        self.0
+            .run(&probe_command(project_root, &["plugin", "list", "--json"]))
     }
 
     fn configurations(
@@ -216,145 +220,4 @@ pub(super) fn drop_ins(path: &Path) -> Result<Vec<PathBuf>, Error> {
     }
     paths.sort();
     Ok(paths)
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-pub(super) mod process {
-    use super::*;
-    use std::{
-        os::fd::AsRawFd,
-        process::{Command, Stdio},
-        time::{Duration, Instant},
-    };
-
-    // POSIX poll operates only on our two pipe descriptors. No process-tree
-    // semantics, runtime dependency, signal-group control, or background reader.
-    #[repr(C)]
-    struct PollFd {
-        fd: std::ffi::c_int,
-        events: std::ffi::c_short,
-        revents: std::ffi::c_short,
-    }
-    #[cfg(target_os = "macos")]
-    type Nfds = std::ffi::c_uint;
-    #[cfg(target_os = "linux")]
-    type Nfds = std::ffi::c_ulong;
-    unsafe extern "C" {
-        fn poll(fds: *mut PollFd, count: Nfds, timeout: std::ffi::c_int) -> std::ffi::c_int;
-    }
-
-    fn drain(
-        pipe: &mut (impl Read + AsRawFd),
-        retained: &mut Vec<u8>,
-        count: &mut usize,
-        overflow: Error,
-        eof: &mut bool,
-        keep: bool,
-    ) -> Result<(), Error> {
-        if *eof {
-            return Ok(());
-        }
-        let mut descriptor = PollFd {
-            fd: pipe.as_raw_fd(),
-            events: 1,
-            revents: 0,
-        };
-        // SAFETY: live, initialized single pollfd; correct platform nfds_t;
-        // timeout zero; the exclusively owned pipe has no competing reader.
-        let ready = unsafe { poll(&mut descriptor, 1, 0) };
-        if ready < 0 {
-            return Err(Error::ProbeFailed);
-        }
-        if ready == 0 {
-            return Ok(());
-        }
-        let mut buffer = [0_u8; 8192];
-        let read = pipe.read(&mut buffer).map_err(|_| Error::ProbeFailed)?;
-        if read == 0 {
-            *eof = true;
-            return Ok(());
-        }
-        *count = count.saturating_add(read);
-        let limit = if keep {
-            HOST_PROBE_STDOUT_MAX_BYTES
-        } else {
-            HOST_PROBE_STDERR_MAX_BYTES
-        };
-        if *count > limit {
-            return Err(overflow);
-        }
-        if keep {
-            retained.extend_from_slice(&buffer[..read]);
-        }
-        Ok(())
-    }
-
-    pub(in crate::host_capability_observation) fn capture(
-        mut command: Command,
-        timeout: Duration,
-    ) -> Result<Vec<u8>, Error> {
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let start = Instant::now();
-        let mut child = command.spawn().map_err(|_| Error::ProbeFailed)?;
-        let mut stdout = child.stdout.take().expect("stdout was configured as piped");
-        let mut stderr = child.stderr.take().expect("stderr was configured as piped");
-        let mut bytes = Vec::new();
-        let mut discarded = Vec::new();
-        let (mut out_count, mut err_count) = (0, 0);
-        let (mut out_eof, mut err_eof) = (false, false);
-        let result = loop {
-            if start.elapsed() >= timeout {
-                break Err(Error::ProbeTimeout);
-            }
-            if let Err(error) = drain(
-                &mut stdout,
-                &mut bytes,
-                &mut out_count,
-                Error::ProbeStdoutTooLarge,
-                &mut out_eof,
-                true,
-            ) {
-                break Err(error);
-            }
-            if let Err(error) = drain(
-                &mut stderr,
-                &mut discarded,
-                &mut err_count,
-                Error::ProbeStderrTooLarge,
-                &mut err_eof,
-                false,
-            ) {
-                break Err(error);
-            }
-            match child.try_wait() {
-                Ok(Some(status)) if !status.success() => break Err(Error::ProbeFailed),
-                Ok(Some(_)) if out_eof && err_eof => break Ok(bytes),
-                Err(_) => break Err(Error::ProbeFailed),
-                _ => {}
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        };
-        if result.is_err() {
-            // Close pipes before direct-child cleanup. A descendant holding a
-            // descriptor cannot keep a reader thread or join alive: there is none.
-            drop(stdout);
-            drop(stderr);
-            let _ = child.kill();
-            let cleanup = Instant::now();
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Err(_) => return Err(Error::ProbeCleanupFailed),
-                    _ if cleanup.elapsed() >= Duration::from_secs(1) => {
-                        return Err(Error::ProbeCleanupFailed);
-                    }
-                    _ => std::thread::sleep(Duration::from_millis(1)),
-                }
-            }
-        }
-        result
-    }
 }

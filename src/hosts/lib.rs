@@ -57,6 +57,7 @@ pub mod host_capability_report_vocabulary;
 pub mod host_capability_selected_mode_consistency;
 pub mod host_detection;
 pub mod host_id;
+pub mod host_probe_port;
 pub mod host_session_activation;
 pub mod normalized_host_event;
 pub mod normalized_host_event_emission;
@@ -189,6 +190,10 @@ pub use normalized_host_event_emission::{
 pub use normalized_host_event_source_class::NormalizedHostEventSourceClass;
 pub use normalized_host_event_source_policy::source_class_allowed;
 
+pub use host_probe_port::{
+    HostExecutableIdentityV1, HostObservationFingerprintV1, HostProbeCommandV1,
+    HostProbeProcessPort,
+};
 pub use host_session_activation::{
     HostSessionActivationError, HostSessionActivationOutcome, HostSessionActivationRequest,
     prepare_host_session,

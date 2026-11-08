@@ -10,7 +10,9 @@ use crate::{
     HostAdapter, HostCapabilityFreshnessDisposition, HostCapabilityModeOverride,
     HostCapabilityReportNonTemporalCore, HostCapabilityReportRefreshOutcome,
     HostCapabilityReportRefreshRequest, HostDetectionError, HostDetectionSignals, HostId,
-    freshness_disposition, host_capability_observation::HostCapabilityObservationRequest,
+    freshness_disposition,
+    host_capability_observation::HostCapabilityObservationRequest,
+    host_probe_port::{HostObservationFingerprintV1, HostProbeProcessPort},
     refresh_host_capability_report, resolve_host,
 };
 
@@ -90,6 +92,8 @@ pub struct HostSessionActivationRequest<'a> {
     pub project_root: PathBuf,
     pub mode_override: Option<HostCapabilityModeOverride>,
     pub cached_report: Option<&'a HostCapabilityReportNonTemporalCore>,
+    /// The exact fingerprint recorded with `cached_report`, if any.
+    pub cached_fingerprint: Option<&'a HostObservationFingerprintV1>,
 }
 
 /// Identity reconciled and capability refresh attempted, not unconditional readiness.
@@ -151,8 +155,11 @@ impl std::error::Error for HostSessionActivationError {
 pub fn prepare_host_session<A: HostAdapter>(
     adapter: &A,
     request: &HostSessionActivationRequest<'_>,
+    port: &dyn HostProbeProcessPort,
 ) -> Result<HostSessionActivationOutcome, HostSessionActivationError> {
-    prepare_with_refresh(adapter, request, refresh_host_capability_report)
+    prepare_with_refresh(adapter, request, |r| {
+        refresh_host_capability_report(r, port)
+    })
 }
 
 fn prepare_with_refresh<A: HostAdapter>(
@@ -170,10 +177,9 @@ fn prepare_with_refresh<A: HostAdapter>(
         });
     }
 
-    // SESSION_START_OR_RESUME: every candidate's validity is unproven. Neither
-    // its contents nor its absence can supply the missing physical proof.
-    // ponytail: always refresh until an authoritative fingerprint proof is integrated.
-    let freshness_disposition = freshness_disposition(false);
+    // SESSION_START_OR_RESUME: always observe fresh. A cached report is
+    // reusable only when the fresh observation's exact fingerprint is complete
+    // and identical to the one recorded with it; caller flags never count.
     let capability_refresh = refresh(&HostCapabilityReportRefreshRequest {
         observation: HostCapabilityObservationRequest {
             host: resolved_host,
@@ -181,6 +187,12 @@ fn prepare_with_refresh<A: HostAdapter>(
         },
         mode_override: request.mode_override.clone(),
     });
+    let reusable = request.cached_report.is_some()
+        && match (&capability_refresh.fingerprint, request.cached_fingerprint) {
+            (Some(current), Some(cached)) => current.permits_reuse_of(cached),
+            _ => false,
+        };
+    let freshness_disposition = freshness_disposition(reusable);
     Ok(HostSessionActivationOutcome {
         resolved_host,
         freshness_disposition,

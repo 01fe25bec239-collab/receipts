@@ -108,11 +108,16 @@ fn injected(
 fn production_delegates_to_real_observation_engine() {
     // Headless exercises the actual public call without machine-dependent I/O.
     let request = request(HostId::Headless);
-    let result = refresh_host_capability_report(&request);
+    let result = refresh_host_capability_report(&request, &NoPort);
     assert_eq!(
         result.observation,
-        observe_host_capabilities(&request.observation)
+        crate::host_capability_observation::observe_host_capabilities(
+            &request.observation,
+            &NoPort
+        )
     );
+    // The production path records the exact fingerprint of what it observed.
+    assert!(result.fingerprint.as_ref().is_some_and(|f| f.is_complete()));
     assert_eq!(result.observation.host, HostId::Headless);
     assert!(result.observation.configurations.is_empty());
     assert_eq!(result.observation.plugins, Err(Error::Unsupported));
@@ -293,7 +298,10 @@ fn production_surface_only_delegates_and_has_no_io_parser_or_cache() {
         .split("pub fn refresh_host_capability_report(")
         .nth(1)
         .unwrap();
-    assert!(body.contains("refresh_with_observer(request, observe_host_capabilities)"));
+    assert!(
+        body.contains("observe_host_capabilities_with_fingerprint(&request.observation, port)")
+    );
+    assert!(body.contains("refresh_with_observer(request, |_| observation)"));
     assert!(body.contains("let observation = observe(&request.observation);"));
     assert!(body.contains("observation.report_selection_inputs("));
     assert!(body.contains("compose_host_capability_report_selection(&inputs)"));
@@ -307,7 +315,6 @@ fn production_surface_only_delegates_and_has_no_io_parser_or_cache() {
         "Command",
         "SystemTime",
         "Instant",
-        "fingerprint",
         "digest",
         "cached",
         "unsafe",
@@ -340,4 +347,15 @@ fn composition_error_and_observation_are_both_preserved() {
             )
         )
     );
+}
+
+/// Probe port that must never be reached (Headless does no probing).
+struct NoPort;
+impl crate::HostProbeProcessPort for NoPort {
+    fn executable(&self) -> Result<crate::HostExecutableIdentityV1, Error> {
+        panic!("no probe expected")
+    }
+    fn run(&self, _: &crate::HostProbeCommandV1) -> Result<Vec<u8>, Error> {
+        panic!("no probe expected")
+    }
 }

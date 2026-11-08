@@ -618,96 +618,8 @@ fn managed_drop_in_enumeration_has_a_file_count_bound() {
     assert_eq!(io::drop_ins(&directory.0), Err(Error::TooManyFiles));
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn child(mode: &str, timeout: Duration) -> Result<Vec<u8>, Error> {
-    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-    command
-        .args([
-            "--ignored",
-            "--exact",
-            "host_capability_observation::tests::probe_child",
-            "--nocapture",
-        ])
-        .env("RECEIPTS_HOST_TEST_PROBE", mode);
-    io::process::capture(command, timeout)
-}
-
-#[test]
-#[ignore = "invoked in an isolated subprocess by transport tests"]
-fn probe_child() {
-    use std::io::Write;
-    let Ok(mode) = std::env::var("RECEIPTS_HOST_TEST_PROBE") else {
-        return;
-    };
-    match mode.as_str() {
-        "stdout-overflow" => std::io::stdout()
-            .write_all(&vec![b'x'; HOST_PROBE_STDOUT_MAX_BYTES + 1])
-            .unwrap(),
-        "stderr-overflow" => std::io::stderr()
-            .write_all(&vec![b'x'; HOST_PROBE_STDERR_MAX_BYTES + 1])
-            .unwrap(),
-        "both" => {
-            let writer =
-                std::thread::spawn(|| std::io::stderr().write_all(&vec![b'e'; 524288]).unwrap());
-            std::io::stdout().write_all(&vec![b'o'; 524288]).unwrap();
-            writer.join().unwrap();
-        }
-        "timeout" => {
-            std::io::stdout().write_all(b"[]").unwrap();
-            std::thread::sleep(Duration::from_secs(60));
-        }
-        "failure" => {
-            std::io::stdout().write_all(b"[]").unwrap();
-            std::process::exit(7);
-        }
-        "stderr-json" => {
-            std::io::stdout().write_all(b"INVALID").unwrap();
-            std::io::stderr()
-                .write_all(br#"[{"id":"receipts"}]"#)
-                .unwrap();
-        }
-        _ => panic!("unknown synthetic probe"),
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-#[test]
-fn process_drains_both_pipes_and_bounds_each_stream() {
-    assert_eq!(
-        child("stdout-overflow", HOST_PROBE_TIMEOUT),
-        Err(Error::ProbeStdoutTooLarge)
-    );
-    assert_eq!(
-        child("stderr-overflow", HOST_PROBE_TIMEOUT),
-        Err(Error::ProbeStderrTooLarge)
-    );
-    let bytes = child("both", HOST_PROBE_TIMEOUT).unwrap();
-    assert!(bytes.len() >= 524288 && bytes.len() <= HOST_PROBE_STDOUT_MAX_BYTES);
-    assert!(!bytes.windows(16).any(|part| part == [b'e'; 16]));
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-#[test]
-fn timeout_and_nonzero_exit_discard_partial_positive_stdout() {
-    let start = std::time::Instant::now();
-    assert_eq!(
-        child("timeout", Duration::from_millis(200)),
-        Err(Error::ProbeTimeout)
-    );
-    assert!(start.elapsed() < Duration::from_secs(3));
-    assert_eq!(
-        child("failure", HOST_PROBE_TIMEOUT),
-        Err(Error::ProbeFailed)
-    );
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-#[test]
-fn json_stderr_cannot_rescue_invalid_stdout() {
-    let bytes = child("stderr-json", HOST_PROBE_TIMEOUT).unwrap();
-    assert!(!bytes.windows(8).any(|part| part == b"receipts"));
-    assert_eq!(decode::claude_plugins(&bytes), Err(Error::InvalidJson));
-}
+// Probe process transport (bounds, timeout, non-zero exit, descendant
+// cleanup) is owned by the admitted composition; see receipts-cli tests.
 
 #[test]
 fn observation_has_no_fingerprint_serialization_hash_or_mutation_path() {
@@ -743,10 +655,109 @@ fn observation_has_no_fingerprint_serialization_hash_or_mutation_path() {
         );
     }
     assert!(implementation.contains("[\"plugin\", \"list\", \"--json\"]"));
+    // Host never spawns a process: no PATH-resolved or direct child launch.
+    assert!(!implementation.contains("Command::new("));
+    assert!(!implementation.contains("process::Command"));
     for shell in ["sh", "bash", "zsh", "fish", "cmd.exe", "powershell"] {
         assert!(!implementation.contains(&format!("Command::new(\"{shell}\")")));
     }
     assert_eq!(HOST_STRUCTURED_OBSERVATION_MAX_BYTES, 1048576);
     assert_eq!(HOST_PROBE_TIMEOUT, Duration::from_secs(10));
     assert_eq!(crate::HostCapabilityValidityInput::ALL.len(), 7);
+}
+
+mod fingerprint {
+    use super::*;
+    use crate::host_probe_port::HostObservationFingerprintV1;
+    use crate::{HostExecutableIdentityV1, HostProbeCommandV1, HostProbeProcessPort};
+    use std::cell::RefCell;
+
+    struct Recording(RefCell<Vec<Vec<String>>>);
+    impl HostProbeProcessPort for Recording {
+        fn executable(&self) -> Result<HostExecutableIdentityV1, Error> {
+            Ok(HostExecutableIdentityV1 {
+                canonical_path: "/opt/claude".into(),
+                content_sha256: "a".repeat(64),
+            })
+        }
+        fn run(&self, command: &HostProbeCommandV1) -> Result<Vec<u8>, Error> {
+            assert_eq!(command.timeout, HOST_PROBE_TIMEOUT);
+            assert_eq!(command.stdout_max_bytes, HOST_PROBE_STDOUT_MAX_BYTES);
+            self.0.borrow_mut().push(command.args.clone());
+            Ok(b"[]".to_vec())
+        }
+    }
+
+    #[test]
+    fn plugin_probe_runs_only_through_the_port_with_fixed_read_only_argv() {
+        let port = Recording(RefCell::new(Vec::new()));
+        let bytes = io::LocalSources(&port)
+            .plugins(Path::new("/project"))
+            .unwrap();
+        assert_eq!(bytes, b"[]");
+        assert_eq!(
+            io::probe_command(Path::new("/project"), &["--version"]).current_dir,
+            Path::new("/project")
+        );
+        assert_eq!(*port.0.borrow(), vec![vec!["plugin", "list", "--json"]]);
+    }
+
+    fn fp() -> HostObservationFingerprintV1 {
+        HostObservationFingerprintV1 {
+            host: HostId::ClaudeCode,
+            project_root: "/project".into(),
+            executable: Some(Ok(HostExecutableIdentityV1 {
+                canonical_path: "/opt/claude".into(),
+                content_sha256: "a".repeat(64),
+            })),
+            version: Some(Ok(b"2.1.0 (Claude Code)".to_vec())),
+            plugins: Some(Ok(b"[]".to_vec())),
+            sources: vec![
+                (Source::ClaudeUserSettings, Ok(b"{}".to_vec())),
+                (Source::ClaudeProjectSettings, Err(Error::Missing)),
+            ],
+        }
+    }
+
+    #[test]
+    fn reuse_requires_an_identical_complete_fingerprint() {
+        let cached = fp();
+        assert!(fp().is_complete());
+        assert!(fp().permits_reuse_of(&cached));
+        let drifts: [fn(&mut HostObservationFingerprintV1); 7] = [
+            |f| f.sources[0].1 = Ok(b"{ }".to_vec()),
+            |f| f.sources[1].1 = Ok(b"{}".to_vec()),
+            |f| f.version = Some(Ok(b"2.1.1 (Claude Code)".to_vec())),
+            |f| f.plugins = Some(Ok(b"[{}]".to_vec())),
+            |f| {
+                f.executable
+                    .as_mut()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .content_sha256 = "b".repeat(64)
+            },
+            |f| f.project_root = "/other".into(),
+            |f| f.host = HostId::Codex,
+        ];
+        for drift in drifts {
+            let mut current = fp();
+            drift(&mut current);
+            assert!(
+                !current.permits_reuse_of(&cached),
+                "drift must refuse reuse"
+            );
+        }
+        // Retained uncertainty forbids reuse even when identical.
+        for uncertain in [
+            |f: &mut HostObservationFingerprintV1| f.sources[0].1 = Err(Error::PermissionDenied),
+            |f: &mut HostObservationFingerprintV1| f.plugins = Some(Err(Error::ProbeTimeout)),
+            |f: &mut HostObservationFingerprintV1| f.executable = Some(Err(Error::Unavailable)),
+        ] {
+            let mut both = fp();
+            uncertain(&mut both);
+            assert!(!both.is_complete());
+            assert!(!both.clone().permits_reuse_of(&both));
+        }
+    }
 }
