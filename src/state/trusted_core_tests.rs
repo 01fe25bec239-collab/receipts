@@ -177,7 +177,8 @@ fn graph_admission_binds_every_payload_field_and_refusals_write_nothing() {
     let mut store = TrustedCoreStore::open_exclusive(dir.db()).unwrap();
     let genesis = || request("p", "g");
     let base = || graph_subject(Op::GraphGenesis, "p", "g");
-    let cases: [(fn(&mut StateWriteSubjectV1), R); 7] = [
+    type Case = (fn(&mut StateWriteSubjectV1), R);
+    let cases: [Case; 7] = [
         (|s| s.operation = Op::GraphMutation, R::WrongOperation),
         (|s| s.project_id = "other".into(), R::ProjectMismatch),
         (|s| s.graph_id = Some("other".into()), R::GraphMismatch),

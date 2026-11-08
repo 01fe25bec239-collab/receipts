@@ -449,9 +449,7 @@ fn frozen_fixtures_c_d_e_reproduce_their_outcome_axis_and_reason() {
     check(&passing(), &fixture("E_openai_user_api_allowed.json"));
 
     let mut c = passing();
-    for e in [&mut c.provider_auth] {
-        e.as_mut().unwrap().provider_id = "anthropic".into();
-    }
+    c.provider_auth.as_mut().unwrap().provider_id = "anthropic".into();
     let p = c.provider_policy.as_mut().unwrap();
     p.provider_id = "anthropic".into();
     p.status = Policy::VerifiedDisallowed;

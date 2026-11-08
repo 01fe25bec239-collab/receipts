@@ -288,7 +288,7 @@ fn unprotected_or_writable_review_is_refused_through_both_adapters_without_launc
     )
     .unwrap();
     for read_only in [true, false] {
-        let policy = RuntimeExecutionPolicy::new(timeout.clone(), read_only);
+        let policy = RuntimeExecutionPolicy::new(timeout, read_only);
         if let RuntimeCapsuleFamily::Review(c) = &capsule {
             assert_eq!(
                 admit_review(c, review.handle(), &policy),
