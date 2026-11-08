@@ -357,7 +357,6 @@ fn changed_blob_digest_advances_epoch_and_invalidates_role() {
         SourceDigestComparison::Changed
     );
     assert_eq!(outcome.sources[0].bytes, b"spec v2");
-    drop(registry);
     assert!(blobs.1 >= 1);
 
     let succession = repo

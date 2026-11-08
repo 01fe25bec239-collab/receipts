@@ -121,7 +121,7 @@ impl<'a> ArtifactFileMaterializerV1<'a> {
             .canonicalize()
             .map_err(|_| invalid("artifact root is not accessible"))?;
         Ok(Self {
-            root: fs::open_root(&canonical).map_err(|code| invalid(code))?,
+            root: fs::open_root(&canonical).map_err(invalid)?,
             project_id: project_id.to_string(),
             catalog,
             max_bytes,
