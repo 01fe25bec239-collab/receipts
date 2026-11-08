@@ -78,3 +78,36 @@ jobs:
 
       - name: Whitespace check over the tested range
         run: git diff --check "${CI_BASE_SHA}" "${CI_TESTED_SHA}"
+
+  # N10: the same full locked suite on macOS. New job: advisory until A1
+  # adds it to branch protection; a failure here is never reported as green.
+  macos-validation:
+    name: macos-validation
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      CI_TESTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Checkout tested commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.CI_TESTED_SHA }}
+          persist-credentials: false
+
+      - name: Verify commit provenance
+        run: |
+          set -euo pipefail
+          echo "CI_TESTED_SHA=${CI_TESTED_SHA}"
+          test "$(git rev-parse HEAD)" = "${CI_TESTED_SHA}"
+
+      - name: Toolchain evidence
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain
+          rustc --version --verbose
+          cargo --version
+          git --version
+          sw_vers
+
+      - name: cargo test
+        run: cargo test --workspace --locked
