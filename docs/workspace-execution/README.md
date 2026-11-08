@@ -1,0 +1,12 @@
+
+## Review workspaces and reviewer evidence
+
+`review_evidence` provides the reviewer side of exact-SHA review over the hardened Git boundary (no arbitrary argv export):
+
+- `provision_review_workspace` reuses hardened provisioning on a fresh local branch `receipts/review/<128-bit hex>` pinned at the reviewed SHA. It is a real branch, not a detached-HEAD claim; the handle is PROVISIONED and bound to the reviewed capsule's `task_id`, which is what `ProtectedLauncher::admit` requires. The reviewer attempt is allocated at admission, separate from the reviewed implementation attempt.
+- `verify_review_workspace` refuses unless HEAD and the branch tip equal the reviewed SHA, the worktree is still on its branch and status (including untracked files) is empty. This detects movement; it is not immutable-execution or OS read-only proof.
+- `review_commit_range` proves the baseline is an ancestor and lists `baseline..implementation` (bounded); `review_diff` returns changed paths and the SHA-256 of the full binary patch (external diff and textconv disabled). Repositories with filter/include configuration are refused first.
+- `provision_temporary_merge` computes `target + candidate` with `git merge-tree --write-tree` (Git 2.38+), records a local two-parent commit and provisions a review workspace at it; conflicts are refused and create nothing. No existing branch or worktree moves.
+- `remove_review_workspace` performs the verified teardown, then deletes the review branch with compare-and-delete at the pinned SHA. Dirty, moved or foreign state is refused and retained.
+
+Linux protected admission of review handles and reviewer-channel use are NOT RUN on this Mac; the portable tests check admit's preconditions.
