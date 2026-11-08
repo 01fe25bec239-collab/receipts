@@ -15,10 +15,25 @@
 //! Integrity checks (HEAD, branch, ref tip, clean status) detect movement;
 //! they are not immutable-execution or OS read-only proof.
 //!
-//! Cleanup removes only what this module created: the worktree through the
-//! verified teardown (clean, registered, expected HEAD) and then the review
-//! branch through an atomic compare-and-delete at the pinned SHA, so a moved
-//! or replaced ref is refused and left untouched. No remote operation exists.
+//! Verification refuses repository and worktree filter/include configuration
+//! at the inspection point, before any content-comparing status, and uses the
+//! sibling hardened status flags (`--no-optional-locks`,
+//! `--ignore-submodules=none`, all untracked files), so configured submodule
+//! ignores cannot hide dirt. Provision-time checks never authorize later
+//! configuration.
+//!
+//! Cleanup removes only what this module created. Ownership is not inferred
+//! from path, branch or SHA: the handle retains the canonical repository and
+//! the identity (device, inode) of the task binding record created in the
+//! worktree's administrative directory at provisioning. Immediately before
+//! removal, inside the verified teardown (clean, registered, expected HEAD),
+//! the live binding must still equal this workspace/task/branch/base and be
+//! that same record object. Then the review branch is removed through a
+//! compare-and-delete at the pinned SHA, only if no registered worktree has
+//! it checked out, so a moved, replaced or reused ref is refused and left
+//! untouched. These are sequential Git/filesystem observations under the
+//! owner custody model, not an atomic lock against concurrent same-user
+//! writers. No remote operation exists.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -30,6 +45,7 @@ use crate::git;
 use crate::handle::{CommitSha, WorkspaceHandle};
 use crate::provision::WorkspaceProvisionRequest;
 use crate::teardown::WorkspaceTeardownRequest;
+use crate::worktree_binding::{self, TaskBinding};
 
 /// Prefix every generated review branch lives under.
 pub const REVIEW_BRANCH_PREFIX: &str = "receipts/review/";
@@ -81,6 +97,10 @@ fn commit(root: &Path, operation: &'static str, sha: &CommitSha) -> Result<(), W
 pub struct ReviewWorkspace {
     handle: WorkspaceHandle,
     reviewed_sha: CommitSha,
+    /// Canonical repository this module provisioned in.
+    repository_root: PathBuf,
+    /// (device, inode) of the binding record created at provisioning.
+    binding_object: (u64, u64),
 }
 
 impl ReviewWorkspace {
@@ -124,10 +144,55 @@ pub fn provision_review_workspace(
         request.reviewed_sha.as_str(),
     )?
     .provision()?;
+    let repository_root = canonical_root(&request.repository_root)?;
+    let binding_object = binding_object(&repository_root, handle.worktree_path())?;
     Ok(ReviewWorkspace {
         handle,
         reviewed_sha: request.reviewed_sha.clone(),
+        repository_root,
+        binding_object,
     })
+}
+
+#[cfg(unix)]
+fn binding_object(root: &Path, worktree: &Path) -> Result<(u64, u64), WorkspaceError> {
+    use std::os::unix::fs::MetadataExt;
+    let fail = |detail: String| WorkspaceError::WorktreeBindingFailed { detail };
+    let dir = worktree_binding::admin_dir(root, worktree).map_err(fail)?;
+    let meta = std::fs::symlink_metadata(dir.join(worktree_binding::BINDING_FILE))
+        .map_err(|e| fail(format!("binding entry: {e}")))?;
+    Ok((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn binding_object(_: &Path, _: &Path) -> Result<(u64, u64), WorkspaceError> {
+    Err(WorkspaceError::WorktreeBindingFailed {
+        detail: "binding identity is unsupported on this platform".into(),
+    })
+}
+
+/// The live binding still names exactly this workspace and is the record
+/// object created at provisioning (not a later identical re-provision).
+fn verify_owned(
+    workspace: &ReviewWorkspace,
+    root: &Path,
+    worktree: &Path,
+) -> Result<(), WorkspaceError> {
+    let op = "remove review workspace";
+    let handle = &workspace.handle;
+    let expected = TaskBinding {
+        repository: root.to_path_buf(),
+        worktree: worktree.to_path_buf(),
+        branch: handle.branch().to_owned(),
+        base_sha: workspace.reviewed_sha.clone(),
+        workspace_id: handle.workspace_id().to_owned(),
+        task_id: handle.task_id().unwrap_or_default().to_owned(),
+    };
+    worktree_binding::verify(root, &expected).map_err(|detail| refused(op, detail))?;
+    if binding_object(root, worktree)? != workspace.binding_object {
+        return Err(refused(op, "binding record was replaced since provisioning"));
+    }
+    Ok(())
 }
 
 /// Freshly observed integrity of a review workspace.
@@ -170,14 +235,20 @@ pub fn verify_review_workspace(
             "review HEAD or branch moved from the reviewed SHA",
         ));
     }
+    // Filters can run programs during status: refuse them (and includes) in
+    // the owned repository and the actual worktree, at this inspection point.
+    git::refuse_untrusted_repository_config(&workspace.repository_root, op)?;
+    git::refuse_untrusted_repository_config(worktree, op)?;
     let status = git::capture(
         worktree,
         op,
         &[
+            os("--no-optional-locks"),
             os("status"),
             os("--porcelain=v1"),
             os("-z"),
             os("--untracked-files=all"),
+            os("--ignore-submodules=none"),
         ],
     )?
     .require_success(op)?;
@@ -201,9 +272,25 @@ pub fn remove_review_workspace(
     if !workspace.review_branch().starts_with(REVIEW_BRANCH_PREFIX) {
         return Err(refused(op, "not a generated review branch"));
     }
-    WorkspaceTeardownRequest::new(repository_root).teardown(&workspace.handle)?;
     let root = canonical_root(repository_root)?;
+    if root != workspace.repository_root {
+        return Err(refused(op, "not the repository this workspace was provisioned in"));
+    }
+    WorkspaceTeardownRequest::new(&root)
+        .teardown_owned(&workspace.handle, &|root, worktree| {
+            verify_owned(workspace, root, worktree)
+        })?;
     let reference = format!("refs/heads/{}", workspace.review_branch());
+    // A worktree registered on the branch after ours was removed owns it now.
+    let registered = crate::teardown::list_registered_worktrees(&root, op, |detail| {
+        refused("remove review workspace", detail)
+    })?;
+    if registered
+        .iter()
+        .any(|record| record.branch_ref.as_deref() == Some(reference.as_bytes()))
+    {
+        return Err(refused(op, "review branch is checked out by another worktree"));
+    }
     git::capture(
         &root,
         op,

@@ -232,3 +232,169 @@ fn temporary_merge_checks_out_the_merged_tree_and_refuses_conflicts() {
     );
     assert!(!place.path().join("conflict").exists());
 }
+
+fn refused_config(result: Result<ReviewWorkspaceIntegrityV1, crate::error::WorkspaceError>) -> String {
+    match result {
+        Err(crate::error::WorkspaceError::RepositoryConfigRefused { key }) => key,
+        other => panic!("expected a configuration refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn verify_refuses_post_provision_filters_and_includes_before_they_run() {
+    let repo = TestRepo::new("review-verify-filter");
+    std::fs::write(repo.path().join(".gitattributes"), "src/a.rs filter=x\n").unwrap();
+    let reviewed = repo.commit_file("src/a.rs", "original");
+    let place = TempDir::new("review-verify-filter-wt");
+    let marker = place.path().join("filter-ran");
+    let ws = provision_review_workspace(&request(&repo, &place, "f", &reviewed)).unwrap();
+    // Valid clean review succeeds.
+    verify_review_workspace(&ws).unwrap();
+
+    // Configured after provisioning; equal-length tracked edit so status
+    // must hash content (and would run the clean filter).
+    git(
+        repo.path(),
+        &[
+            "config",
+            "filter.x.clean",
+            &format!("touch {}; cat", marker.display()),
+        ],
+    );
+    let file = ws.handle().worktree_path().join("src/a.rs");
+    std::fs::write(&file, "changed!").unwrap();
+    assert_eq!(refused_config(verify_review_workspace(&ws)), "filter.x.clean");
+    assert!(!marker.exists(), "the filter must not run before refusal");
+    assert_eq!(std::fs::read(&file).unwrap(), b"changed!", "evidence untouched");
+    git(repo.path(), &["config", "--unset", "filter.x.clean"]);
+
+    // Worktree-scoped configuration of the actual worktree is refused too.
+    git(repo.path(), &["config", "extensions.worktreeConfig", "true"]);
+    git(
+        ws.handle().worktree_path(),
+        &["config", "--worktree", "include.path", "/dev/null"],
+    );
+    assert_eq!(refused_config(verify_review_workspace(&ws)), "include.path");
+    assert!(!marker.exists());
+}
+
+#[test]
+fn configured_submodule_ignores_cannot_hide_dirt() {
+    let sub = TestRepo::new("review-sub-origin");
+    let recorded = sub.head_sha();
+    let repo = TestRepo::new("review-sub-super");
+    git(
+        repo.path(),
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{recorded},sub"),
+        ],
+    );
+    git(repo.path(), &["commit", "--quiet", "-m", "gitlink"]);
+    let reviewed = repo.head_sha();
+    let place = TempDir::new("review-sub-wt");
+    let ws = provision_review_workspace(&request(&repo, &place, "s", &reviewed)).unwrap();
+    verify_review_workspace(&ws).unwrap();
+
+    // Populate the gitlink in the review worktree and move it.
+    let checkout = ws.handle().worktree_path().join("sub");
+    std::fs::remove_dir_all(&checkout).ok();
+    git(
+        ws.handle().worktree_path(),
+        &["clone", "--quiet", sub.path().to_str().unwrap(), "sub"],
+    );
+    git(
+        &checkout,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t.invalid",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "moved",
+        ],
+    );
+    git(repo.path(), &["config", "diff.ignoreSubmodules", "all"]);
+    git(repo.path(), &["config", "submodule.sub.ignore", "all"]);
+    // The configuration hides it from a default status ...
+    assert!(
+        stdout_trimmed(&git(ws.handle().worktree_path(), &["status", "--porcelain"])).is_empty()
+    );
+    // ... but not from verification.
+    assert!(verify_review_workspace(&ws).is_err());
+}
+
+#[test]
+fn stale_handles_never_remove_a_replacement_workspace() {
+    use crate::provision::WorkspaceProvisionRequest;
+    let repo = TestRepo::new("review-own");
+    let reviewed = repo.commit_file("src/a.rs", "a");
+    let place = TempDir::new("review-own-wt");
+
+    // Valid owning cleanup.
+    let ws = provision_review_workspace(&request(&repo, &place, "valid", &reviewed)).unwrap();
+    remove_review_workspace(repo.path(), &ws).unwrap();
+
+    // Stale handle after removal, then a different task/workspace is
+    // provisioned at the identical path, branch and SHA.
+    let ws = provision_review_workspace(&request(&repo, &place, "stale", &reviewed)).unwrap();
+    let path = ws.handle().worktree_path().to_path_buf();
+    remove_review_workspace(repo.path(), &ws).unwrap();
+    let reprovision = |workspace: &str, task: &str| {
+        WorkspaceProvisionRequest::new(
+            repo.path(),
+            workspace,
+            Some(task),
+            ws.review_branch(),
+            &path,
+            &reviewed,
+        )
+        .unwrap()
+        .provision()
+        .unwrap()
+    };
+    let foreign = reprovision("foreign-workspace", "foreign-task");
+    assert!(remove_review_workspace(repo.path(), &ws).is_err());
+    assert!(path.exists() && worktree_registered(&repo, &path), "replacement retained");
+    assert!(branch_exists(&repo, ws.review_branch()), "replacement branch retained");
+    crate::teardown::WorkspaceTeardownRequest::new(repo.path())
+        .teardown(&foreign)
+        .unwrap();
+    git(repo.path(), &["branch", "--quiet", "-D", ws.review_branch()]);
+
+    // Identical workspace/task fields, but a new administrative record:
+    // matching SHA and fields are not ownership.
+    let _same_fields = reprovision(ws.handle().workspace_id(), "task-reviewed");
+    assert!(remove_review_workspace(repo.path(), &ws).is_err());
+    assert!(path.exists() && branch_exists(&repo, ws.review_branch()));
+
+    // Altered, replaced or missing binding on a live workspace refuses.
+    let live = provision_review_workspace(&request(&repo, &place, "live", &reviewed)).unwrap();
+    let live_path = live.handle().worktree_path().to_path_buf();
+    let binding = crate::test_support::worktree_meta_dir(&repo, &live_path)
+        .unwrap()
+        .join(crate::worktree_binding::BINDING_FILE);
+    let original = std::fs::read(&binding).unwrap();
+    // Same bytes, new object: the administrative identity was replaced.
+    std::fs::remove_file(&binding).unwrap();
+    std::fs::write(&binding, &original).unwrap();
+    assert!(remove_review_workspace(repo.path(), &live).is_err());
+    // Altered content.
+    std::fs::write(&binding, b"receipts-workspace-binding/v1\n").unwrap();
+    assert!(remove_review_workspace(repo.path(), &live).is_err());
+    // Missing.
+    std::fs::remove_file(&binding).unwrap();
+    assert!(remove_review_workspace(repo.path(), &live).is_err());
+    assert!(live_path.exists() && branch_exists(&repo, live.review_branch()));
+
+    // A different repository root is refused before anything is inspected.
+    let other = TestRepo::new("review-own-other");
+    let owned = provision_review_workspace(&request(&repo, &place, "owned", &reviewed)).unwrap();
+    assert!(remove_review_workspace(other.path(), &owned).is_err());
+    remove_review_workspace(repo.path(), &owned).unwrap();
+}
