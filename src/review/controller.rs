@@ -215,7 +215,7 @@ impl ReviewController<'_> {
                     &capsule,
                     "routing:no-provider-selected",
                     None,
-                    SafetyInterruptionDetectionConfidence::ExplicitProviderSignal,
+                    SafetyInterruptionDetectionConfidence::Unknown,
                 );
                 return self.finish(ticket, &attempt, sink);
             }
@@ -271,12 +271,14 @@ impl ReviewController<'_> {
     ) -> ReviewDisposition {
         let output = match runtime.run_review(capsule, workspace.handle()) {
             Ok(o) => o,
+            // PolicyBlocked may be Receipts' own refusal (e.g. no protected
+            // launch), not a provider signal: confidence stays UNKNOWN.
             Err(FailureClass::PolicyBlocked) => {
                 return self.interruption(
                     capsule,
                     &candidate.provider_id,
                     candidate.model_id.clone(),
-                    SafetyInterruptionDetectionConfidence::ExplicitProviderSignal,
+                    SafetyInterruptionDetectionConfidence::Unknown,
                 );
             }
             Err(other) => {

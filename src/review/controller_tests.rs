@@ -428,6 +428,11 @@ fn policy_blocked_reviewer_no_provider_shopping() {
         Some(SafetyInterruptionTerminalOutcome::HumanRequired)
     );
     assert_eq!(i.core().retry_attempted(), Some(false));
+    // Never claimed as an explicit provider signal: it may be Receipts' own refusal.
+    assert_eq!(
+        i.core().detection_confidence(),
+        Some(crate::SafetyInterruptionDetectionConfidence::Unknown)
+    );
     assert_eq!(i.core().provider_id(), "provider-b");
     assert_eq!(t.dispatches, 1);
     assert_eq!(routing.asked.borrow().len(), 1, "routing asked once only");
