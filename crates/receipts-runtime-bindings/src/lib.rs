@@ -15,8 +15,9 @@ pub use receipts_orchestration::capsules::{
     VerificationPlanEntryV1,
 };
 pub use receipts_review_contracts::{
-    ReviewCapsuleCriterion, ReviewCapsuleCriterionKind, ReviewCapsuleNonTemporalCore,
-    ReviewCapsuleReviewScope, ReviewCapsuleSeverityPolicy,
+    ReviewCapsuleCheck, ReviewCapsuleCheckResult, ReviewCapsuleCriterion,
+    ReviewCapsuleCriterionKind, ReviewCapsuleNonTemporalCore, ReviewCapsuleReviewScope,
+    ReviewCapsuleSeverityPolicy, ReviewDateTimeV1, ReviewRequestNonNegativeInteger,
 };
 
 pub use receipts_orchestration::graph::CapabilityName;

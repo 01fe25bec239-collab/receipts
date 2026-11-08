@@ -36,6 +36,9 @@ mod codex_task_execution;
 mod failure;
 mod jsonl;
 mod raw_failure;
+mod review_prompt;
+#[cfg(test)]
+mod review_prompt_tests;
 mod runtime_capabilities;
 
 #[cfg(test)]
