@@ -52,20 +52,31 @@ pub struct WorkspaceHostProbeRunner {
 
 /// Streaming SHA-256 of the regular, non-symlink file at the already
 /// canonical `path`; `None` when it no longer is one.
+///
+/// Portable checks only (no per-architecture `O_NOFOLLOW` constant): the
+/// path must still canonicalize to itself and `lstat` as a regular file, and
+/// the opened descriptor must be that same (device, inode) object.
 fn content_digest(path: &Path) -> Option<String> {
     use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     if std::fs::canonicalize(path).ok()?.as_path() != path {
+        return None;
+    }
+    let listed = std::fs::symlink_metadata(path).ok()?;
+    if !listed.file_type().is_file() {
         return None;
     }
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
+    // O_NONBLOCK (same value on macOS and on Linux x86_64/aarch64): a FIFO
+    // swapped in after the lstat cannot block the open.
     #[cfg(target_os = "macos")]
-    options.custom_flags(0x0004 | 0x0100); // O_NONBLOCK | O_NOFOLLOW
+    options.custom_flags(0x0004);
     #[cfg(target_os = "linux")]
-    options.custom_flags(0x0800 | 0x20000); // O_NONBLOCK | O_NOFOLLOW
+    options.custom_flags(0x0800);
     let mut file = options.open(path).ok()?;
-    if !file.metadata().ok()?.is_file() {
+    let opened = file.metadata().ok()?;
+    if !opened.is_file() || (opened.dev(), opened.ino()) != (listed.dev(), listed.ino()) {
         return None;
     }
     let mut hasher = Sha256::new();

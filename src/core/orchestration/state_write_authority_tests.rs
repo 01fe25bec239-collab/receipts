@@ -645,3 +645,436 @@ fn event_referenced_content_is_resolved_and_digest_verified_before_persistence()
             .is_none()
     );
 }
+
+struct At(&'static str);
+impl TrustedClockV1 for At {
+    fn sample(&self) -> Result<TrustedTimeSampleV1, StateError> {
+        Ok(TrustedTimeSampleV1 {
+            canonical_utc_timestamp: self.0.into(),
+            clock_source_id: "synthetic-clock".into(),
+            clock_contract_version: "1".into(),
+        })
+    }
+}
+
+/// Serves exact repository bytes by logical path; no filesystem access.
+struct Repo(&'static str, &'static [u8]);
+impl receipts_state::RepositorySnapshotMaterializer for Repo {
+    fn known_length(
+        &mut self,
+        reference: &receipts_state::RepositorySnapshotRefV1,
+    ) -> Result<Option<u64>, receipts_state::SourceMaterializationFailure> {
+        Ok((reference.logical_relative_path == self.0).then_some(self.1.len() as u64))
+    }
+    fn materialize(
+        &mut self,
+        reference: &receipts_state::RepositorySnapshotRefV1,
+        accept_chunk: &mut dyn FnMut(
+            &[u8],
+        )
+            -> Result<(), receipts_state::SourceMaterializationFailure>,
+    ) -> Result<
+        receipts_state::ExternalSourceMaterialization,
+        receipts_state::SourceMaterializationFailure,
+    > {
+        assert_eq!(reference.logical_relative_path, self.0);
+        accept_chunk(self.1)?;
+        Ok(receipts_state::ExternalSourceMaterialization {
+            materializer_id: "synthetic-repo".into(),
+            provenance: reference.commit_sha.clone(),
+            materialized_at: "2026-11-08T10:00:01Z".into(),
+        })
+    }
+}
+
+struct NoArtifacts;
+impl receipts_state::ArtifactMaterializer for NoArtifacts {
+    fn known_length(
+        &mut self,
+        _: &receipts_state::ArtifactRefV1,
+    ) -> Result<Option<u64>, receipts_state::SourceMaterializationFailure> {
+        panic!("no artifact source in this manifest")
+    }
+    fn materialize(
+        &mut self,
+        _: &receipts_state::ArtifactRefV1,
+        _: &mut dyn FnMut(&[u8]) -> Result<(), receipts_state::SourceMaterializationFailure>,
+    ) -> Result<
+        receipts_state::ExternalSourceMaterialization,
+        receipts_state::SourceMaterializationFailure,
+    > {
+        panic!("no artifact source in this manifest")
+    }
+}
+
+/// Builds the ContextRehydrated event from the attempt State hands it.
+struct Rehydrated;
+impl receipts_state::ContextRehydratedEventSupplier for Rehydrated {
+    fn event_for(
+        &mut self,
+        attempt: &receipts_state::ContextRehydrationAttempt,
+    ) -> receipts_state::EventEnvelope {
+        receipts_state::EventEnvelope {
+            event_id: "01ARZ3NDEKTSV4RRFFQ69G5FB1".into(),
+            project_id: attempt.project_id.clone(),
+            goal_id: None,
+            event_type: EventType::ContextRehydrated,
+            actor: attempt.requested_by_actor.clone(),
+            subject: EventSubject {
+                kind: SubjectKind::Role,
+                id: attempt.durable_role_id.clone(),
+            },
+            occurred_at: attempt.completed_at.clone(),
+            payload: receipts_state::context_rehydration_event_payload(attempt).unwrap(),
+            correlation_id: "corr-rehydrate".into(),
+            epoch: attempt.context_epoch_id.clone(),
+        }
+    }
+}
+
+/// The ExecutorReleased payload, computed independently of State from the
+/// frozen EXECUTOR_RELEASED provenance rule.
+fn released_payload(
+    binding: &receipts_state::ExecutorBinding,
+    project: &str,
+    at: &str,
+) -> EventPayloadReference {
+    use sha2::Digest;
+    let reference =
+        serde_json::json!({"binding_id": binding.binding_id, "project_id": project, "v": 1});
+    let projection = serde_json::json!({
+        "binding_id": binding.binding_id, "model_id": binding.model_id, "project_id": project,
+        "provider_id": binding.provider_id, "release_reason": "LEASE_EXPIRED", "released_at": at,
+        "role_id": binding.role_id, "runtime_id": binding.runtime_id, "v": 1,
+    });
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"multiagent:event-payload-reference:EXECUTOR_RELEASED:v1");
+    hasher.update([0]);
+    hasher.update(projection.to_string().as_bytes());
+    let hex: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    EventPayloadReference {
+        reference: reference.to_string(),
+        digest: format!("sha256:executor-released-provenance:v1:{hex}"),
+    }
+}
+
+#[test]
+fn context_role_succession_and_lease_families_succeed_and_refuse_through_the_core() {
+    use receipts_state::{
+        BoundContextSourceRefV1, ContextEpoch, ContextEpochTrigger, ContextManifest,
+        ContextManifestSource, ContextRehydrationRequest, ContextRehydrationStatus,
+        ContextSourceBindingV1, ContextSourceRef, ContextSourceRefType, ExecutorBinding,
+        ExecutorLeaseExpiryOutcomeV1, ExecutorLeaseExpiryRequestV2,
+        ExecutorReleasedLifecycleAuthorityV1, LogicalRole, LogicalRoleStatus, LogicalRoleType,
+        RepositorySnapshotRefV1, RoleChangeEvidenceV1, SourceClass,
+    };
+    let e = |n: i64| StateEpochValueV1::try_from(n).unwrap();
+    let not_admitted = CorePolicyRefusal::ProjectNotAdmitted;
+    let unknown = CorePolicyRefusal::UnknownSubject;
+    let dir = Dir::new();
+    let mut writer = CoreStateWriter::open(dir.db(), identity("policy")).unwrap();
+    let role = |id: &str| LogicalRole {
+        role_id: id.into(),
+        project_id: "p".into(),
+        role_type: LogicalRoleType::RuntimeA2,
+        status: LogicalRoleStatus::Active,
+        current_context_epoch: e(0),
+        name: None,
+        workstream_id: None,
+        ownership_paths: Vec::new(),
+        integration_branch: None,
+        context_manifest_id: None,
+        active_binding_id: None,
+        created_at: None,
+    };
+    let evidence = RoleChangeEvidenceV1 {
+        changed_at: receipts_state::CanonicalTimestampV1::parse("2026-11-08T10:00:00.000000000Z")
+            .unwrap(),
+        reason: None,
+    };
+    let manifest = |id: &str, project: &str, epoch: i64| ContextManifest {
+        manifest_id: id.into(),
+        role_id: "role-1".into(),
+        project_id: project.into(),
+        epoch: e(epoch),
+        sources: vec![ContextManifestSource {
+            r#ref: ContextSourceRef {
+                ref_type: ContextSourceRefType::RepoPath,
+                target: "docs/spec.md".into(),
+            },
+            source_class: SourceClass::Mandatory,
+            digest: format!("sha256:v1:{}", "0".repeat(64)),
+            last_read_at: None,
+            required_for: Vec::new(),
+        }],
+        created_at: "2026-11-08T09:00:00Z".into(),
+        last_rehydrated_at: None,
+    };
+
+    // Context epochs: explicit append and advancement.
+    writer
+        .append_context_epoch(ContextEpoch {
+            project_id: "p".into(),
+            epoch: e(0),
+            advanced_at: "2026-11-08T09:00:00Z".into(),
+            trigger: ContextEpochTrigger::A1Init,
+        })
+        .unwrap();
+    assert_eq!(
+        policy_refusal(writer.append_context_epoch(ContextEpoch {
+            project_id: "q".into(),
+            epoch: e(0),
+            advanced_at: "2026-11-08T09:00:00Z".into(),
+            trigger: ContextEpochTrigger::A1Init,
+        })),
+        not_admitted
+    );
+
+    // Manifest creation and role context.
+    writer.create_logical_role(role("role-1")).unwrap();
+    writer
+        .create_context_manifest(manifest("m0", "p", 0))
+        .unwrap();
+    assert_eq!(
+        policy_refusal(writer.create_context_manifest(manifest("mq", "q", 0))),
+        not_admitted
+    );
+    writer
+        .set_logical_role_context("role-1", &e(0), None, &e(0), Some("m0"), &evidence)
+        .unwrap();
+    assert_eq!(
+        policy_refusal(writer.set_logical_role_context(
+            "missing-role",
+            &e(0),
+            None,
+            &e(0),
+            Some("m0"),
+            &evidence
+        )),
+        unknown
+    );
+    assert_eq!(
+        writer
+            .reader()
+            .find_logical_role("role-1")
+            .unwrap()
+            .unwrap()
+            .context_manifest_id
+            .as_deref(),
+        Some("m0")
+    );
+
+    // Advancement, then atomic manifest succession at the new epoch.
+    let advanced = writer
+        .advance_context_epoch(
+            "p",
+            "2026-11-08T09:30:00Z",
+            ContextEpochTrigger::NewWave,
+            &[],
+        )
+        .unwrap();
+    assert_eq!(advanced.epoch, e(1));
+    writer
+        .supersede_context_manifest("role-1", &e(0), "m0", manifest("m1", "p", 1), &evidence)
+        .unwrap();
+    assert_eq!(
+        policy_refusal(writer.supersede_context_manifest(
+            "missing-role",
+            &e(1),
+            "m1",
+            manifest("m2", "p", 1),
+            &evidence
+        )),
+        unknown
+    );
+    let succeeded = writer
+        .reader()
+        .find_logical_role("role-1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            succeeded.current_context_epoch,
+            succeeded.context_manifest_id.as_deref()
+        ),
+        (e(1), Some("m1"))
+    );
+
+    // Rehydration of the current manifest.
+    let request = |project: &str| ContextRehydrationRequest {
+        rehydration_attempt_id: "rehydrate-1".into(),
+        project_id: project.into(),
+        durable_role_id: "role-1".into(),
+        context_manifest_id: "m1".into(),
+        context_epoch_id: e(1),
+        requested_by_actor: EventActor {
+            kind: ActorKind::System,
+            id: Some("orchestrator".into()),
+        },
+        executor_binding_id: None,
+        session_reference: None,
+        task_id: Some("task-1".into()),
+        correlation_reference: Some("corr-rehydrate".into()),
+        trigger_kind: ContextEpochTrigger::HostSwitch,
+        trigger_reference: Some("host-switch-1".into()),
+        started_at: "2026-11-08T10:00:00Z".into(),
+        completed_at: "2026-11-08T10:00:02Z".into(),
+        source_bindings: vec![ContextSourceBindingV1 {
+            source_ordinal: 0,
+            source_id: "spec".into(),
+            source_ref: BoundContextSourceRefV1::RepositorySnapshot(RepositorySnapshotRefV1 {
+                project_id: "p".into(),
+                repository_id: "repo".into(),
+                commit_sha: "a".repeat(40),
+                logical_relative_path: "docs/spec.md".into(),
+            }),
+        }],
+        touch_evidence: Vec::new(),
+        demands: Vec::new(),
+    };
+    let mut repository = Repo("docs/spec.md", b"authoritative spec");
+    assert_eq!(
+        policy_refusal(writer.rehydrate_context(
+            request("q"),
+            &mut repository,
+            &mut NoArtifacts,
+            &mut Rehydrated
+        )),
+        not_admitted
+    );
+    let outcome = writer
+        .rehydrate_context(
+            request("p"),
+            &mut repository,
+            &mut NoArtifacts,
+            &mut Rehydrated,
+        )
+        .unwrap();
+    assert_eq!(outcome.attempt.status, ContextRehydrationStatus::Succeeded);
+    assert!(
+        writer
+            .reader()
+            .find_event("01ARZ3NDEKTSV4RRFFQ69G5FB1")
+            .unwrap()
+            .is_some()
+    );
+
+    // Binding pointer.
+    let binding = |id: &str, role_id: &str| ExecutorBinding {
+        binding_id: id.into(),
+        role_id: role_id.into(),
+        provider_id: "provider-a".into(),
+        model_id: "model-a".into(),
+        runtime_id: "runtime-a".into(),
+        session_ref: None,
+        routing_decision_id: None,
+        bound_at: "2026-11-08T09:00:00.000000000Z".into(),
+        lease_expires_at: "2026-11-08T10:30:00.000000000Z".into(),
+        released_at: None,
+        release_reason: None,
+        rehydration_completed: None,
+    };
+    writer
+        .create_executor_binding(binding("b-1", "role-1"))
+        .unwrap();
+    writer
+        .set_logical_role_active_binding("role-1", None, Some("b-1"), &evidence)
+        .unwrap();
+    assert_eq!(
+        policy_refusal(writer.set_logical_role_active_binding(
+            "missing-role",
+            None,
+            Some("b-1"),
+            &evidence
+        )),
+        unknown
+    );
+    assert_eq!(
+        writer
+            .reader()
+            .find_logical_role("role-1")
+            .unwrap()
+            .unwrap()
+            .active_binding_id
+            .as_deref(),
+        Some("b-1")
+    );
+
+    // Lease renewal, then expiry after the renewed deadline.
+    writer.create_logical_role(role("role-2")).unwrap();
+    let leased = binding("b-2", "role-2");
+    writer.create_executor_binding(leased.clone()).unwrap();
+    assert_eq!(
+        policy_refusal(writer.renew_executor_binding_lease(
+            &At("2026-11-08T10:00:00.000000000Z"),
+            "missing-binding",
+            "2026-11-08T11:00:00.000000000Z"
+        )),
+        unknown
+    );
+    writer
+        .renew_executor_binding_lease(
+            &At("2026-11-08T10:00:00.000000000Z"),
+            "b-2",
+            "2026-11-08T11:00:00.000000000Z",
+        )
+        .unwrap();
+    let renewed = writer
+        .reader()
+        .find_executor_binding("b-2")
+        .unwrap()
+        .unwrap();
+    assert_eq!(renewed.lease_expires_at, "2026-11-08T11:00:00.000000000Z");
+    let expiry = |binding_id: &str, at: &str, event: &str| {
+        let actor = EventActor {
+            kind: ActorKind::System,
+            id: Some("orchestration-core".into()),
+        };
+        ExecutorLeaseExpiryRequestV2 {
+            binding_id: binding_id.into(),
+            lifecycle_authority: ExecutorReleasedLifecycleAuthorityV1 {
+                actor: actor.clone(),
+                correlation_id: "corr-lease".into(),
+            },
+            executor_released_event: receipts_state::EventEnvelope {
+                event_id: event.into(),
+                project_id: "p".into(),
+                goal_id: None,
+                event_type: EventType::ExecutorReleased,
+                actor,
+                subject: EventSubject {
+                    kind: SubjectKind::Role,
+                    id: "role-2".into(),
+                },
+                occurred_at: at.into(),
+                payload: released_payload(&renewed, "p", at),
+                correlation_id: "corr-lease".into(),
+                epoch: e(0),
+            },
+        }
+    };
+    let at = "2026-11-08T11:00:00.000000000Z";
+    assert_eq!(
+        policy_refusal(writer.expire_executor_binding_lease(
+            &At(at),
+            expiry("missing-binding", at, "01ARZ3NDEKTSV4RRFFQ69G5FB2")
+        )),
+        unknown
+    );
+    assert_eq!(
+        writer
+            .expire_executor_binding_lease(&At(at), expiry("b-2", at, "01ARZ3NDEKTSV4RRFFQ69G5FB3"))
+            .unwrap(),
+        ExecutorLeaseExpiryOutcomeV1::Released
+    );
+    let released = writer
+        .reader()
+        .find_executor_binding("b-2")
+        .unwrap()
+        .unwrap();
+    assert_eq!(released.released_at.as_deref(), Some(at));
+}

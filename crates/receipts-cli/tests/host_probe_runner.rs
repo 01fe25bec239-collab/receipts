@@ -123,16 +123,37 @@ fn failures_timeouts_and_oversize_output_never_become_evidence() {
     );
 }
 
+/// Property: when the deadline passes, the probe is reported as a timeout
+/// (never as evidence) and its whole process group, including a backgrounded
+/// descendant, is terminated. The deadline must exceed the time the script
+/// needs to start that descendant: the first exec of a freshly written script
+/// on macOS measured ~50 ms median and up to ~164 ms here, and a 300 ms
+/// deadline occasionally expired before `child.pid` existed, so the
+/// descendant check never ran. 2 s keeps the precondition reliable; the
+/// script itself would run for 30 s, so the bounds below still prove the
+/// deadline (not natural exit) ended it.
 #[test]
 fn timeout_terminates_the_probe_and_its_descendants() {
     let d = Dir::new();
     let exe = d.script("/bin/sleep 30 & echo $! > child.pid; echo '[]'; wait");
     let runner = WorkspaceHostProbeRunner::new(&exe, env()).unwrap();
+    let deadline = Duration::from_millis(2000);
+    let started = std::time::Instant::now();
     assert_eq!(
-        runner.run(&command(&d.0, &[], Duration::from_millis(2000), 1 << 20)),
+        runner.run(&command(&d.0, &[], deadline, 1 << 20)),
         Err(Error::ProbeTimeout)
     );
-    let pid = std::fs::read_to_string(d.0.join("child.pid")).unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= deadline,
+        "returned before the deadline: {elapsed:?}"
+    );
+    assert!(
+        elapsed < deadline + receipts_cli::HOST_PROBE_TERMINATION_GRACE + Duration::from_secs(5),
+        "the deadline did not bound the 30 s probe: {elapsed:?}"
+    );
+    let pid = std::fs::read_to_string(d.0.join("child.pid"))
+        .expect("precondition: the descendant started before the deadline");
     let alive = std::process::Command::new("/bin/kill")
         .args(["-0", pid.trim()])
         .status()
