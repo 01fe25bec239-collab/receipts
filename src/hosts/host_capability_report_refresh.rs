@@ -1,8 +1,9 @@
 //! Fresh bounded observation followed by the accepted report composition.
 //!
 //! Freshness means only that this invocation produced the facts. It does not
-//! establish completeness, trust, or native eligibility. No cached report or
-//! fingerprint is consumed; the observation adapter leaves the fingerprint None.
+//! establish completeness, trust, or native eligibility. The production path
+//! fingerprints the same observation; a complete fingerprint sets the report's
+//! `validity_fingerprint` token and digests and mints the coupled cache entry.
 
 use crate::{
     HostCapabilityModeOverride, HostCapabilityReportSelectionCompositionError,

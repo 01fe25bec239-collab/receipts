@@ -17,6 +17,7 @@ fn request(host: HostId) -> HostCapabilityReportRefreshRequest {
         observation: HostCapabilityObservationRequest {
             host,
             project_root: "/unused-refresh-context".into(),
+            hook_execution: None,
         },
         mode_override: None,
     }
@@ -42,6 +43,11 @@ fn unknown() -> HostCapabilityObservation {
             source: Source::CodexProjectConfig,
             result: Err(Error::InvalidToml),
         }],
+        host_version: Value::Unknown,
+        hook_events: Value::Unknown,
+        validity_fingerprint: None,
+        hook_definition_digest: None,
+        relevant_config_digest: None,
     }
 }
 
@@ -127,7 +133,13 @@ fn production_delegates_to_real_observation_engine() {
         HostCapabilityStaleReason::None
     );
     assert_eq!(selected(&result).probe_status(), Probe::Partial);
-    assert_eq!(selected(&result).validity_fingerprint(), None);
+    // The report carries the token of this observation's complete fingerprint.
+    let token = selected(&result).validity_fingerprint().unwrap();
+    assert!(token.starts_with("sha256:") && token.len() == 71);
+    assert_eq!(
+        Some(token),
+        result.observation.validity_fingerprint.as_deref()
+    );
 }
 
 #[test]

@@ -71,6 +71,7 @@ fn refresh_binds_one_unchanged_executable_and_complete_sources() {
         observation: HostCapabilityObservationRequest {
             host: HostId::ClaudeCode,
             project_root: root.join("project"),
+            hook_execution: None,
         },
         mode_override: None,
     };

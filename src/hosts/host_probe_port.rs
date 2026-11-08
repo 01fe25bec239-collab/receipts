@@ -95,7 +95,51 @@ pub struct HostObservationFingerprintV1 {
     pub(crate) sources: Vec<(HostCapabilityObservationSource, Material)>,
 }
 
+/// Report digests derived from one complete fingerprint.
+pub(crate) struct HostObservationDigests {
+    pub(crate) validity_fingerprint: String,
+    pub(crate) hook_definition: Option<String>,
+    pub(crate) relevant_config: String,
+}
+
+fn sha256_token(text: &str) -> String {
+    let hex: String = Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("sha256:{hex}")
+}
+
 impl HostObservationFingerprintV1 {
+    /// `validity_fingerprint` is SHA-256 over this whole digest-only record;
+    /// `hook_definition_digest` is the plugin `hooks/hooks.json` content digest;
+    /// `relevant_config_digest` covers every other settings source.
+    // ponytail: the encoding is this record's `Debug` text, which is
+    // deterministic per build and injective over these fields. A toolchain or
+    // struct change only alters tokens, forcing a re-probe, never false reuse.
+    pub(crate) fn digests(&self) -> HostObservationDigests {
+        use crate::host_capability_observation::HostCapabilityObservationSource as S;
+        let hook_definition = self
+            .sources
+            .iter()
+            .find(|(s, _)| *s == S::ClaudePluginHooks)
+            .and_then(|(_, m)| m.as_ref().ok())
+            .map(|d| {
+                let hex: String = d.sha256.iter().map(|b| format!("{b:02x}")).collect();
+                format!("sha256:{hex}")
+            });
+        let config: Vec<_> = self
+            .sources
+            .iter()
+            .filter(|(s, _)| *s != S::ClaudePluginHooks)
+            .collect();
+        HostObservationDigests {
+            validity_fingerprint: sha256_token(&format!("receipts-host-observation-v1\n{self:?}")),
+            hook_definition,
+            relevant_config: sha256_token(&format!("receipts-host-config-v1\n{config:?}")),
+        }
+    }
+
     /// Every required input was actually observed: probes succeeded and each
     /// settings source was read or is definitively absent. Any other error is
     /// retained uncertainty and forbids reuse.
@@ -157,5 +201,13 @@ impl HostCapabilityCacheEntryV1 {
     /// selected report itself.
     pub fn permits_reuse_by(&self, current: &Self) -> bool {
         self == current
+    }
+
+    /// Reuse rule for a persisted report: this freshly minted entry's report
+    /// equals it exactly. The report embeds `validity_fingerprint`, the token
+    /// of this complete fingerprint, so equality also binds every material
+    /// digest, the executable identity and the mode override.
+    pub fn permits_reuse_of(&self, cached: &HostCapabilityReportNonTemporalCore) -> bool {
+        &self.report == cached
     }
 }

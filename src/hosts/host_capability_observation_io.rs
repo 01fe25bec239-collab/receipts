@@ -28,6 +28,10 @@ impl Sources for LocalSources<'_> {
             .run(&probe_command(project_root, &["plugin", "list", "--json"]))
     }
 
+    fn plugin_hooks(&self, install_path: &Path) -> Result<Vec<u8>, Error> {
+        read_document(&install_path.join("hooks/hooks.json"))
+    }
+
     fn configurations(
         &self,
         request: &HostCapabilityObservationRequest,

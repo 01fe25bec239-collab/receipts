@@ -19,27 +19,20 @@
 //! * bounded source-specific JSON/TOML decoding with the authorized serde,
 //!   serde_json, and toml substrate;
 //! * read-only Host capability observation through fixed configuration paths
-//!   and an enumerated non-worker CLI probe; no shell or filesystem writes;
+//!   and the composition's probe port; no shell and no settings writes;
+//! * [`claude`] binds the frozen `HostAdapter` placeholders for Claude Code
+//!   and maps bounded, untrusted hook stdin to frozen normalized events;
+//! * [`host_event_spool`] is the only write path: owner-checked append-only
+//!   `0600` lines under `<project>/.receipts/inbox/`. It never opens State;
+//! * [`wire`] holds the strict `HostCapabilityReport`/`NormalizedHostEvent`
+//!   JSON codecs;
 //! * no installation, hook mutation, trust approval, credential authority,
-//!   networking, event normalization, or runtime worker execution;
-//! * [`render_graph_snapshot`] formats supplied snapshot evidence only; summary
-//!   and graph topology are omitted, and no live Host presentation is bound;
-//! * adjacent frozen contracts (`InstallPlan`, `CoreHandle`,
-//!   `CoreView`, `UserPrompt`, `UserResponse`,
-//!   shutdown reason) remain externally owned and
-//!   appear here only as unbound associated-type placeholders;
-//! * [`HostCapabilityReport`] composes caller-supplied physical evidence only;
-//!   the adapter's canonical report output is physically bound, while capabilities
-//!   behavior remains unimplemented and this binding establishes no physical probing;
-//! * the in-process [`NormalizedHostEvent`] carrier validates structure only;
-//!   the adapter's canonical event input is physically bound, while emit
-//!   behavior remains unimplemented and its outcome associated type unbound;
-//! * [`emit_validated_normalized_host_event`] composes source compatibility
-//!   validation with one adapter call; it provides no live host event producer
-//!   and establishes no delivery or persistence;
+//!   networking, process launch, or runtime worker execution;
+//! * [`render_graph_snapshot`] formats supplied snapshot evidence only;
 //! * no authoritative state read or write path exists here.
 
 pub mod adapter;
+pub mod claude;
 pub mod graph_snapshot_renderer;
 pub mod host_capability_consistency;
 pub mod host_capability_freshness_policy;
@@ -56,6 +49,7 @@ pub mod host_capability_report_selection_composition;
 pub mod host_capability_report_vocabulary;
 pub mod host_capability_selected_mode_consistency;
 pub mod host_detection;
+pub mod host_event_spool;
 pub mod host_id;
 pub mod host_probe_port;
 pub mod host_session_activation;
@@ -63,6 +57,7 @@ pub mod normalized_host_event;
 pub mod normalized_host_event_emission;
 pub mod normalized_host_event_source_class;
 pub mod normalized_host_event_source_policy;
+pub mod wire;
 
 #[cfg(test)]
 mod adapter_tests;
@@ -128,6 +123,7 @@ mod normalized_host_event_source_class_tests;
 mod normalized_host_event_source_policy_tests;
 
 pub use adapter::HostAdapter;
+pub use claude::ClaudeHostAdapter;
 pub use graph_snapshot_renderer::render_graph_snapshot;
 pub use host_capability_consistency::{
     HostCapabilityConsistencyError, HostCapabilityConsistencyInputs,
@@ -177,6 +173,7 @@ pub use host_capability_selected_mode_consistency::{
     validate_selected_mode_consistency,
 };
 pub use host_detection::{HostDetectionError, HostDetectionSignals, resolve_host};
+pub use host_event_spool::{HostEventSpool, HostEventSpoolError};
 pub use host_id::HostId;
 pub use normalized_host_event::{
     NormalizedHostEvent, NormalizedHostEventConfidence, NormalizedHostEventError,
