@@ -22,6 +22,7 @@ fn passing() -> DispatchAdmissionRequestV1 {
         decision_id: "da-3".into(),
         capability_id: Some("orchestration.multi_runtime".into()),
         binding: binding(),
+        selected_provider_id: Some("openai".into()),
         entitlement: Some(EntitlementEvidenceV1 {
             binding: binding(),
             freshness: F,
@@ -319,22 +320,104 @@ fn missing_evidence_never_passes_and_fails_conservatively() {
             Axis::QualityFloor => r.quality_floor = None,
             Axis::None => unreachable!(),
         }
-        let (got_axis, got_reason) = denied(&r);
-        if axis == Axis::ProviderAuth {
-            // Without auth evidence policy cannot be matched to the provider.
-            assert_eq!(
-                (got_axis, got_reason),
-                (Axis::ProviderPolicy, Some(Reason::ProviderPolicyUnknown))
-            );
-            assert!(
-                derive(&r)
-                    .failures()
-                    .contains(&(Axis::ProviderAuth, Reason::AuthRequired))
-            );
-        } else {
-            assert_eq!((got_axis, got_reason), (axis, Some(reason)));
+        // Each missing input fails only its own axis; in particular missing
+        // authentication is AUTH_REQUIRED, not invented policy uncertainty.
+        assert_eq!(denied(&r), (axis, Some(reason)), "{axis:?}");
+        assert_eq!(derive(&r).failures(), &[(axis, reason)]);
+    }
+}
+
+#[test]
+fn missing_auth_with_valid_selected_provider_policy_is_auth_required() {
+    let mut r = passing();
+    r.provider_auth = None;
+    let d = derive(&r);
+    assert_eq!(axis_result(&d, Axis::ProviderPolicy), Res::Pass);
+    assert_eq!(denied(&r), (Axis::ProviderAuth, Some(Reason::AuthRequired)));
+    // Unknown connection state is the same conservative auth failure.
+    let mut r = passing();
+    r.provider_auth.as_mut().unwrap().connection = ProviderConnectionV1::Unknown;
+    assert_eq!(denied(&r), (Axis::ProviderAuth, Some(Reason::AuthRequired)));
+}
+
+#[test]
+fn provider_mismatch_and_missing_selection_never_grant_permission() {
+    // Policy about another provider than the selected one.
+    let mut r = passing();
+    r.provider_policy.as_mut().unwrap().provider_id = "anthropic".into();
+    assert_eq!(
+        denied(&r),
+        (Axis::ProviderPolicy, Some(Reason::ProviderPolicyUnknown))
+    );
+    // Authentication of another provider.
+    let mut r = passing();
+    r.provider_auth.as_mut().unwrap().provider_id = "anthropic".into();
+    assert_eq!(denied(&r), (Axis::ProviderAuth, Some(Reason::AuthRequired)));
+    // No selected provider: neither policy nor auth can pass.
+    let mut r = passing();
+    r.selected_provider_id = None;
+    let d = derive(&r);
+    assert_eq!(axis_result(&d, Axis::ProviderPolicy), Res::Fail);
+    assert_eq!(axis_result(&d, Axis::ProviderAuth), Res::Fail);
+    assert_eq!(
+        denied(&r),
+        (Axis::ProviderPolicy, Some(Reason::ProviderPolicyUnknown))
+    );
+}
+
+#[test]
+fn only_fresh_availability_asserts_a_current_limit_or_outage() {
+    use AvailabilityObservationV1 as A;
+    let cases = [
+        (F, A::Available, None),
+        (S, A::Available, Some(Reason::NoEligibleRuntime)),
+        (F, A::RateLimited, Some(Reason::ProviderRateLimited)),
+        (S, A::RateLimited, Some(Reason::NoEligibleRuntime)),
+        (F, A::ProvenDown, Some(Reason::ProviderDown)),
+        (S, A::ProvenDown, Some(Reason::NoEligibleRuntime)),
+        (F, A::Unknown, Some(Reason::NoEligibleRuntime)),
+        (S, A::Unknown, Some(Reason::NoEligibleRuntime)),
+    ];
+    for (freshness, observation, expected) in cases {
+        let mut r = passing();
+        let a = r.provider_availability.as_mut().unwrap();
+        a.freshness = freshness;
+        a.observation = observation;
+        let d = derive(&r);
+        match expected {
+            None => assert!(d.dispatch_permitted()),
+            Some(reason) => assert_eq!(
+                denied(&r),
+                (Axis::ProviderAvailability, Some(reason)),
+                "{freshness:?} {observation:?}"
+            ),
         }
     }
+    // Precedence pairs with stale outage: higher axes still win, and the
+    // availability failure is recorded truthfully as NO_ELIGIBLE_RUNTIME.
+    for higher in [Axis::ProviderAuth, Axis::ProviderPolicy, Axis::Safety] {
+        let mut r = passing();
+        let primary = break_axis(higher, &mut r);
+        let a = r.provider_availability.as_mut().unwrap();
+        a.freshness = S;
+        a.observation = A::ProvenDown;
+        assert_eq!(denied(&r), (higher, Some(primary)));
+        assert!(
+            derive(&r)
+                .failures()
+                .contains(&(Axis::ProviderAvailability, Reason::NoEligibleRuntime))
+        );
+    }
+    // Missing auth outranks a fresh outage; the outage stays recorded.
+    let mut r = passing();
+    r.provider_auth = None;
+    r.provider_availability.as_mut().unwrap().observation = A::ProvenDown;
+    assert_eq!(denied(&r), (Axis::ProviderAuth, Some(Reason::AuthRequired)));
+    assert!(
+        derive(&r)
+            .failures()
+            .contains(&(Axis::ProviderAvailability, Reason::ProviderDown))
+    );
 }
 
 #[test]
@@ -449,6 +532,7 @@ fn frozen_fixtures_c_d_e_reproduce_their_outcome_axis_and_reason() {
     check(&passing(), &fixture("E_openai_user_api_allowed.json"));
 
     let mut c = passing();
+    c.selected_provider_id = Some("anthropic".into());
     c.provider_auth.as_mut().unwrap().provider_id = "anthropic".into();
     let p = c.provider_policy.as_mut().unwrap();
     p.provider_id = "anthropic".into();

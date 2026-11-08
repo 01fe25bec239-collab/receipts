@@ -145,6 +145,10 @@ pub struct DispatchAdmissionRequestV1 {
     pub decision_id: String,
     pub capability_id: Option<String>,
     pub binding: AdmissionBindingV1,
+    /// The provider the trusted composition selected for this dispatch.
+    /// Policy and authentication evidence are each evaluated against it,
+    /// independently of one another; `None` never grants either axis.
+    pub selected_provider_id: Option<String>,
     pub entitlement: Option<EntitlementEvidenceV1>,
     pub provider_auth: Option<ProviderAuthEvidenceV1>,
     pub provider_policy: Option<ProviderPolicyEvidenceV1>,
@@ -263,11 +267,16 @@ pub fn derive_dispatch_admission(
         }
     };
 
+    let selected = |provider: &str| request.selected_provider_id.as_deref() == Some(provider);
+
     let auth_failure = match &request.provider_auth {
         None => Some(Reason::AuthRequired),
         Some(e) => {
             bound(Axis::ProviderAuth, &e.binding)?;
-            (!(fresh(e.freshness) && e.connection == ProviderConnectionV1::Authenticated))
+            // Authentication of another provider does not authenticate this one.
+            (!(fresh(e.freshness)
+                && e.connection == ProviderConnectionV1::Authenticated
+                && selected(&e.provider_id)))
                 .then_some(Reason::AuthRequired)
         }
     };
@@ -276,11 +285,9 @@ pub fn derive_dispatch_admission(
         None => Some(Reason::ProviderPolicyUnknown),
         Some(e) => {
             bound(Axis::ProviderPolicy, &e.binding)?;
-            // Policy evidence about another provider is contradictory permission.
-            let matches_provider = request
-                .provider_auth
-                .as_ref()
-                .is_some_and(|auth| auth.provider_id == e.provider_id);
+            // Policy evidence about another provider (or with no selected
+            // provider to compare) is contradictory or unproven permission.
+            let matches_provider = selected(&e.provider_id);
             match e.status {
                 DispatchAdmissionProviderPolicyStatus::VerifiedDisallowed => {
                     Some(Reason::ProviderPolicyDisallowed)
@@ -299,14 +306,11 @@ pub fn derive_dispatch_admission(
         None => Some(Reason::NoEligibleRuntime),
         Some(e) => {
             bound(Axis::ProviderAvailability, &e.binding)?;
-            match e.observation {
-                AvailabilityObservationV1::RateLimited => Some(Reason::ProviderRateLimited),
-                AvailabilityObservationV1::ProvenDown => Some(Reason::ProviderDown),
-                AvailabilityObservationV1::Available
-                    if fresh(e.freshness) && e.runtime_id.is_some() =>
-                {
-                    None
-                }
+            match (fresh(e.freshness), e.observation) {
+                // Only fresh evidence may assert a current limit or outage.
+                (true, AvailabilityObservationV1::RateLimited) => Some(Reason::ProviderRateLimited),
+                (true, AvailabilityObservationV1::ProvenDown) => Some(Reason::ProviderDown),
+                (true, AvailabilityObservationV1::Available) if e.runtime_id.is_some() => None,
                 // Unknown, stale or no admitted runtime is never called "down".
                 _ => Some(Reason::NoEligibleRuntime),
             }
@@ -395,10 +399,7 @@ pub fn derive_dispatch_admission(
             DispatchAdmissionOutcome::Allow,
             Axis::None,
             Reason::None,
-            request
-                .provider_auth
-                .as_ref()
-                .map(|e| e.provider_id.clone()),
+            request.selected_provider_id.clone(),
             request
                 .provider_availability
                 .as_ref()
