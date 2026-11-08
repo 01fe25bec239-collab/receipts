@@ -139,7 +139,7 @@ struct Pointers {
 
 impl SqliteStateRepository {
     /// Moves status ACTIVE↔SUSPENDED or ACTIVE/SUSPENDED→RETIRED.
-    pub fn transition_logical_role_status(
+    pub(crate) fn transition_logical_role_status(
         &mut self,
         role_id: &str,
         expected: LogicalRoleStatus,
@@ -177,7 +177,7 @@ impl SqliteStateRepository {
     /// terminal pair. A replaced or cleared current binding must exist,
     /// belong to this role and be conclusively released (both terminal
     /// fields recorded). Nothing is released, created or repaired here.
-    pub fn set_logical_role_active_binding(
+    pub(crate) fn set_logical_role_active_binding(
         &mut self,
         role_id: &str,
         expected: Option<&str>,
@@ -235,7 +235,7 @@ impl SqliteStateRepository {
     /// project's ContextEpoch history. A supplied manifest must exist and
     /// match this role, project and the new epoch. A set manifest pointer
     /// cannot be cleared.
-    pub fn set_logical_role_context(
+    pub(crate) fn set_logical_role_context(
         &mut self,
         role_id: &str,
         expected_epoch: &StateEpochValueV1,
@@ -268,7 +268,7 @@ impl SqliteStateRepository {
     /// Creates an immutable successor and switches the attached manifest by CAS.
     /// The snapshot, ordered children, role pointer and history commit together.
     /// The predecessor must be attached; same-epoch replacement is permitted.
-    pub fn supersede_context_manifest(
+    pub(crate) fn supersede_context_manifest(
         &mut self,
         role_id: &str,
         expected_epoch: &StateEpochValueV1,

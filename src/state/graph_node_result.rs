@@ -344,7 +344,7 @@ fn list_results(
         .collect()
 }
 impl SqliteStateRepository {
-    pub fn append_node_result_v1(
+    pub(crate) fn append_node_result_v1(
         &mut self,
         project: &str,
         version: &str,

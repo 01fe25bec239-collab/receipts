@@ -325,7 +325,7 @@ fn decode(row: &rusqlite::Row<'_>) -> Result<CheckpointRecord, StateError> {
     Ok(value)
 }
 impl SqliteStateRepository {
-    pub fn append_checkpoint(&mut self, value: CheckpointRecord) -> Result<(), StateError> {
+    pub(crate) fn append_checkpoint(&mut self, value: CheckpointRecord) -> Result<(), StateError> {
         graph::write_transaction(self.connection(), |conn| {
             let exists: bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workspace_checkpoints WHERE project_id=?1 AND checkpoint_id=?2)",params![value.project_id(),value.checkpoint_id()], |r|r.get(0)).map_err(|e|graph::sqlite_error(Phase::Write,e))?;
             if exists {

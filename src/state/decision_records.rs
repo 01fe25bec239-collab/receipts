@@ -445,7 +445,10 @@ impl ProvenanceChainV1 {
 
 impl SqliteStateRepository {
     /// Appends one immutable decision record; a duplicate identity is refused.
-    pub fn append_decision_record(&mut self, record: &DecisionRecordV1) -> Result<(), StateError> {
+    pub(crate) fn append_decision_record(
+        &mut self,
+        record: &DecisionRecordV1,
+    ) -> Result<(), StateError> {
         self.run_transaction(|uow| {
             let conn = uow.tx();
             let exists = conn
@@ -530,7 +533,7 @@ impl SqliteStateRepository {
     /// Appends one immutable provenance link. SHA kinds require strict
     /// lowercase 40-hex; ref kinds an identifier. Any second value for the
     /// same task and kind — identical or contradictory — is refused.
-    pub fn append_provenance_link(
+    pub(crate) fn append_provenance_link(
         &mut self,
         project_id: &str,
         task_id: &str,

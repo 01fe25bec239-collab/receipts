@@ -63,14 +63,14 @@ impl SqliteStateRepository {
     /// The parent directory of `path` must already exist. Every required
     /// PRAGMA is applied and verified; any failure is returned as an
     /// explicit error.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, StateError> {
+    pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self, StateError> {
         let repo = Self::open_with_migrations(path, migrations::registered())?;
         graph_repository::verify_current(repo.connection(), GraphPhase::Read)?;
         Ok(repo)
     }
 
-    /// Explicitly upgrades an exact v11–v18 State database to v19.
-    pub fn migrate_existing_to_current(path: impl AsRef<Path>) -> Result<u32, StateError> {
+    /// Explicitly upgrades an exact v11–v19 State database to v20.
+    pub(crate) fn migrate_existing_to_current(path: impl AsRef<Path>) -> Result<u32, StateError> {
         let mut conn =
             Connection::open_with_flags(path.as_ref(), OpenFlags::SQLITE_OPEN_READ_WRITE)
                 .map_err(|e| graph_repository::sqlite_error(GraphPhase::Migration, e))?;
@@ -100,8 +100,12 @@ impl SqliteStateRepository {
             Some(17) => graph_repository::verify_v17(&conn, GraphPhase::Migration)?,
             Some(18) => graph_repository::verify_v18(&conn, GraphPhase::Migration)?,
             Some(19) => {
+                migrations::v0020_trusted_core::apply(&conn)?;
+                return Ok(20);
+            }
+            Some(20) => {
                 graph_repository::verify_current(&conn, GraphPhase::Migration)?;
-                return Ok(19);
+                return Ok(20);
             }
             // v1–v10 and unknown heads are typed unsupported legacy: no
             // automatic migration and no corruption misclassification.
@@ -136,7 +140,8 @@ impl SqliteStateRepository {
             migrations::v0018_manifest_successors::apply(&conn)?;
         }
         migrations::v0019_row_identity::apply(&conn)?;
-        Ok(19)
+        migrations::v0020_trusted_core::apply(&conn)?;
+        Ok(20)
     }
 
     /// Version-reconciliation core of [`Self::open`], parameterized by the
@@ -175,6 +180,17 @@ impl SqliteStateRepository {
         Self { conn }
     }
 
+    /// The durable random store identity recorded by migration 20.
+    pub(crate) fn store_identity(&self) -> Result<String, StateError> {
+        self.conn
+            .query_row(
+                "SELECT store_id FROM state_store_identity WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| graph_repository::sqlite_error(GraphPhase::Read, e))
+    }
+
     /// The schema version durably recorded in this database.
     pub fn schema_version(&self) -> Result<u32, StateError> {
         self.read_schema_version()
@@ -198,7 +214,7 @@ impl SqliteStateRepository {
     /// `work` receives an opaque [`UnitOfWork`] handle. The handle exposes
     /// no public capability; repository-internal operations and colocated
     /// tests use crate-private methods.
-    pub fn run_transaction<T>(
+    pub(crate) fn run_transaction<T>(
         &mut self,
         work: impl FnOnce(&mut UnitOfWork<'_>) -> Result<T, StateError>,
     ) -> Result<T, StateError> {
@@ -564,6 +580,10 @@ fn bootstrap(conn: &mut Connection, chain: &[Migration]) -> Result<(), StateErro
         }
         if migration.version == 19 && migration.name == "row_identity" {
             migrations::v0019_row_identity::apply(conn)?;
+            continue;
+        }
+        if migration.version == 20 && migration.name == "trusted_core" {
+            migrations::v0020_trusted_core::apply(conn)?;
             continue;
         }
         let tx = conn

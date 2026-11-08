@@ -121,3 +121,17 @@ Conformance cases are generated in `wire/wire_tests.rs` and checked against the 
 
 - the oracle cannot parse numbers beyond `f64`, so only the codec tests those;
 - serde refuses lone-surrogate strings.
+
+## Trusted-core write boundary (schema v20)
+
+`TrustedCoreStore` is the only public State writer. Every legacy writable entrypoint (`SqliteStateRepository::open`, `migrate_existing_to_current`, `run_transaction` and all mutators) is crate-private. Ordinary reads, `StateReader` and `ReadOnlyGraphReader` are unchanged.
+
+- `open_exclusive` / `migrate_exclusive` require an absolute path whose directory is a real directory owned by the effective user with no group/other access; the database (and any `-wal`/`-shm`/`-journal` sidecar) must be a single-link private regular file. It takes a non-blocking `flock` on `<db>.writer-lock`, checks that the opened file is the validated one, and never repairs permissions or upgrades on ordinary open.
+- Each write consumes one non-cloneable `StateWriteAdmission`, minted by the store's holder and bound to the durable random store identity, one operation family and the project, plus graph/source/compiler/policy where the payload carries them. State re-checks equality against the actual payload or the role/binding/attempt it targets; any mismatch writes nothing.
+- The Orchestration core's `CoreStateWriter` is the issuer: it derives subjects from payloads and its admitted compiler/policy identity and refuses foreign graphs before State.
+- `EventProposalV1` is immutable data any component may build. `persist_event_proposal` appends the event (trusted `occurred_at`) and an `event_proposal_receipt` row in one transaction; a replayed proposal or reused event id is refused atomically. All 53 events keep TrustedCore as authoritative publisher; the proposal origin is causal data only.
+- Availability facts (D5) are append-only with a gap-free State-assigned sequence per provider/runtime/model partition. Recovery claims and retry-after expiry must follow the exact latest sequence and never clear the last demotion or produce `Available`; no authenticated post-demotion producer exists yet (adopted post-W3 deferral).
+
+Migration 20 adds `state_store_identity`, `event_proposal_receipt` and `availability_fact`, verifying the exact v19 store before and the v20 store after. Migration SQL for v1–v19 is unchanged; the v19 verifier now accepts head 19 or later.
+
+Limits: this is an object-capability boundary inside the trusted core process. It does not authenticate other code in the same address space, and file modes plus a cooperative lock do not exclude a process with the same filesystem authority. Excluding lower-trust principals (separate identity, no State directory access, no inherited descriptors or writer channels) is a deployment requirement. Separate-principal native proof is NOT RUN.

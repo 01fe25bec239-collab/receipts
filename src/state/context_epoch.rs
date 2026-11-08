@@ -279,13 +279,16 @@ impl SqliteStateRepository {
     /// behavior. The schema's primary-key, CHECK, and NOT NULL
     /// constraints re-enforce the same rules as durable backstops, and
     /// all caller values reach SQL through bound parameters.
-    pub fn append_context_epoch(&mut self, context_epoch: ContextEpoch) -> Result<(), StateError> {
+    pub(crate) fn append_context_epoch(
+        &mut self,
+        context_epoch: ContextEpoch,
+    ) -> Result<(), StateError> {
         validate_for_append(&context_epoch)?;
         self.run_transaction(|uow| uow.insert_context_epoch(&context_epoch))
     }
 
     /// Atomically appends a parent, presence state and ordered source children.
-    pub fn append_context_epoch_with_changed_sources(
+    pub(crate) fn append_context_epoch_with_changed_sources(
         &mut self,
         context_epoch: ContextEpoch,
         changed_sources: ChangedSources,
@@ -391,7 +394,7 @@ impl SqliteStateRepository {
     /// no current-epoch pointer: the authoritative latest epoch remains
     /// the derived [`Self::find_latest_context_epoch`] query. All caller
     /// values reach SQL through bound parameters.
-    pub fn advance_context_epoch(
+    pub(crate) fn advance_context_epoch(
         &mut self,
         project_id: &str,
         advanced_at: &str,
@@ -408,7 +411,7 @@ impl SqliteStateRepository {
     }
 
     /// Advances atomically with caller-supplied changed sources and invalidated roles.
-    pub fn advance_context_epoch_with_changed_sources(
+    pub(crate) fn advance_context_epoch_with_changed_sources(
         &mut self,
         project_id: &str,
         advanced_at: &str,

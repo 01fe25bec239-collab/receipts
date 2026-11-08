@@ -684,7 +684,8 @@ impl SqliteStateRepository {
     /// the structural [`EventPayloadReference`] carried by the envelope, and
     /// no structural field — including `event_id` — is ever transformed
     /// between validation and persistence.
-    pub fn append_event(&mut self, event: EventEnvelope) -> Result<(), StateError> {
+    #[cfg(test)]
+    pub(crate) fn append_event(&mut self, event: EventEnvelope) -> Result<(), StateError> {
         validate_for_append(&event)?;
         self.run_transaction(|uow| uow.insert_event(&event))
     }
@@ -781,7 +782,7 @@ WHERE project_id = ?";
 /// primary-key constraint remains the durable backstop. The supplied
 /// structural values — including `event_id` — are bound exactly as
 /// validated: nothing is rewritten on the way to storage.
-fn insert_event(conn: &Connection, event: &EventEnvelope) -> Result<(), StateError> {
+pub(crate) fn insert_event(conn: &Connection, event: &EventEnvelope) -> Result<(), StateError> {
     let exists: Option<i64> = conn
         .query_row(EVENT_EXISTS_SQL, [&event.event_id], |row| row.get(0))
         .optional()

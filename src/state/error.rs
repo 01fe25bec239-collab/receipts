@@ -244,6 +244,10 @@ pub enum StateError {
     /// Allocation for an unbounded State epoch failed.
     StateEpochValueAllocationFailed { detail: String },
     /// The SQLite database file could not be opened or created.
+    /// The trusted-core write boundary refused an admission or exclusive open.
+    WriteAuthorityRefused {
+        reason: crate::trusted_core::StateWriteRefusalV1,
+    },
     OpenFailed {
         /// Underlying driver detail.
         detail: String,
@@ -745,6 +749,9 @@ impl fmt::Display for StateError {
             }
             StateError::StateEpochValueAllocationFailed { detail } => {
                 write!(f, "failed to allocate StateEpochValueV1: {detail}")
+            }
+            StateError::WriteAuthorityRefused { reason } => {
+                write!(f, "State write authority refused: {}", reason.as_str())
             }
             StateError::OpenFailed { detail } => {
                 write!(f, "failed to open the state database: {detail}")

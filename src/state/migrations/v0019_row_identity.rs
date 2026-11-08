@@ -43,7 +43,7 @@ pub(crate) fn definition_matches(
     let head: i64 = conn.query_row("SELECT MAX(version) FROM state_schema_version", [], |r| {
         r.get(0)
     })?;
-    let expected = if head == 19 && TABLES.contains(&name) {
+    let expected = if head >= 19 && TABLES.contains(&name) {
         format!(
             "CREATE TABLE \"{name}\" {}{} WITHOUT ROWID",
             &expected[expected.find('(').unwrap()..],
@@ -112,7 +112,7 @@ pub(crate) fn apply(conn: &Connection) -> Result<(), StateError> {
         }
         conn.execute_batch(MIGRATION.sql)
             .map_err(|e| graph::sqlite_error(phase, e))?;
-        graph::verify_current(conn, phase)
+        graph::verify_v19(conn, phase)
     });
     let restored = conn
         .execute_batch("PRAGMA foreign_keys=ON")

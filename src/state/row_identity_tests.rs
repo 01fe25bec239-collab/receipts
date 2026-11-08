@@ -76,7 +76,7 @@ fn migration19_failure_rolls_back_exact18_and_restores_foreign_keys() {
     }
     conn.execute_batch("DROP TRIGGER fail19").unwrap();
     migrations::v0019_row_identity::apply(conn).unwrap();
-    crate::graph_repository::verify_current(conn, GraphPhase::Migration).unwrap();
+    crate::graph_repository::verify_v19(conn, GraphPhase::Migration).unwrap();
     assert!(crate::graph_repository::verify_v18(conn, GraphPhase::Migration).is_err());
 }
 
@@ -95,11 +95,11 @@ fn every_supported_head_including18_preserves_values_through19() {
         assert!(SqliteStateRepository::open(tmp.db_path()).is_err());
         assert_eq!(
             SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).unwrap(),
-            19
+            20
         );
         assert_eq!(
             SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).unwrap(),
-            19
+            20
         );
         let repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
         assert_eq!(repo.find_logical_role("r").unwrap(), Some(role));

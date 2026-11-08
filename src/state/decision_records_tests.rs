@@ -546,7 +546,7 @@ fn v16_store_migrates_to_v17_preserving_rows_and_rejects_partial_v17() {
     drop(conn);
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).unwrap(),
-        19
+        20
     );
     let repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
     assert_eq!(repo.count_table_rows("logical_role").unwrap(), 1);
@@ -922,7 +922,20 @@ pub(crate) fn remove_v18(conn: &Connection) {
     conn.execute_batch(&format!("{create}; INSERT INTO context_manifest_v18 SELECT * FROM context_manifest; DROP TABLE context_manifest; ALTER TABLE context_manifest_v18 RENAME TO context_manifest; DELETE FROM state_schema_version WHERE version=18; PRAGMA foreign_keys=ON;")).unwrap();
 }
 
+pub(crate) fn remove_v20(conn: &Connection) {
+    let head: i64 = conn
+        .query_row("SELECT MAX(version) FROM state_schema_version", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    if head < 20 {
+        return;
+    }
+    conn.execute_batch("DROP TABLE event_proposal_receipt; DROP TABLE availability_fact; DROP TABLE state_store_identity; DELETE FROM state_schema_version WHERE version=20;").unwrap();
+}
+
 pub(crate) fn remove_v19(conn: &Connection) {
+    remove_v20(conn);
     let head: i64 = conn
         .query_row("SELECT MAX(version) FROM state_schema_version", [], |r| {
             r.get(0)
