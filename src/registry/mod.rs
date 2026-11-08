@@ -1,12 +1,14 @@
-//! In-process registry foundation only. State persistence is not implemented.
-//! Only the intelligence owner holds the mutable service; workers receive
-//! &Registry. No mutable collections or record references are exposed.
+//! Registry foundation. Only the intelligence owner holds the mutable
+//! service; workers receive &Registry. No mutable collections or record
+//! references are exposed. Durable State history: [`persistence`].
 mod capability;
 pub use capability::*;
 mod seed_loader;
 pub use seed_loader::*;
 mod resolver;
 pub use resolver::*;
+pub mod persistence;
+pub use persistence::{PersistentRegistry, RegistryPersistError};
 
 use crate::EvidenceConfidence;
 use crate::intelligence::{
@@ -527,3 +529,6 @@ mod tests;
 
 #[cfg(test)]
 mod seed_loader_tests;
+
+#[cfg(test)]
+pub(crate) mod persistence_tests;

@@ -1,0 +1,19 @@
+{
+  "subject_kind": "MODEL",
+  "provider_id": "prov-a",
+  "model_id": "model-a",
+  "capability": "receipts.registry.lifecycle",
+  "value": {
+    "evidence": "DEMOTION",
+    "reason": "RATE_LIMITED"
+  },
+  "confidence": "LOCAL_EMPIRICAL",
+  "source_ref": {
+    "ref_type": "ARTIFACT_ID",
+    "target": "synthetic-evidence",
+    "digest": "sha256:00",
+    "section": "s1"
+  },
+  "observed_at": "2026-11-08T10:00:00Z",
+  "lifecycle_state": "UNAVAILABLE"
+}

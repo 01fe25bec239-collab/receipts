@@ -1,0 +1,17 @@
+{
+  "provider_id": "prov-a",
+  "runtime_id": "rt-a",
+  "credential_mode": "USER_API",
+  "technical_status": "CONNECTED",
+  "policy_status": "VERIFIED_ALLOWED",
+  "allowed_execution_contexts": [
+    "LOCAL_EXTERNAL_WORKER"
+  ],
+  "verified_at": "2026-11-08T10:00:00Z",
+  "evidence_source": "https://example.invalid/terms",
+  "evidence_label": "VERIFIED_CURRENT_SELF_FETCHED",
+  "terms_version_or_digest": "v1",
+  "reason": "user API key",
+  "reverification_deadline": "2026-12-01T00:00:00Z",
+  "source_claim_id": "C-10"
+}

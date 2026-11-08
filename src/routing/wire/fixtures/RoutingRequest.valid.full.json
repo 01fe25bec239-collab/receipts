@@ -1,0 +1,27 @@
+{
+  "request_id": "request-1",
+  "task_id": "task-1",
+  "role": "IMPLEMENTER",
+  "task_class": "FRONTIER_IMPLEMENTATION",
+  "quality_floor": "FRONTIER",
+  "required_capabilities": [
+    "coding",
+    "structured_output"
+  ],
+  "preferred_capabilities": [
+    "long_context"
+  ],
+  "quality_priority": "HIGHEST",
+  "cost_priority": "LOW",
+  "constraints": {
+    "distinct_provider_from": "prov-x",
+    "avoid_providers": [
+      "prov-y"
+    ],
+    "user_pinned_model": "model-a",
+    "user_pinned_provider": "prov-a",
+    "max_cost": 12.5
+  },
+  "context_size_hint": 200000,
+  "deadline": "2026-11-09T00:00:00Z"
+}

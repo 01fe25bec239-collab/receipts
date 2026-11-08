@@ -1,0 +1,12 @@
+{
+  "provider_id": "p",
+  "runtime_id": "r",
+  "credential_mode": "PERSONAL_LOCAL_CLI",
+  "technical_status": "AUTH_REQUIRED",
+  "policy_status": "NEEDS_REVIEW",
+  "verified_at": "2026-11-08T10:00:00Z",
+  "evidence_label": "POLICY_NEEDS_REVIEW",
+  "terms_version_or_digest": null,
+  "reverification_deadline": null,
+  "source_claim_id": null
+}

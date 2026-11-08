@@ -187,11 +187,11 @@ fn request(required: &[&str]) -> RoutingRequestNonTemporalCore {
                 Some(vec!["provider-a".into()]),
                 Some("different-model".into()),
                 Some("different-provider".into()),
-                Some(-1.0),
+                Some(Some(-1.0)),
             )
             .unwrap(),
         ),
-        Some(u64::MAX),
+        Some(Some(u64::MAX)),
     )
     .unwrap()
 }
@@ -206,7 +206,7 @@ fn availability(
         model.map(String::from),
         runtime.map(String::from),
         state,
-        Some(u64::MAX),
+        Some(Some(u64::MAX)),
         Some(AvailabilitySignalSource::Unknown),
         None,
     )

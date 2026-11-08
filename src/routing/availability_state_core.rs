@@ -1,14 +1,15 @@
 use crate::{AvailabilitySignalSource, AvailabilityStateKind};
 
 /// In-process, non-temporal availability storage, not the complete wire AvailabilityState.
-/// Retry seconds use a bounded non-negative carrier, not an arbitrary-precision JSON codec.
+/// Retry seconds use a bounded non-negative carrier (`None` absent, `Some(None)`
+/// explicit null), not an arbitrary-precision JSON codec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvailabilityStateNonTemporalCore {
     provider_id: String,
     model_id: Option<String>,
     runtime_id: Option<String>,
     state: AvailabilityStateKind,
-    retry_after_seconds: Option<u64>,
+    retry_after_seconds: Option<Option<u64>>,
     signal_source: Option<AvailabilitySignalSource>,
     note: Option<String>,
 }
@@ -27,7 +28,7 @@ impl AvailabilityStateNonTemporalCore {
         model_id: Option<String>,
         runtime_id: Option<String>,
         state: AvailabilityStateKind,
-        retry_after_seconds: Option<u64>,
+        retry_after_seconds: Option<Option<u64>>,
         signal_source: Option<AvailabilitySignalSource>,
         note: Option<String>,
     ) -> Result<Self, AvailabilityStateCoreError> {
@@ -67,7 +68,7 @@ impl AvailabilityStateNonTemporalCore {
         self.state
     }
 
-    pub fn retry_after_seconds(&self) -> Option<u64> {
+    pub fn retry_after_seconds(&self) -> Option<Option<u64>> {
         self.retry_after_seconds
     }
 

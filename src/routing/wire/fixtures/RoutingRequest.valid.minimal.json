@@ -1,0 +1,9 @@
+{
+  "request_id": "r",
+  "role": "REVIEWER",
+  "task_class": "ECONOMY_DOCS",
+  "quality_floor": "ECONOMY",
+  "required_capabilities": [
+    "docs"
+  ]
+}

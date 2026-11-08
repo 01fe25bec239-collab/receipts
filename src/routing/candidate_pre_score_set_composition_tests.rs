@@ -74,7 +74,7 @@ fn request(
                 avoid.map(|value| vec![value.into()]),
                 None,
                 None,
-                max_cost,
+                max_cost.map(Some),
             )
             .unwrap(),
         ),

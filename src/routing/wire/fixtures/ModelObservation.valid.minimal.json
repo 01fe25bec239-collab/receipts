@@ -1,0 +1,9 @@
+{
+  "observation_id": "o",
+  "provider_id": "p",
+  "model_id": "m",
+  "runtime_id": "r",
+  "task_class": "",
+  "outcome": "TIMEOUT",
+  "observed_at": "2026-11-08T10:00:00Z"
+}

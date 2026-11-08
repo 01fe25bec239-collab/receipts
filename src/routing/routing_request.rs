@@ -157,14 +157,15 @@ impl RoutingPriority {
 
 /// Schema constraints stored without cross-field policy.
 /// `max_cost` is a finite, bounded f64 carrier, not an arbitrary-precision JSON
-/// number codec. Finite negative values are valid; no currency or unit is implied.
+/// number codec: `None` absent, `Some(None)` explicit null. Finite negative
+/// values are valid; no currency or unit is implied.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RoutingRequestConstraints {
     distinct_provider_from: Option<String>,
     avoid_providers: Option<Vec<String>>,
     user_pinned_model: Option<String>,
     user_pinned_provider: Option<String>,
-    max_cost: Option<f64>,
+    max_cost: Option<Option<f64>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,7 +184,7 @@ impl RoutingRequestConstraints {
         avoid_providers: Option<Vec<String>>,
         user_pinned_model: Option<String>,
         user_pinned_provider: Option<String>,
-        max_cost: Option<f64>,
+        max_cost: Option<Option<f64>>,
     ) -> Result<Self, RoutingRequestConstraintsError> {
         if distinct_provider_from.as_deref() == Some("") {
             return Err(RoutingRequestConstraintsError::EmptyDistinctProviderFrom);
@@ -199,7 +200,7 @@ impl RoutingRequestConstraints {
         if user_pinned_provider.as_deref() == Some("") {
             return Err(RoutingRequestConstraintsError::EmptyUserPinnedProvider);
         }
-        if max_cost.is_some_and(|value| !value.is_finite()) {
+        if max_cost.flatten().is_some_and(|value| !value.is_finite()) {
             return Err(RoutingRequestConstraintsError::NonFiniteMaxCost);
         }
         Ok(Self {
@@ -227,7 +228,7 @@ impl RoutingRequestConstraints {
         self.user_pinned_provider.as_deref()
     }
 
-    pub fn max_cost(&self) -> Option<f64> {
+    pub fn max_cost(&self) -> Option<Option<f64>> {
         self.max_cost
     }
 }
@@ -235,8 +236,9 @@ impl RoutingRequestConstraints {
 /// In-process non-temporal core, NOT the complete wire RoutingRequest.
 /// `deadline` is stored separately by the complete in-process [`RoutingRequest`].
 /// `execution_context` is deferred because frozen prose and schema disagree.
-/// `context_size_hint` uses a bounded non-negative u64 carrier, not an
-/// arbitrary-precision JSON integer codec; no units are implied.
+/// `context_size_hint` uses a bounded non-negative u64 carrier (`None` absent,
+/// `Some(None)` explicit null), not an arbitrary-precision JSON integer codec;
+/// no units are implied.
 /// Omitted priorities stay omitted; capabilities are stored without evaluation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RoutingRequestNonTemporalCore {
@@ -250,7 +252,7 @@ pub struct RoutingRequestNonTemporalCore {
     quality_priority: Option<RoutingPriority>,
     cost_priority: Option<RoutingPriority>,
     constraints: Option<RoutingRequestConstraints>,
-    context_size_hint: Option<u64>,
+    context_size_hint: Option<Option<u64>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,7 +280,7 @@ impl RoutingRequestNonTemporalCore {
         quality_priority: Option<RoutingPriority>,
         cost_priority: Option<RoutingPriority>,
         constraints: Option<RoutingRequestConstraints>,
-        context_size_hint: Option<u64>,
+        context_size_hint: Option<Option<u64>>,
     ) -> Result<Self, RoutingRequestCoreError> {
         if request_id.is_empty() {
             return Err(RoutingRequestCoreError::EmptyRequestId);
@@ -360,7 +362,7 @@ impl RoutingRequestNonTemporalCore {
         self.constraints.as_ref()
     }
 
-    pub fn context_size_hint(&self) -> Option<u64> {
+    pub fn context_size_hint(&self) -> Option<Option<u64>> {
         self.context_size_hint
     }
 }

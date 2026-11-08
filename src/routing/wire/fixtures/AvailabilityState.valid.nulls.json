@@ -1,0 +1,6 @@
+{
+  "provider_id": "prov-a",
+  "state": "DEGRADED",
+  "retry_after_seconds": null,
+  "observed_at": "2026-11-08T10:00:00Z"
+}

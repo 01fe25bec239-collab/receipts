@@ -1,0 +1,174 @@
+[
+  {
+    "case": "not_json",
+    "raw": "{",
+    "error": "Json"
+  },
+  {
+    "case": "trailing_input",
+    "raw": "{\"subject_kind\": \"RUNTIME\", \"capability\": \"runtime_probe.json\", \"confidence\": \"LOCAL_EMPIRICAL\", \"observed_at\": \"2026-11-08T10:00:00Z\"} {}",
+    "error": "Json"
+  },
+  {
+    "case": "not_an_object",
+    "document": [
+      {
+        "subject_kind": "RUNTIME",
+        "capability": "runtime_probe.json",
+        "confidence": "LOCAL_EMPIRICAL",
+        "observed_at": "2026-11-08T10:00:00Z"
+      }
+    ],
+    "error": "Shape"
+  },
+  {
+    "case": "unknown_field",
+    "document": {
+      "subject_kind": "RUNTIME",
+      "capability": "runtime_probe.json",
+      "confidence": "LOCAL_EMPIRICAL",
+      "observed_at": "2026-11-08T10:00:00Z",
+      "x_unknown": 1
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "duplicate_key",
+    "raw": "{\"subject_kind\": \"RUNTIME\", \"capability\": \"runtime_probe.json\", \"confidence\": \"LOCAL_EMPIRICAL\", \"observed_at\": \"2026-11-08T10:00:00Z\", \"subject_kind\": \"RUNTIME\"}",
+    "error": "Shape"
+  },
+  {
+    "case": "missing_confidence",
+    "document": {
+      "subject_kind": "MODEL_RUNTIME_PAIR",
+      "provider_id": "prov-a",
+      "model_id": "model-a",
+      "runtime_id": "rt-a",
+      "capability": "coding",
+      "value": true,
+      "source_ref": {
+        "ref_type": "ARTIFACT_ID",
+        "target": "synthetic-evidence",
+        "digest": "sha256:00",
+        "section": "s1"
+      },
+      "observed_at": "2026-11-08T10:00:00Z",
+      "sample_size": 4,
+      "lifecycle_state": "ROUTABLE"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "empty_capability",
+    "document": {
+      "subject_kind": "MODEL_RUNTIME_PAIR",
+      "provider_id": "prov-a",
+      "model_id": "model-a",
+      "runtime_id": "rt-a",
+      "capability": "",
+      "value": true,
+      "confidence": "OFFICIAL_VERIFIED",
+      "source_ref": {
+        "ref_type": "ARTIFACT_ID",
+        "target": "synthetic-evidence",
+        "digest": "sha256:00",
+        "section": "s1"
+      },
+      "observed_at": "2026-11-08T10:00:00Z",
+      "sample_size": 4,
+      "lifecycle_state": "ROUTABLE"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "bad_subject_kind",
+    "document": {
+      "subject_kind": "PROVIDER",
+      "provider_id": "prov-a",
+      "model_id": "model-a",
+      "runtime_id": "rt-a",
+      "capability": "coding",
+      "value": true,
+      "confidence": "OFFICIAL_VERIFIED",
+      "source_ref": {
+        "ref_type": "ARTIFACT_ID",
+        "target": "synthetic-evidence",
+        "digest": "sha256:00",
+        "section": "s1"
+      },
+      "observed_at": "2026-11-08T10:00:00Z",
+      "sample_size": 4,
+      "lifecycle_state": "ROUTABLE"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "bad_lifecycle",
+    "document": {
+      "subject_kind": "MODEL_RUNTIME_PAIR",
+      "provider_id": "prov-a",
+      "model_id": "model-a",
+      "runtime_id": "rt-a",
+      "capability": "coding",
+      "value": true,
+      "confidence": "OFFICIAL_VERIFIED",
+      "source_ref": {
+        "ref_type": "ARTIFACT_ID",
+        "target": "synthetic-evidence",
+        "digest": "sha256:00",
+        "section": "s1"
+      },
+      "observed_at": "2026-11-08T10:00:00Z",
+      "sample_size": 4,
+      "lifecycle_state": "PROMOTED"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "source_ref_empty_target",
+    "document": {
+      "subject_kind": "MODEL_RUNTIME_PAIR",
+      "provider_id": "prov-a",
+      "model_id": "model-a",
+      "runtime_id": "rt-a",
+      "capability": "coding",
+      "value": true,
+      "confidence": "OFFICIAL_VERIFIED",
+      "source_ref": {
+        "ref_type": "URL",
+        "target": ""
+      },
+      "observed_at": "2026-11-08T10:00:00Z",
+      "sample_size": 4,
+      "lifecycle_state": "ROUTABLE"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "duplicate_key_inside_value",
+    "raw": "{\"subject_kind\": \"MODEL_RUNTIME_PAIR\", \"provider_id\": \"prov-a\", \"model_id\": \"model-a\", \"runtime_id\": \"rt-a\", \"capability\": \"coding\", \"value\": {\"a\": 1, \"a\": 2}, \"confidence\": \"OFFICIAL_VERIFIED\", \"source_ref\": {\"ref_type\": \"ARTIFACT_ID\", \"target\": \"synthetic-evidence\", \"digest\": \"sha256:00\", \"section\": \"s1\"}, \"observed_at\": \"2026-11-08T10:00:00Z\", \"sample_size\": 4, \"lifecycle_state\": \"ROUTABLE\"}",
+    "error": "Shape"
+  },
+  {
+    "case": "observed_at_not_rfc3339",
+    "document": {
+      "subject_kind": "MODEL_RUNTIME_PAIR",
+      "provider_id": "prov-a",
+      "model_id": "model-a",
+      "runtime_id": "rt-a",
+      "capability": "coding",
+      "value": true,
+      "confidence": "OFFICIAL_VERIFIED",
+      "source_ref": {
+        "ref_type": "ARTIFACT_ID",
+        "target": "synthetic-evidence",
+        "digest": "sha256:00",
+        "section": "s1"
+      },
+      "observed_at": "x",
+      "sample_size": 4,
+      "lifecycle_state": "ROUTABLE"
+    },
+    "error": "Refused"
+  }
+]

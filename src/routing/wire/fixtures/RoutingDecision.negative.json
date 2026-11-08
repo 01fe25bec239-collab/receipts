@@ -1,0 +1,869 @@
+[
+  {
+    "case": "not_json",
+    "raw": "{",
+    "error": "Json"
+  },
+  {
+    "case": "trailing_input",
+    "raw": "{\"decision_id\": \"d\", \"request_id\": \"r\", \"occurred_at\": \"2026-11-08T10:00:00Z\", \"outcome\": \"NO_ELIGIBLE_CANDIDATE\", \"registry_freshness\": {\"stale\": true}, \"mode\": \"AUTO_CURRENT\"} {}",
+    "error": "Json"
+  },
+  {
+    "case": "not_an_object",
+    "document": [
+      {
+        "decision_id": "d",
+        "request_id": "r",
+        "occurred_at": "2026-11-08T10:00:00Z",
+        "outcome": "NO_ELIGIBLE_CANDIDATE",
+        "registry_freshness": {
+          "stale": true
+        },
+        "mode": "AUTO_CURRENT"
+      }
+    ],
+    "error": "Shape"
+  },
+  {
+    "case": "unknown_field",
+    "document": {
+      "decision_id": "d",
+      "request_id": "r",
+      "occurred_at": "2026-11-08T10:00:00Z",
+      "outcome": "NO_ELIGIBLE_CANDIDATE",
+      "registry_freshness": {
+        "stale": true
+      },
+      "mode": "AUTO_CURRENT",
+      "x_unknown": 1
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "duplicate_key",
+    "raw": "{\"decision_id\": \"d\", \"request_id\": \"r\", \"occurred_at\": \"2026-11-08T10:00:00Z\", \"outcome\": \"NO_ELIGIBLE_CANDIDATE\", \"registry_freshness\": {\"stale\": true}, \"mode\": \"AUTO_CURRENT\", \"decision_id\": \"d\"}",
+    "error": "Shape"
+  },
+  {
+    "case": "missing_registry_freshness",
+    "document": {
+      "decision_id": "decision-1",
+      "request_id": "request-1",
+      "task_id": "task-1",
+      "occurred_at": "2026-11-08T10:00:00Z",
+      "outcome": "SELECTED",
+      "selected_provider": "prov-a",
+      "selected_model": "model-a",
+      "selected_runtime": "rt-a",
+      "selection_reason": {
+        "quality_floor_applied": "FRONTIER",
+        "hard_filters_passed": [
+          "REGISTRY_CANDIDATE"
+        ],
+        "score_components": {
+          "expected_implementation_cost": 1.5,
+          "expected_rejection_probability": 0.25,
+          "expected_repair_cost": 0.5,
+          "expected_review_cost": 0.75,
+          "latency_estimate_seconds": 12.0
+        },
+        "decisive_factor": "AVAILABILITY"
+      },
+      "capability_evidence": [
+        {
+          "capability": "coding",
+          "value": true,
+          "confidence": "OFFICIAL_VERIFIED",
+          "source_ref": {
+            "ref_type": "ARTIFACT_ID",
+            "target": "synthetic-evidence",
+            "digest": "sha256:00",
+            "section": "s1"
+          },
+          "observed_at": "2026-11-08T10:00:00Z",
+          "sample_size": 3
+        }
+      ],
+      "confidence": "HIGH",
+      "availability_at_decision": "AVAILABLE",
+      "estimated_cost_class": "LOW",
+      "alternative_candidates": [
+        {
+          "provider_id": "prov-b",
+          "model_id": "model-b",
+          "runtime_id": "rt-b",
+          "score": 0.5,
+          "rejection_reason": "RANKED_BELOW_SELECTED:AVAILABILITY"
+        }
+      ],
+      "mode": "ASK_ON_UNCERTAINTY",
+      "user_involved": false,
+      "user_pin_applied": true,
+      "fallback_from": "decision-0"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "missing_stale",
+    "document": {
+      "decision_id": "decision-1",
+      "request_id": "request-1",
+      "task_id": "task-1",
+      "occurred_at": "2026-11-08T10:00:00Z",
+      "outcome": "SELECTED",
+      "selected_provider": "prov-a",
+      "selected_model": "model-a",
+      "selected_runtime": "rt-a",
+      "selection_reason": {
+        "quality_floor_applied": "FRONTIER",
+        "hard_filters_passed": [
+          "REGISTRY_CANDIDATE"
+        ],
+        "score_components": {
+          "expected_implementation_cost": 1.5,
+          "expected_rejection_probability": 0.25,
+          "expected_repair_cost": 0.5,
+          "expected_review_cost": 0.75,
+          "latency_estimate_seconds": 12.0
+        },
+        "decisive_factor": "AVAILABILITY"
+      },
+      "capability_evidence": [
+        {
+          "capability": "coding",
+          "value": true,
+          "confidence": "OFFICIAL_VERIFIED",
+          "source_ref": {
+            "ref_type": "ARTIFACT_ID",
+            "target": "synthetic-evidence",
+            "digest": "sha256:00",
+            "section": "s1"
+          },
+          "observed_at": "2026-11-08T10:00:00Z",
+          "sample_size": 3
+        }
+      ],
+      "confidence": "HIGH",
+      "availability_at_decision": "AVAILABLE",
+      "estimated_cost_class": "LOW",
+      "alternative_candidates": [
+        {
+          "provider_id": "prov-b",
+          "model_id": "model-b",
+          "runtime_id": "rt-b",
+          "score": 0.5,
+          "rejection_reason": "RANKED_BELOW_SELECTED:AVAILABILITY"
+        }
+      ],
+      "registry_freshness": {
+        "model_list_age_seconds": 60,
+        "capability_age_seconds": -5,
+        "calibration_sample_size": 0
+      },
+      "mode": "ASK_ON_UNCERTAINTY",
+      "user_involved": false,
+      "user_pin_applied": true,
+      "fallback_from": "decision-0"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "bad_outcome",
+    "document": {
+      "decision_id": "decision-1",
+      "request_id": "request-1",
+      "task_id": "task-1",
+      "occurred_at": "2026-11-08T10:00:00Z",
+      "outcome": "DOWNGRADED",
+      "selected_provider": "prov-a",
+      "selected_model": "model-a",
+      "selected_runtime": "rt-a",
+      "selection_reason": {
+        "quality_floor_applied": "FRONTIER",
+        "hard_filters_passed": [
+          "REGISTRY_CANDIDATE"
+        ],
+        "score_components": {
+          "expected_implementation_cost": 1.5,
+          "expected_rejection_probability": 0.25,
+          "expected_repair_cost": 0.5,
+          "expected_review_cost": 0.75,
+          "latency_estimate_seconds": 12.0
+        },
+        "decisive_factor": "AVAILABILITY"
+      },
+      "capability_evidence": [
+        {
+          "capability": "coding",
+          "value": true,
+          "confidence": "OFFICIAL_VERIFIED",
+          "source_ref": {
+            "ref_type": "ARTIFACT_ID",
+            "target": "synthetic-evidence",
+            "digest": "sha256:00",
+            "section": "s1"
+          },
+          "observed_at": "2026-11-08T10:00:00Z",
+          "sample_size": 3
+        }
+      ],
+      "confidence": "HIGH",
+      "availability_at_decision": "AVAILABLE",
+      "estimated_cost_class": "LOW",
+      "alternative_candidates": [
+        {
+          "provider_id": "prov-b",
+          "model_id": "model-b",
+          "runtime_id": "rt-b",
+          "score": 0.5,
+          "rejection_reason": "RANKED_BELOW_SELECTED:AVAILABILITY"
+        }
+      ],
+      "registry_freshness": {
+        "model_list_age_seconds": 60,
+        "capability_age_seconds": -5,
+        "calibration_sample_size": 0,
+        "stale": false
+      },
+      "mode": "ASK_ON_UNCERTAINTY",
+      "user_involved": false,
+      "user_pin_applied": true,
+      "fallback_from": "decision-0"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "rejection_probability_above_one",
+    "document": {
+      "decision_id": "decision-1",
+      "request_id": "request-1",
+      "task_id": "task-1",
+      "occurred_at": "2026-11-08T10:00:00Z",
+      "outcome": "SELECTED",
+      "selected_provider": "prov-a",
+      "selected_model": "model-a",
+      "selected_runtime": "rt-a",
+      "selection_reason": {
+        "quality_floor_applied": "FRONTIER",
+        "hard_filters_passed": [
+          "REGISTRY_CANDIDATE"
+        ],
+        "score_components": {
+          "expected_implementation_cost": 1.5,
+          "expected_rejection_probability": 1.5,
+          "expected_repair_cost": 0.5,
+          "expected_review_cost": 0.75,
+          "latency_estimate_seconds": 12.0
+        },
+        "decisive_factor": "AVAILABILITY"
+      },
+      "capability_evidence": [
+        {
+          "capability": "coding",
+          "value": true,
+          "confidence": "OFFICIAL_VERIFIED",
+          "source_ref": {
+            "ref_type": "ARTIFACT_ID",
+            "target": "synthetic-evidence",
+            "digest": "sha256:00",
+            "section": "s1"
+          },
+          "observed_at": "2026-11-08T10:00:00Z",
+          "sample_size": 3
+        }
+      ],
+      "confidence": "HIGH",
+      "availability_at_decision": "AVAILABLE",
+      "estimated_cost_class": "LOW",
+      "alternative_candidates": [
+        {
+          "provider_id": "prov-b",
+          "model_id": "model-b",
+          "runtime_id": "rt-b",
+          "score": 0.5,
+          "rejection_reason": "RANKED_BELOW_SELECTED:AVAILABILITY"
+        }
+      ],
+      "registry_freshness": {
+        "model_list_age_seconds": 60,
+        "capability_age_seconds": -5,
+        "calibration_sample_size": 0,
+        "stale": false
+      },
+      "mode": "ASK_ON_UNCERTAINTY",
+      "user_involved": false,
+      "user_pin_applied": true,
+      "fallback_from": "decision-0"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "empty_selected_model",
+    "document": {
+      "decision_id": "decision-1",
+      "request_id": "request-1",
+      "task_id": "task-1",
+      "occurred_at": "2026-11-08T10:00:00Z",
+      "outcome": "SELECTED",
+      "selected_provider": "prov-a",
+      "selected_model": "",
+      "selected_runtime": "rt-a",
+      "selection_reason": {
+        "quality_floor_applied": "FRONTIER",
+        "hard_filters_passed": [
+          "REGISTRY_CANDIDATE"
+        ],
+        "score_components": {
+          "expected_implementation_cost": 1.5,
+          "expected_rejection_probability": 0.25,
+          "expected_repair_cost": 0.5,
+          "expected_review_cost": 0.75,
+          "latency_estimate_seconds": 12.0
+        },
+        "decisive_factor": "AVAILABILITY"
+      },
+      "capability_evidence": [
+        {
+          "capability": "coding",
+          "value": true,
+          "confidence": "OFFICIAL_VERIFIED",
+          "source_ref": {
+            "ref_type": "ARTIFACT_ID",
+            "target": "synthetic-evidence",
+            "digest": "sha256:00",
+            "section": "s1"
+          },
+          "observed_at": "2026-11-08T10:00:00Z",
+          "sample_size": 3
+        }
+      ],
+      "confidence": "HIGH",
+      "availability_at_decision": "AVAILABLE",
+      "estimated_cost_class": "LOW",
+      "alternative_candidates": [
+        {
+          "provider_id": "prov-b",
+          "model_id": "model-b",
+          "runtime_id": "rt-b",
+          "score": 0.5,
+          "rejection_reason": "RANKED_BELOW_SELECTED:AVAILABILITY"
+        }
+      ],
+      "registry_freshness": {
+        "model_list_age_seconds": 60,
+        "capability_age_seconds": -5,
+        "calibration_sample_size": 0,
+        "stale": false
+      },
+      "mode": "ASK_ON_UNCERTAINTY",
+      "user_involved": false,
+      "user_pin_applied": true,
+      "fallback_from": "decision-0"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "fallback_from_too_long",
+    "document": {
+      "decision_id": "decision-1",
+      "request_id": "request-1",
+      "task_id": "task-1",
+      "occurred_at": "2026-11-08T10:00:00Z",
+      "outcome": "SELECTED",
+      "selected_provider": "prov-a",
+      "selected_model": "model-a",
+      "selected_runtime": "rt-a",
+      "selection_reason": {
+        "quality_floor_applied": "FRONTIER",
+        "hard_filters_passed": [
+          "REGISTRY_CANDIDATE"
+        ],
+        "score_components": {
+          "expected_implementation_cost": 1.5,
+          "expected_rejection_probability": 0.25,
+          "expected_repair_cost": 0.5,
+          "expected_review_cost": 0.75,
+          "latency_estimate_seconds": 12.0
+        },
+        "decisive_factor": "AVAILABILITY"
+      },
+      "capability_evidence": [
+        {
+          "capability": "coding",
+          "value": true,
+          "confidence": "OFFICIAL_VERIFIED",
+          "source_ref": {
+            "ref_type": "ARTIFACT_ID",
+            "target": "synthetic-evidence",
+            "digest": "sha256:00",
+            "section": "s1"
+          },
+          "observed_at": "2026-11-08T10:00:00Z",
+          "sample_size": 3
+        }
+      ],
+      "confidence": "HIGH",
+      "availability_at_decision": "AVAILABLE",
+      "estimated_cost_class": "LOW",
+      "alternative_candidates": [
+        {
+          "provider_id": "prov-b",
+          "model_id": "model-b",
+          "runtime_id": "rt-b",
+          "score": 0.5,
+          "rejection_reason": "RANKED_BELOW_SELECTED:AVAILABILITY"
+        }
+      ],
+      "registry_freshness": {
+        "model_list_age_seconds": 60,
+        "capability_age_seconds": -5,
+        "calibration_sample_size": 0,
+        "stale": false
+      },
+      "mode": "ASK_ON_UNCERTAINTY",
+      "user_involved": false,
+      "user_pin_applied": true,
+      "fallback_from": "ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "alternative_missing_reason",
+    "document": {
+      "decision_id": "decision-1",
+      "request_id": "request-1",
+      "task_id": "task-1",
+      "occurred_at": "2026-11-08T10:00:00Z",
+      "outcome": "SELECTED",
+      "selected_provider": "prov-a",
+      "selected_model": "model-a",
+      "selected_runtime": "rt-a",
+      "selection_reason": {
+        "quality_floor_applied": "FRONTIER",
+        "hard_filters_passed": [
+          "REGISTRY_CANDIDATE"
+        ],
+        "score_components": {
+          "expected_implementation_cost": 1.5,
+          "expected_rejection_probability": 0.25,
+          "expected_repair_cost": 0.5,
+          "expected_review_cost": 0.75,
+          "latency_estimate_seconds": 12.0
+        },
+        "decisive_factor": "AVAILABILITY"
+      },
+      "capability_evidence": [
+        {
+          "capability": "coding",
+          "value": true,
+          "confidence": "OFFICIAL_VERIFIED",
+          "source_ref": {
+            "ref_type": "ARTIFACT_ID",
+            "target": "synthetic-evidence",
+            "digest": "sha256:00",
+            "section": "s1"
+          },
+          "observed_at": "2026-11-08T10:00:00Z",
+          "sample_size": 3
+        }
+      ],
+      "confidence": "HIGH",
+      "availability_at_decision": "AVAILABLE",
+      "estimated_cost_class": "LOW",
+      "alternative_candidates": [
+        {
+          "provider_id": "p",
+          "model_id": "m",
+          "runtime_id": "r"
+        }
+      ],
+      "registry_freshness": {
+        "model_list_age_seconds": 60,
+        "capability_age_seconds": -5,
+        "calibration_sample_size": 0,
+        "stale": false
+      },
+      "mode": "ASK_ON_UNCERTAINTY",
+      "user_involved": false,
+      "user_pin_applied": true,
+      "fallback_from": "decision-0"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "evidence_missing_confidence",
+    "document": {
+      "decision_id": "decision-1",
+      "request_id": "request-1",
+      "task_id": "task-1",
+      "occurred_at": "2026-11-08T10:00:00Z",
+      "outcome": "SELECTED",
+      "selected_provider": "prov-a",
+      "selected_model": "model-a",
+      "selected_runtime": "rt-a",
+      "selection_reason": {
+        "quality_floor_applied": "FRONTIER",
+        "hard_filters_passed": [
+          "REGISTRY_CANDIDATE"
+        ],
+        "score_components": {
+          "expected_implementation_cost": 1.5,
+          "expected_rejection_probability": 0.25,
+          "expected_repair_cost": 0.5,
+          "expected_review_cost": 0.75,
+          "latency_estimate_seconds": 12.0
+        },
+        "decisive_factor": "AVAILABILITY"
+      },
+      "capability_evidence": [
+        {
+          "capability": "c"
+        }
+      ],
+      "confidence": "HIGH",
+      "availability_at_decision": "AVAILABLE",
+      "estimated_cost_class": "LOW",
+      "alternative_candidates": [
+        {
+          "provider_id": "prov-b",
+          "model_id": "model-b",
+          "runtime_id": "rt-b",
+          "score": 0.5,
+          "rejection_reason": "RANKED_BELOW_SELECTED:AVAILABILITY"
+        }
+      ],
+      "registry_freshness": {
+        "model_list_age_seconds": 60,
+        "capability_age_seconds": -5,
+        "calibration_sample_size": 0,
+        "stale": false
+      },
+      "mode": "ASK_ON_UNCERTAINTY",
+      "user_involved": false,
+      "user_pin_applied": true,
+      "fallback_from": "decision-0"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "fractional_age",
+    "document": {
+      "decision_id": "decision-1",
+      "request_id": "request-1",
+      "task_id": "task-1",
+      "occurred_at": "2026-11-08T10:00:00Z",
+      "outcome": "SELECTED",
+      "selected_provider": "prov-a",
+      "selected_model": "model-a",
+      "selected_runtime": "rt-a",
+      "selection_reason": {
+        "quality_floor_applied": "FRONTIER",
+        "hard_filters_passed": [
+          "REGISTRY_CANDIDATE"
+        ],
+        "score_components": {
+          "expected_implementation_cost": 1.5,
+          "expected_rejection_probability": 0.25,
+          "expected_repair_cost": 0.5,
+          "expected_review_cost": 0.75,
+          "latency_estimate_seconds": 12.0
+        },
+        "decisive_factor": "AVAILABILITY"
+      },
+      "capability_evidence": [
+        {
+          "capability": "coding",
+          "value": true,
+          "confidence": "OFFICIAL_VERIFIED",
+          "source_ref": {
+            "ref_type": "ARTIFACT_ID",
+            "target": "synthetic-evidence",
+            "digest": "sha256:00",
+            "section": "s1"
+          },
+          "observed_at": "2026-11-08T10:00:00Z",
+          "sample_size": 3
+        }
+      ],
+      "confidence": "HIGH",
+      "availability_at_decision": "AVAILABLE",
+      "estimated_cost_class": "LOW",
+      "alternative_candidates": [
+        {
+          "provider_id": "prov-b",
+          "model_id": "model-b",
+          "runtime_id": "rt-b",
+          "score": 0.5,
+          "rejection_reason": "RANKED_BELOW_SELECTED:AVAILABILITY"
+        }
+      ],
+      "registry_freshness": {
+        "model_list_age_seconds": 1.5,
+        "capability_age_seconds": -5,
+        "calibration_sample_size": 0,
+        "stale": false
+      },
+      "mode": "ASK_ON_UNCERTAINTY",
+      "user_involved": false,
+      "user_pin_applied": true,
+      "fallback_from": "decision-0"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "negative_sample_size",
+    "document": {
+      "decision_id": "decision-1",
+      "request_id": "request-1",
+      "task_id": "task-1",
+      "occurred_at": "2026-11-08T10:00:00Z",
+      "outcome": "SELECTED",
+      "selected_provider": "prov-a",
+      "selected_model": "model-a",
+      "selected_runtime": "rt-a",
+      "selection_reason": {
+        "quality_floor_applied": "FRONTIER",
+        "hard_filters_passed": [
+          "REGISTRY_CANDIDATE"
+        ],
+        "score_components": {
+          "expected_implementation_cost": 1.5,
+          "expected_rejection_probability": 0.25,
+          "expected_repair_cost": 0.5,
+          "expected_review_cost": 0.75,
+          "latency_estimate_seconds": 12.0
+        },
+        "decisive_factor": "AVAILABILITY"
+      },
+      "capability_evidence": [
+        {
+          "capability": "coding",
+          "value": true,
+          "confidence": "OFFICIAL_VERIFIED",
+          "source_ref": {
+            "ref_type": "ARTIFACT_ID",
+            "target": "synthetic-evidence",
+            "digest": "sha256:00",
+            "section": "s1"
+          },
+          "observed_at": "2026-11-08T10:00:00Z",
+          "sample_size": -1
+        }
+      ],
+      "confidence": "HIGH",
+      "availability_at_decision": "AVAILABLE",
+      "estimated_cost_class": "LOW",
+      "alternative_candidates": [
+        {
+          "provider_id": "prov-b",
+          "model_id": "model-b",
+          "runtime_id": "rt-b",
+          "score": 0.5,
+          "rejection_reason": "RANKED_BELOW_SELECTED:AVAILABILITY"
+        }
+      ],
+      "registry_freshness": {
+        "model_list_age_seconds": 60,
+        "capability_age_seconds": -5,
+        "calibration_sample_size": 0,
+        "stale": false
+      },
+      "mode": "ASK_ON_UNCERTAINTY",
+      "user_involved": false,
+      "user_pin_applied": true,
+      "fallback_from": "decision-0"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "duplicate_key_inside_open_value",
+    "raw": "{\"decision_id\": \"decision-1\", \"request_id\": \"request-1\", \"task_id\": \"task-1\", \"occurred_at\": \"2026-11-08T10:00:00Z\", \"outcome\": \"SELECTED\", \"selected_provider\": \"prov-a\", \"selected_model\": \"model-a\", \"selected_runtime\": \"rt-a\", \"selection_reason\": {\"quality_floor_applied\": \"FRONTIER\", \"hard_filters_passed\": [\"REGISTRY_CANDIDATE\"], \"score_components\": {\"expected_implementation_cost\": 1.5, \"expected_rejection_probability\": 0.25, \"expected_repair_cost\": 0.5, \"expected_review_cost\": 0.75, \"latency_estimate_seconds\": 12.0}, \"decisive_factor\": \"AVAILABILITY\"}, \"capability_evidence\": [{\"capability\": \"c\", \"confidence\": \"UNVERIFIED\", \"observed_at\": \"2026-11-08T10:00:00Z\", \"value\": {\"a\": 1, \"a\": 2}}], \"confidence\": \"HIGH\", \"availability_at_decision\": \"AVAILABLE\", \"estimated_cost_class\": \"LOW\", \"alternative_candidates\": [{\"provider_id\": \"prov-b\", \"model_id\": \"model-b\", \"runtime_id\": \"rt-b\", \"score\": 0.5, \"rejection_reason\": \"RANKED_BELOW_SELECTED:AVAILABILITY\"}], \"registry_freshness\": {\"model_list_age_seconds\": 60, \"capability_age_seconds\": -5, \"calibration_sample_size\": 0, \"stale\": false}, \"mode\": \"ASK_ON_UNCERTAINTY\", \"user_involved\": false, \"user_pin_applied\": true, \"fallback_from\": \"decision-0\"}",
+    "error": "Shape"
+  },
+  {
+    "case": "occurred_at_absent_outside_carrier",
+    "document": {
+      "decision_id": "decision-1",
+      "request_id": "request-1",
+      "task_id": "task-1",
+      "outcome": "SELECTED",
+      "selected_provider": "prov-a",
+      "selected_model": "model-a",
+      "selected_runtime": "rt-a",
+      "selection_reason": {
+        "quality_floor_applied": "FRONTIER",
+        "hard_filters_passed": [
+          "REGISTRY_CANDIDATE"
+        ],
+        "score_components": {
+          "expected_implementation_cost": 1.5,
+          "expected_rejection_probability": 0.25,
+          "expected_repair_cost": 0.5,
+          "expected_review_cost": 0.75,
+          "latency_estimate_seconds": 12.0
+        },
+        "decisive_factor": "AVAILABILITY"
+      },
+      "capability_evidence": [
+        {
+          "capability": "coding",
+          "value": true,
+          "confidence": "OFFICIAL_VERIFIED",
+          "source_ref": {
+            "ref_type": "ARTIFACT_ID",
+            "target": "synthetic-evidence",
+            "digest": "sha256:00",
+            "section": "s1"
+          },
+          "observed_at": "2026-11-08T10:00:00Z",
+          "sample_size": 3
+        }
+      ],
+      "confidence": "HIGH",
+      "availability_at_decision": "AVAILABLE",
+      "estimated_cost_class": "LOW",
+      "alternative_candidates": [
+        {
+          "provider_id": "prov-b",
+          "model_id": "model-b",
+          "runtime_id": "rt-b",
+          "score": 0.5,
+          "rejection_reason": "RANKED_BELOW_SELECTED:AVAILABILITY"
+        }
+      ],
+      "registry_freshness": {
+        "model_list_age_seconds": 60,
+        "capability_age_seconds": -5,
+        "calibration_sample_size": 0,
+        "stale": false
+      },
+      "mode": "ASK_ON_UNCERTAINTY",
+      "user_involved": false,
+      "user_pin_applied": true,
+      "fallback_from": "decision-0"
+    },
+    "error": "Refused"
+  },
+  {
+    "case": "evidence_observed_at_absent_outside_carrier",
+    "document": {
+      "decision_id": "decision-1",
+      "request_id": "request-1",
+      "task_id": "task-1",
+      "occurred_at": "2026-11-08T10:00:00Z",
+      "outcome": "SELECTED",
+      "selected_provider": "prov-a",
+      "selected_model": "model-a",
+      "selected_runtime": "rt-a",
+      "selection_reason": {
+        "quality_floor_applied": "FRONTIER",
+        "hard_filters_passed": [
+          "REGISTRY_CANDIDATE"
+        ],
+        "score_components": {
+          "expected_implementation_cost": 1.5,
+          "expected_rejection_probability": 0.25,
+          "expected_repair_cost": 0.5,
+          "expected_review_cost": 0.75,
+          "latency_estimate_seconds": 12.0
+        },
+        "decisive_factor": "AVAILABILITY"
+      },
+      "capability_evidence": [
+        {
+          "capability": "c",
+          "confidence": "UNVERIFIED"
+        }
+      ],
+      "confidence": "HIGH",
+      "availability_at_decision": "AVAILABLE",
+      "estimated_cost_class": "LOW",
+      "alternative_candidates": [
+        {
+          "provider_id": "prov-b",
+          "model_id": "model-b",
+          "runtime_id": "rt-b",
+          "score": 0.5,
+          "rejection_reason": "RANKED_BELOW_SELECTED:AVAILABILITY"
+        }
+      ],
+      "registry_freshness": {
+        "model_list_age_seconds": 60,
+        "capability_age_seconds": -5,
+        "calibration_sample_size": 0,
+        "stale": false
+      },
+      "mode": "ASK_ON_UNCERTAINTY",
+      "user_involved": false,
+      "user_pin_applied": true,
+      "fallback_from": "decision-0"
+    },
+    "error": "Refused"
+  },
+  {
+    "case": "occurred_at_not_rfc3339",
+    "document": {
+      "decision_id": "decision-1",
+      "request_id": "request-1",
+      "task_id": "task-1",
+      "occurred_at": "yesterday",
+      "outcome": "SELECTED",
+      "selected_provider": "prov-a",
+      "selected_model": "model-a",
+      "selected_runtime": "rt-a",
+      "selection_reason": {
+        "quality_floor_applied": "FRONTIER",
+        "hard_filters_passed": [
+          "REGISTRY_CANDIDATE"
+        ],
+        "score_components": {
+          "expected_implementation_cost": 1.5,
+          "expected_rejection_probability": 0.25,
+          "expected_repair_cost": 0.5,
+          "expected_review_cost": 0.75,
+          "latency_estimate_seconds": 12.0
+        },
+        "decisive_factor": "AVAILABILITY"
+      },
+      "capability_evidence": [
+        {
+          "capability": "coding",
+          "value": true,
+          "confidence": "OFFICIAL_VERIFIED",
+          "source_ref": {
+            "ref_type": "ARTIFACT_ID",
+            "target": "synthetic-evidence",
+            "digest": "sha256:00",
+            "section": "s1"
+          },
+          "observed_at": "2026-11-08T10:00:00Z",
+          "sample_size": 3
+        }
+      ],
+      "confidence": "HIGH",
+      "availability_at_decision": "AVAILABLE",
+      "estimated_cost_class": "LOW",
+      "alternative_candidates": [
+        {
+          "provider_id": "prov-b",
+          "model_id": "model-b",
+          "runtime_id": "rt-b",
+          "score": 0.5,
+          "rejection_reason": "RANKED_BELOW_SELECTED:AVAILABILITY"
+        }
+      ],
+      "registry_freshness": {
+        "model_list_age_seconds": 60,
+        "capability_age_seconds": -5,
+        "calibration_sample_size": 0,
+        "stale": false
+      },
+      "mode": "ASK_ON_UNCERTAINTY",
+      "user_involved": false,
+      "user_pin_applied": true,
+      "fallback_from": "decision-0"
+    },
+    "error": "Refused"
+  }
+]

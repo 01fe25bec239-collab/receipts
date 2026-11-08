@@ -43,6 +43,26 @@ pub fn compare_instants(
     Ok(left.0.cmp(&right.0).then_with(|| left.1.cmp(right.1)))
 }
 
+/// Whole elapsed seconds from `earlier` to `later` (floored; negative when
+/// `later` is before `earlier`). Same leap-second refusal as
+/// [`compare_instants`]. Used for retry windows and evidence ages; no clock.
+pub fn elapsed_whole_seconds(
+    earlier: &ModelRoutingDateTimeV1,
+    later: &ModelRoutingDateTimeV1,
+) -> Result<i64, ModelRoutingDateTimeComparisonError> {
+    let (a, b) = (instant(earlier.as_str())?, instant(later.as_str())?);
+    // Fractions are significant digits only; compare them as decimal strings
+    // padded on the right (lexical order equals numeric order then).
+    let width = a.1.len().max(b.1.len());
+    let pad = |f: &[u8]| {
+        let mut v = f.to_vec();
+        v.resize(width, b'0');
+        v
+    };
+    let borrow = i64::from(pad(b.1) < pad(a.1));
+    Ok(b.0 - a.0 - borrow)
+}
+
 /// Whole UTC seconds relative to 1970-01-01T00:00:00Z plus significant
 /// fraction digits. Input is already validated by the carrier; the i64 range
 /// covers every accepted value and offset crossing of years 0000/9999.

@@ -1,0 +1,10 @@
+{
+  "decision_id": "d",
+  "request_id": "r",
+  "occurred_at": "2026-11-08T10:00:00Z",
+  "outcome": "NO_ELIGIBLE_CANDIDATE",
+  "registry_freshness": {
+    "stale": true
+  },
+  "mode": "AUTO_CURRENT"
+}

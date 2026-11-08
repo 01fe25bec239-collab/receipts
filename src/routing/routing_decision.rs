@@ -319,14 +319,17 @@ impl EvidenceSourceRef {
     }
 }
 
-/// Evidence storage with a caller-supplied canonical timestamp. The unrestricted
-/// `value` property remains deferred without an authoritative any-JSON carrier.
+/// Evidence storage with a caller-supplied canonical timestamp. `value` is the
+/// schema's open value: `None` absent, `Some(Value::Null)` explicit null
+/// (UNKNOWN, never coerced). Numbers inside it are bounded `serde_json`
+/// carriers, not arbitrary-precision lexemes.
 /// `sample_size` distinguishes absent/null/value and uses a bounded u64
 /// carrier rather than an arbitrary-precision JSON integer codec.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CapabilityEvidenceNonTemporalCore {
     observed_at: ModelRoutingDateTimeV1,
     capability: String,
+    value: Option<serde_json::Value>,
     confidence: EvidenceConfidence,
     source_ref: Option<EvidenceSourceRef>,
     sample_size: Option<Option<u64>>,
@@ -343,10 +346,21 @@ impl CapabilityEvidenceNonTemporalCore {
         Self {
             observed_at,
             capability,
+            value: None,
             confidence,
             source_ref,
             sample_size,
         }
+    }
+
+    /// The same evidence carrying an explicit `value` (including null).
+    pub fn with_value(mut self, value: serde_json::Value) -> Self {
+        self.value = Some(value);
+        self
+    }
+
+    pub fn value(&self) -> Option<&serde_json::Value> {
+        self.value.as_ref()
     }
 
     pub fn observed_at(&self) -> &ModelRoutingDateTimeV1 {

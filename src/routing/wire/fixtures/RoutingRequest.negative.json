@@ -1,0 +1,478 @@
+[
+  {
+    "case": "not_json",
+    "raw": "{",
+    "error": "Json"
+  },
+  {
+    "case": "trailing_input",
+    "raw": "{\"request_id\": \"r\", \"role\": \"REVIEWER\", \"task_class\": \"ECONOMY_DOCS\", \"quality_floor\": \"ECONOMY\", \"required_capabilities\": [\"docs\"]} {}",
+    "error": "Json"
+  },
+  {
+    "case": "not_an_object",
+    "document": [
+      {
+        "request_id": "r",
+        "role": "REVIEWER",
+        "task_class": "ECONOMY_DOCS",
+        "quality_floor": "ECONOMY",
+        "required_capabilities": [
+          "docs"
+        ]
+      }
+    ],
+    "error": "Shape"
+  },
+  {
+    "case": "unknown_field",
+    "document": {
+      "request_id": "r",
+      "role": "REVIEWER",
+      "task_class": "ECONOMY_DOCS",
+      "quality_floor": "ECONOMY",
+      "required_capabilities": [
+        "docs"
+      ],
+      "x_unknown": 1
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "duplicate_key",
+    "raw": "{\"request_id\": \"r\", \"role\": \"REVIEWER\", \"task_class\": \"ECONOMY_DOCS\", \"quality_floor\": \"ECONOMY\", \"required_capabilities\": [\"docs\"], \"request_id\": \"r\"}",
+    "error": "Shape"
+  },
+  {
+    "case": "missing_required_capabilities",
+    "document": {
+      "request_id": "request-1",
+      "task_id": "task-1",
+      "role": "IMPLEMENTER",
+      "task_class": "FRONTIER_IMPLEMENTATION",
+      "quality_floor": "FRONTIER",
+      "preferred_capabilities": [
+        "long_context"
+      ],
+      "quality_priority": "HIGHEST",
+      "cost_priority": "LOW",
+      "constraints": {
+        "distinct_provider_from": "prov-x",
+        "avoid_providers": [
+          "prov-y"
+        ],
+        "user_pinned_model": "model-a",
+        "user_pinned_provider": "prov-a",
+        "max_cost": 12.5
+      },
+      "context_size_hint": 200000,
+      "deadline": "2026-11-09T00:00:00Z"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "empty_required_capabilities",
+    "document": {
+      "request_id": "request-1",
+      "task_id": "task-1",
+      "role": "IMPLEMENTER",
+      "task_class": "FRONTIER_IMPLEMENTATION",
+      "quality_floor": "FRONTIER",
+      "required_capabilities": [],
+      "preferred_capabilities": [
+        "long_context"
+      ],
+      "quality_priority": "HIGHEST",
+      "cost_priority": "LOW",
+      "constraints": {
+        "distinct_provider_from": "prov-x",
+        "avoid_providers": [
+          "prov-y"
+        ],
+        "user_pinned_model": "model-a",
+        "user_pinned_provider": "prov-a",
+        "max_cost": 12.5
+      },
+      "context_size_hint": 200000,
+      "deadline": "2026-11-09T00:00:00Z"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "bad_role",
+    "document": {
+      "request_id": "request-1",
+      "task_id": "task-1",
+      "role": "CODER",
+      "task_class": "FRONTIER_IMPLEMENTATION",
+      "quality_floor": "FRONTIER",
+      "required_capabilities": [
+        "coding",
+        "structured_output"
+      ],
+      "preferred_capabilities": [
+        "long_context"
+      ],
+      "quality_priority": "HIGHEST",
+      "cost_priority": "LOW",
+      "constraints": {
+        "distinct_provider_from": "prov-x",
+        "avoid_providers": [
+          "prov-y"
+        ],
+        "user_pinned_model": "model-a",
+        "user_pinned_provider": "prov-a",
+        "max_cost": 12.5
+      },
+      "context_size_hint": 200000,
+      "deadline": "2026-11-09T00:00:00Z"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "null_task_id",
+    "document": {
+      "request_id": "request-1",
+      "task_id": null,
+      "role": "IMPLEMENTER",
+      "task_class": "FRONTIER_IMPLEMENTATION",
+      "quality_floor": "FRONTIER",
+      "required_capabilities": [
+        "coding",
+        "structured_output"
+      ],
+      "preferred_capabilities": [
+        "long_context"
+      ],
+      "quality_priority": "HIGHEST",
+      "cost_priority": "LOW",
+      "constraints": {
+        "distinct_provider_from": "prov-x",
+        "avoid_providers": [
+          "prov-y"
+        ],
+        "user_pinned_model": "model-a",
+        "user_pinned_provider": "prov-a",
+        "max_cost": 12.5
+      },
+      "context_size_hint": 200000,
+      "deadline": "2026-11-09T00:00:00Z"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "request_id_too_long",
+    "document": {
+      "request_id": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+      "task_id": "task-1",
+      "role": "IMPLEMENTER",
+      "task_class": "FRONTIER_IMPLEMENTATION",
+      "quality_floor": "FRONTIER",
+      "required_capabilities": [
+        "coding",
+        "structured_output"
+      ],
+      "preferred_capabilities": [
+        "long_context"
+      ],
+      "quality_priority": "HIGHEST",
+      "cost_priority": "LOW",
+      "constraints": {
+        "distinct_provider_from": "prov-x",
+        "avoid_providers": [
+          "prov-y"
+        ],
+        "user_pinned_model": "model-a",
+        "user_pinned_provider": "prov-a",
+        "max_cost": 12.5
+      },
+      "context_size_hint": 200000,
+      "deadline": "2026-11-09T00:00:00Z"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "negative_context_hint",
+    "document": {
+      "request_id": "request-1",
+      "task_id": "task-1",
+      "role": "IMPLEMENTER",
+      "task_class": "FRONTIER_IMPLEMENTATION",
+      "quality_floor": "FRONTIER",
+      "required_capabilities": [
+        "coding",
+        "structured_output"
+      ],
+      "preferred_capabilities": [
+        "long_context"
+      ],
+      "quality_priority": "HIGHEST",
+      "cost_priority": "LOW",
+      "constraints": {
+        "distinct_provider_from": "prov-x",
+        "avoid_providers": [
+          "prov-y"
+        ],
+        "user_pinned_model": "model-a",
+        "user_pinned_provider": "prov-a",
+        "max_cost": 12.5
+      },
+      "context_size_hint": -1,
+      "deadline": "2026-11-09T00:00:00Z"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "fractional_context_hint",
+    "document": {
+      "request_id": "request-1",
+      "task_id": "task-1",
+      "role": "IMPLEMENTER",
+      "task_class": "FRONTIER_IMPLEMENTATION",
+      "quality_floor": "FRONTIER",
+      "required_capabilities": [
+        "coding",
+        "structured_output"
+      ],
+      "preferred_capabilities": [
+        "long_context"
+      ],
+      "quality_priority": "HIGHEST",
+      "cost_priority": "LOW",
+      "constraints": {
+        "distinct_provider_from": "prov-x",
+        "avoid_providers": [
+          "prov-y"
+        ],
+        "user_pinned_model": "model-a",
+        "user_pinned_provider": "prov-a",
+        "max_cost": 12.5
+      },
+      "context_size_hint": 1.5,
+      "deadline": "2026-11-09T00:00:00Z"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "string_context_hint",
+    "document": {
+      "request_id": "request-1",
+      "task_id": "task-1",
+      "role": "IMPLEMENTER",
+      "task_class": "FRONTIER_IMPLEMENTATION",
+      "quality_floor": "FRONTIER",
+      "required_capabilities": [
+        "coding",
+        "structured_output"
+      ],
+      "preferred_capabilities": [
+        "long_context"
+      ],
+      "quality_priority": "HIGHEST",
+      "cost_priority": "LOW",
+      "constraints": {
+        "distinct_provider_from": "prov-x",
+        "avoid_providers": [
+          "prov-y"
+        ],
+        "user_pinned_model": "model-a",
+        "user_pinned_provider": "prov-a",
+        "max_cost": 12.5
+      },
+      "context_size_hint": "5",
+      "deadline": "2026-11-09T00:00:00Z"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "empty_avoided_provider",
+    "document": {
+      "request_id": "request-1",
+      "task_id": "task-1",
+      "role": "IMPLEMENTER",
+      "task_class": "FRONTIER_IMPLEMENTATION",
+      "quality_floor": "FRONTIER",
+      "required_capabilities": [
+        "coding",
+        "structured_output"
+      ],
+      "preferred_capabilities": [
+        "long_context"
+      ],
+      "quality_priority": "HIGHEST",
+      "cost_priority": "LOW",
+      "constraints": {
+        "distinct_provider_from": "prov-x",
+        "avoid_providers": [
+          ""
+        ],
+        "user_pinned_model": "model-a",
+        "user_pinned_provider": "prov-a",
+        "max_cost": 12.5
+      },
+      "context_size_hint": 200000,
+      "deadline": "2026-11-09T00:00:00Z"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "unknown_constraint",
+    "document": {
+      "request_id": "request-1",
+      "task_id": "task-1",
+      "role": "IMPLEMENTER",
+      "task_class": "FRONTIER_IMPLEMENTATION",
+      "quality_floor": "FRONTIER",
+      "required_capabilities": [
+        "coding",
+        "structured_output"
+      ],
+      "preferred_capabilities": [
+        "long_context"
+      ],
+      "quality_priority": "HIGHEST",
+      "cost_priority": "LOW",
+      "constraints": {
+        "distinct_provider_from": "prov-x",
+        "avoid_providers": [
+          "prov-y"
+        ],
+        "user_pinned_model": "model-a",
+        "user_pinned_provider": "prov-a",
+        "max_cost": 12.5,
+        "never_use_model": "m"
+      },
+      "context_size_hint": 200000,
+      "deadline": "2026-11-09T00:00:00Z"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "string_max_cost",
+    "document": {
+      "request_id": "request-1",
+      "task_id": "task-1",
+      "role": "IMPLEMENTER",
+      "task_class": "FRONTIER_IMPLEMENTATION",
+      "quality_floor": "FRONTIER",
+      "required_capabilities": [
+        "coding",
+        "structured_output"
+      ],
+      "preferred_capabilities": [
+        "long_context"
+      ],
+      "quality_priority": "HIGHEST",
+      "cost_priority": "LOW",
+      "constraints": {
+        "distinct_provider_from": "prov-x",
+        "avoid_providers": [
+          "prov-y"
+        ],
+        "user_pinned_model": "model-a",
+        "user_pinned_provider": "prov-a",
+        "max_cost": "1"
+      },
+      "context_size_hint": 200000,
+      "deadline": "2026-11-09T00:00:00Z"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "duplicate_nested_key",
+    "raw": "{\"request_id\":\"r\",\"role\":\"REVIEWER\",\"task_class\":\"ECONOMY_DOCS\",\"quality_floor\":\"ECONOMY\",\"required_capabilities\":[\"docs\"],\"constraints\":{\"max_cost\":1.5,\"max_cost\":2.5}}",
+    "error": "Shape"
+  },
+  {
+    "case": "integral_float_context_hint_outside_carrier",
+    "document": {
+      "request_id": "request-1",
+      "task_id": "task-1",
+      "role": "IMPLEMENTER",
+      "task_class": "FRONTIER_IMPLEMENTATION",
+      "quality_floor": "FRONTIER",
+      "required_capabilities": [
+        "coding",
+        "structured_output"
+      ],
+      "preferred_capabilities": [
+        "long_context"
+      ],
+      "quality_priority": "HIGHEST",
+      "cost_priority": "LOW",
+      "constraints": {
+        "distinct_provider_from": "prov-x",
+        "avoid_providers": [
+          "prov-y"
+        ],
+        "user_pinned_model": "model-a",
+        "user_pinned_provider": "prov-a",
+        "max_cost": 12.5
+      },
+      "context_size_hint": 1.0,
+      "deadline": "2026-11-09T00:00:00Z"
+    },
+    "error": "Refused"
+  },
+  {
+    "case": "deadline_not_rfc3339",
+    "document": {
+      "request_id": "request-1",
+      "task_id": "task-1",
+      "role": "IMPLEMENTER",
+      "task_class": "FRONTIER_IMPLEMENTATION",
+      "quality_floor": "FRONTIER",
+      "required_capabilities": [
+        "coding",
+        "structured_output"
+      ],
+      "preferred_capabilities": [
+        "long_context"
+      ],
+      "quality_priority": "HIGHEST",
+      "cost_priority": "LOW",
+      "constraints": {
+        "distinct_provider_from": "prov-x",
+        "avoid_providers": [
+          "prov-y"
+        ],
+        "user_pinned_model": "model-a",
+        "user_pinned_provider": "prov-a",
+        "max_cost": 12.5
+      },
+      "context_size_hint": 200000,
+      "deadline": "tomorrow"
+    },
+    "error": "Refused"
+  },
+  {
+    "case": "empty_capability_name_outside_carrier",
+    "document": {
+      "request_id": "request-1",
+      "task_id": "task-1",
+      "role": "IMPLEMENTER",
+      "task_class": "FRONTIER_IMPLEMENTATION",
+      "quality_floor": "FRONTIER",
+      "required_capabilities": [
+        ""
+      ],
+      "preferred_capabilities": [
+        "long_context"
+      ],
+      "quality_priority": "HIGHEST",
+      "cost_priority": "LOW",
+      "constraints": {
+        "distinct_provider_from": "prov-x",
+        "avoid_providers": [
+          "prov-y"
+        ],
+        "user_pinned_model": "model-a",
+        "user_pinned_provider": "prov-a",
+        "max_cost": 12.5
+      },
+      "context_size_hint": 200000,
+      "deadline": "2026-11-09T00:00:00Z"
+    },
+    "error": "Refused"
+  }
+]

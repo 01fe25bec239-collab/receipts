@@ -57,7 +57,7 @@ fn constraints(
         avoid.map(|ids| ids.iter().map(|id| String::from(*id)).collect()),
         model.map(String::from),
         provider.map(String::from),
-        cost,
+        cost.map(Some),
     )
     .unwrap()
 }
