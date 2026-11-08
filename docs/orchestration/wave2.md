@@ -14,6 +14,8 @@ Checks, in order. The first failing one is the named axis:
 4. **Concurrency.** Global, then the node's workstream, then the D11-selected provider. A workstream or provider with no configured limit defers.
 5. **Write collision.** Against every in-flight writer, then every writer admitted earlier in the round, through `WriteScopePort`. Only proven disjointness admits. An overlap defers with its witness; an undetermined answer (invalid pattern, matcher resource limit) defers.
 
+Scheduling is pure. A round reads one snapshot and returns decisions; it is not a durable dispatch reservation and does not account actual spend. Two rounds over the same snapshot can admit the same node, and the budget is not carried between rounds. The composition must record the admission, count it as in flight, and update remaining budget before the next round. Nothing here is cross-round safe on its own.
+
 Priority among candidates that pass step 1: longest downstream precedence chain, then most transitive dependents, then oldest `ready_sequence`, then highest `user_priority`, then node id. Capacity used by an earlier admission is gone for later ones, so a full limit defers everything behind it (backpressure) instead of failing it.
 
 ## Collision resolution (`scheduler::resolve_write_collision_v1`)
@@ -39,12 +41,14 @@ A capsule is refused, never built, when:
 
 - the node is not ready, or is of the wrong kind;
 - a write pattern starts with a wildcard;
-- a write pattern does not overlap the node's own adopted ownership;
+- a write pattern is not proven to lie inside the node's own adopted ownership;
 - a write pattern overlaps another workstream's ownership or a forbidden path;
 - the matcher cannot decide a write pattern;
 - any text looks credential-shaped.
 
-Other workstreams' owned paths are added to `forbidden_write_paths`. The port only answers overlap, so "inside the workstream" means: overlaps its own ownership and is proven disjoint from every other adopted scope. Full containment would need a subset query the shared matcher does not have.
+Other workstreams' owned paths are added to `forbidden_write_paths`. The port only answers overlap, which cannot show containment: with own `src/core/**`, another owner `docs/**` and allowed `src/*/safe/**`, the pattern overlaps its owner and is disjoint from the other owner, yet it reaches `src/unowned/safe/x.rs`. So a pattern is built only when `capsules::containment` proves it lies inside the node's own ownership, and the port then proves it disjoint from every other ownership and forbidden path.
+
+The containment proof reuses the Workspace grammar (`WritePathPattern::parse` decides validity: whole-component `**`, `*` inside a component, no `?[]{}`). It is structural and sufficient, not complete. A union counts only when one owned pattern contains the whole pattern, and a `*` in the requested pattern is absorbed only by a `*` in the owner. Anything not shown contained is `OutsideWorkstream`; an invalid or oversized (over 1 KiB) pattern is `WriteScopeUndetermined`. Tests check every claimed containment against the real matcher over a bounded exhaustive path set. A repair must also pass this check; being a subset of the original's patterns is not enough on its own.
 
 The credential check is a heuristic (token prefixes, key headers, `key=value` secrets, long mixed-class high-entropy tokens). Passing it does not prove a value is secret-free. The structural rule is that no capsule field is a credential slot.
 
@@ -89,7 +93,7 @@ All writes go through `CoreStateWriter`, the core issuer.
 
 Before anything is written, the stored head must equal the outcome's parent in both version and v1 digest, and the mutation id must be unused. A stale or concurrent writer gets a retryable `Conflict` and nothing changes.
 
-Newly attached results are stored first, at the parent version, because State requires them before the snapshot. If the snapshot append then fails (for example, a regressing trusted clock), the head does not move. The result row stays as immutable, unreferenced evidence; an identical retry reuses it, and different content under the same reference refuses.
+**Known gap (pending shared State atomic operation).** Newly attached results are stored first, at the parent version, because State requires them before the snapshot, each in its own State transaction. If the snapshot append then fails (for example, a regressing trusted clock), the head does not move but the result rows stay committed. An identical retry reuses them and different content under the same reference refuses. No orphan-row exception is approved, so this is not the final behavior: `persist_mutation_v1` becomes one atomic State operation (results, snapshot, head and mutation history together) once A1 admits the reviewed State dependency. Until then, a failed `persist_mutation_v1` does not guarantee that nothing was written.
 
 Reads (`load_current_graph_v1`, `load_graph_version_v1`, `load_graph_history_v1`, `load_node_results_v1`) recompute and compare the v1 digest. On reload, `created_at` is State's trusted time. The digest profile stays v1 and no historical version is rewritten.
 
@@ -101,8 +105,10 @@ Not persisted: the in-memory `GraphResultLedgerV1` attempt and review facts. Reh
 
 - Integers stored as `i64` need a canonical lexeme in range. Lexical integers (repair capsule, catalog version, evaluation epoch) keep any magnitude. `1.0`, `1e0` and `-0` refuse.
 - `TaskCapsule.verification_plan` is a plan. Each entry projects to `{source: WORKER_EXECUTION, command, exit_code: <expected>, code_sha: <start_sha>}`. Anything else refuses, including executed-check fields.
-- A capsule with no required capability cannot be encoded: the schema needs at least one.
-- An absent or null selected provider/runtime reads as none, and none encodes as null.
+- `cost_policy.max_cost` converts only when the `f64` holds the wire number exactly. `9007199254740993` (would round), `1e-400` (would underflow) and `1e400` refuse; `2.5`, `9007199254740992` and `0.1` convert. A very long spelling of an exactly representable value can refuse, which is the safe side.
+- A capsule with no required capability, or with an empty verification plan (allowed for DOCS and INVESTIGATION operationally, but the schema needs one entry), cannot be encoded. The encoder also checks its own output against the schema rules, so a successful encode always decodes.
+- `verification_plan` entries are expectations, never execution receipts. `exit_code` is the expected exit and `code_sha` is the start SHA; no result, timing or output evidence exists in a plan, and nothing may promote an entry into executed evidence.
+- Wire wrappers keep absence versus null. Operational conversion is not lossless for the selected provider and runtime: an absent and a null value both become none, and re-encoding emits null. Do not describe that round trip as lossless. (`upgrade_info` and `max_cost` keep the distinction.)
 - `RepairCapsule` conversion takes the parent's quality floor.
 - `GoalEvaluation` converts only its deterministic projection. A semantic layer, gaps or convergence refuses.
 

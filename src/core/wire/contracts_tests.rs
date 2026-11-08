@@ -577,3 +577,107 @@ fn goal_evaluation_codec_is_deterministic_only() {
         Err(GraphWireError::Unsupported("GoalEvaluation"))
     );
 }
+
+#[test]
+fn max_cost_conversion_is_exact_or_unsupported() {
+    let base = task().to_string();
+    let convert = |lexeme: &str| {
+        TaskCapsuleWireV1::from_json(
+            &base.replace("\"max_cost\":2.5", &format!("\"max_cost\":{lexeme}")),
+        )
+        .unwrap()
+        .to_task_capsule()
+    };
+    // F2: these used to succeed as 9007199254740992.0 and 0.0.
+    for lossy in [
+        "9007199254740993",
+        "1e-400",
+        "1e400",
+        "0.1000000000000000055511151231257827021181583404541015626",
+    ] {
+        assert_eq!(
+            convert(lossy).map(|c| c.cost_policy().unwrap().max_cost()),
+            Err(GraphWireError::Unsupported("max_cost")),
+            "{lossy}"
+        );
+    }
+    // Values the operational number holds exactly convert and re-encode equal.
+    for (lexeme, expected) in [
+        ("2.5", 2.5),
+        ("9007199254740992", 9_007_199_254_740_992.0),
+        ("0.1", 0.1),
+        ("1e22", 1e22),
+        ("1E2", 100.0),
+        ("5e-324", 5e-324),
+        ("0", 0.0),
+    ] {
+        let capsule = convert(lexeme).unwrap();
+        assert_eq!(
+            capsule.cost_policy().unwrap().max_cost(),
+            Some(Some(expected)),
+            "{lexeme}"
+        );
+        let encoded = TaskCapsuleWireV1::from_task_capsule(&capsule).unwrap();
+        let back = encoded.to_task_capsule().unwrap();
+        assert_eq!(back.cost_policy(), capsule.cost_policy(), "{lexeme}");
+    }
+}
+
+#[test]
+fn encoder_never_emits_schema_invalid_task_capsule_wire() {
+    let capsule = TaskCapsuleWireV1::from_json(&task().to_string())
+        .unwrap()
+        .to_task_capsule()
+        .unwrap();
+    let rebuild = |task_type, plan: Vec<crate::capsules::VerificationPlanEntryV1>| {
+        crate::capsules::TaskCapsule::try_new(
+            "t".into(),
+            "ws".into(),
+            None,
+            1,
+            task_type,
+            "o".into(),
+            capsule.acceptance_criteria().to_vec(),
+            None,
+            SHA.into(),
+            SHA.into(),
+            vec!["docs/**".into()],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            QualityFloor::Economy,
+            vec![crate::CapabilityName::new("graph.core").unwrap()],
+            None,
+            plan,
+            None,
+            crate::capsules::AssuranceProfileSelector::Light,
+            None,
+            None,
+            None,
+            "runtime-a3/t".into(),
+            "/w".into(),
+            None,
+            vec!["s".into()],
+            None,
+            0,
+        )
+        .unwrap()
+    };
+    // F3: DOCS/INVESTIGATION may plan nothing, the schema needs one entry.
+    for task_type in [
+        crate::capsules::TaskType::Docs,
+        crate::capsules::TaskType::Investigation,
+    ] {
+        let empty = rebuild(task_type, vec![]);
+        assert_eq!(
+            TaskCapsuleWireV1::from_task_capsule(&empty),
+            Err(GraphWireError::Unsupported("verification_plan"))
+        );
+        let planned = rebuild(task_type, capsule.verification_plan().to_vec());
+        let wire = TaskCapsuleWireV1::from_task_capsule(&planned).unwrap();
+        // Whatever encodes must decode again through the strict schema check.
+        assert_eq!(TaskCapsuleWireV1::from_json(&wire.to_json()), Ok(wire));
+    }
+}

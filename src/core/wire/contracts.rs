@@ -19,8 +19,13 @@
 //!   `{source: WORKER_EXECUTION, command, exit_code: <expected>, code_sha:
 //!   <start_sha>}`. Decoding accepts exactly that projection; an entry with
 //!   another source or SHA, or with executed-check fields, is refused.
-//! - `TaskCapsule.required_capabilities` needs at least one item on the
-//!   wire, so encoding a capsule with none refuses.
+//! - `TaskCapsule.required_capabilities` and `verification_plan` need at
+//!   least one item on the wire, so encoding a capsule with none refuses; the
+//!   encoder also validates its own output against the schema checks and
+//!   refuses rather than return invalid wire.
+//! - `cost_policy.max_cost` converts only when the `f64` holds the wire
+//!   number exactly (its shortest decimal denotes the same value);
+//!   `9007199254740993`, `1e-400` and out-of-range values refuse.
 //! - `DispatchAdmissionDecision.selected_provider/runtime`: absent and null
 //!   both read as none; none encodes as null.
 //! - `RepairCapsule` conversion needs the parent's quality floor (the
@@ -821,6 +826,48 @@ fn int64(map: &Map, field: &'static str) -> WireResult<Option<i64>> {
         .transpose()
 }
 
+/// The `f64` that holds `lexeme` exactly: it parses and the value's shortest
+/// round-trip decimal denotes the same number. Rounding (`9007199254740993`),
+/// underflow (`1e-400`) and overflow are `Unsupported`, never converted.
+fn exact_f64(lexeme: &str) -> WireResult<f64> {
+    let refuse = || GraphWireError::Unsupported("max_cost");
+    let value: f64 = lexeme.parse().map_err(|_| refuse())?;
+    if value.is_finite()
+        && decimal(lexeme).is_some_and(|d| Some(d) == decimal(&format!("{value:?}")))
+    {
+        Ok(value)
+    } else {
+        Err(refuse())
+    }
+}
+
+/// Sign, significant digits and power of ten of a JSON/Rust decimal, so equal
+/// numbers compare equal whatever their spelling; zero has no sign.
+fn decimal(lexeme: &str) -> Option<(bool, String, i64)> {
+    let (negative, rest) = match lexeme.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, lexeme),
+    };
+    let (mantissa, exponent) = match rest.split_once(['e', 'E']) {
+        Some((m, e)) => (m, e.parse::<i64>().ok()?),
+        None => (rest, 0),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits = format!("{whole}{fraction}");
+    let exponent = exponent.checked_sub(i64::try_from(fraction.len()).ok()?)?;
+    let trimmed = digits.trim_start_matches('0');
+    if trimmed.is_empty() {
+        return Some((false, String::new(), 0));
+    }
+    let significant = trimmed.trim_end_matches('0');
+    let zeros = i64::try_from(trimmed.len() - significant.len()).ok()?;
+    Some((
+        negative,
+        significant.to_owned(),
+        exponent.checked_add(zeros)?,
+    ))
+}
+
 fn unsupported<E>(field: &'static str) -> impl Fn(E) -> GraphWireError {
     move |_| GraphWireError::Unsupported(field)
 }
@@ -977,9 +1024,7 @@ impl TaskCapsuleWireV1 {
                 let max_cost = match p.get("max_cost") {
                     None => None,
                     Some(V::Null) => Some(None),
-                    Some(V::Number(n)) => Some(Some(
-                        n.as_str().parse::<f64>().map_err(unsupported("max_cost"))?,
-                    )),
+                    Some(V::Number(n)) => Some(Some(exact_f64(n.as_str())?)),
                     Some(_) => unreachable!("validated max_cost"),
                 };
                 CostPolicy::try_new(
@@ -1039,6 +1084,10 @@ impl TaskCapsuleWireV1 {
     pub fn from_task_capsule(c: &TaskCapsule) -> WireResult<Self> {
         if c.required_capabilities().is_empty() {
             return Err(GraphWireError::Unsupported("required_capabilities"));
+        }
+        // DOCS and INVESTIGATION capsules may plan no check; the schema needs one.
+        if c.verification_plan().is_empty() {
+            return Err(GraphWireError::Unsupported("verification_plan"));
         }
         let mut map = Map::new();
         map.insert("task_id".into(), s(c.task_id()));
@@ -1157,6 +1206,8 @@ impl TaskCapsuleWireV1 {
         map.insert("stop_conditions".into(), string_array(c.stop_conditions()));
         put(&mut map, "handoff_schema", c.handoff_schema().map(from_ref));
         map.insert("context_epoch".into(), num(&c.context_epoch().to_string()));
+        // Successful encoding is always schema-valid wire.
+        validate_task_capsule(&map).map_err(|_| GraphWireError::Unsupported("TaskCapsule"))?;
         Ok(Self(OrchestrationJsonObjectV1::new(map)))
     }
 }

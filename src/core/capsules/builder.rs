@@ -9,7 +9,7 @@
 //!   unavailable dependency evidence, per `TaskDag`);
 //! - the request was prepared against a context epoch other than State's
 //!   latest for the project, or State has no epoch for it;
-//! - a write path is a root wildcard, does not provably fall in the node's
+//! - a write path is a root wildcard, is not proven to fall inside the node's
 //!   own adopted workstream ownership, overlaps another workstream's
 //!   ownership or a forbidden path, or the matcher cannot decide;
 //! - any text field looks credential-shaped (a heuristic, see
@@ -17,11 +17,13 @@
 //!   secret-free).
 //!
 //! Every other workstream's owned paths are added to `forbidden_write_paths`
-//! as explicit traps. Write-scope proofs go through [`WriteScopePort`]: the
-//! port answers overlap only, so "inside the workstream" is established as
-//! "overlaps its own ownership and is proven disjoint from every other
-//! adopted ownership and forbidden path"; full containment needs a subset
-//! query the shared matcher does not offer.
+//! as explicit traps. A pattern is built only when it is proven to lie
+//! inside the workstream's own ownership
+//! ([`containment`](super::containment), over the Workspace path grammar)
+//! and [`WriteScopePort`] proves it disjoint from every other adopted
+//! ownership and forbidden path. Overlap with the owner is not enough
+//! (`src/*/safe/**` overlaps `src/core/**` yet reaches unowned paths); a
+//! scope whose containment cannot be shown is refused.
 //!
 //! Repairs (N4) keep the original task's objective, criteria, workstream,
 //! write scope (a subset of the original patterns) and quality floor (never
@@ -34,6 +36,7 @@
 
 use receipts_state::SqliteStateRepository;
 
+use super::containment::{Containment, contained_in};
 use super::credential_scan::looks_like_credential;
 use super::*;
 use crate::dag::{InterfaceEvidenceVerifier, TaskDag};
@@ -63,7 +66,7 @@ pub enum CapsuleBuildError {
     PermissiveWildcard {
         pattern: String,
     },
-    /// The pattern does not fall in the node's own workstream ownership.
+    /// The pattern is not proven to lie inside the node's own ownership.
     OutsideWorkstream {
         pattern: String,
     },
@@ -505,7 +508,8 @@ fn current_epoch(
     Ok(latest.epoch.as_str().to_owned())
 }
 
-/// Checks the write scope and returns `forbidden` plus every other
+/// Checks the write scope (containment in the workstream's ownership, then
+/// disjointness from everything else) and returns `forbidden` plus every other
 /// workstream's owned paths (deduplicated, input order then ownership order).
 fn check_write_scope(
     context: &CapsuleContextV1<'_>,
@@ -548,6 +552,21 @@ fn check_write_scope(
                 });
             }
             WriteScopeOverlapV1::Undetermined => {
+                return Err(E::WriteScopeUndetermined {
+                    pattern: pattern.clone(),
+                });
+            }
+        }
+        // Overlap alone cannot show the pattern stays inside the owner:
+        // `src/*/safe/**` overlaps `src/core/**` yet also reaches unowned paths.
+        match contained_in(pattern, &own.owned_paths) {
+            Containment::Contained => {}
+            Containment::NotProven => {
+                return Err(E::OutsideWorkstream {
+                    pattern: pattern.clone(),
+                });
+            }
+            Containment::Undecided => {
                 return Err(E::WriteScopeUndetermined {
                     pattern: pattern.clone(),
                 });

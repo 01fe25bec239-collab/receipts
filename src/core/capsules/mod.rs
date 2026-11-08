@@ -3,6 +3,7 @@
 //! authorize no dispatch, execution, or operational effects.
 
 mod builder;
+mod containment;
 mod credential_scan;
 mod embedded;
 mod error;

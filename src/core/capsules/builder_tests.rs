@@ -354,6 +354,13 @@ fn repair_env(
 }
 
 fn original() -> TaskCapsule {
+    original_with(
+        &["src/core/scheduler/**", "src/core/dag/**"],
+        &["src/core/graph/**", "src/state/**"],
+    )
+}
+
+fn original_with(allowed: &[&str], forbidden: &[&str]) -> TaskCapsule {
     let r = request("i1");
     TaskCapsule::try_new(
         "i1".into(),
@@ -366,8 +373,8 @@ fn original() -> TaskCapsule {
         None,
         SHA.into(),
         SHA.into(),
-        paths(&["src/core/scheduler/**", "src/core/dag/**"]),
-        paths(&["src/core/graph/**", "src/state/**"]),
+        paths(allowed),
+        paths(forbidden),
         None,
         None,
         None,
@@ -575,4 +582,107 @@ fn repair_over_bound_without_rejection_sha_or_lineage_is_rejected() {
         repair(&rejected, &writer, 3, stale),
         Err(CapsuleBuildError::StaleEpoch)
     );
+}
+
+/// Own `src/core/**`, another owner `docs/**`: nothing else is owned.
+fn escape_ownership() -> Vec<WorkstreamOwnershipV1> {
+    vec![
+        WorkstreamOwnershipV1 {
+            workstream_id: "ws-a".into(),
+            owned_paths: paths(&["src/core/**"]),
+        },
+        WorkstreamOwnershipV1 {
+            workstream_id: "ws-b".into(),
+            owned_paths: paths(&["docs/**"]),
+        },
+    ]
+}
+
+#[test]
+fn task_scope_must_be_contained_in_the_owned_paths_under_the_real_matcher() {
+    let dir = Dir::new();
+    let writer = writer_with_epochs(&dir, "policy", &["7"]);
+    let env = task_env();
+    let ownership = escape_ownership();
+    let context = CapsuleContextV1 {
+        envelope: &env,
+        interface: None,
+        state: writer.reader(),
+        ownership: &ownership,
+        worktree: "/work/t",
+    };
+    let with = |allowed: &[&str]| {
+        let mut r = request("t");
+        r.allowed_write_paths = paths(allowed);
+        r.forbidden_write_paths = Vec::new();
+        build_task_capsule_v1(&context, &RealPort, r)
+    };
+    // F1: overlaps own, is disjoint from docs/**, yet reaches src/unowned/safe/x.
+    assert!(matches!(
+        with(&["src/*/safe/**"]),
+        Err(CapsuleBuildError::OutsideWorkstream { .. })
+    ));
+    for escaping in ["src/co*/x.rs", "src/**/core/x.rs", "src/core*/x.rs"] {
+        assert!(
+            matches!(
+                with(&[escaping]),
+                Err(CapsuleBuildError::OutsideWorkstream { .. })
+            ),
+            "{escaping}"
+        );
+    }
+    // Containment needs only one of several allowed patterns to fail.
+    assert!(matches!(
+        with(&["src/core/a.rs", "src/*/safe/**"]),
+        Err(CapsuleBuildError::OutsideWorkstream { .. })
+    ));
+    // Provably contained scopes are still built.
+    for inside in [
+        "src/core/scheduler/**",
+        "src/core/*/x.rs",
+        "src/core/**/a/**",
+        "src/core/x.rs",
+        "src/core",
+    ] {
+        assert!(with(&[inside]).is_ok(), "{inside}");
+    }
+    // A pattern too large to decide is refused, never admitted.
+    let huge = format!("src/core/{}", "a".repeat(5000));
+    assert!(matches!(
+        with(&[&huge]),
+        Err(CapsuleBuildError::WriteScopeUndetermined { .. })
+    ));
+}
+
+#[test]
+fn repair_scope_must_be_contained_in_the_owned_paths_under_the_real_matcher() {
+    let dir = Dir::new();
+    let writer = writer_with_epochs(&dir, "policy", &["7"]);
+    let env = repair_env(Some(SHA2), Rejected, "i1");
+    let ownership = escape_ownership();
+    let context = CapsuleContextV1 {
+        envelope: &env,
+        interface: None,
+        state: writer.reader(),
+        ownership: &ownership,
+        worktree: "/work/i2",
+    };
+    let build = |allowed: &[&str]| {
+        let original = original_with(allowed, &[]);
+        let mut r = repair_request();
+        r.allowed_write_paths = paths(allowed);
+        build_repair_capsule_v1(
+            &context,
+            &RealPort,
+            &GraphResultLedgerV1::new(),
+            &original,
+            3,
+            r,
+        )
+    };
+    assert!(matches!(
+        build(&["src/*/safe/**"]),
+        Err(CapsuleBuildError::OutsideWorkstream { .. })
+    ));
+    assert!(build(&["src/core/scheduler/**"]).is_ok());
 }

@@ -162,6 +162,31 @@ impl WriteScopePort for PrefixPort {
     }
 }
 
+/// The real Workspace path-language engine behind the port, exactly as the
+/// receipts-e2e adapter binds it (Core cannot depend on that crate).
+pub(crate) struct RealPort;
+
+impl WriteScopePort for RealPort {
+    fn overlap(&self, left: &[String], right: &[String]) -> WriteScopeOverlapV1 {
+        use receipts_workspace_execution::{WritePathPattern, WritePathSet, intersects};
+        let parse = |paths: &[String]| {
+            paths
+                .iter()
+                .map(|p| WritePathPattern::parse(p).ok())
+                .collect::<Option<Vec<_>>>()
+                .map(WritePathSet::new)
+        };
+        let (Some(left), Some(right)) = (parse(left), parse(right)) else {
+            return WriteScopeOverlapV1::Undetermined;
+        };
+        match intersects(&left, &right) {
+            Ok(None) => WriteScopeOverlapV1::Disjoint,
+            Ok(Some(witness)) => WriteScopeOverlapV1::Overlaps { witness },
+            Err(_) => WriteScopeOverlapV1::Undetermined,
+        }
+    }
+}
+
 pub(crate) fn paths(values: &[&str]) -> Vec<String> {
     values.iter().map(|v| v.to_string()).collect()
 }
