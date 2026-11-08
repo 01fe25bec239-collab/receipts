@@ -34,7 +34,7 @@ pub mod failover;
 mod tests;
 
 use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::BuildHasher;
 use std::sync::Arc;
 
 use receipts_runtime_adapters::FailureClass;
@@ -112,9 +112,7 @@ pub struct RandomJitter;
 
 impl JitterSource for RandomJitter {
     fn pick(&self, provider: &str, model: &str, attempt: u32, max: u64) -> u64 {
-        let mut hasher = RandomState::new().build_hasher();
-        (provider, model, attempt).hash(&mut hasher);
-        let draw = hasher.finish();
+        let draw = RandomState::new().hash_one((provider, model, attempt));
         match max.checked_add(1) {
             Some(span) => draw % span,
             None => draw,
