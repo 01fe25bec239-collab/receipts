@@ -41,6 +41,8 @@ mod json_integer;
 mod json_integer_tests;
 pub mod logical_role;
 pub mod logical_role_lifecycle;
+pub mod materializers;
+pub mod recovery;
 pub mod repository;
 pub mod startup_recovery;
 pub mod trusted_core;
@@ -125,6 +127,12 @@ mod logical_role_lifecycle_tests;
 mod logical_role_tests;
 
 #[cfg(test)]
+mod materializers_tests;
+
+#[cfg(test)]
+mod recovery_tests;
+
+#[cfg(test)]
 mod startup_recovery_tests;
 
 #[cfg(test)]
@@ -191,6 +199,15 @@ pub use graph_repository::{
 pub use logical_role::{LogicalRole, LogicalRoleStatus, LogicalRoleType};
 pub use logical_role_lifecycle::{
     LogicalRoleHistoryEntryV1, RoleChangeEvidenceV1, RoleChangeKind, RoleChangeRefusal,
+};
+pub use materializers::{
+    ArtifactCatalogEntryV1, ArtifactFileMaterializerV1, ArtifactPortV1, MaterializerRegistryV1,
+    RepositoryPortV1,
+};
+pub use recovery::{
+    ChangedSourceSuccessionRequestV1, ChangedSourceSuccessionV1, ContinuationClearanceV1,
+    RecoveryRefusalV1, RehydrationRequiredV1, RoleRebindRequestV1, RoleRecoveryV1,
+    StartupRecoveryReportV1,
 };
 pub use repository::SqliteStateRepository;
 pub use startup_recovery::{

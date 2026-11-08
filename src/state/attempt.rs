@@ -508,6 +508,59 @@ impl SqliteStateRepository {
             rows.map(|row| row.map_err(sqlite_error)?).collect()
         })
     }
+
+    /// Lists every attempt in `project_id` that has a durable start row and
+    /// no finish row, ordered by `started_at` then `attempt_id`.
+    ///
+    /// This is exactly what State can prove: "started, never finished". It
+    /// says nothing about whether a runtime process or worktree still exists;
+    /// deciding that an unfinished attempt is orphaned, capturing its
+    /// worktree and executing any recovery belong to the Workspace recovery
+    /// owner. State runs no Git command and kills no process.
+    pub fn list_unfinished_attempts(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<AttemptRecord>, StateError> {
+        checked(id(project_id), Field::ProjectId)?;
+        read(self.connection(), |conn| {
+            unfinished_attempts(conn, project_id)
+        })
+    }
+}
+
+/// The verified unfinished-attempt query on the caller's open transaction
+/// (the startup recovery scan reads it inside its own snapshot).
+pub(crate) fn verified_unfinished_attempts(
+    conn: &Connection,
+    project_id: &str,
+) -> Result<Vec<AttemptRecord>, StateError> {
+    checked(id(project_id), Field::ProjectId)?;
+    verify_store(conn)?;
+    unfinished_attempts(conn, project_id)
+}
+
+fn unfinished_attempts(
+    conn: &Connection,
+    project_id: &str,
+) -> Result<Vec<AttemptRecord>, StateError> {
+    let mut statement = conn
+        .prepare(&format!(
+            "{SELECT_JOINED} WHERE s.project_id=?1 AND f.attempt_id IS NULL ORDER BY s.started_at, s.attempt_id"
+        ))
+        .map_err(sqlite_error)?;
+    let rows = statement
+        .query_map([project_id], |r| Ok(decode(r)))
+        .map_err(sqlite_error)?;
+    let mut records = rows
+        .map(|row| row.map_err(sqlite_error)?)
+        .collect::<Result<Vec<_>, _>>()?;
+    // Stored text order is not trusted as time order; sort on the decoded value.
+    records.sort_by(|a, b| {
+        a.started_at()
+            .cmp(b.started_at())
+            .then_with(|| a.attempt_id().as_str().cmp(b.attempt_id().as_str()))
+    });
+    Ok(records)
 }
 
 fn read<T>(

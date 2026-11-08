@@ -86,6 +86,7 @@ use crate::event_proposal::{EventPersistReceiptV1, EventProposalV1};
 use crate::executor_binding::{ExecutorBinding, ReleaseReason};
 use crate::executor_binding_lease_expiry::{
     ExecutorLeaseExpiryOutcomeV1, ExecutorLeaseExpiryRequestV2,
+    ExecutorReleasedLifecycleAuthorityV1,
 };
 use crate::graph_history::StateGraphMutationV1;
 use crate::graph_node_result::StateGraphNodeResultV1;
@@ -93,6 +94,10 @@ use crate::graph_repository::{StateGraphGenesisV1, StateGraphSnapshotV1};
 use crate::logical_role::{LogicalRole, LogicalRoleStatus};
 use crate::logical_role_lifecycle::RoleChangeEvidenceV1;
 use crate::output_ref::OutputRef;
+use crate::recovery::{
+    ChangedSourceSuccessionRequestV1, ChangedSourceSuccessionV1, RehydrationRequiredV1,
+    RoleRebindRequestV1, StartupRecoveryReportV1,
+};
 use crate::repository::SqliteStateRepository;
 use crate::trusted_time::TrustedClockV1;
 
@@ -802,6 +807,60 @@ impl TrustedCoreStore {
         )?;
         self.repo
             .renew_executor_binding_lease(clock, binding_id, lease_expires_at)
+    }
+
+    // ---- recovery (ST-W2) -------------------------------------------------------
+
+    /// Startup recovery scan for one project (ExecutorBinding family). See
+    /// [`crate::recovery`]: expired leases are released with their events,
+    /// every role's continuation requirement and the unfinished attempts are
+    /// reported from the same snapshot.
+    pub fn recover_startup(
+        &mut self,
+        admission: StateWriteAdmission,
+        clock: &dyn TrustedClockV1,
+        project_id: &str,
+        authority: &ExecutorReleasedLifecycleAuthorityV1,
+    ) -> Result<StartupRecoveryReportV1, StateError> {
+        self.check(
+            admission,
+            StateWriteOperationV1::ExecutorBinding,
+            Bound::project(project_id),
+        )?;
+        self.repo.recover_startup(clock, project_id, authority)
+    }
+
+    /// Atomic expected-current-CAS failover rebind (ExecutorBinding family);
+    /// the result names the rehydration the new executor must complete first.
+    pub fn rebind_role(
+        &mut self,
+        admission: StateWriteAdmission,
+        clock: &dyn TrustedClockV1,
+        request: &RoleRebindRequestV1,
+    ) -> Result<RehydrationRequiredV1, StateError> {
+        let project = self.role_project(&request.role_id)?;
+        self.check(
+            admission,
+            StateWriteOperationV1::ExecutorBinding,
+            Bound::project(&project),
+        )?;
+        self.repo.rebind_role(clock, request)
+    }
+
+    /// Changed-source epoch/successor transaction (ContextEpoch family).
+    pub fn succeed_changed_context_sources(
+        &mut self,
+        admission: StateWriteAdmission,
+        clock: &dyn TrustedClockV1,
+        request: &ChangedSourceSuccessionRequestV1,
+    ) -> Result<ChangedSourceSuccessionV1, StateError> {
+        let project = self.role_project(&request.role_id)?;
+        self.check(
+            admission,
+            StateWriteOperationV1::ContextEpoch,
+            Bound::project(&project),
+        )?;
+        self.repo.succeed_changed_context_sources(clock, request)
     }
 
     // ---- availability (D5) -----------------------------------------------------

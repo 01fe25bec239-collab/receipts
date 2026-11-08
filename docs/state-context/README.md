@@ -135,3 +135,43 @@ Conformance cases are generated in `wire/wire_tests.rs` and checked against the 
 Migration 20 adds `state_store_identity`, `event_proposal_receipt` and `availability_fact`, verifying the exact v19 store before and the v20 store after. Migration SQL for v1–v19 is unchanged; the v19 verifier now accepts head 19 or later.
 
 Limits: this is an object-capability boundary inside the trusted core process. It does not authenticate other code in the same address space, and file modes plus a cooperative lock do not exclude a process with the same filesystem authority. Excluding lower-trust principals (separate identity, no State directory access, no inherited descriptors or writer channels) is a deployment requirement. Separate-principal native proof is NOT RUN.
+
+## Recovery and rehydration (ST-W2-1/2)
+
+No new DDL: schema head stays 20. Everything below uses existing tables, and each action is one serialized transaction that commits rows, role history and its frozen event together, or writes nothing.
+
+| `TrustedCoreStore` method | Admission family | What it does |
+| --- | --- | --- |
+| `recover_startup` | `ExecutorBinding`, project | Fences one trusted-clock sample against the project watermark. Releases every unreleased binding whose lease deadline is at or before trusted now (`LEASE_EXPIRED` plus `EXECUTOR_RELEASED`). Then reports, from the same snapshot, each role's startup classification and continuation result, plus the unfinished attempts. A repeat scan releases nothing and changes no record. A corrupt deadline, clock regression, foreign clock or busy store refuses the whole scan. |
+| `rebind_role` | `ExecutorBinding`, role's project | Expected-current CAS on the role's binding pointer. Optionally releases the still-unreleased current binding with a non-`LEASE_EXPIRED` reason. Creates the successor binding, which must be unreleased, not claim rehydration, be bound no later than now and have a lease after now. Moves the pointer with history and appends `EXECUTOR_BOUND` or `EXECUTOR_REPLACED`. The role must be `ACTIVE` and keeps its identity and status. A RUNTIME_A1 rebind is refused while another A1 role in the project holds an unreleased binding. Returns `RehydrationRequiredV1`. |
+| `succeed_changed_context_sources` | `ContextEpoch`, role's project | Takes the role's SUCCEEDED rehydration at its current (latest) epoch and manifest that observed `CHANGED` digests. Advances the project epoch with those changed sources and this role invalidated, inserts an immutable successor manifest carrying the observed digests at the new epoch, CAS-moves the role context with history and appends `CONTEXT_EPOCH_ADVANCED`. |
+
+`continuation_clearance(clock, role)` is a read and writes nothing; a sample behind the watermark is refused. It clears a role only when all of these hold:
+
+- the role is `ACTIVE`;
+- its pointer names an unreleased binding;
+- trusted now is before that binding's lease deadline;
+- no later epoch invalidated the role;
+- a SUCCEEDED rehydration with no `CHANGED` source exists for exactly that binding, the role's current manifest and its current epoch.
+
+Every other case is a typed `RecoveryRefusalV1`. "Needs rebind" is `NO_ACTIVE_BINDING`, `BINDING_RELEASED` or `LEASE_EXPIRED` (see `requires_rebind`). Changed digests give `CHANGED_SOURCES_PENDING`. The frozen role status set is unchanged.
+
+`list_unfinished_attempts(project)` lists attempts that have a start row and no finish row. That is all State can prove. Whether an attempt is orphaned, and capturing or recovering its worktree, belong to Workspace. State runs no Git command, kills no process and resets no checkout.
+
+Events use only frozen types, with State-derived canonical references and domain-separated digests. Event ids are ULID-shaped SHA-256 prefixes of the action's subject, so a repeated action cannot mint a second event.
+
+Materializers (`receipts_state::materializers`):
+
+- `ArtifactFileMaterializerV1` reads catalogued artifacts (`artifact_id` → relative path + SHA-256) below one root. Each read walks the path from the held root descriptor with `openat(O_NOFOLLOW)`. It refuses the following:
+  - `..`, absolute, empty or backslash components;
+  - symlinks at any depth;
+  - hard links;
+  - non-regular files such as FIFOs and directories;
+  - files over the bound;
+  - files whose identity, size or timestamps change during the read;
+  - SHA-256 mismatches against the catalog.
+
+  Every refusal is a typed source failure, so the attempt fails with no body.
+- `MaterializerRegistryV1::ports()` supplies the repository-blob port and the artifact port to `rehydrate_context`. An unplugged port fails with `MATERIALIZER_NOT_REGISTERED`. State queries keep their existing closed registry. Workspace's real `GitBlobMaterializer` is WE-W3-4 and is not implemented here; tests use a fake blob port only.
+
+Missing Core interface: Orchestration's `CoreStateWriter` does not yet forward `recover_startup`, `rebind_role` or `succeed_changed_context_sources`. The State side and its admission checks are complete; Core needs three forwarding methods using its existing `admit`/`admit_role` with the families above.

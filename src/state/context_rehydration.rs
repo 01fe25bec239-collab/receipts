@@ -2439,7 +2439,7 @@ fn insert_attempt(
     Ok(())
 }
 
-fn read_attempt(
+pub(crate) fn read_attempt(
     conn: &Connection,
     project_id: &str,
     attempt_id: &str,

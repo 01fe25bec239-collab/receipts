@@ -679,6 +679,11 @@ pub enum StateError {
         role_id: String,
         reason: crate::logical_role_lifecycle::RoleChangeRefusal,
     },
+    /// A recovery action or the continuation gate refused; nothing was written.
+    RecoveryRefused {
+        role_id: String,
+        reason: crate::recovery::RecoveryRefusalV1,
+    },
     /// Chronological event-query arguments were invalid. Never echoes input.
     EventQueryInvalid { detail: &'static str },
     /// A selected event's opaque `occurred_at` is outside CanonicalTimestampV1;
@@ -1054,6 +1059,11 @@ impl fmt::Display for StateError {
             StateError::LogicalRoleChangeRefused { role_id, reason } => write!(
                 f,
                 "LogicalRole {role_id:?} change refused: {}",
+                reason.as_str()
+            ),
+            StateError::RecoveryRefused { role_id, reason } => write!(
+                f,
+                "recovery for LogicalRole {role_id:?} refused: {}",
                 reason.as_str()
             ),
             StateError::EventQueryInvalid { detail } => {
