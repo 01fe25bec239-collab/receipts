@@ -633,9 +633,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "receipts-review-contracts"
+version = "0.1.0"
+dependencies = [
+ "receipts-workspace-execution",
+]
+
+[[package]]
 name = "receipts-review-integration"
 version = "0.1.0"
 dependencies = [
+ "receipts-review-contracts",
  "receipts-workspace-execution",
 ]
 
@@ -653,7 +661,7 @@ name = "receipts-runtime-bindings"
 version = "0.1.0"
 dependencies = [
  "receipts-orchestration",
- "receipts-review-integration",
+ "receipts-review-contracts",
 ]
 
 [[package]]

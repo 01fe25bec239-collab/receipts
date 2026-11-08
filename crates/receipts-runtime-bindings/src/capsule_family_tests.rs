@@ -1,6 +1,6 @@
 use crate::RuntimeCapsuleFamily;
 use receipts_orchestration::capsules::{RepairCapsule, TaskCapsule};
-use receipts_review_integration::ReviewCapsuleNonTemporalCore;
+use receipts_review_contracts::ReviewCapsuleNonTemporalCore;
 
 #[test]
 fn variants_accept_canonical_owner_types_directly() {
@@ -32,7 +32,6 @@ fn exported_capsules_are_the_canonical_constructor_types() {
     let _: fn(crate::ReviewCapsuleNonTemporalCore) -> RuntimeCapsuleFamily =
         RuntimeCapsuleFamily::Review;
     let _: fn(crate::Criterion) -> receipts_orchestration::capsules::Criterion = |value| value;
-    let _: fn(
-        crate::ReviewCapsuleCriterion,
-    ) -> receipts_review_integration::ReviewCapsuleCriterion = |value| value;
+    let _: fn(crate::ReviewCapsuleCriterion) -> receipts_review_contracts::ReviewCapsuleCriterion =
+        |value| value;
 }

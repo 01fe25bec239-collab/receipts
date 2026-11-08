@@ -839,7 +839,9 @@ fn reproduction_structured_schema_and_context_epoch_are_stored_without_inference
 
 #[test]
 fn reconciled_fields_remain_absent_and_nested_timestamps_use_the_canonical_type() {
-    let source = include_str!("review_capsule_structured_core.rs");
+    let source = include_str!(
+        "../../crates/receipts-review-contracts/src/review_capsule_structured_core.rs"
+    );
     for field in ["started_at", "finished_at"] {
         assert!(source.contains(&format!("{field}: Option<ReviewDateTimeV1>")));
         assert!(source.contains(&format!("fn {field}(&self) -> Option<&ReviewDateTimeV1>")));

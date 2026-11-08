@@ -10,4 +10,5 @@ license = "Apache-2.0"
 path = "../../src/review/lib.rs"
 
 [dependencies]
+receipts-review-contracts = { path = "../receipts-review-contracts" }
 receipts-workspace-execution = { path = "../receipts-workspace-execution" }

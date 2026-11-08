@@ -1,0 +1,12 @@
+[package]
+name = "receipts-review-contracts"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+publish = false
+license = "Apache-2.0"
+
+# Canonical shared Review data (capsule, date-time, integer carrier) only.
+# No codecs, controllers, State or Runtime dependency.
+[dependencies]
+receipts-workspace-execution = { path = "../receipts-workspace-execution" }

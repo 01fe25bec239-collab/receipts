@@ -21,7 +21,8 @@ pub use a4_review_structured_core::{
 #[cfg(test)]
 mod a4_review_structured_core_tests;
 
-pub mod review_capsule_structured_core;
+// Canonical data lives in receipts-review-contracts; old module/root paths are re-exports.
+pub use receipts_review_contracts::review_capsule_structured_core;
 pub use review_capsule_structured_core::{
     ReviewCapsuleCheck, ReviewCapsuleCheckResult, ReviewCapsuleConstructionError,
     ReviewCapsuleCriterion, ReviewCapsuleCriterionKind, ReviewCapsuleNonTemporalCore,
@@ -58,6 +59,9 @@ pub use exact_sha_acceptance_gate::{
 
 #[cfg(test)]
 mod exact_sha_acceptance_gate_tests;
+
+#[cfg(test)]
+mod contract_identity_tests;
 
 pub mod assurance_profile;
 pub use assurance_profile::{
@@ -109,8 +113,8 @@ pub use safety_interruption_structured_core::{
 #[cfg(test)]
 mod safety_interruption_structured_core_tests;
 
-pub mod date_time;
 pub use date_time::{ReviewDateTimeError, ReviewDateTimeV1};
+pub use receipts_review_contracts::date_time;
 
 #[cfg(test)]
 mod date_time_tests;

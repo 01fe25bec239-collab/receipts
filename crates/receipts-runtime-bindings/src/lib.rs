@@ -14,7 +14,7 @@ pub use receipts_orchestration::capsules::{
     RepairFindingCategoryV1, RepairFindingSeverityV1, TaskCapsule, TaskType,
     VerificationPlanEntryV1,
 };
-pub use receipts_review_integration::{
+pub use receipts_review_contracts::{
     ReviewCapsuleCriterion, ReviewCapsuleCriterionKind, ReviewCapsuleNonTemporalCore,
     ReviewCapsuleReviewScope, ReviewCapsuleSeverityPolicy,
 };

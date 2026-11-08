@@ -883,6 +883,7 @@ fn boundary_has_exact_fields_no_mutable_api_or_deferred_runtime_wire_support() {
     let deps = cargo.split("[dependencies]").nth(1).unwrap().trim();
     assert_eq!(
         deps,
-        "receipts-workspace-execution = { path = \"../receipts-workspace-execution\" }"
+        "receipts-review-contracts = { path = \"../receipts-review-contracts\" }\n\
+         receipts-workspace-execution = { path = \"../receipts-workspace-execution\" }"
     );
 }
