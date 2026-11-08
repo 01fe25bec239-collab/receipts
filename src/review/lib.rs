@@ -142,3 +142,61 @@ pub use a4_review::A4Review;
 
 #[cfg(test)]
 mod a4_review_tests;
+
+pub mod wire;
+
+pub mod ports;
+pub use ports::{
+    ImplementerIdentity, ReviewRecordProposal, ReviewRecordSink, ReviewerCandidate,
+    ReviewerRequirements, ReviewerRoutingPort, ReviewerRoutingRefusal, ReviewerRunOutput,
+    ReviewerRuntime, reviewer_output_from_claude, reviewer_output_from_codex,
+};
+
+mod records;
+
+pub mod reproduction;
+pub use reproduction::{CheckRun, CheckRunStatus, CheckRunnerConfig, run_check};
+
+pub mod capsule_builder;
+pub use capsule_builder::{CapsuleBuildRefusal, ReviewCapsuleBuildInput, build_review_capsule};
+
+#[cfg(test)]
+mod capsule_builder_tests;
+
+pub mod review_parse;
+pub use review_parse::{ReviewParseError, parse_reviewer_output};
+
+pub mod controller;
+pub use controller::{
+    AttemptFinished, ReviewController, ReviewDisposition, ReviewRefusal, ReviewTicket,
+};
+
+#[cfg(test)]
+mod controller_tests;
+
+#[cfg(test)]
+mod test_repo;
+
+pub mod acceptance_gate;
+pub use acceptance_gate::{
+    AcceptanceCheckId, AcceptanceCheckResult, AcceptanceGate, AcceptanceInput, FailureSeverity,
+    GateOutcome,
+};
+
+#[cfg(test)]
+mod acceptance_gate_tests;
+
+pub mod repair_controller;
+pub use repair_controller::{
+    RepairController, RepairDecision, RepairEscalation, RepairInput, RepairOutcome, RepairRequest,
+    RepairTier,
+};
+
+#[cfg(test)]
+mod repair_controller_tests;
+
+/// Review's own State and Runtime dependencies, re-exported unchanged so the
+/// Review-owned integration layer (`receipts-e2e`) binds exactly these crate
+/// instances without new manifest edges. Adds no type and no authority.
+pub use receipts_runtime_adapters as runtime;
+pub use receipts_state as state;

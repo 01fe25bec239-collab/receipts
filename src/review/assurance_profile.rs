@@ -112,6 +112,27 @@ pub enum DistinctProviderPolicy {
     Required,
 }
 
+impl DistinctProviderPolicy {
+    pub const ALL: [Self; 3] = [Self::Off, Self::Preferred, Self::Required];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "OFF",
+            Self::Preferred => "PREFERRED",
+            Self::Required => "REQUIRED",
+        }
+    }
+
+    /// Ordering for "raise only" composition: OFF < PREFERRED < REQUIRED.
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::Preferred => 1,
+            Self::Required => 2,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecurityPipelinePolicy {
     /// NO_AUTOMATIC_REQUIREMENT from this profile. Other rules may require security.
