@@ -286,15 +286,14 @@ pub fn derive_dispatch_admission(
         Some(e) => {
             bound(Axis::ProviderPolicy, &e.binding)?;
             // Policy evidence about another provider (or with no selected
-            // provider to compare) is contradictory or unproven permission.
-            let matches_provider = selected(&e.provider_id);
+            // provider to compare) says nothing about the selected provider:
+            // neither permission nor a disallow is attributed to it.
             match e.status {
+                _ if !selected(&e.provider_id) => Some(Reason::ProviderPolicyUnknown),
                 DispatchAdmissionProviderPolicyStatus::VerifiedDisallowed => {
                     Some(Reason::ProviderPolicyDisallowed)
                 }
-                DispatchAdmissionProviderPolicyStatus::VerifiedAllowed
-                    if fresh(e.freshness) && matches_provider =>
-                {
+                DispatchAdmissionProviderPolicyStatus::VerifiedAllowed if fresh(e.freshness) => {
                     None
                 }
                 _ => Some(Reason::ProviderPolicyUnknown),

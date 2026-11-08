@@ -604,6 +604,85 @@ fn symlink_redirects_are_not_followed() {
     assert_eq!(io::read_document(&path), Err(Error::NotRegularFile));
 }
 
+#[test]
+fn no_follow_open_flags_are_selected_per_os_and_architecture() {
+    // Expected values: macOS SDK sys/fcntl.h + sys/errno.h; libc 0.2.189
+    // linux_like/{linux/{gnu,musl},android}/<arch> O_NONBLOCK|O_NOFOLLOW, ELOOP.
+    let cases = [
+        ("macos", "aarch64", Some((0x4 | 0x100, 62))),
+        ("macos", "x86_64", Some((0x4 | 0x100, 62))),
+        ("linux", "x86_64", Some((0x800 | 0x2_0000, 40))),
+        ("linux", "x86", Some((0x800 | 0x2_0000, 40))),
+        ("linux", "aarch64", Some((0x800 | 0x8000, 40))),
+        ("linux", "arm", Some((0x800 | 0x8000, 40))),
+        ("android", "aarch64", Some((0x800 | 0x8000, 40))),
+        ("android", "x86_64", Some((0x800 | 0x2_0000, 40))),
+        // Unverified or divergent: refused rather than guessed.
+        ("linux", "riscv64", None),
+        ("linux", "mips", None),
+        ("linux", "sparc64", None),
+        ("linux", "powerpc64", None),
+        ("freebsd", "x86_64", None),
+        ("windows", "x86_64", None),
+    ];
+    for (os, arch, expected) in cases {
+        assert_eq!(io::no_follow_open(os, arch), expected, "{os} {arch}");
+    }
+    let native = io::no_follow_open(std::env::consts::OS, std::env::consts::ARCH);
+    assert_eq!(io::open_flags(), native.ok_or(Error::Unsupported));
+}
+
+/// Replaces the accepted regular final entry after `regular_path` and before
+/// the open: the deterministic schedule of a final-component race.
+#[cfg(unix)]
+fn replaced_after_validation(replace: impl FnOnce(&Path)) -> Result<Vec<u8>, Error> {
+    let directory = Directory::new();
+    let path = directory.0.join("settings.json");
+    std::fs::write(&path, b"{}").unwrap();
+    let flags = io::open_flags().unwrap();
+    io::regular_path(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    replace(&path);
+    io::open_document(&path, flags)
+}
+
+#[cfg(unix)]
+#[test]
+fn final_entry_replaced_by_a_symlink_is_refused_before_reading_the_target() {
+    let outside = Directory::new();
+    let target = outside.0.join("secret.json");
+    std::fs::write(&target, br#"{"substituted":"SECRET"}"#).unwrap();
+    let result = replaced_after_validation(|path| {
+        std::os::unix::fs::symlink(&target, path).unwrap();
+    });
+    assert_eq!(result, Err(Error::NotRegularFile));
+}
+
+#[cfg(unix)]
+fn mkfifo(path: &Path) {
+    let status = std::process::Command::new("/usr/bin/mkfifo")
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn fifo_entries_are_refused_without_blocking() {
+    // Replaced after validation: the nonblocking open returns at once and the
+    // descriptor check refuses it (a blocking open would hang here).
+    assert_eq!(
+        replaced_after_validation(mkfifo),
+        Err(Error::NotRegularFile)
+    );
+    // Present before validation: refused before any open.
+    let directory = Directory::new();
+    let path = directory.0.join("settings.json");
+    mkfifo(&path);
+    assert_eq!(io::read_document(&path), Err(Error::NotRegularFile));
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn managed_drop_in_enumeration_has_a_file_count_bound() {

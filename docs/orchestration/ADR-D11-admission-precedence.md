@@ -21,8 +21,8 @@ Status: adopted for the Wave2 preparation lineage under the already-approved D11
 | ENTITLEMENT | LOCKED_REQUIRES_PRO / ENTITLEMENT_EXPIRED | same reason |
 | ENTITLEMENT | ENTITLEMENT_UNKNOWN, stale ALLOW, missing | ENTITLEMENT_UNKNOWN |
 | PROVIDER_POLICY | fresh VERIFIED_ALLOWED for the selected provider | PASS |
-| PROVIDER_POLICY | VERIFIED_DISALLOWED (any freshness) | PROVIDER_POLICY_DISALLOWED |
-| PROVIDER_POLICY | NEEDS_REVIEW, UNKNOWN, stale/missing, a record about another provider, or no selected provider | PROVIDER_POLICY_UNKNOWN |
+| PROVIDER_POLICY | VERIFIED_DISALLOWED for the selected provider (any freshness) | PROVIDER_POLICY_DISALLOWED |
+| PROVIDER_POLICY | NEEDS_REVIEW, UNKNOWN, stale/missing, a record about another provider (any status, including VERIFIED_DISALLOWED), or no selected provider | PROVIDER_POLICY_UNKNOWN |
 | PROVIDER_AUTH | fresh Authenticated for the selected provider | PASS |
 | PROVIDER_AUTH | Unauthenticated, Unknown, stale, missing, another provider | AUTH_REQUIRED (technical state; never "wrong credentials") |
 | PROVIDER_AVAILABILITY | fresh Available with an admitted runtime | PASS |
@@ -43,6 +43,6 @@ Returned outside the frozen decision, because a decision referencing those facts
 
 ## Proof
 
-`dispatch_admission_derivation_tests.rs`: all-PASS; each single-axis failure; all thirteen non-NONE reasons mapped (plus no-runtime); all 15 pairs in both input orders; all-fail; missing and stale per axis (each failing only its own axis); missing auth with valid selected-provider policy; policy/auth provider mismatch and missing selection; fresh versus stale Available/RateLimited/ProvenDown/Unknown and their precedence pairs; binding mismatch per axis and field; contradictory safety; frozen fixtures C/D/E reproduce outcome, axis, reason and selected provider/runtime unchanged.
+`dispatch_admission_derivation_tests.rs`: all-PASS; each single-axis failure; all thirteen non-NONE reasons mapped (plus no-runtime); all 15 pairs in both input orders; all-fail; missing and stale per axis (each failing only its own axis); missing auth with valid selected-provider policy; policy/auth provider mismatch and missing selection; foreign-provider or unselected VERIFIED_DISALLOWED/ALLOWED at both freshnesses (PROVIDER_POLICY_UNKNOWN, never DISALLOWED) versus matching-provider allow/disallow, with precedence against safety, entitlement and auth; fresh versus stale Available/RateLimited/ProvenDown/Unknown and their precedence pairs; binding mismatch per axis and field; contradictory safety; frozen fixtures C/D/E reproduce outcome, axis, reason and selected provider/runtime unchanged.
 
 Not covered: the real evidence producers (FeatureAdmission, provider auth, ProviderPolicyEligibility, AvailabilityState, SafetyInterruption, routing) and their freshness policies; scheduler consumption is OR-W2-1.

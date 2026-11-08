@@ -465,6 +465,94 @@ fn policy_permission_for_another_provider_is_unknown_not_allowed() {
 }
 
 #[test]
+fn only_selected_provider_policy_evidence_attributes_a_disallow() {
+    let policy_case = |selected: Option<&str>, provider: &str, status, freshness| {
+        let mut r = passing();
+        r.selected_provider_id = selected.map(Into::into);
+        let p = r.provider_policy.as_mut().unwrap();
+        p.provider_id = provider.into();
+        p.status = status;
+        p.freshness = freshness;
+        r
+    };
+    let policy_reason = |r: &DispatchAdmissionRequestV1| {
+        derive(r)
+            .failures()
+            .iter()
+            .find(|(a, _)| *a == Axis::ProviderPolicy)
+            .map(|(_, reason)| *reason)
+    };
+    let (allowed, disallowed) = (Policy::VerifiedAllowed, Policy::VerifiedDisallowed);
+    let unknown = Some(Reason::ProviderPolicyUnknown);
+    let cases = [
+        // Foreign-provider evidence never speaks for the selected provider.
+        (Some("openai"), "anthropic", disallowed, F, unknown),
+        (Some("openai"), "anthropic", disallowed, S, unknown),
+        (Some("openai"), "anthropic", allowed, F, unknown),
+        (Some("openai"), "anthropic", allowed, S, unknown),
+        // No selection: there is no selected provider to disallow.
+        (None, "openai", disallowed, F, unknown),
+        (None, "anthropic", disallowed, S, unknown),
+        (None, "openai", allowed, F, unknown),
+        // Matching provider: fresh allow passes; a known disallow keeps its
+        // reason at any freshness; a stale allow is unproven.
+        (Some("openai"), "openai", allowed, F, None),
+        (
+            Some("openai"),
+            "openai",
+            disallowed,
+            F,
+            Some(Reason::ProviderPolicyDisallowed),
+        ),
+        (
+            Some("openai"),
+            "openai",
+            disallowed,
+            S,
+            Some(Reason::ProviderPolicyDisallowed),
+        ),
+        (Some("openai"), "openai", allowed, S, unknown),
+    ];
+    for (selected, provider, status, freshness, expected) in cases {
+        let r = policy_case(selected, provider, status, freshness);
+        let label = format!("{selected:?} {provider} {status:?} {freshness:?}");
+        assert_eq!(policy_reason(&r), expected, "{label}");
+        if expected.is_none() {
+            assert!(derive(&r).dispatch_permitted(), "{label}");
+        } else if selected.is_some() {
+            // Higher-precedence axes pass, so policy is primary.
+            assert_eq!(denied(&r), (Axis::ProviderPolicy, expected), "{label}");
+        } else {
+            // Missing selection also fails auth; policy still outranks it.
+            assert_eq!(denied(&r), (Axis::ProviderPolicy, expected), "{label}");
+            assert!(
+                derive(&r)
+                    .failures()
+                    .contains(&(Axis::ProviderAuth, Reason::AuthRequired))
+            );
+        }
+    }
+    // Precedence with foreign disallow: safety and entitlement still win and
+    // policy is recorded as unknown; no axis claims a selected-provider
+    // disallow; policy still outranks auth.
+    for higher in [Axis::Safety, Axis::Entitlement] {
+        let mut r = policy_case(Some("openai"), "anthropic", disallowed, F);
+        let primary = break_axis(higher, &mut r);
+        assert_eq!(denied(&r), (higher, Some(primary)));
+        assert_eq!(policy_reason(&r), unknown);
+    }
+    let mut r = policy_case(Some("openai"), "anthropic", disallowed, F);
+    r.provider_auth = None;
+    assert_eq!(denied(&r), (Axis::ProviderPolicy, unknown));
+    assert!(
+        derive(&r)
+            .failures()
+            .iter()
+            .all(|(_, reason)| *reason != Reason::ProviderPolicyDisallowed)
+    );
+}
+
+#[test]
 fn wrong_binding_or_contradictory_safety_is_a_typed_pre_dispatch_refusal() {
     for axis in PRIMARY_FAILURE_PRECEDENCE {
         for field in 0..3 {

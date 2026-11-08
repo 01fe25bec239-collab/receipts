@@ -143,7 +143,7 @@ fn io_error(error: std::io::Error) -> Error {
     }
 }
 
-fn regular_path(path: &Path) -> Result<(), Error> {
+pub(super) fn regular_path(path: &Path) -> Result<(), Error> {
     // Fixed paths only; do not follow symlink redirects in any component. This
     // also rejects named pipes/devices before open. Metadata is not a size bound.
     for ancestor in path.ancestors() {
@@ -164,21 +164,53 @@ fn regular_path(path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-pub(super) fn read_document(path: &Path) -> Result<Vec<u8>, Error> {
-    regular_path(path)?;
-    let mut options = OpenOptions::new();
-    options.read(true);
-    // A final-component race must not turn the regular file open into a
-    // blocking FIFO open or follow a replacement symlink.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        #[cfg(target_os = "macos")]
-        options.custom_flags(0x0004 | 0x0100); // O_NONBLOCK | O_NOFOLLOW
-        #[cfg(target_os = "linux")]
-        options.custom_flags(0x0800 | 0x20000); // O_NONBLOCK | O_NOFOLLOW
+/// `(O_NONBLOCK | O_NOFOLLOW, ELOOP)` for one `(OS, ARCH)`, only where the
+/// values were checked against local authoritative definitions: the macOS
+/// SDK `sys/fcntl.h` / `sys/errno.h` (`0x4 | 0x100`, `62`) and libc 0.2.189
+/// Linux gnu/musl/uclibc and Android (`O_NONBLOCK` `0x800`, `ELOOP` `40`;
+/// `O_NOFOLLOW` `0x20000` on x86/x86_64 but `0x8000` on arm/aarch64). This
+/// is the target set of `PROJECT_OPEN_FLAGS` in the execution env policy.
+/// Other targets (including Windows, the BSDs and Linux mips/sparc/powerpc/
+/// riscv64, whose values vary or were not checked) are refused, not guessed.
+pub(super) fn no_follow_open(os: &str, arch: &str) -> Option<(i32, i32)> {
+    match (os, arch) {
+        ("macos", "x86_64" | "aarch64") => Some((0x4 | 0x100, 62)),
+        ("linux" | "android", "x86" | "x86_64") => Some((0x800 | 0x2_0000, 40)),
+        ("linux" | "android", "arm" | "aarch64") => Some((0x800 | 0x8000, 40)),
+        _ => None,
     }
-    let file = options.open(path).map_err(io_error)?;
+}
+
+/// This target's no-follow open, or `Unsupported` before any filesystem access.
+pub(super) fn open_flags() -> Result<(i32, i32), Error> {
+    no_follow_open(std::env::consts::OS, std::env::consts::ARCH).ok_or(Error::Unsupported)
+}
+
+pub(super) fn read_document(path: &Path) -> Result<Vec<u8>, Error> {
+    let flags = open_flags()?;
+    regular_path(path)?;
+    open_document(path, flags)
+}
+
+#[cfg(not(unix))]
+pub(super) fn open_document(_: &Path, _: (i32, i32)) -> Result<Vec<u8>, Error> {
+    Err(Error::Unsupported)
+}
+
+/// Opens the entry `regular_path` accepted. A final-component race must not
+/// turn this into a blocking FIFO open or follow a replacement symlink.
+#[cfg(unix)]
+pub(super) fn open_document(path: &Path, (flags, eloop): (i32, i32)) -> Result<Vec<u8>, Error> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(flags);
+    let file = options
+        .open(path)
+        .map_err(|error| match error.raw_os_error() {
+            // O_NOFOLLOW refused a symlink now at the final component.
+            Some(code) if code == eloop => Error::NotRegularFile,
+            _ => io_error(error),
+        })?;
     if !file.metadata().map_err(io_error)?.is_file() {
         return Err(Error::NotRegularFile);
     }
