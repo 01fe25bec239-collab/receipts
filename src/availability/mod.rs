@@ -3,29 +3,39 @@
 //! Typed Runtime [`FailureClass`] observations drive availability:
 //! `RateLimited` → RATE_LIMITED, `SessionExhausted` → SESSION_EXHAUSTED and
 //! `ProviderDown` → PROVIDER_DOWN, each for a window of `retry_after` when the
-//! observation carries one, else capped exponential backoff per
-//! (provider, model, runtime). `SafetyCheckPending`/`PolicyBlocked` never
-//! change availability: they are holds for the safety protocol and stop
-//! failover (I-12, no provider-shopping). Every other class (timeouts,
+//! observation carries one, else capped exponential backoff with jitter per
+//! (provider, model) — the attempt history is shared by every runtime of the
+//! model, so changing runtime never restarts it. `SafetyCheckPending`/
+//! `PolicyBlocked` never change availability: they are holds for the safety
+//! protocol and stop failover (I-12, no provider-shopping), and an active
+//! limit never overwrites a safety, policy or authentication base state
+//! ([`AvailabilityManager::effective`]). Every other class (timeouts,
 //! crashes, invalid output, cancellation, auth, unknown) is not an
 //! availability signal here.
 //!
 //! Quota scope stays UNKNOWN unless a provider-reported QuotaState verifies
-//! it ([`QuotaState::verified_scope`]). With UNKNOWN scope a limit marks only
-//! the exact candidate and the provider DEGRADED for the same window — never
-//! sibling models RATE_LIMITED. A verified PROVIDER (MODEL) scope limits
-//! every runtime of that provider (model).
+//! it ([`QuotaState::verified_scope`]) AND, for MODEL scope, names the
+//! observed model; evidence for another provider or model is refused. With
+//! UNKNOWN scope a limit marks only the exact candidate and the provider
+//! DEGRADED for the same window — never sibling models RATE_LIMITED. A
+//! verified PROVIDER (MODEL) scope limits every runtime of that provider
+//! (model).
 //!
 //! The manager keeps the effect records it derived (AvailabilityState
-//! values, append order) so it can be persisted and replayed after restart.
-//! An elapsed window is not recovery evidence: the candidate becomes
-//! retryable as DEGRADED until caller evidence newer than the limit reports
-//! otherwise. Nothing here reports a provider recovered (no authenticated
-//! producer exists; D5).
+//! values, append order) so it can be persisted and replayed after restart;
+//! each record's note carries the attempt and, for a backoff window, the
+//! ceiling and jitter drawn. An elapsed window is not recovery evidence: the
+//! candidate becomes retryable as DEGRADED until caller evidence newer than
+//! the limit reports otherwise. Nothing here reports a provider recovered
+//! (no authenticated producer exists; D5).
 
 pub mod failover;
 #[cfg(test)]
 mod tests;
+
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hash, Hasher};
+use std::sync::Arc;
 
 use receipts_runtime_adapters::FailureClass;
 use receipts_state::{
@@ -34,7 +44,10 @@ use receipts_state::{
     EventType, SqliteStateRepository, SubjectKind,
 };
 
-use crate::persistence::{EventScope, RoutingPersistError, RoutingStatePort, routing_proposal};
+use crate::persistence::{
+    EventScope, Publication, RoutingPersistError, RoutingStatePort, publish, record_event,
+    record_reference,
+};
 use crate::policy_eligibility::{
     ModelRoutingDateTimeComparisonError, ModelRoutingDateTimeV1, compare_instants,
     elapsed_whole_seconds,
@@ -46,10 +59,11 @@ use crate::{
     AvailabilityStateNonTemporalCore, QuotaScope, QuotaState,
 };
 
-/// Capped exponential backoff: attempt n waits `min(cap, base·2^(n-1))`.
-/// Values are deployment configuration (calibration knobs), not vendor data.
-/// ponytail: no jitter — decisions stay deterministic; add caller-seeded
-/// jitter if many workers retry one provider in lockstep.
+/// Capped exponential backoff with jitter: attempt n has the ceiling
+/// `min(cap, base·2^(n-1))` and waits a jittered `ceil(ceiling/2) ..= ceiling`
+/// ("equal jitter"), so a window is never zero, never exceeds the cap and
+/// concurrent workers spread out. Values are deployment configuration
+/// (calibration knobs), not vendor data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackoffPolicy {
     base_seconds: u64,
@@ -66,6 +80,7 @@ impl BackoffPolicy {
             max_attempts,
         })
     }
+    /// The un-jittered ceiling for `attempt` (saturating, never above the cap).
     pub fn delay_seconds(&self, attempt: u32) -> u64 {
         let factor = 1u64
             .checked_shl(attempt.saturating_sub(1))
@@ -74,8 +89,46 @@ impl BackoffPolicy {
             .saturating_mul(factor)
             .min(self.cap_seconds)
     }
+    /// The inclusive window range for `attempt`: `(ceil(ceiling/2), ceiling)`.
+    pub fn window_range(&self, attempt: u32) -> (u64, u64) {
+        let ceiling = self.delay_seconds(attempt);
+        (ceiling - ceiling / 2, ceiling)
+    }
     pub fn max_attempts(&self) -> u32 {
         self.max_attempts
+    }
+}
+
+/// Where backoff jitter comes from. Production uses [`RandomJitter`]; tests
+/// inject a controlled source. The manager clamps every draw to its bound.
+pub trait JitterSource: Send + Sync + std::fmt::Debug {
+    /// A value in `0..=max` for the backoff of `(provider, model)` at `attempt`.
+    fn pick(&self, provider: &str, model: &str, attempt: u32, max: u64) -> u64;
+}
+
+/// Process-random jitter from the standard library's randomly keyed hasher.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RandomJitter;
+
+impl JitterSource for RandomJitter {
+    fn pick(&self, provider: &str, model: &str, attempt: u32, max: u64) -> u64 {
+        let mut hasher = RandomState::new().build_hasher();
+        (provider, model, attempt).hash(&mut hasher);
+        let draw = hasher.finish();
+        match max.checked_add(1) {
+            Some(span) => draw % span,
+            None => draw,
+        }
+    }
+}
+
+/// A controlled source: always draws `self.0` (clamped to the bound).
+#[derive(Debug, Clone, Copy)]
+pub struct FixedJitter(pub u64);
+
+impl JitterSource for FixedJitter {
+    fn pick(&self, _: &str, _: &str, _: u32, max: u64) -> u64 {
+        self.0.min(max)
     }
 }
 
@@ -117,6 +170,8 @@ pub enum AvailabilityError {
     Time(ModelRoutingDateTimeComparisonError),
     /// The quota report names another provider.
     QuotaProviderMismatch,
+    /// The quota report names another model than the observed one.
+    QuotaModelMismatch,
     /// Observation older than the latest record for the same candidate.
     OutOfOrder,
 }
@@ -151,15 +206,24 @@ fn covers(record: &AvailabilityState, provider: &str, model: &str, runtime: &str
 #[derive(Debug, Clone)]
 pub struct AvailabilityManager {
     policy: BackoffPolicy,
+    jitter: Arc<dyn JitterSource>,
     records: Vec<AvailabilityState>,
 }
 
 impl AvailabilityManager {
+    /// A manager with process-random jitter.
     pub fn new(policy: BackoffPolicy) -> Self {
         Self {
             policy,
+            jitter: Arc::new(RandomJitter),
             records: Vec::new(),
         }
+    }
+
+    /// The same manager drawing its backoff jitter from `jitter`.
+    pub fn with_jitter(mut self, jitter: Arc<dyn JitterSource>) -> Self {
+        self.jitter = jitter;
+        self
     }
 
     /// Effect records in append order.
@@ -190,15 +254,23 @@ impl AvailabilityManager {
             Some(q) if q.core().provider_id() != &obs.provider_id => {
                 return Err(AvailabilityError::QuotaProviderMismatch);
             }
-            Some(q) => q.verified_scope(),
+            Some(q) if q.model_id().is_some_and(|named| named != m) => {
+                return Err(AvailabilityError::QuotaModelMismatch);
+            }
+            // MODEL scope is proven only by a report that names this model.
+            Some(q) => match q.verified_scope() {
+                QuotaScope::Model if q.model_id().is_none() => QuotaScope::Unknown,
+                scope => scope,
+            },
             None => QuotaScope::Unknown,
         };
-        // Consecutive limits on the exact candidate raise the attempt; a quiet
-        // period of at least one window after the last one resets it.
+        // Consecutive limits on the (provider, model) raise the attempt
+        // whatever the runtime; a quiet period of two windows after the last
+        // one resets it.
         let mut attempt = 1;
         if let Some(last) = self.records.iter().rev().find(|x| {
             let c = x.core();
-            c.provider_id() == p && c.model_id() == Some(m) && c.runtime_id() == Some(r)
+            c.provider_id() == p && c.model_id() == Some(m)
         }) {
             let since = elapsed_whole_seconds(last.observed_at(), &obs.observed_at)?;
             if since < 0 {
@@ -209,9 +281,24 @@ impl AvailabilityManager {
                 attempt = note_attempt(last).saturating_add(1);
             }
         }
-        let window_seconds = obs
-            .retry_after_seconds
-            .unwrap_or_else(|| self.policy.delay_seconds(attempt));
+        // A provider's retry-after is authoritative; otherwise the backoff
+        // window is jittered inside its bounds.
+        let (window_seconds, window_note) = match obs.retry_after_seconds {
+            Some(window) => (window, "window_source=RETRY_AFTER".to_owned()),
+            None => {
+                let (low, ceiling) = self.policy.window_range(attempt);
+                let drawn = self
+                    .jitter
+                    .pick(p, m, attempt, ceiling - low)
+                    .min(ceiling - low);
+                (
+                    low + drawn,
+                    format!(
+                        "window_source=BACKOFF;backoff_ceiling={ceiling};jitter_seconds={drawn}"
+                    ),
+                )
+            }
+        };
         let record = |model: Option<&str>, runtime: Option<&str>, kind, note: String| {
             AvailabilityState::new(
                 AvailabilityStateNonTemporalCore::try_new(
@@ -228,7 +315,7 @@ impl AvailabilityManager {
             )
         };
         let note = format!(
-            "failure_class={};attempt={attempt};quota_scope={}",
+            "failure_class={};attempt={attempt};quota_scope={};{window_note}",
             obs.failure.as_str(),
             quota_scope.as_str()
         );
@@ -276,6 +363,17 @@ impl AvailabilityManager {
         let (Some(model), Some(runtime)) = (c.model_id(), c.runtime_id()) else {
             return Ok(base.clone());
         };
+        // A safety, policy or authentication refusal is its own axis: a
+        // limit never overwrites it, so it can neither turn into a WAIT nor
+        // into failover (I-12) and keeps its authoritative reason.
+        if matches!(
+            c.state(),
+            AvailabilityStateKind::SafetyCheckPending
+                | AvailabilityStateKind::PolicyBlocked
+                | AvailabilityStateKind::AuthRequired
+        ) {
+            return Ok(base.clone());
+        }
         let mut worst: Option<(u64, &AvailabilityState)> = None;
         let mut degrade = false;
         for record in self
@@ -284,12 +382,13 @@ impl AvailabilityManager {
             .filter(|x| covers(x, c.provider_id(), model, runtime))
         {
             let elapsed = elapsed_whole_seconds(record.observed_at(), now)?;
-            let window = window_of(record);
-            let remaining = (window as i64).saturating_sub(elapsed.max(0));
+            // Unsigned throughout: a window of any u64 stays active for as
+            // long as it really lasts and never wraps into the past.
+            let remaining = window_of(record).saturating_sub(elapsed.max(0).unsigned_abs());
             let kind = record.core().state();
             if remaining > 0 && is_limit(kind) {
-                if worst.is_none_or(|(w, _)| remaining as u64 > w) {
-                    worst = Some((remaining as u64, record));
+                if worst.is_none_or(|(w, _)| remaining > w) {
+                    worst = Some((remaining, record));
                 }
             } else if remaining > 0
                 || (is_limit(kind)
@@ -349,11 +448,19 @@ impl AvailabilityManager {
                 decode_availability_state(r.record_json()).map_err(RoutingPersistError::Decode)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { policy, records })
+        Ok(Self {
+            policy,
+            jitter: Arc::new(RandomJitter),
+            records,
+        })
     }
 
-    /// Persists an assessed effect (records, events and the D5 demotion
-    /// fact), then commits it. Holds and non-signals persist nothing.
+    /// Persists an assessed effect — every record, its event and the D5
+    /// demotion fact — as ONE publication, then commits it. The manager
+    /// advances only after the port reports success, so a failed publish
+    /// leaves memory equal to what a restart rebuilds, and the identical call
+    /// retried after a lost acknowledgement returns the original receipts
+    /// without a second demotion fact. Holds and non-signals persist nothing.
     pub fn persist_and_commit<P: RoutingStatePort>(
         &mut self,
         port: &mut P,
@@ -363,10 +470,9 @@ impl AvailabilityManager {
         let ObservationEffect::Limited { records, state, .. } = effect else {
             return Ok(PersistedAvailability::default());
         };
-        let mut out = PersistedAvailability::default();
-        let mut sequence = self.records.len();
+        let mut publication = Publication::default();
         for (i, record) in records.iter().enumerate() {
-            sequence += 1;
+            let sequence = self.records.len() + i + 1;
             let stored = DecisionRecordV1::parse(
                 &scope.project_id,
                 DecisionRecordKind::AvailabilityObservation,
@@ -381,7 +487,7 @@ impl AvailabilityManager {
             } else {
                 EventType::RateLimitObserved
             };
-            let proposal = routing_proposal(
+            publication.events.push(record_event(
                 scope,
                 event,
                 EventSubject {
@@ -390,15 +496,9 @@ impl AvailabilityManager {
                 },
                 &stored,
                 stored.record_id(),
-            )?;
-            out.events
-                .extend(crate::persistence::persist_record_with_events(
-                    port,
-                    &stored,
-                    &[proposal],
-                )?);
+            )?);
             if i == 0 {
-                let fact = AvailabilityFactV1::new(
+                publication.fact = Some(AvailabilityFactV1::new(
                     scope.project_id.clone(),
                     core.provider_id().to_owned(),
                     core.runtime_id().unwrap_or_default().to_owned(),
@@ -406,17 +506,19 @@ impl AvailabilityManager {
                     AvailabilityFactKindV1::Demotion,
                     state.as_str().to_owned(),
                     AvailabilityFactSourceV1::RuntimeFailureClass,
-                    crate::persistence::record_reference(&stored),
+                    record_reference(&stored),
                     None,
-                )?;
-                out.demotion = Some(
-                    port.append_availability_fact(&fact)
-                        .map_err(RoutingPersistError::Port)?,
-                );
+                )?);
             }
+            publication.records.push(stored);
         }
+        let receipt = publish(port, &publication)?;
         self.commit(effect);
-        Ok(out)
+        Ok(PersistedAvailability {
+            events: receipt.events,
+            demotion: receipt.fact,
+            replayed: receipt.replayed,
+        })
     }
 }
 
@@ -426,6 +528,8 @@ pub struct PersistedAvailability {
     pub events: Vec<EventPersistReceiptV1>,
     /// The D5 demotion fact for the exact candidate.
     pub demotion: Option<AvailabilityFactReceiptV1>,
+    /// This was an exact retry of an effect already made durable.
+    pub replayed: bool,
 }
 
 fn note_attempt(record: &AvailabilityState) -> u32 {

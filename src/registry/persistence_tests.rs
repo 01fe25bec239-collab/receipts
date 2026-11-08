@@ -2,11 +2,12 @@ use receipts_runtime_adapters::{
     CapabilityStatus, CodexCapabilityEvidence, CodexCapabilityProbeReport,
     ExtensionCapabilityReport, RuntimeCapabilities,
 };
-use receipts_state::{DecisionRecordKind, EventProposalOriginV1};
+use receipts_state::{DecisionRecordKind, EventProposalOriginV1, EventQuery, EventType};
 
 use super::*;
 use crate::persistence::{
     RoutingPersistError, RoutingStatePort, fallback_chain_length, load_decision, persist_decision,
+    persist_request, request_reference, sha256_hex,
 };
 use crate::test_state::*;
 
@@ -281,7 +282,11 @@ fn decisions_persist_explain_and_link_failover_chains() {
     };
     let first = w.route(&request(Some("task-1")));
     let receipts = persist_decision(&mut core, &CoreHarness::scope(), &first).unwrap();
-    assert_eq!(receipts.len(), 2, "ROUTING_DECIDED + EXECUTOR_SELECTED");
+    assert_eq!(
+        receipts.events.len(),
+        2,
+        "ROUTING_DECIDED + EXECUTOR_SELECTED"
+    );
     let none = std::collections::BTreeMap::new();
     let second = w
         .route_with(
@@ -294,11 +299,11 @@ fn decisions_persist_explain_and_link_failover_chains() {
         .unwrap()
         .decision;
     persist_decision(&mut core, &CoreHarness::scope(), &second).unwrap();
-    // Decisions are immutable: the same id cannot be written twice.
-    assert!(matches!(
-        persist_decision(&mut core, &CoreHarness::scope(), &first),
-        Err(RoutingPersistError::Port(_))
-    ));
+    // Decisions are immutable: an exact retry returns the original receipts,
+    // a different decision under the same id is refused.
+    let again = persist_decision(&mut core, &CoreHarness::scope(), &first).unwrap();
+    assert!(again.replayed);
+    assert_eq!(again.events, receipts.events);
     let untasked = w.route(&request(None));
     assert!(matches!(
         persist_decision(&mut core, &CoreHarness::scope(), &untasked),
@@ -326,8 +331,391 @@ fn decisions_persist_explain_and_link_failover_chains() {
     );
     let receipt = core
         .reader()
-        .find_event_receipt(&receipts[0].event_id)
+        .find_event_receipt(&receipts.events[0].event_id)
         .unwrap()
         .unwrap();
     assert_eq!(receipt.origin, EventProposalOriginV1::Routing);
+}
+
+// ---- repair: atomic publication of registry changes and decisions (F1) ----------
+
+fn provider(name: &str) -> ProviderId {
+    ids(name, "m", "r").0
+}
+
+fn fresh() -> Observation {
+    obs(EvidenceConfidence::Unverified, FRESH)
+}
+
+fn empty_registry() -> Registry {
+    PersistentRegistry::new(PROJECT).registry().clone()
+}
+
+#[test]
+fn failed_registry_publication_leaves_live_and_restarted_state_equal_and_retryable() {
+    let mut core = CoreHarness::new("registry-rollback");
+    let scope = CoreHarness::scope();
+    let mut reg = PersistentRegistry::new(PROJECT);
+
+    core.arm(Fault::Rollback);
+    assert!(matches!(
+        reg.insert_provider(&mut core, &scope, provider("prov-a"), fresh()),
+        Err(RegistryPersistError::Persist(RoutingPersistError::Port(
+            HarnessError::Rolled
+        )))
+    ));
+    assert_eq!(reg.registry(), &empty_registry(), "memory did not advance");
+    assert_eq!(stored(&core), 0);
+    assert_eq!(core.events(&[]), 0, "no record without its event");
+    core.reopen();
+    assert_eq!(
+        PersistentRegistry::reload::<()>(core.reader(), PROJECT)
+            .unwrap()
+            .registry(),
+        reg.registry(),
+        "restart agrees with live"
+    );
+
+    // The same call, retried, now succeeds exactly once (not AlreadyExists).
+    reg.insert_provider(&mut core, &scope, provider("prov-a"), fresh())
+        .unwrap();
+    assert_eq!(
+        (stored(&core), core.events(&[EventType::RegistryRefreshed])),
+        (1, 1)
+    );
+    core.reopen();
+    assert_eq!(
+        PersistentRegistry::reload::<()>(core.reader(), PROJECT)
+            .unwrap()
+            .registry(),
+        reg.registry()
+    );
+}
+
+#[test]
+fn lost_registry_acknowledgement_is_recovered_by_the_identical_retry() {
+    let mut core = CoreHarness::new("registry-ack");
+    let scope = CoreHarness::scope();
+    let mut reg = PersistentRegistry::new(PROJECT);
+
+    core.arm(Fault::AckLost);
+    assert!(
+        reg.insert_provider(&mut core, &scope, provider("prov-a"), fresh())
+            .is_err()
+    );
+    // The change is durable with its event; live memory is simply behind.
+    assert_eq!((stored(&core), core.events(&[])), (1, 1));
+    assert_eq!(reg.registry(), &empty_registry());
+
+    let receipt = reg
+        .insert_provider(&mut core, &scope, provider("prov-a"), fresh())
+        .unwrap();
+    assert_eq!(
+        (stored(&core), core.events(&[])),
+        (1, 1),
+        "nothing duplicated"
+    );
+    assert!(
+        core.reader()
+            .find_event_receipt(&receipt.event_id)
+            .unwrap()
+            .is_some(),
+        "the original event's receipt"
+    );
+    core.reopen();
+    assert_eq!(
+        PersistentRegistry::reload::<()>(core.reader(), PROJECT)
+            .unwrap()
+            .registry(),
+        reg.registry(),
+        "live equals restarted"
+    );
+}
+
+#[test]
+fn conflicting_registry_retry_is_refused_and_writes_nothing() {
+    let mut core = CoreHarness::new("registry-conflict");
+    let scope = CoreHarness::scope();
+    let mut reg = PersistentRegistry::new(PROJECT);
+    core.arm(Fault::AckLost);
+    assert!(
+        reg.insert_provider(&mut core, &scope, provider("prov-a"), fresh())
+            .is_err()
+    );
+    // A DIFFERENT change aimed at the stored sequence is not a retry.
+    assert!(matches!(
+        reg.insert_provider(&mut core, &scope, provider("prov-b"), fresh()),
+        Err(RegistryPersistError::Persist(RoutingPersistError::Port(
+            HarnessError::Conflict
+        )))
+    ));
+    assert_eq!((stored(&core), core.events(&[])), (1, 1));
+    assert_eq!(reg.registry(), &empty_registry());
+    // Recovery path: reload what the store really holds and continue.
+    let mut reloaded = PersistentRegistry::reload::<HarnessError>(core.reader(), PROJECT).unwrap();
+    assert!(reloaded.registry().provider("prov-a").is_some());
+    reloaded
+        .insert_provider(&mut core, &scope, provider("prov-b"), fresh())
+        .unwrap();
+    assert_eq!((stored(&core), core.events(&[])), (2, 2));
+}
+
+#[test]
+fn a_probe_report_is_one_publication_never_partly_recorded() {
+    let mut core = CoreHarness::new("registry-probe-atomic");
+    let scope = CoreHarness::scope();
+    let mut reg = persist_ops(&mut core, &specs());
+    let (p, _, r) = ids("prov-a", "model-a", "rt-a");
+    let probe = RuntimeCapabilities::Codex(CodexCapabilityProbeReport {
+        version: "synthetic".into(),
+        json: CodexCapabilityEvidence::Supported,
+        output_schema: CodexCapabilityEvidence::Unknown,
+        sandbox: CodexCapabilityEvidence::Supported,
+    });
+    let (count, events) = (stored(&core), core.events(&[]));
+    let before = reg.registry().clone();
+
+    core.arm(Fault::Rollback);
+    assert!(
+        reg.record_runtime_probe(&mut core, &scope, &p, &r, &probe, ts(FRESH), source())
+            .is_err()
+    );
+    assert_eq!((stored(&core), core.events(&[])), (count, events));
+    assert_eq!(reg.registry(), &before);
+
+    core.arm(Fault::AckLost);
+    assert!(
+        reg.record_runtime_probe(&mut core, &scope, &p, &r, &probe, ts(FRESH), source())
+            .is_err()
+    );
+    assert_eq!((stored(&core), core.events(&[])), (count + 3, events + 3));
+    let receipts = reg
+        .record_runtime_probe(&mut core, &scope, &p, &r, &probe, ts(FRESH), source())
+        .unwrap();
+    assert_eq!(receipts.len(), 3);
+    assert_eq!((stored(&core), core.events(&[])), (count + 3, events + 3));
+    core.reopen();
+    assert_eq!(
+        PersistentRegistry::reload::<()>(core.reader(), PROJECT)
+            .unwrap()
+            .registry(),
+        reg.registry()
+    );
+}
+
+fn routing_request(task: Option<&str>) -> crate::RoutingRequest {
+    crate::RoutingRequest::new(
+        crate::RoutingRequestNonTemporalCore::try_new(
+            "request-1".into(),
+            task.map(str::to_owned),
+            crate::RoutingRequestRole::Implementer,
+            crate::RoutingTaskClass::FrontierImplementation,
+            crate::RoutingQualityFloor::Frontier,
+            vec!["coding".into()],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap(),
+        None,
+    )
+}
+
+#[test]
+fn decision_events_are_all_or_nothing_and_retry_exactly() {
+    let mut core = CoreHarness::new("decision-atomic");
+    let scope = CoreHarness::scope();
+    let w = crate::router_tests::world(&specs());
+    let first = w.route(&routing_request(Some("task-1")));
+    let selected = [EventType::RoutingDecided, EventType::ExecutorSelected];
+    let decisions = |c: &CoreHarness| c.records(DecisionRecordKind::RoutingDecision);
+
+    // The second SELECTED event cannot fail alone: ROUTING_DECIDED,
+    // EXECUTOR_SELECTED and the record are all absent, and the caller holds
+    // no half-result.
+    core.arm(Fault::Rollback);
+    assert!(persist_decision(&mut core, &scope, &first).is_err());
+    assert_eq!((decisions(&core), core.events(&selected)), (0, 0));
+
+    // Lost acknowledgement: all three are durable; the retry returns BOTH
+    // original receipts and adds nothing.
+    core.arm(Fault::AckLost);
+    assert!(persist_decision(&mut core, &scope, &first).is_err());
+    assert_eq!((decisions(&core), core.events(&selected)), (1, 2));
+    let retried = persist_decision(&mut core, &scope, &first).unwrap();
+    assert!(retried.replayed);
+    assert_eq!(retried.events.len(), 2);
+    assert_eq!((decisions(&core), core.events(&selected)), (1, 2));
+    core.reopen();
+    assert_eq!(
+        load_decision(core.reader(), PROJECT, "decision-1")
+            .unwrap()
+            .unwrap(),
+        first
+    );
+    assert_eq!(core.events(&selected), 2);
+
+    // A different decision under the same id is a conflict: refused, nothing
+    // written.
+    let conflicting = w
+        .route_with(
+            &routing_request(Some("task-1")),
+            0,
+            &std::collections::BTreeMap::new(),
+            "decision-1",
+            Some("decision-0".into()),
+        )
+        .unwrap()
+        .decision;
+    assert!(matches!(
+        persist_decision(&mut core, &scope, &conflicting),
+        Err(RoutingPersistError::Port(HarnessError::Conflict))
+    ));
+    assert_eq!((decisions(&core), core.events(&selected)), (1, 2));
+}
+
+// ---- repair: ROUTING_REQUESTED through an admitted request reference (F7) ----------
+
+#[test]
+fn routing_requested_is_published_from_the_admitted_request_content() {
+    let mut core = CoreHarness::new("routing-requested");
+    let scope = CoreHarness::scope();
+    let request = routing_request(Some("task-1"));
+    let requested = [EventType::RoutingRequested];
+
+    // Not admitted by the composition's resolver: nothing is persisted.
+    assert!(matches!(
+        persist_request(&mut core, &scope, &request),
+        Err(RoutingPersistError::Port(HarnessError::ContentMismatch))
+    ));
+    assert_eq!(core.events(&requested), 0);
+
+    core.admit_request(PROJECT, &request);
+    let receipt = persist_request(&mut core, &scope, &request).unwrap();
+    assert_eq!(receipt.events.len(), 1);
+    assert_eq!(receipt.events[0].origin, EventProposalOriginV1::Routing);
+    let event = core
+        .reader()
+        .list_events(&EventQuery {
+            project_id: PROJECT.into(),
+            subject: None,
+            event_types: Some(requested.to_vec()),
+            limit: 10,
+        })
+        .unwrap()
+        .remove(0);
+    let body = crate::wire::encode_routing_request(&request);
+    assert_eq!(event.payload.reference, request_reference("request-1"));
+    assert_eq!(
+        event.payload.digest,
+        format!("sha256:{}", sha256_hex(body.as_bytes()))
+    );
+    assert_eq!(
+        (event.subject.id.as_str(), event.correlation_id.as_str()),
+        ("task-1", "request-1")
+    );
+
+    // An exact retry is the same receipt; nothing is duplicated.
+    let again = persist_request(&mut core, &scope, &request).unwrap();
+    assert!(again.replayed);
+    assert_eq!(again.events, receipt.events);
+    assert_eq!(core.events(&requested), 1);
+
+    // Another project cannot ride on this admission; a request whose body
+    // differs from the admitted one is refused; so is one without a task.
+    let other_project = crate::persistence::EventScope {
+        project_id: "project-other".into(),
+        ..CoreHarness::scope()
+    };
+    assert!(matches!(
+        persist_request(&mut core, &other_project, &request),
+        Err(RoutingPersistError::Port(HarnessError::ContentMismatch))
+    ));
+    let altered = crate::RoutingRequest::new(
+        crate::RoutingRequestNonTemporalCore::try_new(
+            "request-1".into(),
+            Some("task-1".into()),
+            crate::RoutingRequestRole::Implementer,
+            crate::RoutingTaskClass::FrontierImplementation,
+            crate::RoutingQualityFloor::Frontier,
+            vec!["coding".into(), "extra".into()],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap(),
+        None,
+    );
+    assert!(matches!(
+        persist_request(&mut core, &scope, &altered),
+        Err(RoutingPersistError::Port(HarnessError::ContentMismatch))
+    ));
+    assert!(matches!(
+        persist_request(&mut core, &scope, &routing_request(None)),
+        Err(RoutingPersistError::TaskIdRequired)
+    ));
+    assert_eq!(core.events(&requested), 1);
+
+    // The request event precedes the decision it asked for.
+    let w = crate::router_tests::world(&specs());
+    persist_decision(&mut core, &scope, &w.route(&request)).unwrap();
+    let all = core
+        .reader()
+        .list_events(&EventQuery {
+            project_id: PROJECT.into(),
+            subject: None,
+            event_types: None,
+            limit: 10,
+        })
+        .unwrap();
+    let kinds: Vec<_> = all.iter().map(|e| e.event_type).collect();
+    let at = |t| kinds.iter().position(|k| *k == t).unwrap();
+    assert!(at(EventType::RoutingRequested) < at(EventType::RoutingDecided));
+}
+
+#[test]
+fn sha256_matches_the_standard_vectors_and_state_digests() {
+    for (input, expected) in [
+        (
+            "",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ),
+        (
+            "abc",
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        ),
+        (
+            "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+        ),
+    ] {
+        assert_eq!(sha256_hex(input.as_bytes()), expected, "{input:?}");
+    }
+    assert_eq!(
+        sha256_hex(&vec![b'a'; 1_000_000]),
+        "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+    );
+    // 55, 56, 63, 64 and 65 bytes straddle the padding boundaries.
+    for n in [55, 56, 63, 64, 65, 119, 120, 128] {
+        let bytes: Vec<u8> = (0..n as u8).collect();
+        let _ = sha256_hex(&bytes);
+    }
+    // State computes record digests with its own SHA-256: they must agree.
+    let w = crate::router_tests::world(&specs());
+    let decision = w.route(&routing_request(Some("task-1")));
+    let record = receipts_state::DecisionRecordV1::parse(
+        PROJECT,
+        DecisionRecordKind::RoutingDecision,
+        decision.decision_id(),
+        &crate::wire::encode_routing_decision(&decision),
+    )
+    .unwrap();
+    assert_eq!(
+        sha256_hex(record.record_json().as_bytes()),
+        record.record_sha256()
+    );
 }

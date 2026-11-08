@@ -4,7 +4,7 @@
 //! Every successful registry change is one immutable State `ModelCapability`
 //! record (`REGISTRY_CAPABILITY`, storage id `registry-<20-digit sequence>`,
 //! so State's binary id order is append order) plus one Routing event
-//! proposal. Capability evidence is stored as itself. Structure and lifecycle
+//! proposal; a probe report publishes all its entries together. Capability evidence is stored as itself. Structure and lifecycle
 //! changes use the reserved `receipts.registry.*` capability names:
 //!
 //! | change | subject_kind / ids | capability | value / lifecycle_state |
@@ -17,8 +17,11 @@
 //!
 //! Reload replays the records through [`ModelIntelligenceService`], so every
 //! invariant is re-checked and the reloaded registry equals the one written.
-//! Each change is validated on a copy first; nothing is committed in memory
-//! unless State accepted the record.
+//! Each change is validated on a copy first and published (record + event)
+//! as one atomic [`Publication`]; memory advances only after the port reports
+//! success, so a refused or failed publish leaves live and restarted state
+//! equal, and repeating the identical call after a lost acknowledgement
+//! returns the original receipt.
 
 use receipts_runtime_adapters::{
     CapabilityStatus, ClaudeCapabilityEvidence, CodexCapabilityEvidence, RuntimeCapabilities,
@@ -32,7 +35,7 @@ use serde_json::{Value, json};
 use super::*;
 use crate::intelligence::DemotionReason;
 use crate::persistence::{
-    EventScope, RoutingPersistError, RoutingStatePort, persist_record_with_events, routing_proposal,
+    EventScope, Publication, RoutingPersistError, RoutingStatePort, publish, record_event,
 };
 use crate::wire::{decode_model_capability, encode_model_capability};
 
@@ -319,6 +322,56 @@ impl PersistentRegistry {
         self.service.registry()
     }
 
+    /// Persists `changes` (validated in order on a copy) as ONE publication:
+    /// all records and events become durable together or not at all. Memory
+    /// advances only after the port reports success, so a failed publish
+    /// leaves the live registry equal to what a restart would rebuild; the
+    /// identical call retried after a lost acknowledgement returns the
+    /// original receipts.
+    fn append_all<P: RoutingStatePort>(
+        &mut self,
+        port: &mut P,
+        scope: &EventScope,
+        changes: Vec<(ModelCapabilityRecord, EventType)>,
+    ) -> Result<Vec<EventPersistReceiptV1>, RegistryPersistError<P::Error>> {
+        if changes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut next = ModelIntelligenceService {
+            registry: self.service.registry.clone(),
+        };
+        let mut publication = Publication::default();
+        for (offset, (record, event)) in changes.iter().enumerate() {
+            if replay(&mut next, record).is_none() {
+                return Err(RegistryPersistError::ReplayMismatch);
+            }
+            let stored = DecisionRecordV1::parse(
+                &self.project_id,
+                DecisionRecordKind::RegistryCapability,
+                &format!("registry-{:020}", self.next_sequence + offset as u64),
+                &encode_model_capability(record),
+            )
+            .map_err(|e| RegistryPersistError::Persist(RoutingPersistError::State(e)))?;
+            let event = record_event(
+                scope,
+                *event,
+                EventSubject {
+                    kind: StateSubjectKind::Provider,
+                    id: record.provider_id().unwrap_or_default().to_owned(),
+                },
+                &stored,
+                stored.record_id(),
+            )
+            .map_err(|e| RegistryPersistError::Persist(RoutingPersistError::State(e)))?;
+            publication.events.push(event);
+            publication.records.push(stored);
+        }
+        let receipt = publish(port, &publication)?;
+        self.service = next;
+        self.next_sequence += changes.len() as u64;
+        Ok(receipt.events)
+    }
+
     fn append<P: RoutingStatePort>(
         &mut self,
         port: &mut P,
@@ -326,37 +379,10 @@ impl PersistentRegistry {
         record: ModelCapabilityRecord,
         event: EventType,
     ) -> Result<EventPersistReceiptV1, RegistryPersistError<P::Error>> {
-        let mut next = ModelIntelligenceService {
-            registry: self.service.registry.clone(),
-        };
-        if replay(&mut next, &record).is_none() {
-            return Err(RegistryPersistError::ReplayMismatch);
-        }
-        let stored = DecisionRecordV1::parse(
-            &self.project_id,
-            DecisionRecordKind::RegistryCapability,
-            &format!("registry-{:020}", self.next_sequence),
-            &encode_model_capability(&record),
-        )
-        .map_err(|e| RegistryPersistError::Persist(RoutingPersistError::State(e)))?;
-        let provider = record.provider_id().unwrap_or_default().to_owned();
-        let proposal = routing_proposal(
-            scope,
-            event,
-            EventSubject {
-                kind: StateSubjectKind::Provider,
-                id: provider,
-            },
-            &stored,
-            stored.record_id(),
-        )
-        .map_err(|e| RegistryPersistError::Persist(RoutingPersistError::State(e)))?;
-        let receipt = persist_record_with_events(port, &stored, &[proposal])?
+        Ok(self
+            .append_all(port, scope, vec![(record, event)])?
             .pop()
-            .expect("one proposal, one receipt");
-        self.service = next;
-        self.next_sequence += 1;
-        Ok(receipt)
+            .expect("one change, one receipt"))
     }
 
     pub fn insert_provider<P: RoutingStatePort>(
@@ -523,29 +549,40 @@ impl PersistentRegistry {
         {
             return Err(RegistryPersistError::ProbeRuntimeMismatch);
         }
-        probe_entries(report)
+        let evidence: Vec<_> = probe_entries(report)
             .into_iter()
-            .map(|(name, value)| {
-                self.record_capability(
-                    port,
-                    scope,
-                    CapabilityEvidence {
-                        subject: CapabilitySubject::Runtime {
-                            provider_id: provider_id.clone(),
-                            runtime_id: runtime_id.clone(),
-                        },
-                        capability: CapabilityId::try_new(name).expect("non-empty"),
-                        value: Some(value),
-                        observation: Observation {
-                            confidence: EvidenceConfidence::LocalEmpirical,
-                            source_ref: Some(source_ref.clone()),
-                            observed_at: observed_at.clone(),
-                        },
-                        sample_size: None,
-                    },
+            .map(|(name, value)| CapabilityEvidence {
+                subject: CapabilitySubject::Runtime {
+                    provider_id: provider_id.clone(),
+                    runtime_id: runtime_id.clone(),
+                },
+                capability: CapabilityId::try_new(name).expect("non-empty"),
+                value: Some(value),
+                observation: Observation {
+                    confidence: EvidenceConfidence::LocalEmpirical,
+                    source_ref: Some(source_ref.clone()),
+                    observed_at: observed_at.clone(),
+                },
+                sample_size: None,
+            })
+            .collect();
+        // The whole report is one publication: it is accepted entirely or
+        // not at all, so a retry can never duplicate part of it.
+        self.service.clone_check(|s| {
+            evidence
+                .iter()
+                .try_for_each(|e| s.record_capability(e.clone()))
+        })?;
+        let changes = evidence
+            .iter()
+            .map(|e| {
+                (
+                    ModelCapabilityRecord::from_evidence(e),
+                    EventType::RegistryRefreshed,
                 )
             })
-            .collect()
+            .collect();
+        self.append_all(port, scope, changes)
     }
 }
 

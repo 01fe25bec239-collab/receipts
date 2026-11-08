@@ -12,14 +12,20 @@
 //! ModelObservation, AvailabilityState) are also admitted by State's strict
 //! schema validator, which refuses duplicate keys at every depth.
 //!
-//! Absent and explicit null stay distinct. Numbers are bounded carriers
-//! (u64/i64/finite f64), not arbitrary-precision lexemes; encoding writes
-//! sorted keys, so `encode(decode(canonical)) == canonical`. Decoding grants
-//! no routing, dispatch or persistence authority.
+//! Absent and explicit null stay distinct. Numbers are judged on their exact
+//! value and then held exactly by a bounded carrier (u64/i64/finite f64): a
+//! schema-valid number the carrier cannot hold exactly (`1e400`, `2^64`,
+//! `9007199254740993` as an f64, `1e-400`) is `Refused`, never rounded and
+//! never reported as malformed (see `number`). Encoding writes sorted keys,
+//! so `encode(decode(canonical)) == canonical`. Decoding grants no routing,
+//! dispatch or persistence authority.
 
 use serde::de::{Deserializer, IgnoredAny};
 use serde::{Deserialize, de::DeserializeOwned};
+use serde_json::value::RawValue;
 use serde_json::{Map, Number, Value};
+
+use self::number::{float, int, lift, open, uint, unit_float};
 
 use crate::intelligence::LifecycleState;
 use crate::policy_eligibility::{
@@ -39,6 +45,9 @@ use crate::{
 };
 use receipts_state::{DecisionRecordKind, DecisionRecordV1};
 
+mod number;
+#[cfg(test)]
+mod number_tests;
 #[cfg(test)]
 mod tests;
 
@@ -82,9 +91,10 @@ fn non_null<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Opti
     T::deserialize(d).map(Some)
 }
 
-/// Any JSON value, keeping explicit null distinct from absence.
-fn any_value<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
-    Value::deserialize(d).map(Some)
+/// Any JSON value as its raw token, keeping explicit null distinct from
+/// absence and every number's exact spelling.
+fn any_value<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Box<RawValue>>, D::Error> {
+    Box::<RawValue>::deserialize(d).map(Some)
 }
 
 fn parse<T: DeserializeOwned>(json: &str, schema: &'static str) -> R<T> {
@@ -113,25 +123,6 @@ fn time(text: String, field: &'static str) -> R<ModelRoutingDateTimeV1> {
 fn length_ok(value: &str, min: usize, max: Option<usize>) -> bool {
     let n = value.chars().count();
     n >= min && max.is_none_or(|max| n <= max)
-}
-
-/// A JSON-Schema integer is a number with no fractional part; anything else
-/// is a shape error. An integral value the carrier cannot hold exactly
-/// (`1.0`, beyond the u64/i64 range) is refused instead.
-fn integral(value: &Value, schema: &'static str) -> R<()> {
-    match value.as_f64() {
-        Some(f) if value.is_number() && f.fract() == 0.0 => Ok(()),
-        _ => Err(RoutingWireError::Shape(schema)),
-    }
-}
-
-/// `minimum: 0` integer (negatives are a shape error).
-fn bounded_u64(value: &Value, schema: &'static str, field: &'static str) -> R<u64> {
-    integral(value, schema)?;
-    if value.as_f64().is_some_and(|f| f < 0.0) {
-        return Err(RoutingWireError::Shape(schema));
-    }
-    value.as_u64().ok_or(RoutingWireError::Refused(field))
 }
 
 // ---- encode helpers --------------------------------------------------------
@@ -190,7 +181,7 @@ struct RequestDto {
     #[serde(default, deserialize_with = "non_null")]
     constraints: Option<ConstraintsDto>,
     #[serde(default, deserialize_with = "nullable")]
-    context_size_hint: Option<Option<Value>>,
+    context_size_hint: Option<Option<Box<RawValue>>>,
     #[serde(default, deserialize_with = "nullable")]
     deadline: Option<Option<String>>,
 }
@@ -207,7 +198,7 @@ struct ConstraintsDto {
     #[serde(default, deserialize_with = "non_null")]
     user_pinned_provider: Option<String>,
     #[serde(default, deserialize_with = "nullable")]
-    max_cost: Option<Option<f64>>,
+    max_cost: Option<Option<Box<RawValue>>>,
 }
 
 const REQ: &str = "RoutingRequest";
@@ -247,16 +238,12 @@ pub fn decode_routing_request(json: &str) -> R<RoutingRequest> {
                 c.avoid_providers,
                 c.user_pinned_model,
                 c.user_pinned_provider,
-                c.max_cost,
+                lift(c.max_cost, |r| float(r, REQ, "max_cost"))?,
             )
             .map_err(|_| RoutingWireError::Refused("constraints"))
         })
         .transpose()?;
-    let context_size_hint = match d.context_size_hint {
-        None => None,
-        Some(None) => Some(None),
-        Some(Some(v)) => Some(Some(bounded_u64(&v, REQ, "context_size_hint")?)),
-    };
+    let context_size_hint = lift(d.context_size_hint, |r| uint(r, REQ, "context_size_hint"))?;
     let core = RoutingRequestNonTemporalCore::try_new(
         d.request_id,
         d.task_id,
@@ -373,33 +360,20 @@ fn confidence(text: &str, schema: &'static str) -> R<EvidenceConfidence> {
 
 /// `minimum: 0` integer, nullable; absent/null kept.
 fn non_negative(
-    v: Option<Option<Value>>,
+    v: Option<Option<Box<RawValue>>>,
     schema: &'static str,
     field: &'static str,
 ) -> R<Option<Option<u64>>> {
-    match v {
-        None => Ok(None),
-        Some(None) => Ok(Some(None)),
-        Some(Some(v)) => Ok(Some(Some(bounded_u64(&v, schema, field)?))),
-    }
+    lift(v, |r| uint(r, schema, field))
 }
 
 /// Signed nullable integer with no minimum.
 fn signed(
-    v: Option<Option<Value>>,
+    v: Option<Option<Box<RawValue>>>,
     schema: &'static str,
     field: &'static str,
 ) -> R<Option<Option<i64>>> {
-    match v {
-        None => Ok(None),
-        Some(None) => Ok(Some(None)),
-        Some(Some(v)) => {
-            integral(&v, schema)?;
-            v.as_i64()
-                .map(|n| Some(Some(n)))
-                .ok_or(RoutingWireError::Refused(field))
-        }
-    }
+    lift(v, |r| int(r, schema, field))
 }
 
 // ---- RoutingDecision --------------------------------------------------------
@@ -459,15 +433,15 @@ struct ReasonDto {
 #[serde(deny_unknown_fields)]
 struct ScoreDto {
     #[serde(default, deserialize_with = "nullable")]
-    expected_implementation_cost: Option<Option<f64>>,
+    expected_implementation_cost: Option<Option<Box<RawValue>>>,
     #[serde(default, deserialize_with = "nullable")]
-    expected_rejection_probability: Option<Option<f64>>,
+    expected_rejection_probability: Option<Option<Box<RawValue>>>,
     #[serde(default, deserialize_with = "nullable")]
-    expected_repair_cost: Option<Option<f64>>,
+    expected_repair_cost: Option<Option<Box<RawValue>>>,
     #[serde(default, deserialize_with = "nullable")]
-    expected_review_cost: Option<Option<f64>>,
+    expected_review_cost: Option<Option<Box<RawValue>>>,
     #[serde(default, deserialize_with = "nullable")]
-    latency_estimate_seconds: Option<Option<f64>>,
+    latency_estimate_seconds: Option<Option<Box<RawValue>>>,
 }
 
 #[derive(Deserialize)]
@@ -475,14 +449,14 @@ struct ScoreDto {
 struct EvidenceDto {
     capability: String,
     #[serde(default, deserialize_with = "any_value")]
-    value: Option<Value>,
+    value: Option<Box<RawValue>>,
     confidence: String,
     #[serde(default, deserialize_with = "non_null")]
     source_ref: Option<SourceRefDto>,
     #[serde(default, deserialize_with = "non_null")]
     observed_at: Option<String>,
     #[serde(default, deserialize_with = "nullable")]
-    sample_size: Option<Option<Value>>,
+    sample_size: Option<Option<Box<RawValue>>>,
 }
 
 #[derive(Deserialize)]
@@ -492,7 +466,7 @@ struct AlternativeDto {
     model_id: String,
     runtime_id: String,
     #[serde(default, deserialize_with = "nullable")]
-    score: Option<Option<f64>>,
+    score: Option<Option<Box<RawValue>>>,
     rejection_reason: String,
 }
 
@@ -500,11 +474,11 @@ struct AlternativeDto {
 #[serde(deny_unknown_fields)]
 struct FreshnessDto {
     #[serde(default, deserialize_with = "nullable")]
-    model_list_age_seconds: Option<Option<Value>>,
+    model_list_age_seconds: Option<Option<Box<RawValue>>>,
     #[serde(default, deserialize_with = "nullable")]
-    capability_age_seconds: Option<Option<Value>>,
+    capability_age_seconds: Option<Option<Box<RawValue>>>,
     #[serde(default, deserialize_with = "nullable")]
-    calibration_sample_size: Option<Option<Value>>,
+    calibration_sample_size: Option<Option<Box<RawValue>>>,
     stale: bool,
 }
 
@@ -535,12 +509,18 @@ pub fn decode_routing_decision(json: &str) -> R<RoutingDecisionNonTemporalCore> 
             let score = r
                 .score_components
                 .map(|s| {
+                    let number = |v, field| lift(v, |r| float(r, DEC, field));
                     RoutingScoreComponents::try_new(
-                        s.expected_implementation_cost,
-                        s.expected_rejection_probability,
-                        s.expected_repair_cost,
-                        s.expected_review_cost,
-                        s.latency_estimate_seconds,
+                        number(
+                            s.expected_implementation_cost,
+                            "expected_implementation_cost",
+                        )?,
+                        lift(s.expected_rejection_probability, |r| {
+                            unit_float(r, DEC, "expected_rejection_probability")
+                        })?,
+                        number(s.expected_repair_cost, "expected_repair_cost")?,
+                        number(s.expected_review_cost, "expected_review_cost")?,
+                        number(s.latency_estimate_seconds, "latency_estimate_seconds")?,
                     )
                     .map_err(|_| RoutingWireError::Shape(DEC))
                 })
@@ -570,7 +550,7 @@ pub fn decode_routing_decision(json: &str) -> R<RoutingDecisionNonTemporalCore> 
                         non_negative(e.sample_size, DEC, "sample_size")?,
                     );
                     Ok(match e.value {
-                        Some(v) => core.with_value(v),
+                        Some(v) => core.with_value(open(&v, "capability_evidence.value")?),
                         None => core,
                     })
                 })
@@ -583,11 +563,12 @@ pub fn decode_routing_decision(json: &str) -> R<RoutingDecisionNonTemporalCore> 
             items
                 .into_iter()
                 .map(|a| {
+                    let score = lift(a.score, |r| float(r, DEC, "score"))?;
                     AlternativeCandidate::try_new(
                         a.provider_id,
                         a.model_id,
                         a.runtime_id,
-                        a.score,
+                        score,
                         a.rejection_reason,
                     )
                     .map_err(|_| RoutingWireError::Shape(DEC))
@@ -769,7 +750,7 @@ struct AvailabilityDto {
     runtime_id: Option<String>,
     state: String,
     #[serde(default, deserialize_with = "nullable")]
-    retry_after_seconds: Option<Option<Value>>,
+    retry_after_seconds: Option<Option<Box<RawValue>>>,
     #[serde(default, deserialize_with = "non_null")]
     signal_source: Option<String>,
     observed_at: String,
@@ -845,13 +826,13 @@ struct QuotaDto {
     model_id: Option<String>,
     quota_scope: String,
     #[serde(default, deserialize_with = "nullable")]
-    limit: Option<Option<f64>>,
+    limit: Option<Option<Box<RawValue>>>,
     #[serde(default, deserialize_with = "nullable")]
-    remaining: Option<Option<f64>>,
+    remaining: Option<Option<Box<RawValue>>>,
     #[serde(default, deserialize_with = "nullable")]
     resets_at: Option<Option<String>>,
     #[serde(default, deserialize_with = "nullable")]
-    retry_after_seconds: Option<Option<Value>>,
+    retry_after_seconds: Option<Option<Box<RawValue>>>,
     #[serde(default, deserialize_with = "non_null")]
     visibility: Option<String>,
     observed_at: String,
@@ -876,8 +857,8 @@ pub fn decode_quota_state(json: &str) -> R<QuotaState> {
     QuotaState::try_new(
         core,
         d.model_id,
-        d.limit,
-        d.remaining,
+        lift(d.limit, |r| float(r, QUO, "limit"))?,
+        lift(d.remaining, |r| float(r, QUO, "remaining"))?,
         resets_at,
         non_negative(d.retry_after_seconds, QUO, "retry_after_seconds")?,
         d.visibility
@@ -923,13 +904,13 @@ struct CapabilityDto {
     runtime_id: Option<String>,
     capability: String,
     #[serde(default, deserialize_with = "any_value")]
-    value: Option<Value>,
+    value: Option<Box<RawValue>>,
     confidence: String,
     #[serde(default, deserialize_with = "non_null")]
     source_ref: Option<SourceRefDto>,
     observed_at: String,
     #[serde(default, deserialize_with = "nullable")]
-    sample_size: Option<Option<Value>>,
+    sample_size: Option<Option<Box<RawValue>>>,
     #[serde(default, deserialize_with = "non_null")]
     lifecycle_state: Option<String>,
 }
@@ -945,7 +926,7 @@ pub fn decode_model_capability(json: &str) -> R<ModelCapabilityRecord> {
         d.model_id,
         d.runtime_id,
         d.capability,
-        d.value,
+        d.value.map(|r| open(&r, "value")).transpose()?,
         confidence(&d.confidence, CAP)?,
         d.source_ref.map(|s| source_ref(s, CAP)).transpose()?,
         time(d.observed_at, "observed_at")?,
@@ -991,15 +972,15 @@ struct ObservationDto {
     task_class: String,
     outcome: String,
     #[serde(default, deserialize_with = "non_null")]
-    repair_count: Option<Value>,
+    repair_count: Option<Box<RawValue>>,
     #[serde(default, deserialize_with = "nullable")]
-    cost: Option<Option<f64>>,
+    cost: Option<Option<Box<RawValue>>>,
     #[serde(default, deserialize_with = "nullable")]
-    tokens: Option<Option<Value>>,
+    tokens: Option<Option<Box<RawValue>>>,
     #[serde(default, deserialize_with = "nullable")]
-    latency_seconds: Option<Option<f64>>,
+    latency_seconds: Option<Option<Box<RawValue>>>,
     #[serde(default, deserialize_with = "nullable")]
-    cost_to_accepted_result: Option<Option<f64>>,
+    cost_to_accepted_result: Option<Option<Box<RawValue>>>,
     #[serde(default, deserialize_with = "non_null")]
     difficulty_hint: Option<String>,
     #[serde(default, deserialize_with = "non_null")]
@@ -1019,7 +1000,7 @@ pub fn decode_model_observation(json: &str) -> R<ModelObservation> {
     )?;
     let repair_count = d
         .repair_count
-        .map(|v| bounded_u64(&v, OBS, "repair_count"))
+        .map(|r| uint(&r, OBS, "repair_count"))
         .transpose()?;
     ModelObservation::try_new(
         d.observation_id,
@@ -1035,10 +1016,12 @@ pub fn decode_model_observation(json: &str) -> R<ModelObservation> {
             OBS,
         )?,
         repair_count,
-        d.cost,
+        lift(d.cost, |r| float(r, OBS, "cost"))?,
         signed(d.tokens, OBS, "tokens")?,
-        d.latency_seconds,
-        d.cost_to_accepted_result,
+        lift(d.latency_seconds, |r| float(r, OBS, "latency_seconds"))?,
+        lift(d.cost_to_accepted_result, |r| {
+            float(r, OBS, "cost_to_accepted_result")
+        })?,
         d.difficulty_hint
             .map(|h| pick(&DifficultyHint::ALL, DifficultyHint::as_str, &h, OBS))
             .transpose()?,
