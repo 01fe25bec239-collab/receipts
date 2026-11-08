@@ -8,9 +8,8 @@ use std::path::PathBuf;
 
 use crate::{
     HostAdapter, HostCapabilityFreshnessDisposition, HostCapabilityModeOverride,
-    HostCapabilityReportRefreshOutcome,
-    HostCapabilityReportRefreshRequest, HostDetectionError, HostDetectionSignals, HostId,
-    freshness_disposition,
+    HostCapabilityReportRefreshOutcome, HostCapabilityReportRefreshRequest, HostDetectionError,
+    HostDetectionSignals, HostId, freshness_disposition,
     host_capability_observation::HostCapabilityObservationRequest,
     host_probe_port::{HostCapabilityCacheEntryV1, HostProbeProcessPort},
     refresh_host_capability_report, resolve_host,

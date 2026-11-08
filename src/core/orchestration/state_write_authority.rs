@@ -166,7 +166,10 @@ impl CoreStateWriter {
         self.store.reader()
     }
 
-    fn admitted_source(&self, project_id: &str) -> Result<&GraphSourceEvidenceRefV1, CorePolicyRefusal> {
+    fn admitted_source(
+        &self,
+        project_id: &str,
+    ) -> Result<&GraphSourceEvidenceRefV1, CorePolicyRefusal> {
         self.identity
             .projects
             .get(project_id)
@@ -299,7 +302,10 @@ impl CoreStateWriter {
 
     // ---- execution records ---------------------------------------------------
 
-    pub fn append_attempt_started(&mut self, start: AttemptStart) -> Result<(), CoreStateWriteError> {
+    pub fn append_attempt_started(
+        &mut self,
+        start: AttemptStart,
+    ) -> Result<(), CoreStateWriteError> {
         let admission = self.admit(Op::Attempt, start.project_id(), Some(start.graph_id()))?;
         Ok(self.store.append_attempt_started(admission, start)?)
     }
@@ -316,7 +322,10 @@ impl CoreStateWriter {
         Ok(self.store.append_attempt_finished(admission, finish)?)
     }
 
-    pub fn append_checkpoint(&mut self, value: CheckpointRecord) -> Result<(), CoreStateWriteError> {
+    pub fn append_checkpoint(
+        &mut self,
+        value: CheckpointRecord,
+    ) -> Result<(), CoreStateWriteError> {
         let admission = self.admit(Op::Checkpoint, value.project_id(), None)?;
         Ok(self.store.append_checkpoint(admission, value)?)
     }
@@ -369,7 +378,10 @@ impl CoreStateWriter {
             .digest
             .strip_prefix("sha256:")
             .filter(|hex| {
-                hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                hex.len() == 64
+                    && hex
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
             })
             .ok_or(CorePolicyRefusal::UnsupportedDigest)?;
         let bytes = content

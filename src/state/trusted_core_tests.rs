@@ -258,7 +258,11 @@ fn admissions_bind_the_issuing_live_writer_instance() {
     std::fs::set_permissions(b.db(), std::fs::Permissions::from_mode(0o600)).unwrap();
     let mut store_a = TrustedCoreStore::open_exclusive(a.db()).unwrap();
     let mut store_b = TrustedCoreStore::open_exclusive(b.db()).unwrap();
-    assert_eq!(store_a.store_id(), store_b.store_id(), "copy keeps the UUID");
+    assert_eq!(
+        store_a.store_id(),
+        store_b.store_id(),
+        "copy keeps the UUID"
+    );
 
     // Same writer: success.
     let own = store_a.admit(project_subject(Op::ProvenanceLink, "p"));
@@ -267,14 +271,20 @@ fn admissions_bind_the_issuing_live_writer_instance() {
 
     // Copied A/B: A's admission is refused by B, B unchanged.
     let from_a = store_a.admit(project_subject(Op::ProvenanceLink, "p"));
-    assert_eq!(refusal(link(&mut store_b, from_a, "t2").unwrap_err()), R::WrongStore);
+    assert_eq!(
+        refusal(link(&mut store_b, from_a, "t2").unwrap_err()),
+        R::WrongStore
+    );
     assert_eq!(provenance_count(&store_b), 0);
 
     // Old admission after close/reopen of the same file is refused.
     let stale = store_a.admit(project_subject(Op::ProvenanceLink, "p"));
     drop(store_a);
     let mut reopened = TrustedCoreStore::open_exclusive(a.db()).unwrap();
-    assert_eq!(refusal(link(&mut reopened, stale, "t3").unwrap_err()), R::WrongStore);
+    assert_eq!(
+        refusal(link(&mut reopened, stale, "t3").unwrap_err()),
+        R::WrongStore
+    );
     assert_eq!(provenance_count(&reopened), 1);
     // A newly minted admission after the legitimate reopen succeeds, once.
     let fresh = reopened.admit(project_subject(Op::ProvenanceLink, "p"));
@@ -285,7 +295,10 @@ fn admissions_bind_the_issuing_live_writer_instance() {
 /// Holds an extra directory whose mode the test controls.
 fn private_dir_below(parent: &std::path::Path, name: &str) -> PathBuf {
     let path = parent.join(name);
-    std::fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&path)
+        .unwrap();
     path
 }
 
@@ -344,7 +357,12 @@ fn a_symlinked_or_replaced_state_directory_is_refused() {
         refusal(TrustedCoreStore::open_exclusive(&path).unwrap_err()),
         R::InsecurePath
     );
-    assert!(std::fs::symlink_metadata(target.join("state.db")).unwrap().file_type().is_symlink());
+    assert!(
+        std::fs::symlink_metadata(target.join("state.db"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
 }
 
 #[test]
@@ -419,14 +437,21 @@ fn unsafe_pre_existing_sidecars_are_refused_before_sqlite_opens() {
             .mode(0o640)
             .open(sidecar(&dir, suffix))
             .unwrap();
-        std::fs::set_permissions(sidecar(&dir, suffix), std::fs::Permissions::from_mode(0o640))
-            .unwrap();
+        std::fs::set_permissions(
+            sidecar(&dir, suffix),
+            std::fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
         assert_eq!(
             refusal(TrustedCoreStore::open_exclusive(dir.db()).unwrap_err()),
             R::InsecureMode
         );
         assert_eq!(
-            std::fs::metadata(sidecar(&dir, suffix)).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(sidecar(&dir, suffix))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
             0o640
         );
     }

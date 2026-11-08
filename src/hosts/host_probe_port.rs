@@ -109,7 +109,6 @@ impl HostObservationFingerprintV1 {
                 .iter()
                 .all(|(_, m)| matches!(m, Ok(_) | Err(HostCapabilityObservationError::Missing)))
     }
-
 }
 
 /// One complete observation's fingerprint, the mode override it was

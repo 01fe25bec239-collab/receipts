@@ -233,7 +233,9 @@ fn temporary_merge_checks_out_the_merged_tree_and_refuses_conflicts() {
     assert!(!place.path().join("conflict").exists());
 }
 
-fn refused_config(result: Result<ReviewWorkspaceIntegrityV1, crate::error::WorkspaceError>) -> String {
+fn refused_config(
+    result: Result<ReviewWorkspaceIntegrityV1, crate::error::WorkspaceError>,
+) -> String {
     match result {
         Err(crate::error::WorkspaceError::RepositoryConfigRefused { key }) => key,
         other => panic!("expected a configuration refusal, got {other:?}"),
@@ -263,13 +265,23 @@ fn verify_refuses_post_provision_filters_and_includes_before_they_run() {
     );
     let file = ws.handle().worktree_path().join("src/a.rs");
     std::fs::write(&file, "changed!").unwrap();
-    assert_eq!(refused_config(verify_review_workspace(&ws)), "filter.x.clean");
+    assert_eq!(
+        refused_config(verify_review_workspace(&ws)),
+        "filter.x.clean"
+    );
     assert!(!marker.exists(), "the filter must not run before refusal");
-    assert_eq!(std::fs::read(&file).unwrap(), b"changed!", "evidence untouched");
+    assert_eq!(
+        std::fs::read(&file).unwrap(),
+        b"changed!",
+        "evidence untouched"
+    );
     git(repo.path(), &["config", "--unset", "filter.x.clean"]);
 
     // Worktree-scoped configuration of the actual worktree is refused too.
-    git(repo.path(), &["config", "extensions.worktreeConfig", "true"]);
+    git(
+        repo.path(),
+        &["config", "extensions.worktreeConfig", "true"],
+    );
     git(
         ws.handle().worktree_path(),
         &["config", "--worktree", "include.path", "/dev/null"],
@@ -323,7 +335,11 @@ fn configured_submodule_ignores_cannot_hide_dirt() {
     git(repo.path(), &["config", "submodule.sub.ignore", "all"]);
     // The configuration hides it from a default status ...
     assert!(
-        stdout_trimmed(&git(ws.handle().worktree_path(), &["status", "--porcelain"])).is_empty()
+        stdout_trimmed(&git(
+            ws.handle().worktree_path(),
+            &["status", "--porcelain"]
+        ))
+        .is_empty()
     );
     // ... but not from verification.
     assert!(verify_review_workspace(&ws).is_err());
@@ -360,12 +376,21 @@ fn stale_handles_never_remove_a_replacement_workspace() {
     };
     let foreign = reprovision("foreign-workspace", "foreign-task");
     assert!(remove_review_workspace(repo.path(), &ws).is_err());
-    assert!(path.exists() && worktree_registered(&repo, &path), "replacement retained");
-    assert!(branch_exists(&repo, ws.review_branch()), "replacement branch retained");
+    assert!(
+        path.exists() && worktree_registered(&repo, &path),
+        "replacement retained"
+    );
+    assert!(
+        branch_exists(&repo, ws.review_branch()),
+        "replacement branch retained"
+    );
     crate::teardown::WorkspaceTeardownRequest::new(repo.path())
         .teardown(&foreign)
         .unwrap();
-    git(repo.path(), &["branch", "--quiet", "-D", ws.review_branch()]);
+    git(
+        repo.path(),
+        &["branch", "--quiet", "-D", ws.review_branch()],
+    );
 
     // Identical workspace/task fields, but a new administrative record:
     // matching SHA and fields are not ownership.

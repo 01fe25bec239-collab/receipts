@@ -1,4 +1,5 @@
 use super::*;
+use crate::HostCapabilityReportNonTemporalCore;
 use crate::{
     HostCapabilityHookCoverageClass as Coverage, HostCapabilityInactiveReason as Reason,
     HostCapabilityModeOverrideSource, HostCapabilityModeSelectionError,
@@ -11,7 +12,6 @@ use crate::{
         HostCapabilityObservation, HostCapabilityObservationValue as Value,
     },
 };
-use crate::HostCapabilityReportNonTemporalCore;
 use std::{cell::Cell, future::Ready};
 
 // Placeholder contracts are test-only. Any operation other than id is a defect.

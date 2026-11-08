@@ -192,8 +192,7 @@ pub use normalized_host_event_source_policy::source_class_allowed;
 
 pub use host_probe_port::{
     HostCapabilityCacheEntryV1, HostExecutableIdentityV1, HostObservationFingerprintV1,
-    HostProbeCommandV1,
-    HostProbeProcessPort,
+    HostProbeCommandV1, HostProbeProcessPort,
 };
 pub use host_session_activation::{
     HostSessionActivationError, HostSessionActivationOutcome, HostSessionActivationRequest,

@@ -190,7 +190,10 @@ fn verify_owned(
     };
     worktree_binding::verify(root, &expected).map_err(|detail| refused(op, detail))?;
     if binding_object(root, worktree)? != workspace.binding_object {
-        return Err(refused(op, "binding record was replaced since provisioning"));
+        return Err(refused(
+            op,
+            "binding record was replaced since provisioning",
+        ));
     }
     Ok(())
 }
@@ -274,12 +277,14 @@ pub fn remove_review_workspace(
     }
     let root = canonical_root(repository_root)?;
     if root != workspace.repository_root {
-        return Err(refused(op, "not the repository this workspace was provisioned in"));
+        return Err(refused(
+            op,
+            "not the repository this workspace was provisioned in",
+        ));
     }
-    WorkspaceTeardownRequest::new(&root)
-        .teardown_owned(&workspace.handle, &|root, worktree| {
-            verify_owned(workspace, root, worktree)
-        })?;
+    WorkspaceTeardownRequest::new(&root).teardown_owned(&workspace.handle, &|root, worktree| {
+        verify_owned(workspace, root, worktree)
+    })?;
     let reference = format!("refs/heads/{}", workspace.review_branch());
     // A worktree registered on the branch after ours was removed owns it now.
     let registered = crate::teardown::list_registered_worktrees(&root, op, |detail| {
@@ -289,7 +294,10 @@ pub fn remove_review_workspace(
         .iter()
         .any(|record| record.branch_ref.as_deref() == Some(reference.as_bytes()))
     {
-        return Err(refused(op, "review branch is checked out by another worktree"));
+        return Err(refused(
+            op,
+            "review branch is checked out by another worktree",
+        ));
     }
     git::capture(
         &root,

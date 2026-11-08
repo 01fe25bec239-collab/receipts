@@ -743,7 +743,14 @@ mod fingerprint {
                     .unwrap()
                     .content_sha256 = "b".repeat(64)
             },
-            |f| f.executable.as_mut().unwrap().as_mut().unwrap().probe_policy = "other".into(),
+            |f| {
+                f.executable
+                    .as_mut()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .probe_policy = "other".into()
+            },
             |f| f.project_root = "/other".into(),
             |f| f.host = HostId::Codex,
         ];

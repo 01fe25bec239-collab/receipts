@@ -55,6 +55,9 @@ use crate::error::WorkspaceError;
 use crate::git;
 use crate::handle::{CommitSha, WorkspaceHandle, WorkspaceState};
 
+/// Caller ownership proof over the canonical root and worktree.
+pub(crate) type OwnershipProof<'a> = dyn Fn(&Path, &Path) -> Result<(), WorkspaceError> + 'a;
+
 /// A request to tear down one provisioned local task worktree.
 ///
 /// The only caller-supplied input is the local repository root whose
@@ -115,7 +118,7 @@ impl WorkspaceTeardownRequest {
     pub(crate) fn teardown_owned(
         &self,
         handle: &WorkspaceHandle,
-        owned: &dyn Fn(&Path, &Path) -> Result<(), WorkspaceError>,
+        owned: &OwnershipProof<'_>,
     ) -> Result<WorkspaceHandle, WorkspaceError> {
         if !handle.state().may_transition_to(WorkspaceState::TornDown) {
             return Err(WorkspaceError::TeardownUnsupportedState {
@@ -152,7 +155,7 @@ impl WorkspaceTeardownRequest {
         &self,
         handle: &WorkspaceHandle,
         expected_head: &CommitSha,
-        owned: Option<&dyn Fn(&Path, &Path) -> Result<(), WorkspaceError>>,
+        owned: Option<&OwnershipProof<'_>>,
     ) -> Result<WorkspaceHandle, WorkspaceError> {
         // Step 2: resolve the requested repository root to its canonical
         // (realpath) location before any Git command runs, so registration

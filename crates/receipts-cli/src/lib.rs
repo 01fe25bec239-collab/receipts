@@ -76,7 +76,13 @@ fn content_digest(path: &Path) -> Option<String> {
             n => hasher.update(&buffer[..n]),
         }
     }
-    Some(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    Some(
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    )
 }
 
 impl WorkspaceHostProbeRunner {

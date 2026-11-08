@@ -964,6 +964,8 @@ mod secure {
         }
         // SAFETY: fstatat succeeded and initialised the buffer.
         let st = unsafe { st.assume_init() };
+        // Field widths differ between platforms; the casts are not redundant everywhere.
+        #[allow(clippy::unnecessary_cast)]
         Ok(Some(Facts {
             kind: (st.st_mode & libc::S_IFMT) as u32,
             uid: st.st_uid,
@@ -1019,7 +1021,11 @@ mod secure {
     }
 
     fn walk(parent: &Path) -> Result<File, StateError> {
-        let mut dir = open_at(None, &name(OsStr::new("/"))?, libc::O_RDONLY | libc::O_DIRECTORY)?;
+        let mut dir = open_at(
+            None,
+            &name(OsStr::new("/"))?,
+            libc::O_RDONLY | libc::O_DIRECTORY,
+        )?;
         for component in parent.components().skip(1) {
             let entry = name(component.as_os_str())?;
             let child = open_at(Some(&dir), &entry, libc::O_RDONLY | libc::O_DIRECTORY)?;
@@ -1104,7 +1110,8 @@ mod secure {
         };
         let dir_now = std::fs::symlink_metadata(parent).map_err(io)?;
         let dir_held = Facts::of(&held.dir)?;
-        if !dir_now.file_type().is_dir() || (dir_now.dev(), dir_now.ino()) != (dir_held.dev, dir_held.ino)
+        if !dir_now.file_type().is_dir()
+            || (dir_now.dev(), dir_now.ino()) != (dir_held.dev, dir_held.ino)
         {
             return Err(refused(R::IdentityRace));
         }

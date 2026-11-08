@@ -102,7 +102,9 @@ fn policy_refusal<T: std::fmt::Debug>(result: Result<T, CoreStateWriteError>) ->
     }
 }
 
-fn state_refusal<T: std::fmt::Debug>(result: Result<T, CoreStateWriteError>) -> StateWriteRefusalV1 {
+fn state_refusal<T: std::fmt::Debug>(
+    result: Result<T, CoreStateWriteError>,
+) -> StateWriteRefusalV1 {
     match result {
         Err(CoreStateWriteError::State(StateError::WriteAuthorityRefused { reason })) => reason,
         other => panic!("expected a State authority refusal, got {other:?}"),
@@ -277,10 +279,9 @@ fn genesis_source_comes_from_the_admitted_context_not_the_payload() {
     );
     // A project the composition never admitted is refused before State.
     assert_eq!(
-        policy_refusal(writer.create_initial_graph(
-            &Clock,
-            genesis_in("q", COMPILER, "policy", SOURCE)
-        )),
+        policy_refusal(
+            writer.create_initial_graph(&Clock, genesis_in("q", COMPILER, "policy", SOURCE))
+        ),
         CorePolicyRefusal::ProjectNotAdmitted
     );
     drop(writer);
@@ -335,9 +336,11 @@ fn every_project_family_goes_through_the_core_and_refuses_foreign_or_unknown_sub
     };
     let dir = Dir::new();
     // `r` is admitted but has no graph; `q` is not admitted at all.
-    let mut writer =
-        CoreStateWriter::open(dir.db(), identity_for("policy", &[("p", SOURCE), ("r", SOURCE)]))
-            .unwrap();
+    let mut writer = CoreStateWriter::open(
+        dir.db(),
+        identity_for("policy", &[("p", SOURCE), ("r", SOURCE)]),
+    )
+    .unwrap();
     writer
         .create_initial_graph(&Clock, genesis(COMPILER, "policy"))
         .unwrap();
@@ -352,8 +355,14 @@ fn every_project_family_goes_through_the_core_and_refuses_foreign_or_unknown_sub
         .unwrap()
     };
     writer.append_node_result("p", "1", "r1", result()).unwrap();
-    assert_eq!(policy_refusal(writer.append_node_result("q", "1", "r2", result())), not_admitted);
-    assert_eq!(policy_refusal(writer.append_node_result("r", "1", "r2", result())), unknown);
+    assert_eq!(
+        policy_refusal(writer.append_node_result("q", "1", "r2", result())),
+        not_admitted
+    );
+    assert_eq!(
+        policy_refusal(writer.append_node_result("r", "1", "r2", result())),
+        unknown
+    );
 
     // Attempts: start resolves the stored graph, finish the stored attempt.
     let start = |project: &str, id: &str| {
@@ -371,15 +380,34 @@ fn every_project_family_goes_through_the_core_and_refuses_foreign_or_unknown_sub
         )
         .unwrap()
     };
-    writer.append_attempt_started(start("p", "01ARZ3NDEKTSV4RRFFQ69G5FA1")).unwrap();
-    assert_eq!(policy_refusal(writer.append_attempt_started(start("q", "01ARZ3NDEKTSV4RRFFQ69G5FA2"))), not_admitted);
-    assert_eq!(policy_refusal(writer.append_attempt_started(start("r", "01ARZ3NDEKTSV4RRFFQ69G5FA3"))), unknown);
+    writer
+        .append_attempt_started(start("p", "01ARZ3NDEKTSV4RRFFQ69G5FA1"))
+        .unwrap();
+    assert_eq!(
+        policy_refusal(writer.append_attempt_started(start("q", "01ARZ3NDEKTSV4RRFFQ69G5FA2"))),
+        not_admitted
+    );
+    assert_eq!(
+        policy_refusal(writer.append_attempt_started(start("r", "01ARZ3NDEKTSV4RRFFQ69G5FA3"))),
+        unknown
+    );
     let finish = |id: &str| {
-        AttemptFinish::new(AttemptId::parse(id).unwrap(), "2026-11-08T10:01:00.000000000Z", None, None, None)
-            .unwrap()
+        AttemptFinish::new(
+            AttemptId::parse(id).unwrap(),
+            "2026-11-08T10:01:00.000000000Z",
+            None,
+            None,
+            None,
+        )
+        .unwrap()
     };
-    writer.append_attempt_finished(finish("01ARZ3NDEKTSV4RRFFQ69G5FA1")).unwrap();
-    assert_eq!(policy_refusal(writer.append_attempt_finished(finish("01ARZ3NDEKTSV4RRFFQ69G5FA9"))), unknown);
+    writer
+        .append_attempt_finished(finish("01ARZ3NDEKTSV4RRFFQ69G5FA1"))
+        .unwrap();
+    assert_eq!(
+        policy_refusal(writer.append_attempt_finished(finish("01ARZ3NDEKTSV4RRFFQ69G5FA9"))),
+        unknown
+    );
 
     // Checkpoints and output refs.
     let checkpoint = |project: &str| {
@@ -393,10 +421,17 @@ fn every_project_family_goes_through_the_core_and_refuses_foreign_or_unknown_sub
         .unwrap()
     };
     writer.append_checkpoint(checkpoint("p")).unwrap();
-    assert_eq!(policy_refusal(writer.append_checkpoint(checkpoint("q"))), not_admitted);
-    let output = |project: &str| OutputRef::new(project, "out", &"b".repeat(64), "uri:x", "1").unwrap();
+    assert_eq!(
+        policy_refusal(writer.append_checkpoint(checkpoint("q"))),
+        not_admitted
+    );
+    let output =
+        |project: &str| OutputRef::new(project, "out", &"b".repeat(64), "uri:x", "1").unwrap();
     writer.append_output_ref(output("p")).unwrap();
-    assert_eq!(policy_refusal(writer.append_output_ref(output("q"))), not_admitted);
+    assert_eq!(
+        policy_refusal(writer.append_output_ref(output("q"))),
+        not_admitted
+    );
 
     // Decision records and provenance links.
     let review = |project: &str| {
@@ -412,13 +447,21 @@ fn every_project_family_goes_through_the_core_and_refuses_foreign_or_unknown_sub
         .unwrap()
     };
     writer.append_decision_record(&review("p")).unwrap();
-    assert_eq!(policy_refusal(writer.append_decision_record(&review("q"))), not_admitted);
+    assert_eq!(
+        policy_refusal(writer.append_decision_record(&review("q"))),
+        not_admitted
+    );
     let sha = "d".repeat(40);
     writer
         .append_provenance_link("p", "t", ProvenanceLinkKind::ReviewSha, &sha)
         .unwrap();
     assert_eq!(
-        policy_refusal(writer.append_provenance_link("q", "t", ProvenanceLinkKind::ReviewSha, &sha)),
+        policy_refusal(writer.append_provenance_link(
+            "q",
+            "t",
+            ProvenanceLinkKind::ReviewSha,
+            &sha
+        )),
         not_admitted
     );
 
@@ -449,7 +492,10 @@ fn every_project_family_goes_through_the_core_and_refuses_foreign_or_unknown_sub
         created_at: None,
     };
     writer.create_logical_role(role("p", "role-1")).unwrap();
-    assert_eq!(policy_refusal(writer.create_logical_role(role("q", "role-2"))), not_admitted);
+    assert_eq!(
+        policy_refusal(writer.create_logical_role(role("q", "role-2"))),
+        not_admitted
+    );
     let evidence = RoleChangeEvidenceV1 {
         changed_at: receipts_state::CanonicalTimestampV1::parse("2026-11-08T10:00:00.000000000Z")
             .unwrap(),
@@ -478,7 +524,9 @@ fn every_project_family_goes_through_the_core_and_refuses_foreign_or_unknown_sub
         release_reason: None,
         rehydration_completed: None,
     };
-    writer.create_executor_binding(binding("role-1", "b-1")).unwrap();
+    writer
+        .create_executor_binding(binding("role-1", "b-1"))
+        .unwrap();
     assert_eq!(
         policy_refusal(writer.create_executor_binding(binding("missing-role", "b-2"))),
         unknown
@@ -525,16 +573,24 @@ fn review_proposal(project: &str, reference: &str, digest: String) -> EventPropo
 fn event_referenced_content_is_resolved_and_digest_verified_before_persistence() {
     const EVENT: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
     let dir = Dir::new();
-    let mut writer =
-        CoreStateWriter::open(dir.db(), identity_for("policy", &[("p", SOURCE), ("r", SOURCE)]))
-            .unwrap();
+    let mut writer = CoreStateWriter::open(
+        dir.db(),
+        identity_for("policy", &[("p", SOURCE), ("r", SOURCE)]),
+    )
+    .unwrap();
     let content = Content(vec![
         ("p", "artifact:present", b"present bytes"),
         ("r", "artifact:foreign", b"foreign bytes"),
     ]);
     let nothing_persisted = |writer: &CoreStateWriter| {
         assert!(writer.reader().find_event(EVENT).unwrap().is_none());
-        assert!(writer.reader().find_trusted_time_watermark("p").unwrap().is_none());
+        assert!(
+            writer
+                .reader()
+                .find_trusted_time_watermark("p")
+                .unwrap()
+                .is_none()
+        );
     };
     let cases = [
         // Nonexistent content with a syntactically valid digest.
@@ -581,5 +637,11 @@ fn event_referenced_content_is_resolved_and_digest_verified_before_persistence()
             .persist_event_proposal(&Clock, &content, &proposal, "01ARZ3NDEKTSV4RRFFQ69G5FAW")
             .is_err()
     );
-    assert!(writer.reader().find_event("01ARZ3NDEKTSV4RRFFQ69G5FAW").unwrap().is_none());
+    assert!(
+        writer
+            .reader()
+            .find_event("01ARZ3NDEKTSV4RRFFQ69G5FAW")
+            .unwrap()
+            .is_none()
+    );
 }

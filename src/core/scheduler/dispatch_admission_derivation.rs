@@ -277,7 +277,7 @@ pub fn derive_dispatch_admission(
             (!(fresh(e.freshness)
                 && e.connection == ProviderConnectionV1::Authenticated
                 && selected(&e.provider_id)))
-                .then_some(Reason::AuthRequired)
+            .then_some(Reason::AuthRequired)
         }
     };
 
