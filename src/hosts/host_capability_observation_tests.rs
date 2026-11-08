@@ -675,10 +675,7 @@ mod fingerprint {
     struct Recording(RefCell<Vec<Vec<String>>>);
     impl HostProbeProcessPort for Recording {
         fn executable(&self) -> Result<HostExecutableIdentityV1, Error> {
-            Ok(HostExecutableIdentityV1 {
-                canonical_path: "/opt/claude".into(),
-                content_sha256: "a".repeat(64),
-            })
+            Ok(identity())
         }
         fn run(&self, command: &HostProbeCommandV1) -> Result<Vec<u8>, Error> {
             assert_eq!(command.timeout, HOST_PROBE_TIMEOUT);
@@ -702,33 +699,42 @@ mod fingerprint {
         assert_eq!(*port.0.borrow(), vec![vec!["plugin", "list", "--json"]]);
     }
 
+    fn m(bytes: &[u8]) -> crate::host_probe_port::Material {
+        crate::host_probe_port::digest(&Ok(bytes.to_vec()))
+    }
+
+    fn identity() -> HostExecutableIdentityV1 {
+        HostExecutableIdentityV1 {
+            canonical_path: "/opt/claude".into(),
+            content_sha256: "a".repeat(64),
+            probe_policy: "policy".into(),
+        }
+    }
+
     fn fp() -> HostObservationFingerprintV1 {
         HostObservationFingerprintV1 {
             host: HostId::ClaudeCode,
             project_root: "/project".into(),
-            executable: Some(Ok(HostExecutableIdentityV1 {
-                canonical_path: "/opt/claude".into(),
-                content_sha256: "a".repeat(64),
-            })),
-            version: Some(Ok(b"2.1.0 (Claude Code)".to_vec())),
-            plugins: Some(Ok(b"[]".to_vec())),
+            executable: Some(Ok(identity())),
+            version: Some(m(b"2.1.0 (Claude Code)")),
+            plugins: Some(m(b"[]")),
             sources: vec![
-                (Source::ClaudeUserSettings, Ok(b"{}".to_vec())),
+                (Source::ClaudeUserSettings, m(b"{}")),
                 (Source::ClaudeProjectSettings, Err(Error::Missing)),
             ],
         }
     }
 
     #[test]
-    fn reuse_requires_an_identical_complete_fingerprint() {
+    fn any_material_or_context_drift_changes_the_fingerprint() {
         let cached = fp();
         assert!(fp().is_complete());
-        assert!(fp().permits_reuse_of(&cached));
-        let drifts: [fn(&mut HostObservationFingerprintV1); 7] = [
-            |f| f.sources[0].1 = Ok(b"{ }".to_vec()),
-            |f| f.sources[1].1 = Ok(b"{}".to_vec()),
-            |f| f.version = Some(Ok(b"2.1.1 (Claude Code)".to_vec())),
-            |f| f.plugins = Some(Ok(b"[{}]".to_vec())),
+        assert_eq!(fp(), cached);
+        let drifts: [fn(&mut HostObservationFingerprintV1); 8] = [
+            |f| f.sources[0].1 = m(b"{ }"),
+            |f| f.sources[1].1 = m(b"{}"),
+            |f| f.version = Some(m(b"2.1.1 (Claude Code)")),
+            |f| f.plugins = Some(m(b"[{}]")),
             |f| {
                 f.executable
                     .as_mut()
@@ -737,27 +743,67 @@ mod fingerprint {
                     .unwrap()
                     .content_sha256 = "b".repeat(64)
             },
+            |f| f.executable.as_mut().unwrap().as_mut().unwrap().probe_policy = "other".into(),
             |f| f.project_root = "/other".into(),
             |f| f.host = HostId::Codex,
         ];
         for drift in drifts {
             let mut current = fp();
             drift(&mut current);
-            assert!(
-                !current.permits_reuse_of(&cached),
-                "drift must refuse reuse"
-            );
+            assert_ne!(current, cached, "drift must change the fingerprint");
         }
-        // Retained uncertainty forbids reuse even when identical.
+        // Retained uncertainty is incomplete, so no cache entry is minted.
         for uncertain in [
             |f: &mut HostObservationFingerprintV1| f.sources[0].1 = Err(Error::PermissionDenied),
             |f: &mut HostObservationFingerprintV1| f.plugins = Some(Err(Error::ProbeTimeout)),
             |f: &mut HostObservationFingerprintV1| f.executable = Some(Err(Error::Unavailable)),
+            |f: &mut HostObservationFingerprintV1| {
+                f.executable = Some(Err(Error::ExecutableChanged))
+            },
         ] {
             let mut both = fp();
             uncertain(&mut both);
             assert!(!both.is_complete());
-            assert!(!both.clone().permits_reuse_of(&both));
         }
+    }
+
+    /// Reports a different executable after the first identity query.
+    struct Swapping(std::cell::Cell<u32>);
+    impl HostProbeProcessPort for Swapping {
+        fn executable(&self) -> Result<HostExecutableIdentityV1, Error> {
+            self.0.set(self.0.get() + 1);
+            let mut id = identity();
+            if self.0.get() > 1 {
+                id.content_sha256 = "b".repeat(64);
+            }
+            Ok(id)
+        }
+        fn run(&self, _: &HostProbeCommandV1) -> Result<Vec<u8>, Error> {
+            Ok(b"[]".to_vec())
+        }
+    }
+
+    #[test]
+    fn identity_change_across_probes_leaves_the_fingerprint_incomplete() {
+        let (_, fingerprint) = observe_host_capabilities_with_fingerprint(
+            &HostCapabilityObservationRequest {
+                host: HostId::ClaudeCode,
+                project_root: "/nonexistent-receipts-project".into(),
+            },
+            &Swapping(std::cell::Cell::new(0)),
+        );
+        assert_eq!(fingerprint.executable, Some(Err(Error::ExecutableChanged)));
+        assert!(!fingerprint.is_complete());
+    }
+
+    #[test]
+    fn fingerprint_retains_digests_not_payload_bytes() {
+        let marker = "PRIVATE-MARKER-7f3a";
+        let mut f = fp();
+        f.sources[0].1 = m(format!("{{\"env\":{{\"K\":\"{marker}\"}}}}").as_bytes());
+        f.plugins = Some(m(marker.as_bytes()));
+        let rendered = format!("{f:?}");
+        assert!(!rendered.contains(marker), "{rendered}");
+        assert!(rendered.contains(":sha256:"));
     }
 }

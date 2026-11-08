@@ -8,19 +8,26 @@
 //! `claude` fallback.
 //!
 //! [`HostObservationFingerprintV1`] binds one observation to the executable
-//! identity and content digest, its version output, and the exact bytes (or
-//! typed absence/error) of every probe and settings source, plus the host and
-//! project context. Equality is exact byte equality; metadata such as mtimes
-//! and caller validity flags are never part of it. A cached report may be
-//! reused only for an identical, complete fingerprint.
+//! identity, content digest and probe policy, and to the SHA-256 digest and
+//! length (or typed absence/error) of the version output, every probe and
+//! every settings source, plus the host and project context. Raw probe and
+//! settings bytes are never retained. Metadata such as mtimes and caller
+//! validity flags are never part of it.
+//!
+//! [`HostCapabilityCacheEntryV1`] couples one complete fingerprint with the
+//! mode override and the report selected from that same observation. It has
+//! no public constructor: only the real refresh path mints it, so a report
+//! and a fingerprint obtained independently can never be paired into reuse.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::HostId;
+use sha2::{Digest, Sha256};
+
 use crate::host_capability_observation::{
     HostCapabilityObservationError, HostCapabilityObservationSource,
 };
+use crate::{HostCapabilityModeOverride, HostCapabilityReportNonTemporalCore, HostId};
 
 /// One bounded read-only probe invocation requested by Host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +47,8 @@ pub struct HostExecutableIdentityV1 {
     pub canonical_path: PathBuf,
     /// Lowercase hex SHA-256 of the executable's bytes.
     pub content_sha256: String,
+    /// Value-free description of the admitted probe environment policy.
+    pub probe_policy: String,
 }
 
 /// Implemented by the admitted composition, never by Host.
@@ -51,9 +60,30 @@ pub trait HostProbeProcessPort {
     fn run(&self, command: &HostProbeCommandV1) -> Result<Vec<u8>, HostCapabilityObservationError>;
 }
 
-pub(crate) type Material = Result<Vec<u8>, HostCapabilityObservationError>;
+/// Length and SHA-256 of observed bytes; the bytes themselves are dropped.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ContentDigest {
+    len: usize,
+    sha256: [u8; 32],
+}
 
-/// Exact material one observation was derived from.
+impl std::fmt::Debug for ContentDigest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let hex: String = self.sha256.iter().map(|b| format!("{b:02x}")).collect();
+        write!(f, "{}:sha256:{hex}", self.len)
+    }
+}
+
+pub(crate) type Material = Result<ContentDigest, HostCapabilityObservationError>;
+
+pub(crate) fn digest(bytes: &Result<Vec<u8>, HostCapabilityObservationError>) -> Material {
+    bytes.as_ref().map_err(|e| *e).map(|b| ContentDigest {
+        len: b.len(),
+        sha256: Sha256::digest(b).into(),
+    })
+}
+
+/// Digest-only material one observation was derived from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostObservationFingerprintV1 {
     pub(crate) host: HostId,
@@ -80,8 +110,53 @@ impl HostObservationFingerprintV1 {
                 .all(|(_, m)| matches!(m, Ok(_) | Err(HostCapabilityObservationError::Missing)))
     }
 
-    /// Reuse rule: the cached fingerprint is identical and complete.
-    pub fn permits_reuse_of(&self, cached: &Self) -> bool {
-        self.is_complete() && self == cached
+}
+
+/// One complete observation's fingerprint, the mode override it was
+/// composed with and the report selected from it. Minted only by
+/// `refresh_host_capability_report`; no public constructor or field.
+///
+/// ```compile_fail,E0451
+/// use receipts_host_integration::{HostCapabilityCacheEntryV1,
+///     HostCapabilityReportNonTemporalCore, HostObservationFingerprintV1};
+/// fn forge(fingerprint: HostObservationFingerprintV1, report: HostCapabilityReportNonTemporalCore) {
+///     let _ = HostCapabilityCacheEntryV1 { fingerprint, mode_override: None, report };
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostCapabilityCacheEntryV1 {
+    pub(crate) fingerprint: HostObservationFingerprintV1,
+    pub(crate) mode_override: Option<HostCapabilityModeOverride>,
+    pub(crate) report: HostCapabilityReportNonTemporalCore,
+}
+
+impl HostCapabilityCacheEntryV1 {
+    /// `None` unless the fingerprint is complete.
+    pub(crate) fn mint(
+        fingerprint: HostObservationFingerprintV1,
+        mode_override: Option<HostCapabilityModeOverride>,
+        report: HostCapabilityReportNonTemporalCore,
+    ) -> Option<Self> {
+        fingerprint.is_complete().then_some(Self {
+            fingerprint,
+            mode_override,
+            report,
+        })
+    }
+
+    pub fn fingerprint(&self) -> &HostObservationFingerprintV1 {
+        &self.fingerprint
+    }
+
+    pub fn report(&self) -> &HostCapabilityReportNonTemporalCore {
+        &self.report
+    }
+
+    /// Reuse rule: `current` (freshly minted) and `self` agree on every
+    /// report-shaping input — host, project, executable identity and probe
+    /// policy, every material digest and the mode override — and on the
+    /// selected report itself.
+    pub fn permits_reuse_by(&self, current: &Self) -> bool {
+        self == current
     }
 }

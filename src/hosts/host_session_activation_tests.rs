@@ -11,6 +11,7 @@ use crate::{
         HostCapabilityObservation, HostCapabilityObservationValue as Value,
     },
 };
+use crate::HostCapabilityReportNonTemporalCore;
 use std::{cell::Cell, future::Ready};
 
 // Placeholder contracts are test-only. Any operation other than id is a defect.
@@ -63,8 +64,7 @@ fn request() -> HostSessionActivationRequest<'static> {
         explicit_host_override: None,
         project_root: "/unused-session-context".into(),
         mode_override: None,
-        cached_report: None,
-        cached_fingerprint: None,
+        cached: None,
     }
 }
 
@@ -92,6 +92,34 @@ fn refreshed(
         report_selection: compose_host_capability_report_selection(&inputs),
         observation,
         fingerprint: None,
+        cache_entry: None,
+    }
+}
+
+fn headless_refresh(
+    project_root: &str,
+    mode_override: Option<HostCapabilityModeOverride>,
+) -> HostCapabilityReportRefreshOutcome {
+    refresh_host_capability_report(
+        &HostCapabilityReportRefreshRequest {
+            observation: HostCapabilityObservationRequest {
+                host: HostId::Headless,
+                project_root: project_root.into(),
+            },
+            mode_override,
+        },
+        &NoPort,
+    )
+}
+
+/// A genuinely minted entry whose report is replaced (crate-private
+/// construction only; no public path can do this).
+fn entry(report: HostCapabilityReportNonTemporalCore) -> HostCapabilityCacheEntryV1 {
+    HostCapabilityCacheEntryV1 {
+        report,
+        ..headless_refresh("/unused-session-context", None)
+            .cache_entry
+            .unwrap()
     }
 }
 
@@ -231,8 +259,9 @@ fn identity_errors_are_typed_and_have_bounded_diagnostics() {
 }
 
 fn requires_refresh(candidate: Option<&HostCapabilityReportNonTemporalCore>) {
+    let candidate = candidate.cloned().map(entry);
     let request = HostSessionActivationRequest {
-        cached_report: candidate,
+        cached: candidate.as_ref(),
         ..request()
     };
     let calls = Cell::new(0);
@@ -280,8 +309,9 @@ fn nonempty_uncomparable_fingerprint_refreshes() {
 fn stale_embedded_never_survives_real_session_start_or_resume() {
     let candidate = cached(Stale::ValidityFingerprintChanged, Some("looks-valid"));
     assert_eq!(candidate.selected_mode(), Mode::Embedded);
+    let candidate = entry(candidate);
     let request = HostSessionActivationRequest {
-        cached_report: Some(&candidate),
+        cached: Some(&candidate),
         ..request()
     };
     for _ in 0..2 {
@@ -298,6 +328,10 @@ fn stale_embedded_never_survives_real_session_start_or_resume() {
         );
         assert_eq!(result.capability_refresh, expected);
         assert_eq!(
+            result.freshness_disposition,
+            HostCapabilityFreshnessDisposition::ReprobeThenSelect
+        );
+        assert_eq!(
             report(&result.capability_refresh).selected_mode(),
             Mode::Supervised
         );
@@ -306,6 +340,76 @@ fn stale_embedded_never_survives_real_session_start_or_resume() {
             None
         );
     }
+}
+
+#[test]
+fn only_an_identical_minted_entry_is_reused() {
+    let genuine = headless_refresh("/unused-session-context", None)
+        .cache_entry
+        .expect("complete headless observation mints an entry");
+    let reuse = |cached: &HostCapabilityCacheEntryV1,
+                 mode_override: Option<HostCapabilityModeOverride>,
+                 project_root: &str| {
+        prepare_host_session(
+            &Adapter(HostId::Headless),
+            &HostSessionActivationRequest {
+                project_root: project_root.into(),
+                mode_override,
+                cached: Some(cached),
+                ..request()
+            },
+            &NoPort,
+        )
+        .unwrap()
+        .freshness_disposition
+    };
+    // Valid unchanged reuse.
+    assert_eq!(
+        reuse(&genuine, None, "/unused-session-context"),
+        HostCapabilityFreshnessDisposition::ReuseReport
+    );
+    // Mode override drift: the report would be shaped differently.
+    let changed = Some(
+        HostCapabilityModeOverride::new(HostCapabilityModeOverrideSource::ALL[0], "x".into())
+            .unwrap(),
+    );
+    assert_eq!(
+        reuse(&genuine, changed.clone(), "/unused-session-context"),
+        HostCapabilityFreshnessDisposition::ReprobeThenSelect
+    );
+    let with_override = headless_refresh("/unused-session-context", changed.clone())
+        .cache_entry
+        .unwrap();
+    assert_eq!(
+        reuse(&with_override, None, "/unused-session-context"),
+        HostCapabilityFreshnessDisposition::ReprobeThenSelect
+    );
+    assert_eq!(
+        reuse(&with_override, changed, "/unused-session-context"),
+        HostCapabilityFreshnessDisposition::ReuseReport
+    );
+    // Project context drift.
+    assert_eq!(
+        reuse(&genuine, None, "/other-project"),
+        HostCapabilityFreshnessDisposition::ReprobeThenSelect
+    );
+    // A substituted report under a genuine fingerprint is refused.
+    let substituted = entry(cached(Stale::None, Some("old")));
+    assert_eq!(substituted.fingerprint(), genuine.fingerprint());
+    assert_eq!(
+        reuse(&substituted, None, "/unused-session-context"),
+        HostCapabilityFreshnessDisposition::ReprobeThenSelect
+    );
+    // A substituted fingerprint under the genuine report is refused.
+    let mut foreign_fingerprint = genuine.clone();
+    foreign_fingerprint.fingerprint = headless_refresh("/other-project", None)
+        .cache_entry
+        .unwrap()
+        .fingerprint;
+    assert_eq!(
+        reuse(&foreign_fingerprint, None, "/unused-session-context"),
+        HostCapabilityFreshnessDisposition::ReprobeThenSelect
+    );
 }
 
 #[test]
@@ -332,13 +436,14 @@ fn changed_plugin_install_and_other_failures_use_existing_policy() {
             Reason::HooksExcludedByAdminPolicy,
         ),
     ];
-    let candidate = cached(Stale::None, Some("old"));
-    assert_eq!(candidate.plugin_installed(), Some(true));
+    let report_candidate = cached(Stale::None, Some("old"));
+    assert_eq!(report_candidate.plugin_installed(), Some(true));
+    let candidate = entry(report_candidate);
     for host in [HostId::ClaudeCode, HostId::Codex, HostId::Headless] {
         for (change, reason) in cases {
             let request = HostSessionActivationRequest {
                 explicit_host_override: Some(host),
-                cached_report: Some(&candidate),
+                cached: Some(&candidate),
                 ..request()
             };
             let mut observation = unknown(host);
@@ -425,6 +530,7 @@ fn all_selection_outcomes_and_composition_errors_are_preserved() {
             observation: observation.clone(),
             report_selection,
             fingerprint: None,
+            cache_entry: None,
         };
         let outcome =
             prepare_with_refresh(&Adapter(HostId::Headless), &request(), |_| expected.clone())
@@ -451,6 +557,7 @@ fn hybrid_is_only_preserved_when_existing_selector_establishes_it() {
         observation: unknown(HostId::Headless),
         report_selection: compose_host_capability_report_selection(&inputs),
         fingerprint: None,
+        cache_entry: None,
     };
     assert_eq!(report(&expected).selected_mode(), Mode::Hybrid);
     let result =
@@ -463,12 +570,7 @@ fn production_is_only_identity_and_refresh_composition() {
     let source = include_str!("host_session_activation.rs");
     let body = source.split("pub fn prepare_host_session<").nth(1).unwrap();
     assert!(body.contains("refresh_host_capability_report(r, port)"));
-    // Reuse only via the exact fingerprint rule; the cached report's contents
-    // are never read and caller flags never count.
-    assert!(body.contains("current.permits_reuse_of(cached)"));
     assert!(body.contains("freshness_disposition(reusable)"));
-    assert_eq!(body.matches("cached_report.").count(), 1);
-    assert!(body.contains("cached_report.is_some()"));
     assert!(body.find("resolve_host(").unwrap() < body.find("adapter.id()").unwrap());
     for forbidden in [
         "HostId::",

@@ -129,7 +129,7 @@ fn timeout_terminates_the_probe_and_its_descendants() {
     let exe = d.script("/bin/sleep 30 & echo $! > child.pid; echo '[]'; wait");
     let runner = WorkspaceHostProbeRunner::new(&exe, env()).unwrap();
     assert_eq!(
-        runner.run(&command(&d.0, &[], Duration::from_millis(300), 1 << 20)),
+        runner.run(&command(&d.0, &[], Duration::from_millis(2000), 1 << 20)),
         Err(Error::ProbeTimeout)
     );
     let pid = std::fs::read_to_string(d.0.join("child.pid")).unwrap();
@@ -139,4 +139,73 @@ fn timeout_terminates_the_probe_and_its_descendants() {
         .unwrap()
         .success();
     assert!(!alive, "descendant {pid} survived the probe deadline");
+}
+
+#[test]
+fn unchanged_executable_keeps_its_admitted_identity_across_probes() {
+    let d = Dir::new();
+    let runner = WorkspaceHostProbeRunner::new(&d.script("printf ok"), env()).unwrap();
+    let id = runner.executable().unwrap();
+    for _ in 0..3 {
+        assert_eq!(
+            runner.run(&command(&d.0, &[], Duration::from_secs(10), 1 << 20)),
+            Ok(b"ok".to_vec())
+        );
+    }
+    assert_eq!(runner.executable().unwrap(), id);
+    assert!(id.probe_policy.contains("Claude"));
+}
+
+#[test]
+fn replacement_after_construction_is_refused_even_with_identical_output() {
+    let d = Dir::new();
+    let exe = d.script("printf original");
+    let runner = WorkspaceHostProbeRunner::new(&exe, env()).unwrap();
+    // Identical output, different bytes: output equality cannot hide drift.
+    d.script("printf original # upgraded");
+    let probe = command(&d.0, &[], Duration::from_secs(10), 1 << 20);
+    assert_eq!(runner.run(&probe), Err(Error::ExecutableChanged));
+    assert_eq!(runner.executable(), Err(Error::ExecutableChanged));
+    // Restoring the admitted bytes restores the admitted identity.
+    d.script("printf original");
+    assert_eq!(runner.run(&probe), Ok(b"original".to_vec()));
+    // A newly validated runner explicitly admits the new bytes.
+    d.script("printf original # upgraded");
+    let upgraded = WorkspaceHostProbeRunner::new(&exe, env()).unwrap();
+    assert_eq!(upgraded.run(&probe), Ok(b"original".to_vec()));
+    assert_eq!(runner.executable(), Err(Error::ExecutableChanged));
+}
+
+#[test]
+fn replacement_during_a_probe_discards_its_output() {
+    let d = Dir::new();
+    // The probe rewrites its own file (same reported output) before exiting.
+    let exe = d.0.join("claude");
+    let body = format!(
+        "#!/bin/sh\nprintf '#!/bin/sh\\nprintf same\\n' > {}\nprintf same\n",
+        exe.display()
+    );
+    std::fs::write(&exe, body).unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let runner = WorkspaceHostProbeRunner::new(&exe, env()).unwrap();
+    assert_eq!(
+        runner.run(&command(&d.0, &[], Duration::from_secs(10), 1 << 20)),
+        Err(Error::ExecutableChanged)
+    );
+}
+
+#[test]
+fn replacing_the_path_with_a_symlink_is_refused() {
+    let d = Dir::new();
+    let exe = d.script("printf ok");
+    let runner = WorkspaceHostProbeRunner::new(&exe, env()).unwrap();
+    let other = d.0.join("other");
+    std::fs::copy(&exe, &other).unwrap();
+    std::fs::remove_file(&exe).unwrap();
+    std::os::unix::fs::symlink(&other, &exe).unwrap();
+    assert_eq!(runner.executable(), Err(Error::ExecutableChanged));
+    assert_eq!(
+        runner.run(&command(&d.0, &[], Duration::from_secs(10), 1 << 20)),
+        Err(Error::ExecutableChanged)
+    );
 }

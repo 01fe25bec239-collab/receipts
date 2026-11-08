@@ -5,7 +5,7 @@
 //! File settings cannot establish higher managed tiers, project trust, or
 //! Receipts hook ownership. Consequently they never authorize native hooks.
 
-use crate::host_probe_port::{HostObservationFingerprintV1, HostProbeProcessPort};
+use crate::host_probe_port::{HostObservationFingerprintV1, HostProbeProcessPort, digest};
 use crate::{
     HostCapabilityHookCoverageClass, HostCapabilityModeOverride, HostCapabilityProbeStatus,
     HostCapabilityReportSelectionCompositionInputs, HostCapabilityStaleReason, HostId,
@@ -62,6 +62,8 @@ pub enum HostCapabilityObservationError {
     ProbeStdoutTooLarge,
     ProbeStderrTooLarge,
     ProbeCleanupFailed,
+    /// The probe executable no longer holds the admitted bytes.
+    ExecutableChanged,
 }
 use HostCapabilityObservationError as Error;
 
@@ -206,13 +208,21 @@ pub fn observe_host_capabilities_with_fingerprint(
     let version =
         probes.then(|| port.run(&io::probe_command(&request.project_root, &["--version"])));
     let (observation, plugins, sources) = observe_material(request, &io::LocalSources(port));
+    // Every probe must describe the same admitted executable: re-check after
+    // the last probe so a port that reports a different identity (or none)
+    // leaves this fingerprint incomplete.
+    let executable = executable.map(|before| match (before, port.executable()) {
+        (Ok(before), Ok(after)) if before == after => Ok(before),
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        (Ok(_), Ok(_)) => Err(Error::ExecutableChanged),
+    });
     let fingerprint = HostObservationFingerprintV1 {
         host: request.host,
         project_root: request.project_root.clone(),
         executable,
-        version,
-        plugins,
-        sources,
+        version: version.as_ref().map(digest),
+        plugins: plugins.as_ref().map(digest),
+        sources: sources.iter().map(|(s, m)| (*s, digest(m))).collect(),
     };
     (observation, fingerprint)
 }

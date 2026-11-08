@@ -8,11 +8,11 @@ use std::path::PathBuf;
 
 use crate::{
     HostAdapter, HostCapabilityFreshnessDisposition, HostCapabilityModeOverride,
-    HostCapabilityReportNonTemporalCore, HostCapabilityReportRefreshOutcome,
+    HostCapabilityReportRefreshOutcome,
     HostCapabilityReportRefreshRequest, HostDetectionError, HostDetectionSignals, HostId,
     freshness_disposition,
     host_capability_observation::HostCapabilityObservationRequest,
-    host_probe_port::{HostObservationFingerprintV1, HostProbeProcessPort},
+    host_probe_port::{HostCapabilityCacheEntryV1, HostProbeProcessPort},
     refresh_host_capability_report, resolve_host,
 };
 
@@ -91,9 +91,8 @@ pub struct HostSessionActivationRequest<'a> {
     pub explicit_host_override: Option<HostId>,
     pub project_root: PathBuf,
     pub mode_override: Option<HostCapabilityModeOverride>,
-    pub cached_report: Option<&'a HostCapabilityReportNonTemporalCore>,
-    /// The exact fingerprint recorded with `cached_report`, if any.
-    pub cached_fingerprint: Option<&'a HostObservationFingerprintV1>,
+    /// A previously minted coupled entry; never current evidence by itself.
+    pub cached: Option<&'a HostCapabilityCacheEntryV1>,
 }
 
 /// Identity reconciled and capability refresh attempted, not unconditional readiness.
@@ -177,9 +176,10 @@ fn prepare_with_refresh<A: HostAdapter>(
         });
     }
 
-    // SESSION_START_OR_RESUME: always observe fresh. A cached report is
-    // reusable only when the fresh observation's exact fingerprint is complete
-    // and identical to the one recorded with it; caller flags never count.
+    // SESSION_START_OR_RESUME: always observe fresh. A cached entry is
+    // reusable only when this fresh observation minted an identical entry
+    // (complete fingerprint, same override, same report); caller flags never
+    // count and independently supplied reports/fingerprints are not accepted.
     let capability_refresh = refresh(&HostCapabilityReportRefreshRequest {
         observation: HostCapabilityObservationRequest {
             host: resolved_host,
@@ -187,11 +187,10 @@ fn prepare_with_refresh<A: HostAdapter>(
         },
         mode_override: request.mode_override.clone(),
     });
-    let reusable = request.cached_report.is_some()
-        && match (&capability_refresh.fingerprint, request.cached_fingerprint) {
-            (Some(current), Some(cached)) => current.permits_reuse_of(cached),
-            _ => false,
-        };
+    let reusable = match (&capability_refresh.cache_entry, request.cached) {
+        (Some(current), Some(cached)) => cached.permits_reuse_by(current),
+        _ => false,
+    };
     let freshness_disposition = freshness_disposition(reusable);
     Ok(HostSessionActivationOutcome {
         resolved_host,
