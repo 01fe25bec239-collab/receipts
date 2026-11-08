@@ -128,6 +128,11 @@ impl EventProposalV1 {
     pub fn claimed_observed_at(&self) -> Option<&str> {
         self.claimed_observed_at.as_deref()
     }
+    /// The referenced content and its supplied digest (a claim until the
+    /// trusted core verifies the actual bytes).
+    pub fn payload(&self) -> &EventPayloadReference {
+        &self.payload
+    }
 
     /// Lowercase hex SHA-256 over a fixed-order JSON array of every field.
     pub fn sha256(&self) -> String {

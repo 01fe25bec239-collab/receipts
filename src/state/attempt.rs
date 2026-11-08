@@ -133,10 +133,10 @@ pub struct AttemptStart {
     started_at: CanonicalTimestampV1,
 }
 impl AttemptStart {
-    pub(crate) fn project_id(&self) -> &str {
+    pub fn project_id(&self) -> &str {
         &self.project_id
     }
-    pub(crate) fn graph_id(&self) -> &str {
+    pub fn graph_id(&self) -> &str {
         &self.graph_id
     }
     /// `attempt_number` is a positive decimal of any length; `start_sha` is a
@@ -191,7 +191,7 @@ pub struct AttemptFinish {
     failure_class: Option<String>,
 }
 impl AttemptFinish {
-    pub(crate) fn attempt_id(&self) -> &AttemptId {
+    pub fn attempt_id(&self) -> &AttemptId {
         &self.attempt_id
     }
     /// Optional strings are opaque and preserved exactly, including empty values.

@@ -21,7 +21,8 @@ pub use json_value::{
 };
 pub use remote_policy::{ProjectRemotePolicy, WorkspaceCompositionLevel};
 pub use state_write_authority::{
-    CoreAdmissionIdentity, CorePolicyRefusal, CoreStateWriteError, CoreStateWriter,
+    CoreAdmissionIdentity, CoreContentResolverV1, CorePolicyRefusal, CoreStateWriteError,
+    CoreStateWriter,
 };
 
 #[cfg(test)]

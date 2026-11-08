@@ -423,7 +423,12 @@ impl Store {
             genesis.genesis_provenance().compiler_id().clone(),
             genesis.policy_id().to_owned(),
         )
-        .unwrap_or_else(|| panic!("admission identity"));
+        .unwrap_or_else(|| panic!("admission identity"))
+        // The fixture composition admits the project with the source it compiled.
+        .with_project(
+            genesis.project_id(),
+            genesis.genesis_provenance().source_ref().clone(),
+        );
         let mut writer = ok(CoreStateWriter::open(&self.0, identity), "open core writer");
         if let Err(error) = writer.create_initial_graph(&SyntheticClock, genesis) {
             panic!("create genesis: {error}");
