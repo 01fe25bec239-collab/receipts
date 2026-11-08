@@ -60,6 +60,7 @@ pub mod rejected_repair_transition;
 pub mod repair_completion_transition;
 pub mod review_evidence;
 pub mod review_verdict_transition;
+pub mod store;
 pub mod version;
 
 pub use records::{
@@ -121,6 +122,8 @@ mod repair_completion_transition_tests;
 mod review_evidence_tests;
 #[cfg(test)]
 mod review_verdict_transition_tests;
+#[cfg(test)]
+mod store_tests;
 
 pub use accepted_integration_transition::{
     AUTHORIZED_ACCEPTED_INTEGRATION_TRANSITIONS, AcceptedIntegrationTransitionError,
@@ -185,4 +188,8 @@ pub use review_evidence::{
 pub use review_verdict_transition::{
     AUTHORIZED_REVIEW_VERDICT_TRANSITIONS, ReviewVerdictTransitionError,
     validate_review_verdict_transition,
+};
+pub use store::{
+    GraphStoreErrorV1, load_current_graph_v1, load_graph_history_v1, load_graph_version_v1,
+    load_node_results_v1, persist_compiled_graph_v1, persist_mutation_v1,
 };
