@@ -22,6 +22,7 @@ members = [
     "crates/receipts-model-routing",
     "crates/receipts-review-integration",
     "crates/receipts-review-contracts",
+    "crates/receipts-e2e",
     "crates/receipts-runtime-bindings",
 ]
 
