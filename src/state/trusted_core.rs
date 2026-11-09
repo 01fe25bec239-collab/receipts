@@ -899,7 +899,7 @@ mod secure {
     /// The facts checked for every object, from `fstat` or `fstatat`.
     #[derive(PartialEq)]
     struct Facts {
-        kind: u32,
+        kind: libc::mode_t,
         uid: u32,
         mode: u32,
         nlink: u64,
@@ -910,8 +910,11 @@ mod secure {
     impl Facts {
         fn of(file: &File) -> Result<Self, StateError> {
             let m = file.metadata().map_err(io)?;
+            // MetadataExt uses u32; libc mode_t is u16 on macOS and u32 on Linux.
+            #[allow(clippy::unnecessary_cast)]
+            let mode = m.mode() as libc::mode_t;
             Ok(Self {
-                kind: m.mode() & libc::S_IFMT as u32,
+                kind: mode & libc::S_IFMT,
                 uid: m.uid(),
                 mode: m.mode() & 0o7777,
                 nlink: m.nlink(),
@@ -920,7 +923,7 @@ mod secure {
             })
         }
         fn regular(&self) -> bool {
-            self.kind == libc::S_IFREG as u32
+            self.kind == libc::S_IFREG
         }
         fn same_object(&self, other: &Self) -> bool {
             (self.dev, self.ino) == (other.dev, other.ino)
@@ -967,7 +970,7 @@ mod secure {
         // Field widths differ between platforms; the casts are not redundant everywhere.
         #[allow(clippy::unnecessary_cast)]
         Ok(Some(Facts {
-            kind: (st.st_mode & libc::S_IFMT) as u32,
+            kind: st.st_mode & libc::S_IFMT,
             uid: st.st_uid,
             mode: (st.st_mode & 0o7777) as u32,
             nlink: st.st_nlink as u64,
@@ -1007,7 +1010,7 @@ mod secure {
     /// An ancestor may be shared only if no other principal can replace the
     /// entry below it.
     fn protected_ancestor(dir: &Facts, child: &Facts) -> Result<(), StateError> {
-        if dir.kind != libc::S_IFDIR as u32 {
+        if dir.kind != libc::S_IFDIR {
             return Err(refused(R::InsecurePath));
         }
         if dir.uid != 0 && dir.uid != euid() {
@@ -1033,7 +1036,7 @@ mod secure {
             dir = child;
         }
         let facts = Facts::of(&dir)?;
-        if facts.kind != libc::S_IFDIR as u32 {
+        if facts.kind != libc::S_IFDIR {
             return Err(refused(R::InsecurePath));
         }
         facts.private()?;
