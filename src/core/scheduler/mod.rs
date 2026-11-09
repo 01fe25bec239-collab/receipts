@@ -1,7 +1,8 @@
 //! Owned scheduler namespace.
 //!
-//! Dispatch-admission evidence and validated non-temporal composition.
-//! No scheduler loop, policy engine, or operational dispatch.
+//! Dispatch-admission evidence, the D11 evaluator, the deterministic
+//! dispatch scheduler and write-collision resolution. No dispatch loop,
+//! routing or execution happens here.
 
 pub mod dispatch_admission_axis_references;
 pub mod dispatch_admission_core;
@@ -11,6 +12,8 @@ pub mod dispatch_admission_derivation;
 pub mod dispatch_admission_provider_auth_axis;
 pub mod dispatch_admission_provider_policy_axis;
 pub mod dispatch_admission_vocabulary;
+pub mod dispatch_scheduler;
+pub mod write_collision;
 pub mod write_scope_port;
 
 pub use dispatch_admission_axis_references::{
@@ -42,6 +45,15 @@ pub use dispatch_admission_vocabulary::{
     DispatchAdmissionAxisResult, DispatchAdmissionDenialReason, DispatchAdmissionFailingAxis,
     DispatchAdmissionOutcome,
 };
+pub use dispatch_scheduler::{
+    ConcurrencyLimitsV1, DeferralV1, DispatchBudgetV1, DispatchCandidateV1, DispatchPriorityV1,
+    DispatchScheduleV1, InFlightWriterV1, ScheduledCandidateV1, SchedulingContextV1,
+    SchedulingDecisionV1, SchedulingRefusalV1, schedule_dispatch_v1,
+};
+pub use write_collision::{
+    CollidingWriterV1, CollisionMutationV1, WorkstreamOwnershipV1, WriteCollisionResolutionErrorV1,
+    WriteCollisionResolutionV1, WriteCollisionResolvedV1, resolve_write_collision_v1,
+};
 pub use write_scope_port::{
     WriteScopeCollisionV1, WriteScopeOverlapV1, WriteScopePort, classify_write_collision,
 };
@@ -60,5 +72,9 @@ mod dispatch_admission_derivation_tests;
 mod dispatch_admission_provider_auth_axis_tests;
 #[cfg(test)]
 mod dispatch_admission_vocabulary_tests;
+#[cfg(test)]
+mod dispatch_scheduler_tests;
+#[cfg(test)]
+mod write_collision_tests;
 #[cfg(test)]
 mod write_scope_port_tests;

@@ -149,7 +149,7 @@ pub fn project_persisted_current_graph_v1(
     .map_err(invalid)
 }
 
-fn node(stored: &StateGraphNodeV1) -> Result<GraphNode, Error> {
+pub(crate) fn node(stored: &StateGraphNodeV1) -> Result<GraphNode, Error> {
     let kind = GraphNodeKind::new(stored.kind().to_owned()).map_err(invalid)?;
     let state = GraphNodeState::parse(stored.state()).map_err(invalid)?;
     let mut node =
@@ -197,7 +197,7 @@ fn node(stored: &StateGraphNodeV1) -> Result<GraphNode, Error> {
     Ok(node)
 }
 
-fn edge(stored: &StateGraphEdgeV1) -> Result<GraphEdge, Error> {
+pub(crate) fn edge(stored: &StateGraphEdgeV1) -> Result<GraphEdge, Error> {
     let (id, graph, from, to) = (
         stored.edge_id(),
         stored.graph_id(),

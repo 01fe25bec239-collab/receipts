@@ -20,6 +20,8 @@ pub mod scheduler;
 
 pub mod capsules;
 
+pub mod compiler;
+
 pub mod goal;
 
 pub mod orchestration;
@@ -30,3 +32,6 @@ pub mod wire;
 
 #[cfg(test)]
 mod facade_tests;
+
+#[cfg(test)]
+mod test_support;
