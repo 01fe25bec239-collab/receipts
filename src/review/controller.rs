@@ -23,24 +23,45 @@
 //! [`ReviewRecordSink`]. Reviewer-asserted `reviewer`, `reproduction`,
 //! `reviewed_at` and `unauthorized_file_changes` are replaced by values the
 //! controller observed.
+//!
+//! Replay safety: a durable claim is taken from the sink BEFORE routing or
+//! dispatch. Only the caller that acquires it executes; the result package is
+//! sealed durably before any record is published, and publication is
+//! idempotent and resumable. A repeated or concurrent call for the same
+//! attempt recovers the recorded disposition (and finishes any unfinished
+//! publication) or refuses; it never routes, provisions, dispatches or
+//! reproduces again, and a persistence failure never leads to a second
+//! execution.
+//!
+//! Policy is applied before any success is produced: the reviewer quality
+//! floor is derived raise-only and must be met by Routing's evidence;
+//! findings in a mandatory category are blocking whatever the reviewer
+//! flagged (the verdict becomes REJECT); every audit dimension must be
+//! assessed; a PASS_WITH_NONBLOCKING_FINDINGS ticket is not passing until
+//! each nonblocking finding has an explicit disposition.
 
 use crate::capsule_builder::{CapsuleBuildRefusal, ReviewCapsuleBuildInput, build_review_capsule};
 use crate::ports::{
-    ImplementerIdentity, ReviewRecordProposal, ReviewRecordSink, ReviewerCandidate,
+    ImplementerIdentity, ReviewClaim, ReviewRecordProposal, ReviewRecordSink, ReviewerCandidate,
     ReviewerRequirements, ReviewerRoutingPort, ReviewerRoutingRefusal, ReviewerRuntime,
+    SealedReview, reviewer_tier_rank,
 };
 use crate::records::{ProposalBuilder, derived_id};
 use crate::reproduction::{CheckRunStatus, CheckRunnerConfig, run_check};
 use crate::review_parse::parse_reviewer_output;
-use crate::wire::{encode_a4_review, encode_review_capsule, encode_safety_interruption};
+use crate::wire::{
+    decode_a4_review, encode_a4_review, encode_review_capsule, encode_safety_interruption,
+};
 use crate::{
     A4Review, A4ReviewFinding, A4ReviewFindingCategory, A4ReviewFindingConfidence,
     A4ReviewFindingSeverity, A4ReviewFindingSource, A4ReviewNonTemporalCore, A4ReviewReproduction,
     A4ReviewReproductionCheck, A4ReviewReproductionCheckResult, A4ReviewReproductionLimitation,
-    A4ReviewReviewer, A4ReviewVerdict, DistinctProviderPolicy, ReviewCapsuleCheck,
-    ReviewCapsuleCheckResult, ReviewCapsuleCriterionKind, ReviewCapsuleNonTemporalCore,
-    ReviewDateTimeV1, ReviewRequest, SafetyInterruption, SafetyInterruptionDetectionConfidence,
-    SafetyInterruptionNonTemporalCore, SafetyInterruptionState, SafetyInterruptionTerminalOutcome,
+    A4ReviewReviewer, A4ReviewVerdict, AssuranceReviewerQualityFloor, DistinctProviderPolicy,
+    ReviewCapsuleCheck, ReviewCapsuleCheckResult, ReviewCapsuleCriterionKind,
+    ReviewCapsuleNonTemporalCore, ReviewDateTimeV1, ReviewRequest, ReviewRequestReviewerFloor,
+    SafetyInterruption, SafetyInterruptionDetectionConfidence, SafetyInterruptionNonTemporalCore,
+    SafetyInterruptionState, SafetyInterruptionTerminalOutcome,
+    is_assurance_profile_blocking_floor,
 };
 use receipts_runtime_adapters::FailureClass;
 use receipts_state::{DecisionRecordKind, EventType, SubjectKind};
@@ -73,9 +94,21 @@ pub enum ReviewRefusal {
     /// The reviewer session is the implementer's or an excluded one.
     SameSession,
     DistinctProviderRequired,
+    /// Routing named no quality evidence for the selected reviewer: missing
+    /// evidence never counts as meeting a floor.
+    QualityEvidenceMissing,
+    /// The evidenced tier is below the effective floor.
+    QualityBelowFloor {
+        required: ReviewRequestReviewerFloor,
+        evidenced: ReviewRequestReviewerFloor,
+    },
     UnknownRuntime(String),
     Workspace(String),
+    /// The durable claim could not be taken or the package not persisted.
     Records(String),
+    /// An earlier or concurrent run holds the claim without a sealed
+    /// result; nothing is executed again (operator recovery).
+    ClaimInFlight,
 }
 
 /// Terminal review disposition. Only `Reviewed` with a passing verdict can
@@ -89,6 +122,19 @@ pub enum ReviewDisposition {
     PolicyBlocked(SafetyInterruption),
     /// Nothing was dispatched.
     Refused(ReviewRefusal),
+    /// An earlier run's sealed result, recovered without any execution.
+    Replayed(Box<ReplayedReview>),
+}
+
+/// What an earlier, sealed run recorded.
+#[derive(Debug, Clone)]
+pub struct ReplayedReview {
+    /// `REVIEWED`, `POLICY_BLOCKED`, `INVALID_OUTPUT` or `REFUSED`.
+    pub outcome: String,
+    /// The recorded review, when the original run produced one.
+    pub review: Option<A4Review>,
+    /// The original run's owned worktree cleanup succeeded.
+    pub cleanup_ok: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -105,13 +151,47 @@ pub struct ReviewTicket {
 }
 
 impl ReviewTicket {
-    /// True only for a persisted, cleaned-up, controller-attested PASS or
-    /// PASS_WITH_NONBLOCKING_FINDINGS.
+    /// The review this ticket speaks for: its own, or the recovered one.
+    pub fn review(&self) -> Option<&A4Review> {
+        match &self.disposition {
+            ReviewDisposition::Reviewed(r) => Some(r),
+            ReviewDisposition::Replayed(p) => p.review.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Nonblocking findings that still need an explicit disposition.
+    pub fn pending_dispositions(&self) -> Vec<String> {
+        match self.review() {
+            Some(r) if r.core().verdict() == A4ReviewVerdict::PassWithNonblockingFindings => r
+                .core()
+                .nonblocking_findings()
+                .iter()
+                .map(|f| f.finding_id().to_owned())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// True only for a persisted, cleaned-up, controller-attested PASS.
+    /// PASS_WITH_NONBLOCKING_FINDINGS is a distinct verdict that stays
+    /// pending until [`crate::disposition_proposal`] records an explicit
+    /// disposition for every finding (the acceptance gate enforces the same
+    /// coverage), and REJECT never passes, whatever its finding arrays hold.
     pub fn passed(&self) -> bool {
-        matches!(&self.disposition, ReviewDisposition::Reviewed(r)
-            if r.core().verdict() != A4ReviewVerdict::Reject)
+        let clean = match &self.disposition {
+            ReviewDisposition::Reviewed(_) => matches!(self.cleanup, Some(Ok(()))),
+            ReviewDisposition::Replayed(p) => p.cleanup_ok,
+            _ => false,
+        };
+        self.review().is_some_and(|r| {
+            matches!(
+                r.core().verdict(),
+                A4ReviewVerdict::Pass | A4ReviewVerdict::PassWithNonblockingFindings
+            )
+        }) && self.pending_dispositions().is_empty()
             && self.persisted.is_ok()
-            && matches!(self.cleanup, Some(Ok(())))
+            && clean
     }
 }
 
@@ -139,6 +219,29 @@ pub fn effective_distinct_provider(request: &ReviewRequest) -> DistinctProviderP
     }
 }
 
+/// Raise-only reviewer quality floor: the assurance profile's minimum
+/// (BALANCED for LIGHT, FRONTIER otherwise), raised but never lowered by the
+/// request's own `reviewer_floor`.
+pub fn effective_reviewer_floor(request: &ReviewRequest) -> ReviewRequestReviewerFloor {
+    let profile = match request
+        .core()
+        .assurance_profile()
+        .requirements()
+        .reviewer_quality_floor
+    {
+        AssuranceReviewerQualityFloor::Balanced => ReviewRequestReviewerFloor::Balanced,
+        AssuranceReviewerQualityFloor::Frontier => ReviewRequestReviewerFloor::Frontier,
+    };
+    match request
+        .core()
+        .review_policy()
+        .and_then(|p| p.reviewer_floor())
+    {
+        Some(asked) if reviewer_tier_rank(asked) > reviewer_tier_rank(profile) => asked,
+        _ => profile,
+    }
+}
+
 fn requirements(attempt: &AttemptFinished<'_>) -> ReviewerRequirements {
     let distinct = effective_distinct_provider(attempt.request);
     let policy = attempt.request.core().review_policy();
@@ -149,7 +252,7 @@ fn requirements(attempt: &AttemptFinished<'_>) -> ReviewerRequirements {
     excluded.extend(attempt.implementer.session_ref.clone());
     ReviewerRequirements {
         distinct_provider: distinct,
-        reviewer_floor: policy.and_then(|p| p.reviewer_floor()),
+        reviewer_floor: effective_reviewer_floor(attempt.request),
         excluded_providers: if distinct == DistinctProviderPolicy::Required {
             vec![attempt.implementer.provider_id.clone()]
         } else {
@@ -177,12 +280,104 @@ fn independence(
     {
         return Err(ReviewRefusal::DistinctProviderRequired);
     }
+    match &candidate.quality {
+        Some(q) if !q.basis_ref.trim().is_empty() => {
+            if reviewer_tier_rank(q.tier) < reviewer_tier_rank(req.reviewer_floor) {
+                return Err(ReviewRefusal::QualityBelowFloor {
+                    required: req.reviewer_floor,
+                    evidenced: q.tier,
+                });
+            }
+        }
+        _ => return Err(ReviewRefusal::QualityEvidenceMissing),
+    }
     Ok(())
+}
+
+/// Durable identity of one finished attempt's review.
+pub fn review_claim_key(attempt: &AttemptFinished<'_>) -> String {
+    let core = attempt.request.core();
+    derived_id(
+        "review-claim",
+        &[
+            attempt.project_id,
+            core.request_id(),
+            core.task_id(),
+            core.attempt_id(),
+            core.implementation_sha().as_str(),
+        ],
+    )
+}
+
+fn refused_ticket(refusal: ReviewRefusal, persisted: Result<(), String>) -> ReviewTicket {
+    ReviewTicket {
+        capsule: None,
+        disposition: ReviewDisposition::Refused(refusal),
+        dispatches: 0,
+        cleanup: None,
+        persisted,
+        proposal: None,
+    }
 }
 
 impl ReviewController<'_> {
     pub fn on_attempt_finished(
         &self,
+        attempt: AttemptFinished<'_>,
+        sink: &mut dyn ReviewRecordSink,
+    ) -> ReviewTicket {
+        let key = review_claim_key(&attempt);
+        match sink.claim(&key) {
+            // No claim: nothing was executed, nothing is retried elsewhere.
+            Err(e) => refused_ticket(ReviewRefusal::Records(e.clone()), Err(e)),
+            Ok(ReviewClaim::InFlight) => refused_ticket(
+                ReviewRefusal::ClaimInFlight,
+                Err(
+                    "a claim exists without a sealed result; recovery is an operator decision"
+                        .into(),
+                ),
+            ),
+            Ok(ReviewClaim::Sealed(sealed)) => self.recover(&key, &sealed, sink),
+            Ok(ReviewClaim::Acquired) => self.execute(&key, attempt, sink),
+        }
+    }
+
+    /// Completes an earlier run's publication from its sealed package and
+    /// returns its recorded disposition. Executes nothing.
+    fn recover(
+        &self,
+        key: &str,
+        sealed: &SealedReview,
+        sink: &mut dyn ReviewRecordSink,
+    ) -> ReviewTicket {
+        let rebuilt = sealed.proposal();
+        let review = rebuilt.as_ref().ok().and_then(|p| {
+            p.decision_records
+                .iter()
+                .find(|r| r.kind() == DecisionRecordKind::A4Review)
+                .and_then(|r| decode_a4_review(r.record_json()).ok())
+        });
+        let persisted = match &rebuilt {
+            Ok(p) => sink.publish(key, p),
+            Err(e) => Err(e.clone()),
+        };
+        ReviewTicket {
+            capsule: None,
+            disposition: ReviewDisposition::Replayed(Box::new(ReplayedReview {
+                outcome: sealed.outcome.clone(),
+                review,
+                cleanup_ok: sealed.cleanup_ok,
+            })),
+            dispatches: 0,
+            cleanup: None,
+            persisted,
+            proposal: rebuilt.ok(),
+        }
+    }
+
+    fn execute(
+        &self,
+        key: &str,
         attempt: AttemptFinished<'_>,
         sink: &mut dyn ReviewRecordSink,
     ) -> ReviewTicket {
@@ -202,7 +397,7 @@ impl ReviewController<'_> {
             Ok(c) => c,
             Err(e) => {
                 ticket.disposition = ReviewDisposition::Refused(ReviewRefusal::Capsule(e));
-                return self.finish(ticket, &attempt, sink);
+                return self.finish(ticket, &attempt, key, sink);
             }
         };
         ticket.capsule = Some(capsule.clone());
@@ -217,15 +412,15 @@ impl ReviewController<'_> {
                     None,
                     SafetyInterruptionDetectionConfidence::Unknown,
                 );
-                return self.finish(ticket, &attempt, sink);
+                return self.finish(ticket, &attempt, key, sink);
             }
             Err(ReviewerRoutingRefusal::NoEligibleReviewer) => {
-                return self.finish(ticket, &attempt, sink);
+                return self.finish(ticket, &attempt, key, sink);
             }
         };
         if let Err(refusal) = independence(&candidate, &req, attempt.implementer) {
             ticket.disposition = ReviewDisposition::Refused(refusal);
-            return self.finish(ticket, &attempt, sink);
+            return self.finish(ticket, &attempt, key, sink);
         }
         let Some(runtime) = self
             .runtimes
@@ -235,7 +430,7 @@ impl ReviewController<'_> {
             ticket.disposition = ReviewDisposition::Refused(ReviewRefusal::UnknownRuntime(
                 candidate.runtime_id.clone(),
             ));
-            return self.finish(ticket, &attempt, sink);
+            return self.finish(ticket, &attempt, key, sink);
         };
         let workspace = match provision_review_workspace(&ReviewWorkspaceRequest {
             repository_root: attempt.repository_root.to_path_buf(),
@@ -248,7 +443,7 @@ impl ReviewController<'_> {
             Err(e) => {
                 ticket.disposition =
                     ReviewDisposition::Refused(ReviewRefusal::Workspace(e.to_string()));
-                return self.finish(ticket, &attempt, sink);
+                return self.finish(ticket, &attempt, key, sink);
             }
         };
         ticket.dispatches = 1;
@@ -257,7 +452,7 @@ impl ReviewController<'_> {
         ticket.cleanup = Some(
             remove_review_workspace(attempt.repository_root, &workspace).map_err(|e| e.to_string()),
         );
-        self.finish(ticket, &attempt, sink)
+        self.finish(ticket, &attempt, key, sink)
     }
 
     fn review_in(
@@ -412,6 +607,47 @@ impl ReviewController<'_> {
         let r = reported.core();
         let mut blocking = r.blocking_findings().to_vec();
         let mut verdict = r.verdict();
+        // Mandatory-category floor: the capsule's blocking categories, the
+        // eight-category assurance floor and a missing required negative
+        // test are blocking whatever the reviewer flagged. Such a finding is
+        // moved to the blocking array (flag set) and the verdict is REJECT.
+        let mandatory = |category: A4ReviewFindingCategory| {
+            is_assurance_profile_blocking_floor(category)
+                || category == A4ReviewFindingCategory::MissingRequiredNegativeTest
+                || capsule
+                    .severity_policy()
+                    .blocking_categories()
+                    .iter()
+                    .any(|c| c == category.as_str())
+        };
+        let mut nonblocking = Vec::new();
+        let mut promoted = false;
+        for f in r.nonblocking_findings() {
+            if mandatory(f.category()) {
+                blocking.push(
+                    A4ReviewFinding::new(
+                        f.finding_id().to_owned(),
+                        f.severity(),
+                        f.category(),
+                        f.description().to_owned(),
+                        true,
+                        f.path().map(str::to_owned),
+                        f.line(),
+                        f.evidence_ref().cloned(),
+                        f.confidence(),
+                        f.source(),
+                    )
+                    .map_err(|e| format!("{e:?}"))?,
+                );
+                promoted = true;
+            } else {
+                nonblocking.push(f.clone());
+            }
+        }
+        // A blocking-array entry in a mandatory category is already blocking.
+        if promoted {
+            verdict = A4ReviewVerdict::Reject;
+        }
         for (n, command) in mismatches.iter().enumerate() {
             blocking.push(
                 A4ReviewFinding::new(
@@ -472,7 +708,7 @@ impl ReviewController<'_> {
             verdict,
             true,
             blocking,
-            r.nonblocking_findings().to_vec(),
+            nonblocking,
             r.dimensions().to_vec(),
             Some(reviewer),
             Some(A4ReviewReproduction::new(
@@ -521,15 +757,29 @@ impl ReviewController<'_> {
         }
     }
 
+    /// Seals the exact package durably, then publishes it. A failure at
+    /// either step is reported and leaves the claim in place, so a retry
+    /// finishes publication from the sealed package (or refuses) and never
+    /// executes the review again.
     fn finish(
         &self,
         mut ticket: ReviewTicket,
         attempt: &AttemptFinished<'_>,
+        key: &str,
         sink: &mut dyn ReviewRecordSink,
     ) -> ReviewTicket {
-        match records(&ticket, attempt) {
+        match records(&ticket, attempt, key) {
             Ok(proposal) => {
-                ticket.persisted = sink.persist(&proposal);
+                let cleanup_ok = matches!(ticket.cleanup, Some(Ok(())));
+                let sealed = SealedReview::new(
+                    &proposal,
+                    outcome_label(&ticket.disposition),
+                    cleanup_ok,
+                    ticket.dispatches,
+                );
+                ticket.persisted = sink
+                    .seal(key, &sealed)
+                    .and_then(|()| sink.publish(key, &proposal));
                 ticket.proposal = Some(proposal);
             }
             Err(e) => ticket.persisted = Err(e),
@@ -538,15 +788,27 @@ impl ReviewController<'_> {
     }
 }
 
+fn outcome_label(d: &ReviewDisposition) -> &'static str {
+    match d {
+        ReviewDisposition::Reviewed(_) => "REVIEWED",
+        ReviewDisposition::InvalidOutput(_) => "INVALID_OUTPUT",
+        ReviewDisposition::PolicyBlocked(_) => "POLICY_BLOCKED",
+        ReviewDisposition::Refused(_) => "REFUSED",
+        ReviewDisposition::Replayed(_) => "REPLAYED",
+    }
+}
+
 fn records(
     ticket: &ReviewTicket,
     attempt: &AttemptFinished<'_>,
+    claim_key: &str,
 ) -> Result<ReviewRecordProposal, String> {
     let core = attempt.request.core();
     let mut b = ProposalBuilder::new(
         attempt.project_id,
         core.task_id(),
         core.context_epoch().decimal_digits(),
+        claim_key,
     )?;
     let task = (SubjectKind::Task, core.task_id());
     if let Some(capsule) = &ticket.capsule
@@ -565,7 +827,11 @@ fn records(
             let id = review.core().review_id();
             b.decision(DecisionRecordKind::A4Review, id, &json)?;
             let payload = b.content(&format!("review:a4:{id}"), json.as_bytes());
-            let passed = review.core().verdict() != A4ReviewVerdict::Reject;
+            // Explicit match: a verdict is never "passing" by exclusion.
+            let passed = matches!(
+                review.core().verdict(),
+                A4ReviewVerdict::Pass | A4ReviewVerdict::PassWithNonblockingFindings
+            );
             b.event(
                 if passed {
                     EventType::ReviewPassed
@@ -575,14 +841,30 @@ fn records(
                 task,
                 payload.clone(),
             )?;
-            let findings = review.core().blocking_findings().len()
-                + review.core().nonblocking_findings().len();
-            for _ in 0..findings {
-                b.event(
-                    EventType::FindingRaised,
-                    (SubjectKind::Review, id),
-                    payload.clone(),
-                )?;
+            // One event per finding, each carrying that finding (not the
+            // whole review), blocking findings first.
+            for f in review
+                .core()
+                .blocking_findings()
+                .iter()
+                .chain(review.core().nonblocking_findings())
+            {
+                let body = serde_json::json!({
+                    "review_id": id,
+                    "task_id": review.core().task_id(),
+                    "reviewed_sha": review.core().reviewed_sha(),
+                    "finding_id": f.finding_id(),
+                    "severity": f.severity().as_str(),
+                    "category": f.category().as_str(),
+                    "description": f.description(),
+                    "blocking": f.blocking(),
+                })
+                .to_string();
+                let payload = b.content(
+                    &format!("review:finding:{id}:{}", f.finding_id()),
+                    body.as_bytes(),
+                );
+                b.event(EventType::FindingRaised, (SubjectKind::Review, id), payload)?;
             }
         }
         ReviewDisposition::PolicyBlocked(interruption) => {
@@ -609,6 +891,8 @@ fn records(
             );
             b.event(EventType::HumanRequired, task, payload)?;
         }
+        // A replayed ticket is never re-recorded; its package already exists.
+        ReviewDisposition::Replayed(_) => {}
         ReviewDisposition::Refused(refusal) => {
             let reason = format!("{refusal:?}");
             let body = format!(

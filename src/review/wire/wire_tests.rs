@@ -804,3 +804,140 @@ fn absent_null_and_empty_stay_distinct() {
         None
     );
 }
+
+// ---- F8: exponent extremes return exact values or Unsupported, never panic.
+
+#[test]
+fn exponent_extremes_never_panic_and_stay_exact() {
+    use super::json::{NotInteger, integer_digits};
+    let min = i64::MIN.to_string();
+    let max = i64::MAX.to_string();
+    // Zero is zero under any exponent, including ones that overflow i64.
+    for token in [
+        format!("0e-{}", &min[1..]),
+        format!("-0e-{}", &min[1..]),
+        format!("0.0e-{}", &min[1..]),
+        format!("0e{max}"),
+        format!("0.00e{max}"),
+        "0e99999999999999999999999".to_owned(),
+        "0e-99999999999999999999999".to_owned(),
+        "0.0e-99999999999999999999999".to_owned(),
+    ] {
+        assert_eq!(integer_digits(&token), Ok("0".to_owned()), "{token}");
+    }
+    // A nonzero value under a huge negative exponent is a fraction.
+    for token in [
+        format!("1e-{}", &min[1..]),
+        format!("10e-{}", &min[1..]),
+        "1e-99999999999999999999999".to_owned(),
+        format!("1.5e-{}", &min[1..]),
+    ] {
+        assert_eq!(integer_digits(&token), Err(NotInteger::Fraction), "{token}");
+    }
+    // A nonzero value under a huge positive exponent is unsupported.
+    for token in [
+        format!("1e{max}"),
+        "1e99999999999999999999999".to_owned(),
+        format!("7.5e{max}"),
+    ] {
+        assert_eq!(
+            integer_digits(&token),
+            Err(NotInteger::Oversized),
+            "{token}"
+        );
+    }
+    // Boundaries just inside the representable range stay exact.
+    assert_eq!(integer_digits("1e3"), Ok("1000".to_owned()));
+    assert_eq!(integer_digits("1000e-3"), Ok("1".to_owned()));
+    // The wire error classes: zero decodes, fraction is WrongType, huge is Unsupported.
+    let wire = |token: &str| {
+        decode_review_capsule(&capsule_min().replace(
+            r#""context_epoch":0"#,
+            &format!(r#""context_epoch":{token}"#),
+        ))
+    };
+    assert_eq!(
+        wire("0e-9223372036854775808")
+            .unwrap()
+            .context_epoch()
+            .decimal_digits(),
+        "0"
+    );
+    assert_eq!(kind_of(wire("1e-9223372036854775808")).1, K::WrongType);
+    assert_eq!(
+        kind_of(wire("1e9223372036854775807")).1,
+        K::UnsupportedValue
+    );
+}
+
+// ---- F9: \u requires exactly four hexadecimal digits, in every codec.
+
+#[test]
+fn unicode_escapes_require_four_hex_digits_in_every_codec() {
+    let poisoned = |fixture: String, escape: &str| {
+        let mut f = fixture;
+        assert_eq!(f.pop(), Some('}'));
+        format!(r#"{f},"zz":"{escape}"}}"#)
+    };
+    let fixtures: [(&str, String, fn(&str) -> bool); 7] = [
+        ("review_request", review_request_min(), |t| {
+            decode_review_request(t).is_ok()
+        }),
+        ("review_capsule", capsule_min(), |t| {
+            decode_review_capsule(t).is_ok()
+        }),
+        ("a3_handoff", handoff_min(), |t| {
+            decode_a3_handoff(t).is_ok()
+        }),
+        ("a4_review", a4_min(), |t| decode_a4_review(t).is_ok()),
+        ("integration_request", ireq_min(), |t| {
+            decode_integration_request(t).is_ok()
+        }),
+        ("integration_decision", idec_min(), |t| {
+            decode_integration_decision(t).is_ok()
+        }),
+        ("safety_interruption", safety_min(), |t| {
+            decode_safety_interruption(t).is_ok()
+        }),
+    ];
+    let kinds: [fn(&str) -> Option<K>; 7] = [
+        |t| decode_review_request(t).err().map(|e| e.kind),
+        |t| decode_review_capsule(t).err().map(|e| e.kind),
+        |t| decode_a3_handoff(t).err().map(|e| e.kind),
+        |t| decode_a4_review(t).err().map(|e| e.kind),
+        |t| decode_integration_request(t).err().map(|e| e.kind),
+        |t| decode_integration_decision(t).err().map(|e| e.kind),
+        |t| decode_safety_interruption(t).err().map(|e| e.kind),
+    ];
+    for ((name, fixture, _), kind_of_text) in fixtures.iter().zip(kinds) {
+        for bad in [
+            r"\u+041",
+            r"\u-041",
+            r"\u 041",
+            r"\u0x41",
+            r"\u004",
+            r"\u00g1",
+            r"\u+0+1",
+            r"\ud83d\u+e00",
+            r"\ud83d\ude0",
+        ] {
+            let text = poisoned(fixture.clone(), bad);
+            assert_eq!(
+                kind_of_text(&text),
+                Some(K::Syntax),
+                "{name}: {bad} must be a syntax error"
+            );
+        }
+        // Valid escapes still pass syntax (the extra member is then refused as unknown).
+        for good in [r"A", r"é", r"😀", r"ꯍ"] {
+            let text = poisoned(fixture.clone(), good);
+            assert_ne!(kind_of_text(&text), Some(K::Syntax), "{name}: {good}");
+        }
+    }
+    // Keys use the same string reader.
+    let key = review_request_min().replacen(r#""task_id""#, r#""task\u+069d""#, 1);
+    assert_eq!(kind_of(decode_review_request(&key)).1, K::Syntax);
+    // The exact original control: "\u+041" must never decode as "A".
+    let a = review_request_min().replace(r#""objective":"o""#, r#""objective":"\u+041""#);
+    assert!(decode_review_request(&a).is_err());
+}

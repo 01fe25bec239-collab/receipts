@@ -7,7 +7,7 @@
 
 use crate::ports::ReviewerRunOutput;
 use crate::wire::{ReviewWireError, decode_a4_review};
-use crate::{A4Review, A4ReviewVerdict, ReviewCapsuleNonTemporalCore};
+use crate::{A4Review, A4ReviewDimension, A4ReviewVerdict, ReviewCapsuleNonTemporalCore};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewParseError {
@@ -22,6 +22,9 @@ pub enum ReviewParseError {
     IndependenceDenied,
     /// Verdict and findings contradict each other.
     VerdictInconsistent(&'static str),
+    /// The frozen lifecycle requires every audit dimension to be assessed
+    /// (NOT_APPLICABLE where appropriate); these were not.
+    IncompleteDimensions(String),
 }
 
 fn document(text: &str) -> Result<&str, ReviewParseError> {
@@ -79,6 +82,11 @@ pub fn parse_reviewer_output(
             "nonblocking_findings entry with blocking=true",
         ));
     }
+    // Operational policy (not schema admission, which stays permissive in
+    // `wire`): PASS carries no findings and no verdict other than REJECT
+    // carries blocking ones, matching the exact-SHA foundation. A REJECT is
+    // retained as a REJECT whatever its finding arrays hold; it can never
+    // become acceptance because they are empty.
     match core.verdict() {
         A4ReviewVerdict::Pass if !core.nonblocking_findings().is_empty() => {
             return Err(E::VerdictInconsistent("PASS with findings"));
@@ -88,10 +96,15 @@ pub fn parse_reviewer_output(
         {
             return Err(E::VerdictInconsistent("PASS with blocking findings"));
         }
-        A4ReviewVerdict::Reject if core.blocking_findings().is_empty() => {
-            return Err(E::VerdictInconsistent("REJECT without a blocking finding"));
-        }
         _ => {}
+    }
+    let missing: Vec<&str> = A4ReviewDimension::ALL
+        .into_iter()
+        .filter(|d| !core.dimensions().iter().any(|r| r.dimension() == *d))
+        .map(A4ReviewDimension::as_str)
+        .collect();
+    if !missing.is_empty() {
+        return Err(E::IncompleteDimensions(missing.join(",")));
     }
     Ok(review)
 }

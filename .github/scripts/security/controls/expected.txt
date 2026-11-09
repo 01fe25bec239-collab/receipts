@@ -1,0 +1,16 @@
+# file | phrases that must all be reported (comma separated) | or PASS
+block-write.yml|write permission,privileged trigger,secret exposed,not pinned,persists credentials
+inline-write.yml|write permission
+write-all.yml|write permission
+quoted-keys.yml|write permission
+job-level-write.yml|write permission
+flow-trigger.yml|privileged trigger
+flow-mapping-trigger.yml|privileged trigger
+inline-steps.yml|persists credentials,not pinned,secret exposed
+anchored-write.yml|write permission
+missing-permissions.yml|no top-level permissions
+secrets-inherit.yml|secret exposed
+docker-unpinned.yml|not pinned
+malformed.yml|unparseable
+safe-block.yml|PASS
+safe-inline.yml|PASS

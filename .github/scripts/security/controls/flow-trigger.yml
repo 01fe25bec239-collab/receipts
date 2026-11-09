@@ -1,0 +1,7 @@
+on: [push, workflow_run]
+permissions: {contents: read}
+jobs:
+  x:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi

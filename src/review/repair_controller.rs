@@ -3,7 +3,17 @@
 //! Progression comes from the existing pure
 //! [`DeterministicRepairCycleControlCore`] (bound 3, exact SHA and attested
 //! independence per pair). Escalation ladder: repair 1 at the same tier,
-//! repairs 2–3 at the frontier floor, then HUMAN_REQUIRED. A policy or
+//! repairs 2–3 at the frontier floor, then ESCALATED_TO_A2 and
+//! HUMAN_REQUIRED (the A1 escalation step is governance outside this
+//! package). Finding-specific mandatory policy is applied BEFORE that
+//! ordinary ladder and can only raise it (A3_A4_REPAIR_LOOP "Who repairs" and
+//! "Who reviews the repair"): a security-boundary finding makes the frontier
+//! floor mandatory from the first repair and escalates `distinct_provider` to
+//! REQUIRED; a security, contract or architecture(invariant) finding bars
+//! the reviewer that raised it (and its model) from grading the repair; a
+//! contract or architecture finding prefers a different model. A review that
+//! raised such a finding without a recorded reviewer identity cannot be
+//! excluded, so the repair escalates instead of guessing. A policy or
 //! safety interruption is never turned into a repair (that would re-route
 //! the same capsule elsewhere): it escalates. Every rejected SHA in the
 //! history is carried forward in order; the A4Review records that reject
@@ -16,8 +26,8 @@ use crate::records::{ProposalBuilder, derived_id};
 use crate::{
     A3HandoffNonTemporalCore, A4ReviewFinding, A4ReviewFindingCategory, A4ReviewNonTemporalCore,
     A4ReviewVerdict, DEFAULT_MAX_REPAIR_ATTEMPTS, DeterministicRepairCycleControlCore,
-    RepairCycleControlError, RepairCycleDisposition, ReviewRequest, SafetyInterruption,
-    is_assurance_profile_blocking_floor, ports::ReviewRecordProposal,
+    DistinctProviderPolicy, RepairCycleControlError, RepairCycleDisposition, ReviewRequest,
+    SafetyInterruption, is_assurance_profile_blocking_floor, ports::ReviewRecordProposal,
 };
 use receipts_state::{EventType, SubjectKind};
 use receipts_workspace_execution::CommitSha;
@@ -56,7 +66,40 @@ pub struct RepairRequest {
     /// 1-based repair ordinal, at most `bound`.
     pub attempt_n: usize,
     pub bound: usize,
+    /// Effective tier: the ordinary ladder, raised by finding-specific policy.
     pub tier: RepairTier,
+    /// Raise-only provider independence for the repair's executor/reviewer.
+    pub distinct_provider: DistinctProviderPolicy,
+    /// A different model is preferred (contract/architecture misreading).
+    pub prefer_different_model: bool,
+    /// Reviewers that raised a security, contract or invariant finding and
+    /// so may not grade its repair.
+    pub excluded_reviewers: ReviewerExclusions,
+    /// Why the finding-specific policy applied, per finding.
+    pub policy_triggers: Vec<RepairPolicyTrigger>,
+}
+
+/// Identities barred from reviewing a repair.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReviewerExclusions {
+    pub session_refs: Vec<String>,
+    /// `(provider, model)` pairs; a missing model excludes the provider's
+    /// reviews of that runtime only through the session refs.
+    pub provider_models: Vec<(String, Option<String>)>,
+    /// The `review_id`s whose finders these are.
+    pub review_ids: Vec<String>,
+}
+
+/// One finding that triggered a mandatory repair policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairPolicyTrigger {
+    pub review_id: String,
+    pub finding_id: String,
+    pub category: A4ReviewFindingCategory,
+    pub frontier_floor: bool,
+    pub distinct_provider_required: bool,
+    pub exclude_finder: bool,
+    pub prefer_different_model: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +107,9 @@ pub enum RepairEscalation {
     BoundExhausted,
     /// Safety/policy refusal: no repair dispatch, no provider-shopping.
     SafetyInterruption,
+    /// A review raised a security, contract or invariant finding without a
+    /// recorded reviewer identity, so the finder cannot be excluded.
+    FinderUnidentified,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +168,69 @@ fn rejected_shas(reviews: &[A4ReviewNonTemporalCore]) -> Vec<CommitSha> {
         .collect()
 }
 
+fn trigger_for(review_id: &str, f: &A4ReviewFinding) -> Option<RepairPolicyTrigger> {
+    use A4ReviewFindingCategory as C;
+    let (frontier, distinct, exclude, prefer) = match f.category() {
+        C::SecurityBoundaryViolation => (true, true, true, false),
+        C::ContractViolation | C::ArchitectureViolation => (false, false, true, true),
+        _ => return None,
+    };
+    Some(RepairPolicyTrigger {
+        review_id: review_id.to_owned(),
+        finding_id: f.finding_id().to_owned(),
+        category: f.category(),
+        frontier_floor: frontier,
+        distinct_provider_required: distinct,
+        exclude_finder: exclude,
+        prefer_different_model: prefer,
+    })
+}
+
+/// Finding-specific mandatory policy over every rejecting review so far.
+fn finding_policy(
+    reviews: &[A4ReviewNonTemporalCore],
+) -> Result<(Vec<RepairPolicyTrigger>, ReviewerExclusions), RepairEscalation> {
+    let mut triggers = Vec::new();
+    let mut exclusions = ReviewerExclusions::default();
+    for review in reviews
+        .iter()
+        .filter(|r| r.verdict() == A4ReviewVerdict::Reject)
+    {
+        let found: Vec<RepairPolicyTrigger> = review
+            .blocking_findings()
+            .iter()
+            .chain(review.nonblocking_findings())
+            .filter_map(|f| trigger_for(review.review_id(), f))
+            .collect();
+        if found.is_empty() {
+            continue;
+        }
+        if found.iter().any(|t| t.exclude_finder) {
+            let Some(reviewer) = review.reviewer() else {
+                return Err(RepairEscalation::FinderUnidentified);
+            };
+            if reviewer.session_ref().is_none() && reviewer.provider_id().is_none() {
+                return Err(RepairEscalation::FinderUnidentified);
+            }
+            if let Some(session) = reviewer.session_ref() {
+                exclusions.session_refs.push(session.to_owned());
+            }
+            if let Some(provider) = reviewer.provider_id() {
+                exclusions
+                    .provider_models
+                    .push((provider.to_owned(), reviewer.model_id().map(str::to_owned)));
+            }
+            exclusions.review_ids.push(review.review_id().to_owned());
+        }
+        triggers.extend(found);
+    }
+    exclusions.session_refs.sort();
+    exclusions.session_refs.dedup();
+    exclusions.provider_models.sort();
+    exclusions.provider_models.dedup();
+    Ok((triggers, exclusions))
+}
+
 pub struct RepairController;
 
 impl RepairController {
@@ -144,6 +253,33 @@ impl RepairController {
                     // evaluate() guarantees a non-empty history here.
                     let review = &input.reviews[input.reviews.len() - 1];
                     let handoff = &input.handoffs[input.handoffs.len() - 1];
+                    let (triggers, excluded_reviewers) = match finding_policy(input.reviews) {
+                        Ok(p) => p,
+                        Err(reason) => {
+                            let outcome = RepairDecision::HumanRequired {
+                                reason,
+                                rejected_shas: rejected,
+                            };
+                            let proposal = records(input, &outcome);
+                            return Ok(RepairOutcome {
+                                decision: outcome,
+                                proposal,
+                            });
+                        }
+                    };
+                    let profile_distinct = input
+                        .request
+                        .core()
+                        .assurance_profile()
+                        .requirements()
+                        .distinct_provider;
+                    let distinct_provider = if triggers.iter().any(|t| t.distinct_provider_required)
+                    {
+                        DistinctProviderPolicy::Required
+                    } else {
+                        profile_distinct
+                    };
+                    let floor_by_finding = triggers.iter().any(|t| t.frontier_floor);
                     RepairDecision::Issue(RepairRequest {
                         repair_request_id: derived_id(
                             "repair",
@@ -161,11 +297,15 @@ impl RepairController {
                         findings: ordered_findings(review),
                         attempt_n: n,
                         bound: DEFAULT_MAX_REPAIR_ATTEMPTS,
-                        tier: if n == 1 {
+                        tier: if n == 1 && !floor_by_finding {
                             RepairTier::SameTier
                         } else {
                             RepairTier::FrontierFloor
                         },
+                        distinct_provider,
+                        prefer_different_model: triggers.iter().any(|t| t.prefer_different_model),
+                        excluded_reviewers,
+                        policy_triggers: triggers,
                     })
                 }
                 (_, _) => RepairDecision::HumanRequired {
@@ -206,8 +346,45 @@ pub fn repair_request_json(r: &RepairRequest) -> String {
         "attempt_n": r.attempt_n,
         "bound": r.bound,
         "tier": r.tier.as_str(),
+        "distinct_provider": r.distinct_provider.as_str(),
+        "prefer_different_model": r.prefer_different_model,
+        "excluded_reviewers": {
+            "session_refs": r.excluded_reviewers.session_refs,
+            "provider_models": r.excluded_reviewers.provider_models.iter()
+                .map(|(p, m)| json!({"provider_id": p, "model_id": m}))
+                .collect::<Vec<Value>>(),
+            "review_ids": r.excluded_reviewers.review_ids,
+        },
+        "policy_triggers": r.policy_triggers.iter().map(|t| json!({
+            "review_id": t.review_id,
+            "finding_id": t.finding_id,
+            "category": t.category.as_str(),
+            "frontier_floor": t.frontier_floor,
+            "distinct_provider_required": t.distinct_provider_required,
+            "exclude_finder": t.exclude_finder,
+            "prefer_different_model": t.prefer_different_model,
+        })).collect::<Vec<Value>>(),
     })
     .to_string()
+}
+
+/// Durable identity of one repair decision (idempotent publication).
+pub fn repair_claim_key(input: &RepairInput<'_>) -> String {
+    let core = input.request.core();
+    let last = input
+        .reviews
+        .last()
+        .map(|r| r.review_id())
+        .unwrap_or_default();
+    derived_id(
+        "repair-claim",
+        &[
+            input.project_id,
+            core.task_id(),
+            last,
+            &input.completed_repair_attempts.to_string(),
+        ],
+    )
 }
 
 fn records(input: &RepairInput<'_>, d: &RepairDecision) -> Result<ReviewRecordProposal, String> {
@@ -216,6 +393,7 @@ fn records(input: &RepairInput<'_>, d: &RepairDecision) -> Result<ReviewRecordPr
         input.project_id,
         core.task_id(),
         core.context_epoch().decimal_digits(),
+        &repair_claim_key(input),
     )?;
     let task = (SubjectKind::Task, core.task_id());
     match d {
@@ -244,6 +422,9 @@ fn records(input: &RepairInput<'_>, d: &RepairDecision) -> Result<ReviewRecordPr
             );
             if *reason == RepairEscalation::BoundExhausted {
                 b.event(EventType::RepairLimitReached, task, payload.clone())?;
+                // The ladder's A2 step (specification re-examined). The A1
+                // escalation step is governance outside this package.
+                b.event(EventType::EscalatedToA2, task, payload.clone())?;
             }
             b.event(EventType::HumanRequired, task, payload)?;
         }

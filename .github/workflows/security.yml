@@ -4,7 +4,9 @@ name: Security scan
 # lint, on every PR and on main. Read-only token, no secrets, no
 # pull_request_target, no writes. New jobs are advisory until A1 adds them
 # to branch protection; nothing here flips that on a timer. Any tool,
-# control, dataset, timeout or cleanup failure fails the job.
+# control, dataset, timeout or cleanup failure fails the job. The reports,
+# configurations, control definitions and identity receipts are uploaded even
+# when the job fails (redacted; planted inputs are never retained).
 on:
   pull_request:
   push:
@@ -41,8 +43,25 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "${CI_TESTED_SHA}"
 
+      # Hermetic: stub scanners, no network. Proves the scripts' own window,
+      # snapshot, YAML-policy, termination, cleanup and retention behaviour.
+      - name: Security script controls
+        timeout-minutes: 10
+        run: .github/scripts/security/selftest.sh
+
       - name: Acquire pinned tools and advisory dataset
+        timeout-minutes: 20
         run: .github/scripts/security/acquire.sh "${RUNNER_TEMP}/security"
 
       - name: Negative controls and scans
+        timeout-minutes: 20
         run: .github/scripts/security/run.sh "${RUNNER_TEMP}/security" "${GITHUB_WORKSPACE}"
+
+      - name: Upload retained evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: security-scan-evidence-${{ github.run_id }}
+          retention-days: 14
+          if-no-files-found: warn
+          path: ${{ runner.temp }}/security/evidence

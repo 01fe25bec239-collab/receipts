@@ -2,8 +2,9 @@
 //! Product code never runs Git directly; these helpers only set up fixtures.
 
 use crate::ports::{
-    ReviewRecordProposal, ReviewRecordSink, ReviewerCandidate, ReviewerRequirements,
-    ReviewerRoutingPort, ReviewerRoutingRefusal, ReviewerRunOutput, ReviewerRuntime,
+    ReviewClaim, ReviewRecordProposal, ReviewRecordSink, ReviewerCandidate,
+    ReviewerQualityEvidence, ReviewerRequirements, ReviewerRoutingPort, ReviewerRoutingRefusal,
+    ReviewerRunOutput, ReviewerRuntime, SealedReview,
 };
 use crate::reproduction::CheckRunnerConfig;
 use crate::{
@@ -19,6 +20,7 @@ use receipts_workspace_execution::{
     WorkspaceHandle,
 };
 use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -239,6 +241,10 @@ impl FixedRouting {
                 runtime_id: runtime.into(),
                 model_id: Some("model".into()),
                 resume_session: None,
+                quality: Some(ReviewerQualityEvidence {
+                    tier: crate::ReviewRequestReviewerFloor::Frontier,
+                    basis_ref: "registry:test-frontier".into(),
+                }),
             }),
             asked: RefCell::new(Vec::new()),
         }
@@ -356,29 +362,148 @@ pub(crate) fn verdict_json(
         })
         .collect();
     format!(
-        r#"{{"review_id":"{}","task_id":"{}","reviewed_sha":"{}","independence_attested":true,"verdict":"{verdict}","blocking_findings":[{}],"nonblocking_findings":[],"dimensions":[{{"dimension":"CORRECTNESS","assessment":"SATISFIED"}}]}}"#,
+        r#"{{"review_id":"{}","task_id":"{}","reviewed_sha":"{}","independence_attested":true,"verdict":"{verdict}","blocking_findings":[{}],"nonblocking_findings":[],"dimensions":[{}]}}"#,
         capsule.review_id(),
         capsule.task_id(),
         capsule.implementation_sha().as_str(),
-        findings.join(",")
+        findings.join(","),
+        all_dimensions_json()
     )
 }
 
-/// Records proposals; optionally refuses.
+/// Every audit dimension assessed, as the frozen lifecycle requires.
+pub(crate) fn all_dimensions_json() -> String {
+    crate::A4ReviewDimension::ALL
+        .iter()
+        .map(|d| {
+            format!(
+                r#"{{"dimension":"{}","assessment":"SATISFIED"}}"#,
+                d.as_str()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Test fake of a conforming sink. It is in-memory, so it proves controller
+/// behaviour against the sink contract; durability across restart is proven
+/// in `receipts-e2e` against a file journal and the real Core writer.
 #[derive(Default)]
 pub(crate) struct MemorySink {
+    /// Published packages, once each (publication is idempotent by claim key).
     pub(crate) proposals: Vec<ReviewRecordProposal>,
+    pub(crate) claims: BTreeMap<String, Option<SealedReview>>,
+    pub(crate) published: BTreeSet<String>,
+    /// `claim` fails: no execution may follow.
     pub(crate) refuse: bool,
+    pub(crate) fail_seal: bool,
+    /// Remaining `publish` calls that fail before succeeding.
+    pub(crate) fail_publish: usize,
 }
 
 impl ReviewRecordSink for MemorySink {
-    fn persist(&mut self, proposal: &ReviewRecordProposal) -> Result<(), String> {
+    fn claim(&mut self, key: &str) -> Result<ReviewClaim, String> {
         if self.refuse {
             return Err("sink refused".into());
         }
-        self.proposals.push(proposal.clone());
+        Ok(match self.claims.get(key) {
+            None => {
+                self.claims.insert(key.to_owned(), None);
+                ReviewClaim::Acquired
+            }
+            Some(None) => ReviewClaim::InFlight,
+            Some(Some(sealed)) => ReviewClaim::Sealed(sealed.clone()),
+        })
+    }
+    fn seal(&mut self, key: &str, sealed: &SealedReview) -> Result<(), String> {
+        if self.fail_seal {
+            return Err("seal failed".into());
+        }
+        match self.claims.get_mut(key) {
+            Some(slot @ None) => {
+                *slot = Some(sealed.clone());
+                Ok(())
+            }
+            Some(Some(existing)) if existing.to_bytes() == sealed.to_bytes() => Ok(()),
+            Some(Some(_)) => Err("a different package is already sealed".into()),
+            None => Err("no claim".into()),
+        }
+    }
+    fn publish(&mut self, key: &str, proposal: &ReviewRecordProposal) -> Result<(), String> {
+        if self.fail_publish > 0 {
+            self.fail_publish -= 1;
+            return Err("publish failed".into());
+        }
+        if self.published.insert(key.to_owned()) {
+            self.proposals.push(proposal.clone());
+        }
         Ok(())
     }
+}
+
+/// Persists review packages into a real State store (trusted-core store,
+/// trusted time sample) and returns a read-only view.
+pub(crate) fn state_with_packages(
+    dir: &TempDir,
+    packages: &[&ReviewRecordProposal],
+    extra: impl FnOnce(&mut receipts_state::TrustedCoreStore),
+) -> receipts_state::StateReader {
+    use receipts_state::{
+        StateError, StateReader, StateWriteOperationV1, StateWriteSubjectV1, TrustedClockV1,
+        TrustedCoreStore, TrustedTimeSampleV1,
+    };
+    use std::os::unix::fs::PermissionsExt;
+    struct Clock;
+    impl TrustedClockV1 for Clock {
+        fn sample(&self) -> Result<TrustedTimeSampleV1, StateError> {
+            Ok(TrustedTimeSampleV1 {
+                canonical_utc_timestamp: "2026-11-08T10:00:00.000000000Z".into(),
+                clock_source_id: "synthetic-clock".into(),
+                clock_contract_version: "1".into(),
+            })
+        }
+    }
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir(&state_dir).unwrap();
+    std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let db = state_dir.join("state.db");
+    let mut store = TrustedCoreStore::open_exclusive(&db).unwrap();
+    let mut n = 0u32;
+    for package in packages {
+        for record in &package.decision_records {
+            let admission = store.admit(StateWriteSubjectV1 {
+                operation: StateWriteOperationV1::DecisionRecord,
+                project_id: package.project_id.clone(),
+                graph_id: None,
+                source_ref: None,
+                compiler_id: None,
+                policy_id: None,
+            });
+            store.append_decision_record(admission, record).unwrap();
+        }
+        for event in &package.events {
+            n += 1;
+            let admission = store.admit(StateWriteSubjectV1 {
+                operation: StateWriteOperationV1::EventProposal,
+                project_id: package.project_id.clone(),
+                graph_id: None,
+                source_ref: None,
+                compiler_id: None,
+                policy_id: None,
+            });
+            store
+                .persist_event_proposal(
+                    admission,
+                    &Clock,
+                    event,
+                    &format!("01ARZ3NDEKTSV4RRFFQ69G{n:04}"),
+                )
+                .unwrap();
+        }
+    }
+    extra(&mut store);
+    drop(store);
+    StateReader::open_existing(&db).unwrap()
 }
 
 pub(crate) fn time_limit() -> Duration {

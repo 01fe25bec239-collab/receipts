@@ -4,9 +4,9 @@ use crate::wire::encode_a4_review;
 use crate::{
     A3HandoffCheck, A3HandoffCheckResult, A3HandoffNonTemporalCore, A4Review, A4ReviewDimension,
     A4ReviewDimensionAssessment, A4ReviewDimensionReview, A4ReviewFinding, A4ReviewFindingCategory,
-    A4ReviewFindingSeverity, A4ReviewNonTemporalCore, A4ReviewVerdict, AssuranceProfile,
-    RepairCycleControlError, SafetyInterruption, SafetyInterruptionNonTemporalCore,
-    SafetyInterruptionState,
+    A4ReviewFindingSeverity, A4ReviewNonTemporalCore, A4ReviewReviewer, A4ReviewVerdict,
+    AssuranceProfile, DistinctProviderPolicy, RepairCycleControlError, SafetyInterruption,
+    SafetyInterruptionNonTemporalCore, SafetyInterruptionState,
 };
 use receipts_state::{
     DecisionRecordKind, DecisionRecordV1, EventType, StateReader, StateWriteOperationV1,
@@ -38,6 +38,16 @@ fn finding(id: &str, category: A4ReviewFindingCategory, blocking: bool) -> A4Rev
     .unwrap()
 }
 
+fn finder(n: usize) -> A4ReviewReviewer {
+    A4ReviewReviewer::new(
+        Some("provider-b".into()),
+        Some("model-b".into()),
+        Some("runtime-b".into()),
+        Some(format!("finder-session-{n}")),
+    )
+    .unwrap()
+}
+
 fn review(n: usize, verdict: A4ReviewVerdict) -> A4ReviewNonTemporalCore {
     let (blocking, nonblocking) = match verdict {
         A4ReviewVerdict::Reject => (
@@ -62,7 +72,7 @@ fn review(n: usize, verdict: A4ReviewVerdict) -> A4ReviewNonTemporalCore {
             A4ReviewDimensionAssessment::Satisfied,
             None,
         )],
-        None,
+        Some(finder(n)),
         None,
         Some(vec![]),
         None,
@@ -196,7 +206,11 @@ fn bound_exceeded_escalates_human_required() {
         .collect();
     assert_eq!(
         events,
-        [EventType::RepairLimitReached, EventType::HumanRequired]
+        [
+            EventType::RepairLimitReached,
+            EventType::EscalatedToA2,
+            EventType::HumanRequired
+        ]
     );
 }
 
@@ -329,4 +343,223 @@ fn rejected_sha_record_never_deleted() {
         .map(|s| s.as_str().to_owned())
         .collect();
     assert_eq!(carried, [sha_n(0), sha_n(1), sha_n(2)]);
+}
+
+// ---- F7: mandatory finding-specific policy precedes the ordinary ladder.
+
+fn reject_with(
+    n: usize,
+    category: A4ReviewFindingCategory,
+    reviewer: Option<A4ReviewReviewer>,
+) -> A4ReviewNonTemporalCore {
+    let f = A4ReviewFinding::new(
+        format!("f-{n}"),
+        A4ReviewFindingSeverity::High,
+        category,
+        "d".into(),
+        true,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    A4ReviewNonTemporalCore::new(
+        format!("review-{n}"),
+        "task-1".into(),
+        sha_n(n),
+        A4ReviewVerdict::Reject,
+        true,
+        vec![f],
+        vec![],
+        vec![A4ReviewDimensionReview::new(
+            A4ReviewDimension::Correctness,
+            A4ReviewDimensionAssessment::Satisfied,
+            None,
+        )],
+        reviewer,
+        None,
+        Some(vec![]),
+        None,
+        None,
+    )
+    .unwrap()
+}
+
+fn decide_with(profile: AssuranceProfile, reviews: Vec<A4ReviewNonTemporalCore>) -> RepairOutcome {
+    let n = reviews.len();
+    let handoffs: Vec<_> = (0..n).map(handoff).collect();
+    let req = request(BASE, &sha_n(0), profile, None);
+    RepairController::decide(&RepairInput {
+        project_id: "project",
+        request: &req,
+        handoffs: &handoffs,
+        reviews: &reviews,
+        completed_repair_attempts: n - 1,
+        interruption: None,
+    })
+    .unwrap()
+}
+
+fn issued(o: RepairOutcome) -> RepairRequest {
+    let RepairDecision::Issue(r) = o.decision else {
+        panic!("{:?}", o.decision)
+    };
+    r
+}
+
+#[test]
+fn first_security_boundary_repair_gets_the_frontier_floor_and_escalated_independence() {
+    let r = issued(decide_with(
+        AssuranceProfile::Light,
+        vec![reject_with(
+            0,
+            A4ReviewFindingCategory::SecurityBoundaryViolation,
+            Some(finder(0)),
+        )],
+    ));
+    assert_eq!(r.attempt_n, 1);
+    assert_eq!(r.tier, RepairTier::FrontierFloor);
+    // LIGHT's own policy is OFF; the finding escalates it to REQUIRED.
+    assert_eq!(r.distinct_provider, DistinctProviderPolicy::Required);
+    assert!(!r.prefer_different_model);
+    // The finder (session and model) may not grade its own diagnosis.
+    assert_eq!(r.excluded_reviewers.session_refs, ["finder-session-0"]);
+    assert_eq!(
+        r.excluded_reviewers.provider_models,
+        [("provider-b".to_owned(), Some("model-b".to_owned()))]
+    );
+    assert_eq!(r.excluded_reviewers.review_ids, ["review-0"]);
+    assert_eq!(r.policy_triggers.len(), 1);
+    assert!(r.policy_triggers[0].frontier_floor);
+    // The payload carries all of it.
+    let json = repair_request_json(&r);
+    for needle in [
+        "\"tier\":\"FRONTIER_FLOOR\"",
+        "\"distinct_provider\":\"REQUIRED\"",
+        "finder-session-0",
+        "SECURITY_BOUNDARY_VIOLATION",
+    ] {
+        assert!(json.contains(needle), "{needle} in {json}");
+    }
+}
+
+#[test]
+fn contract_and_architecture_findings_exclude_the_finder_and_prefer_another_model() {
+    for category in [
+        A4ReviewFindingCategory::ContractViolation,
+        A4ReviewFindingCategory::ArchitectureViolation,
+    ] {
+        let r = issued(decide_with(
+            AssuranceProfile::Standard,
+            vec![reject_with(0, category, Some(finder(0)))],
+        ));
+        // The ordinary ladder still holds for the first repair ...
+        assert_eq!(r.tier, RepairTier::SameTier, "{category:?}");
+        // ... but the finder cannot grade it and a different model is preferred.
+        assert!(r.prefer_different_model);
+        assert_eq!(r.excluded_reviewers.session_refs, ["finder-session-0"]);
+        // The profile's PREFERRED stays: nothing here lowers or forces it.
+        assert_eq!(r.distinct_provider, DistinctProviderPolicy::Preferred);
+    }
+}
+
+#[test]
+fn ordinary_findings_and_the_profile_are_never_lowered_by_the_policy() {
+    // Style only: no policy, ordinary ladder, no exclusions.
+    let r = issued(decide_with(
+        AssuranceProfile::Standard,
+        vec![reject_with(
+            0,
+            A4ReviewFindingCategory::Style,
+            Some(finder(0)),
+        )],
+    ));
+    assert_eq!(r.tier, RepairTier::SameTier);
+    assert!(r.policy_triggers.is_empty() && r.excluded_reviewers == ReviewerExclusions::default());
+    // HIGH_ASSURANCE keeps REQUIRED whatever the finding.
+    let r = issued(decide_with(
+        AssuranceProfile::HighAssurance,
+        vec![reject_with(0, A4ReviewFindingCategory::Style, None)],
+    ));
+    assert_eq!(r.distinct_provider, DistinctProviderPolicy::Required);
+    // A later repair is at the frontier floor regardless.
+    let r = issued(decide_with(
+        AssuranceProfile::Standard,
+        vec![
+            reject_with(0, A4ReviewFindingCategory::Style, Some(finder(0))),
+            reject_with(1, A4ReviewFindingCategory::Style, Some(finder(1))),
+        ],
+    ));
+    assert_eq!((r.attempt_n, r.tier), (2, RepairTier::FrontierFloor));
+}
+
+#[test]
+fn security_policy_persists_across_later_rejections_and_accumulates_finders() {
+    // R1 rejected for a security boundary, R2 for a contract problem: the
+    // earlier finder stays excluded and independence stays escalated.
+    let r = issued(decide_with(
+        AssuranceProfile::Standard,
+        vec![
+            reject_with(
+                0,
+                A4ReviewFindingCategory::SecurityBoundaryViolation,
+                Some(finder(0)),
+            ),
+            reject_with(
+                1,
+                A4ReviewFindingCategory::ContractViolation,
+                Some(finder(1)),
+            ),
+        ],
+    ));
+    assert_eq!(r.distinct_provider, DistinctProviderPolicy::Required);
+    assert_eq!(
+        r.excluded_reviewers.session_refs,
+        ["finder-session-0", "finder-session-1"]
+    );
+}
+
+#[test]
+fn an_unidentifiable_finder_cannot_be_excluded_so_the_repair_escalates() {
+    let o = decide_with(
+        AssuranceProfile::Standard,
+        vec![reject_with(
+            0,
+            A4ReviewFindingCategory::SecurityBoundaryViolation,
+            None,
+        )],
+    );
+    let RepairDecision::HumanRequired { reason, .. } = o.decision else {
+        panic!("{:?}", o.decision)
+    };
+    assert_eq!(reason, RepairEscalation::FinderUnidentified);
+    let events: Vec<_> = o
+        .proposal
+        .unwrap()
+        .events
+        .iter()
+        .map(|e| e.event_type())
+        .collect();
+    assert_eq!(events, [EventType::HumanRequired]);
+}
+
+#[test]
+fn bound_exhaustion_emits_the_a2_escalation_before_human_required() {
+    let o = decide(4, A4ReviewVerdict::Reject, None).unwrap();
+    let p = o.proposal.unwrap();
+    let types: Vec<_> = p.events.iter().map(|e| e.event_type()).collect();
+    assert_eq!(
+        types,
+        [
+            EventType::RepairLimitReached,
+            EventType::EscalatedToA2,
+            EventType::HumanRequired
+        ]
+    );
+    // Stable idempotency identities, one per event.
+    assert_eq!(p.event_keys.len(), 3);
+    let distinct: std::collections::BTreeSet<_> = p.event_keys.iter().collect();
+    assert_eq!(distinct.len(), 3);
 }

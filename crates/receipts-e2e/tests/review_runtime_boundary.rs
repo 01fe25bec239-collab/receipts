@@ -15,10 +15,11 @@ use receipts_review_integration::runtime::{
 use receipts_review_integration::{
     AssuranceProfile, AttemptFinished, CheckRunnerConfig, ImplementerIdentity,
     ReviewCapsuleCriterion, ReviewCapsuleCriterionKind, ReviewCapsuleNonTemporalCore,
-    ReviewCapsuleReviewScope, ReviewController, ReviewDateTimeV1, ReviewDisposition,
+    ReviewCapsuleReviewScope, ReviewClaim, ReviewController, ReviewDateTimeV1, ReviewDisposition,
     ReviewRecordProposal, ReviewRecordSink, ReviewRequest, ReviewRequestNonNegativeInteger,
-    ReviewRequestNonTemporalCore, ReviewerCandidate, ReviewerRequirements, ReviewerRoutingPort,
-    ReviewerRoutingRefusal, ReviewerRunOutput, ReviewerRuntime, reviewer_output_from_claude,
+    ReviewRequestNonTemporalCore, ReviewRequestReviewerFloor, ReviewerCandidate,
+    ReviewerQualityEvidence, ReviewerRequirements, ReviewerRoutingPort, ReviewerRoutingRefusal,
+    ReviewerRunOutput, ReviewerRuntime, SealedReview, reviewer_output_from_claude,
     reviewer_output_from_codex,
 };
 use receipts_runtime_bindings::RuntimeCapsuleFamily;
@@ -93,15 +94,38 @@ impl ReviewerRoutingPort for Pick {
             runtime_id: self.1.into(),
             model_id: None,
             resume_session: None,
+            quality: Some(ReviewerQualityEvidence {
+                tier: ReviewRequestReviewerFloor::Frontier,
+                basis_ref: "registry:boundary-frontier".into(),
+            }),
         })
     }
 }
 
+/// In-memory conforming sink (these tests prove refusal behaviour only;
+/// durability is proven in `review_core_persistence`).
 #[derive(Default)]
-struct Sink(Vec<ReviewRecordProposal>);
+struct Sink {
+    published: Vec<ReviewRecordProposal>,
+    claims: std::collections::BTreeMap<String, Option<SealedReview>>,
+}
 impl ReviewRecordSink for Sink {
-    fn persist(&mut self, p: &ReviewRecordProposal) -> Result<(), String> {
-        self.0.push(p.clone());
+    fn claim(&mut self, key: &str) -> Result<ReviewClaim, String> {
+        Ok(match self.claims.get(key) {
+            None => {
+                self.claims.insert(key.to_owned(), None);
+                ReviewClaim::Acquired
+            }
+            Some(None) => ReviewClaim::InFlight,
+            Some(Some(s)) => ReviewClaim::Sealed(s.clone()),
+        })
+    }
+    fn seal(&mut self, key: &str, sealed: &SealedReview) -> Result<(), String> {
+        self.claims.insert(key.to_owned(), Some(sealed.clone()));
+        Ok(())
+    }
+    fn publish(&mut self, _: &str, p: &ReviewRecordProposal) -> Result<(), String> {
+        self.published.push(p.clone());
         Ok(())
     }
 }

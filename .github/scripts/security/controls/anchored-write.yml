@@ -1,0 +1,10 @@
+on: push
+permissions: &p {contents: read}
+jobs:
+  x:
+    runs-on: ubuntu-latest
+    permissions:
+      <<: *p
+      contents: write
+    steps:
+      - run: echo hi

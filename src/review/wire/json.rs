@@ -178,9 +178,13 @@ impl Parser<'_> {
         ))
     }
     fn hex4(&mut self) -> Result<u32, SyntaxError> {
+        // JSON requires exactly four hexadecimal digits; `from_str_radix`
+        // would also accept a leading `+`.
         let h = self.b.get(self.i..self.i + 4).ok_or(SyntaxError::Invalid)?;
-        let s = std::str::from_utf8(h).map_err(|_| SyntaxError::Invalid)?;
-        let v = u32::from_str_radix(s, 16).map_err(|_| SyntaxError::Invalid)?;
+        let mut v = 0u32;
+        for b in h {
+            v = (v << 4) | (*b as char).to_digit(16).ok_or(SyntaxError::Invalid)?;
+        }
         self.i += 4;
         Ok(v)
     }
@@ -240,8 +244,14 @@ pub(crate) enum NotInteger {
     Oversized,
 }
 
+/// Exponents beyond this magnitude are saturated: they decide only zero /
+/// fraction / oversized, never a digit count.
+const EXPONENT_SATURATION: i128 = 1_000_000_000_000_000_000_000_000_000_000;
+
 /// Canonical decimal digits of an integral number token (`1.0`, `1e3`, `-0`
-/// are integers).
+/// are integers). Total over every grammatical token: zero is `"0"` under
+/// any exponent, a nonzero value that is not an integer is `Fraction`, and
+/// one beyond the carrier is `Oversized`. Never panics.
 pub(crate) fn integer_digits(token: &str) -> Result<String, NotInteger> {
     use NotInteger::{Fraction, Oversized};
     let (negative, rest) = match token.strip_prefix('-') {
@@ -249,29 +259,25 @@ pub(crate) fn integer_digits(token: &str) -> Result<String, NotInteger> {
         None => (false, token),
     };
     let (mantissa, exponent) = match rest.find(['e', 'E']) {
-        Some(at) => (
-            &rest[..at],
-            rest[at + 1..].parse::<i64>().map_err(|_| Oversized)?,
-        ),
+        Some(at) => (&rest[..at], saturating_exponent(&rest[at + 1..])?),
         None => (rest, 0),
     };
     let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
     let mut digits: String = format!("{int}{frac}");
-    let exponent = exponent.checked_sub(frac.len() as i64).ok_or(Oversized)?;
+    if digits.bytes().all(|b| b == b'0') {
+        return Ok("0".into());
+    }
+    let exponent = exponent - frac.len() as i128;
     if exponent >= 0 {
         let zeros = usize::try_from(exponent).map_err(|_| Oversized)?;
         if zeros > MAX_INTEGER_DIGITS {
-            // Only zero can stay small under a huge positive exponent.
-            return if digits.bytes().all(|b| b == b'0') {
-                Ok("0".into())
-            } else {
-                Err(Oversized)
-            };
+            return Err(Oversized);
         }
         digits.extend(std::iter::repeat_n('0', zeros));
     } else {
-        let cut = usize::try_from(-exponent).map_err(|_| Oversized)?;
-        let keep = digits.len().checked_sub(cut);
+        let keep = usize::try_from(-exponent)
+            .ok()
+            .and_then(|cut| digits.len().checked_sub(cut));
         let (head, tail) = match keep {
             Some(k) => digits.split_at(k),
             None => ("", digits.as_str()),
@@ -291,6 +297,23 @@ pub(crate) fn integer_digits(token: &str) -> Result<String, NotInteger> {
     } else {
         magnitude.to_owned()
     })
+}
+
+/// `[+-]?digits` as a saturated signed value (grammar already validated).
+fn saturating_exponent(text: &str) -> Result<i128, NotInteger> {
+    let (negative, digits) = match text.as_bytes().first() {
+        Some(b'-') => (true, &text[1..]),
+        Some(b'+') => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let mut value: i128 = 0;
+    for b in digits.bytes() {
+        if !b.is_ascii_digit() {
+            return Err(NotInteger::Oversized);
+        }
+        value = (value * 10 + i128::from(b - b'0')).min(EXPONENT_SATURATION);
+    }
+    Ok(if negative { -value } else { value })
 }
 
 /// Canonical JSON writer: members are written in the order supplied.

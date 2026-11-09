@@ -343,8 +343,11 @@ fn unparseable_a4_output_never_pass() {
         ("pass with blocking", |cap| {
             output(&verdict_json(cap, "PASS", &["CORRECTNESS"]))
         }),
-        ("reject without blocking", |cap| {
-            output(&verdict_json(cap, "REJECT", &[]))
+        ("one audit dimension of twelve", |cap| {
+            output(&verdict_json(cap, "PASS", &[]).replace(
+                &all_dimensions_json(),
+                r#"{"dimension":"CORRECTNESS","assessment":"SATISFIED"}"#,
+            ))
         }),
         ("independence denied", |cap| {
             output(&verdict_json(cap, "PASS", &[]).replace(
@@ -635,5 +638,604 @@ fn unknown_runtime_and_no_reviewer_refuse_without_dispatch() {
         runtime_id: String::new(),
         model_id: None,
         resume_session: None,
+        quality: None,
     };
+}
+
+// ---- Controls for F1/F3/F6/F13. They were first run red against the
+// unfixed controller (see the repair evidence directory).
+
+fn scripted(
+    json: impl Fn(&crate::ReviewCapsuleNonTemporalCore) -> String + 'static,
+) -> ScriptedReviewer {
+    ScriptedReviewer::new("runtime-b", move |cap| Ok(output(&json(cap))))
+}
+
+#[test]
+fn replay_of_a_finished_attempt_does_not_dispatch_again() {
+    let c = case(AssuranceProfile::Standard, None, "ok\n");
+    let routing = FixedRouting::candidate("provider-b", "runtime-b");
+    let reviewer = pass_reviewer("runtime-b");
+    let mut sink = MemorySink::default();
+    let _first = run(&c, &routing, &[&reviewer], time_limit(), &mut sink);
+    let _second = run(&c, &routing, &[&reviewer], time_limit(), &mut sink);
+    assert_eq!(reviewer.calls.borrow().len(), 1, "reviewer ran twice");
+    assert_eq!(routing.asked.borrow().len(), 1, "routing asked twice");
+}
+
+#[test]
+fn quality_floor_is_derived_and_raise_only() {
+    use crate::ReviewRequestReviewerFloor as F;
+    for (profile, asked, want) in [
+        (AssuranceProfile::Standard, None, F::Frontier),
+        (AssuranceProfile::Light, None, F::Balanced),
+        (AssuranceProfile::Standard, Some(F::Economy), F::Frontier),
+        (AssuranceProfile::Light, Some(F::Frontier), F::Frontier),
+        (AssuranceProfile::Light, Some(F::Economy), F::Balanced),
+    ] {
+        let policy = asked.map(|f| ReviewRequestPolicy::new(None, None, Some(f), None));
+        let c = case(profile, policy, "ok\n");
+        let routing = FixedRouting::candidate("provider-b", "runtime-b");
+        let reviewer = pass_reviewer("runtime-b");
+        let _ = run(
+            &c,
+            &routing,
+            &[&reviewer],
+            time_limit(),
+            &mut MemorySink::default(),
+        );
+        assert_eq!(
+            routing.asked.borrow()[0].reviewer_floor,
+            want,
+            "{profile:?} {asked:?}"
+        );
+    }
+}
+
+#[test]
+fn nonblocking_mandatory_category_finding_cannot_produce_a_passing_ticket() {
+    let c = case(AssuranceProfile::Standard, None, "ok\n");
+    let routing = FixedRouting::candidate("provider-b", "runtime-b");
+    let reviewer = scripted(|cap| {
+        format!(
+            r#"{{"review_id":"{}","task_id":"{}","reviewed_sha":"{}","independence_attested":true,"verdict":"PASS_WITH_NONBLOCKING_FINDINGS","blocking_findings":[],"nonblocking_findings":[{{"finding_id":"n1","severity":"HIGH","category":"SECURITY_BOUNDARY_VIOLATION","description":"boundary","blocking":false}}],"dimensions":[{}]}}"#,
+            cap.review_id(),
+            cap.task_id(),
+            cap.implementation_sha().as_str(),
+            all_dimensions_json()
+        )
+    });
+    let t = run(
+        &c,
+        &routing,
+        &[&reviewer],
+        time_limit(),
+        &mut MemorySink::default(),
+    );
+    assert!(
+        !t.passed(),
+        "mandatory category passed: {:?}",
+        t.disposition
+    );
+    assert!(
+        !events(&t).contains(&EventType::ReviewPassed),
+        "{:?}",
+        events(&t)
+    );
+}
+
+#[test]
+fn every_audit_dimension_must_be_assessed_and_not_applicable_is_accepted() {
+    let c = case(AssuranceProfile::Standard, None, "ok\n");
+    let routing = FixedRouting::candidate("provider-b", "runtime-b");
+    // One dimension of twelve: incomplete, never a passing ticket.
+    let one = scripted(|cap| {
+        verdict_json(cap, "PASS", &[]).replace(
+            &all_dimensions_json(),
+            r#"{"dimension":"CORRECTNESS","assessment":"SATISFIED"}"#,
+        )
+    });
+    let t = run(
+        &c,
+        &routing,
+        &[&one],
+        time_limit(),
+        &mut MemorySink::default(),
+    );
+    assert!(!t.passed());
+    let ReviewDisposition::InvalidOutput(why) = &t.disposition else {
+        panic!("{:?}", t.disposition)
+    };
+    assert!(why.contains("IncompleteDimensions"), "{why}");
+    assert!(why.contains("SCOPE_COMPLIANCE"), "{why}");
+    // NOT_APPLICABLE counts as assessed.
+    let na = scripted(|cap| {
+        verdict_json(cap, "PASS", &[]).replace(
+            r#"{"dimension":"NEGATIVE_TESTS","assessment":"SATISFIED"}"#,
+            r#"{"dimension":"NEGATIVE_TESTS","assessment":"NOT_APPLICABLE"}"#,
+        )
+    });
+    let t = run(
+        &c,
+        &routing,
+        &[&na],
+        time_limit(),
+        &mut MemorySink::default(),
+    );
+    assert!(t.passed(), "{:?}", t.disposition);
+}
+
+#[test]
+fn empty_reject_is_retained_and_never_becomes_acceptance() {
+    let c = case(AssuranceProfile::Standard, None, "ok\n");
+    let routing = FixedRouting::candidate("provider-b", "runtime-b");
+    let reviewer = scripted(|cap| verdict_json(cap, "REJECT", &[]));
+    let mut sink = MemorySink::default();
+    let t = run(&c, &routing, &[&reviewer], time_limit(), &mut sink);
+    // Schema admits it and policy keeps it a REJECT: recorded, rejected SHA
+    // preserved, never passing, whatever its (empty) finding arrays hold.
+    assert_eq!(reviewed(&t).core().verdict(), A4ReviewVerdict::Reject);
+    assert!(reviewed(&t).core().blocking_findings().is_empty());
+    assert!(!t.passed());
+    assert_eq!(
+        events(&t),
+        [EventType::ReviewDispatched, EventType::ReviewRejected]
+    );
+    assert_eq!(sink.proposals[0].decision_records.len(), 1);
+}
+
+#[test]
+fn finding_raised_events_identify_each_finding() {
+    let c = case(AssuranceProfile::Standard, None, "ok\n");
+    let routing = FixedRouting::candidate("provider-b", "runtime-b");
+    let reviewer = scripted(|cap| {
+        let f = |id: &str| {
+            format!(
+                r#"{{"finding_id":"{id}","severity":"LOW","category":"STYLE","description":"d","blocking":false}}"#
+            )
+        };
+        format!(
+            r#"{{"review_id":"{}","task_id":"{}","reviewed_sha":"{}","independence_attested":true,"verdict":"PASS_WITH_NONBLOCKING_FINDINGS","blocking_findings":[],"nonblocking_findings":[{},{}],"dimensions":[{}]}}"#,
+            cap.review_id(),
+            cap.task_id(),
+            cap.implementation_sha().as_str(),
+            f("a"),
+            f("b"),
+            all_dimensions_json()
+        )
+    });
+    let t = run(
+        &c,
+        &routing,
+        &[&reviewer],
+        time_limit(),
+        &mut MemorySink::default(),
+    );
+    let p = t.proposal.as_ref().unwrap();
+    let raised: Vec<_> = p
+        .events
+        .iter()
+        .filter(|e| e.event_type() == EventType::FindingRaised)
+        .map(|e| e.payload().digest.clone())
+        .collect();
+    assert_eq!(raised.len(), 2);
+    assert_ne!(raised[0], raised[1], "both events carry the same payload");
+    // PASS_WITH_NONBLOCKING cannot pass before its findings are dispositioned.
+    assert!(!t.passed(), "undispositioned nonblocking findings passed");
+}
+
+// ---- F1/F2: durable claim before execution; replay recovers, never re-runs.
+
+fn calls(r: &ScriptedReviewer) -> usize {
+    r.calls.borrow().len()
+}
+
+#[test]
+fn replay_recovers_the_recorded_disposition_without_executing_anything() {
+    let c = case(AssuranceProfile::Standard, None, "ok\n");
+    let routing = FixedRouting::candidate("provider-b", "runtime-b");
+    let reviewer = pass_reviewer("runtime-b");
+    let mut sink = MemorySink::default();
+    let first = run(&c, &routing, &[&reviewer], time_limit(), &mut sink);
+    assert!(first.passed());
+    let second = run(&c, &routing, &[&reviewer], time_limit(), &mut sink);
+    assert_eq!(calls(&reviewer), 1, "reviewer ran twice");
+    assert_eq!(routing.asked.borrow().len(), 1, "routing asked twice");
+    assert_eq!(second.dispatches, 0);
+    assert!(second.cleanup.is_none(), "no worktree was provisioned");
+    let ReviewDisposition::Replayed(recorded) = &second.disposition else {
+        panic!("{:?}", second.disposition)
+    };
+    assert_eq!(recorded.outcome, "REVIEWED");
+    assert_eq!(
+        recorded.review.as_ref().unwrap().core().review_id(),
+        reviewed(&first).core().review_id()
+    );
+    assert!(second.passed(), "the recovered PASS is still a PASS");
+    assert_eq!(sink.proposals.len(), 1, "published exactly once");
+}
+
+#[test]
+fn no_claim_means_nothing_executes() {
+    let c = case(AssuranceProfile::Standard, None, "ok\n");
+    let routing = FixedRouting::candidate("provider-b", "runtime-b");
+    let reviewer = pass_reviewer("runtime-b");
+    let mut sink = MemorySink {
+        refuse: true,
+        ..Default::default()
+    };
+    let t = run(&c, &routing, &[&reviewer], time_limit(), &mut sink);
+    assert!(matches!(
+        t.disposition,
+        ReviewDisposition::Refused(ReviewRefusal::Records(_))
+    ));
+    assert!(t.persisted.is_err() && !t.passed());
+    assert_eq!(calls(&reviewer), 0);
+    assert!(routing.asked.borrow().is_empty(), "routed before claiming");
+    assert!(!c.repo.scratch("review-wt").exists());
+}
+
+#[test]
+fn seal_failure_never_leads_to_a_second_execution() {
+    let c = case(AssuranceProfile::Standard, None, "ok\n");
+    let routing = FixedRouting::candidate("provider-b", "runtime-b");
+    let reviewer = pass_reviewer("runtime-b");
+    let mut sink = MemorySink {
+        fail_seal: true,
+        ..Default::default()
+    };
+    let first = run(&c, &routing, &[&reviewer], time_limit(), &mut sink);
+    assert!(first.persisted.is_err() && !first.passed());
+    // The retry finds the claim without a sealed result: safe refusal.
+    sink.fail_seal = false;
+    let retry = run(&c, &routing, &[&reviewer], time_limit(), &mut sink);
+    assert!(matches!(
+        retry.disposition,
+        ReviewDisposition::Refused(ReviewRefusal::ClaimInFlight)
+    ));
+    assert!(!retry.passed());
+    assert_eq!(calls(&reviewer), 1);
+    assert_eq!(routing.asked.borrow().len(), 1);
+    assert!(sink.proposals.is_empty(), "nothing partial was published");
+}
+
+#[test]
+fn publish_failure_is_completed_from_the_sealed_package() {
+    let c = case(AssuranceProfile::Standard, None, "ok\n");
+    let routing = FixedRouting::candidate("provider-b", "runtime-b");
+    let reviewer = pass_reviewer("runtime-b");
+    let mut sink = MemorySink {
+        fail_publish: 1,
+        ..Default::default()
+    };
+    let first = run(&c, &routing, &[&reviewer], time_limit(), &mut sink);
+    assert!(first.persisted.is_err() && !first.passed());
+    assert!(sink.proposals.is_empty());
+    let retry = run(&c, &routing, &[&reviewer], time_limit(), &mut sink);
+    assert!(retry.persisted.is_ok(), "{:?}", retry.persisted);
+    assert!(retry.passed());
+    assert_eq!(calls(&reviewer), 1);
+    assert_eq!(sink.proposals.len(), 1);
+    // The published package is exactly the one the first run sealed.
+    assert_eq!(
+        sink.proposals[0].to_journal(),
+        first.proposal.unwrap().to_journal()
+    );
+}
+
+#[test]
+fn policy_blocked_survives_repeated_callbacks_without_shopping() {
+    let c = case(AssuranceProfile::Standard, None, "ok\n");
+    let routing = FixedRouting::candidate("provider-b", "runtime-b");
+    let blocked = ScriptedReviewer::new("runtime-b", |_| Err(FailureClass::PolicyBlocked));
+    let mut sink = MemorySink::default();
+    let first = run(&c, &routing, &[&blocked], time_limit(), &mut sink);
+    assert!(matches!(
+        first.disposition,
+        ReviewDisposition::PolicyBlocked(_)
+    ));
+    for _ in 0..3 {
+        let again = run(&c, &routing, &[&blocked], time_limit(), &mut sink);
+        let ReviewDisposition::Replayed(r) = &again.disposition else {
+            panic!("{:?}", again.disposition)
+        };
+        assert_eq!(r.outcome, "POLICY_BLOCKED");
+        assert!(!again.passed());
+    }
+    assert_eq!(calls(&blocked), 1);
+    assert_eq!(routing.asked.borrow().len(), 1, "no second route/provider");
+    assert_eq!(sink.proposals.len(), 1);
+}
+
+#[test]
+fn sealed_journal_rebuilds_the_identical_package_and_refuses_tampering() {
+    let c = case(AssuranceProfile::Standard, None, "ok\n");
+    let routing = FixedRouting::candidate("provider-b", "runtime-b");
+    let reviewer = pass_reviewer("runtime-b");
+    let mut sink = MemorySink::default();
+    let t = run(&c, &routing, &[&reviewer], time_limit(), &mut sink);
+    let package = t.proposal.unwrap();
+    let again = crate::ReviewRecordProposal::from_journal(&package.to_journal()).unwrap();
+    assert_eq!(again.to_journal(), package.to_journal());
+    assert_eq!(again.event_keys, package.event_keys);
+    assert_eq!(again.content, package.content);
+    assert_eq!(again.events.len(), package.events.len());
+    // Sealed bytes round-trip, and any edit is refused.
+    let sealed = crate::SealedReview::new(&package, "REVIEWED", true, 1);
+    let bytes = sealed.to_bytes();
+    assert!(crate::SealedReview::from_bytes(&bytes).is_ok());
+    let text = String::from_utf8(bytes).unwrap();
+    let edited = text.replacen("task-1", "task-2", 1);
+    assert_ne!(edited, text, "the edit changed nothing");
+    assert!(crate::SealedReview::from_bytes(edited.as_bytes()).is_err());
+    // An event whose payload bytes were swapped is refused on rebuild.
+    let journal = String::from_utf8(package.to_journal()).unwrap();
+    let first = package.content[0].1.clone();
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let mut altered = first.clone();
+    altered[0] ^= 1;
+    let swapped = journal.replacen(&hex(&first), &hex(&altered), 1);
+    assert_ne!(swapped, journal);
+    assert!(crate::ReviewRecordProposal::from_journal(swapped.as_bytes()).is_err());
+}
+
+// ---- F3: the quality floor is derived, raise-only and evidenced.
+
+fn candidate_with(tier: Option<crate::ReviewRequestReviewerFloor>, basis: &str) -> FixedRouting {
+    let mut routing = FixedRouting::candidate("provider-b", "runtime-b");
+    routing.answer = routing.answer.map(|mut c| {
+        c.quality = tier.map(|tier| crate::ReviewerQualityEvidence {
+            tier,
+            basis_ref: basis.into(),
+        });
+        c
+    });
+    routing
+}
+
+#[test]
+fn candidate_quality_evidence_must_meet_the_derived_floor() {
+    use crate::ReviewRequestReviewerFloor as F;
+    // (profile, request floor, evidenced tier, basis) -> refusal?
+    let cases = [
+        (AssuranceProfile::Standard, None, None, "b", "missing"),
+        (
+            AssuranceProfile::Standard,
+            None,
+            Some(F::Balanced),
+            "b",
+            "below",
+        ),
+        (
+            AssuranceProfile::Standard,
+            None,
+            Some(F::Economy),
+            "b",
+            "below",
+        ),
+        (
+            AssuranceProfile::Standard,
+            Some(F::Economy),
+            Some(F::Economy),
+            "b",
+            "below",
+        ),
+        (
+            AssuranceProfile::Standard,
+            None,
+            Some(F::Frontier),
+            " ",
+            "missing",
+        ),
+        (
+            AssuranceProfile::Light,
+            None,
+            Some(F::Economy),
+            "b",
+            "below",
+        ),
+        (
+            AssuranceProfile::Light,
+            Some(F::Frontier),
+            Some(F::Balanced),
+            "b",
+            "below",
+        ),
+        (
+            AssuranceProfile::Standard,
+            None,
+            Some(F::Frontier),
+            "b",
+            "ok",
+        ),
+        (AssuranceProfile::Light, None, Some(F::Balanced), "b", "ok"),
+        (
+            AssuranceProfile::Light,
+            Some(F::Economy),
+            Some(F::Balanced),
+            "b",
+            "ok",
+        ),
+        (
+            AssuranceProfile::Light,
+            Some(F::Frontier),
+            Some(F::Frontier),
+            "b",
+            "ok",
+        ),
+    ];
+    for (profile, asked, tier, basis, want) in cases {
+        let policy = asked.map(|f| ReviewRequestPolicy::new(None, None, Some(f), None));
+        let c = case(profile, policy, "ok\n");
+        let routing = candidate_with(tier, basis);
+        let reviewer = pass_reviewer("runtime-b");
+        let t = run(
+            &c,
+            &routing,
+            &[&reviewer],
+            time_limit(),
+            &mut MemorySink::default(),
+        );
+        let label = format!("{profile:?} {asked:?} {tier:?} {basis:?}");
+        match (want, &t.disposition) {
+            ("missing", ReviewDisposition::Refused(ReviewRefusal::QualityEvidenceMissing))
+            | ("below", ReviewDisposition::Refused(ReviewRefusal::QualityBelowFloor { .. })) => {
+                assert_eq!(t.dispatches, 0, "{label}");
+                assert_eq!(calls(&reviewer), 0, "{label}: dispatched without evidence");
+                assert!(!t.passed(), "{label}");
+            }
+            ("ok", ReviewDisposition::Reviewed(_)) => assert!(t.passed(), "{label}"),
+            (_, other) => panic!("{label}: {other:?}"),
+        }
+    }
+}
+
+// ---- F6: policy is applied before any success is produced.
+
+fn nonblocking_json(cap: &crate::ReviewCapsuleNonTemporalCore, categories: &[&str]) -> String {
+    let findings: Vec<String> = categories
+        .iter()
+        .enumerate()
+        .map(|(n, cat)| {
+            format!(
+                r#"{{"finding_id":"n{n}","severity":"LOW","category":"{cat}","description":"d","blocking":false}}"#
+            )
+        })
+        .collect();
+    format!(
+        r#"{{"review_id":"{}","task_id":"{}","reviewed_sha":"{}","independence_attested":true,"verdict":"PASS_WITH_NONBLOCKING_FINDINGS","blocking_findings":[],"nonblocking_findings":[{}],"dimensions":[{}]}}"#,
+        cap.review_id(),
+        cap.task_id(),
+        cap.implementation_sha().as_str(),
+        findings.join(","),
+        all_dimensions_json()
+    )
+}
+
+#[test]
+fn mandatory_categories_are_blocking_whatever_the_reviewer_flagged() {
+    let mandatory = [
+        "ARCHITECTURE_VIOLATION",
+        "CONTRACT_VIOLATION",
+        "SECURITY_BOUNDARY_VIOLATION",
+        "WRITE_SCOPE_VIOLATION",
+        "UNDISCLOSED_CHANGE",
+        "UNREPRODUCIBLE_EVIDENCE",
+        "OVERSTATED_LABEL",
+        "TEST_WEAKENED_OR_DELETED",
+        "MISSING_REQUIRED_NEGATIVE_TEST",
+    ];
+    for category in mandatory {
+        let c = case(AssuranceProfile::Standard, None, "ok\n");
+        let routing = FixedRouting::candidate("provider-b", "runtime-b");
+        let reviewer = scripted(move |cap| nonblocking_json(cap, &[category, "STYLE"]));
+        let mut sink = MemorySink::default();
+        let t = run(&c, &routing, &[&reviewer], time_limit(), &mut sink);
+        assert!(!t.passed(), "{category} passed");
+        let r = reviewed(&t).core();
+        assert_eq!(r.verdict(), A4ReviewVerdict::Reject, "{category}");
+        assert_eq!(r.blocking_findings().len(), 1, "{category}");
+        assert_eq!(r.blocking_findings()[0].category().as_str(), category);
+        assert!(r.blocking_findings()[0].blocking());
+        // The truly nonblocking finding stays nonblocking.
+        assert_eq!(r.nonblocking_findings().len(), 1);
+        let kinds = events(&t);
+        assert!(kinds.contains(&EventType::ReviewRejected), "{category}");
+        assert!(!kinds.contains(&EventType::ReviewPassed), "{category}");
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|k| **k == EventType::FindingRaised)
+                .count(),
+            2
+        );
+        // The stored record says REJECT too.
+        assert!(
+            sink.proposals[0].decision_records[0]
+                .record_json()
+                .contains("\"verdict\":\"REJECT\"")
+        );
+    }
+}
+
+#[test]
+fn nonblocking_ordinary_findings_stay_pending_until_dispositioned() {
+    use crate::{FindingDisposition, FindingDispositionKind, disposition_proposal};
+    let c = case(AssuranceProfile::Standard, None, "ok\n");
+    let routing = FixedRouting::candidate("provider-b", "runtime-b");
+    let reviewer = scripted(|cap| nonblocking_json(cap, &["STYLE", "NAMING"]));
+    let mut sink = MemorySink::default();
+    let t = run(&c, &routing, &[&reviewer], time_limit(), &mut sink);
+    let r = reviewed(&t).core().clone();
+    assert_eq!(r.verdict(), A4ReviewVerdict::PassWithNonblockingFindings);
+    assert!(!t.passed(), "undispositioned findings progressed");
+    assert_eq!(t.pending_dispositions(), ["n0", "n1"]);
+    // One FINDING_RAISED per finding, each with its own payload.
+    let p = t.proposal.as_ref().unwrap();
+    let raised: Vec<_> = p
+        .events
+        .iter()
+        .filter(|e| e.event_type() == EventType::FindingRaised)
+        .collect();
+    assert_eq!(raised.len(), 2);
+    assert_ne!(raised[0].payload().digest, raised[1].payload().digest);
+    assert!(
+        p.content.iter().any(|(r, b)| r.ends_with(":n0")
+            && String::from_utf8_lossy(b).contains("\"finding_id\":\"n0\""))
+    );
+    // Explicit dispositions complete it: one DISPOSITIONED event per finding.
+    let dispositions = vec![
+        FindingDisposition {
+            finding_id: "n0".into(),
+            kind: FindingDispositionKind::FixNow {
+                task_id: "task-2".into(),
+            },
+            decided_by: "a2".into(),
+        },
+        FindingDisposition {
+            finding_id: "n1".into(),
+            kind: FindingDispositionKind::Defer {
+                issue_id: "ISSUE-9".into(),
+                revisit_point: "wave 3".into(),
+            },
+            decided_by: "a2".into(),
+        },
+    ];
+    let package = disposition_proposal("project", &c.request, &r, &dispositions).unwrap();
+    let kinds: Vec<_> = package.events.iter().map(|e| e.event_type()).collect();
+    assert_eq!(
+        kinds,
+        [
+            EventType::FindingDispositioned,
+            EventType::FindingDispositioned
+        ]
+    );
+    assert_ne!(
+        package.events[0].payload().digest,
+        package.events[1].payload().digest
+    );
+}
+
+// ---- F9 through reviewer-output parsing.
+
+#[test]
+fn reviewer_output_with_a_signed_unicode_escape_is_invalid_output() {
+    let c = case(AssuranceProfile::Standard, None, "ok\n");
+    let routing = FixedRouting::candidate("provider-b", "runtime-b");
+    let reviewer = scripted(|cap| {
+        verdict_json(cap, "PASS", &[]).replacen(
+            r#""independence_attested":true"#,
+            r#""rationale":"\u+041","independence_attested":true"#,
+            1,
+        )
+    });
+    let t = run(
+        &c,
+        &routing,
+        &[&reviewer],
+        time_limit(),
+        &mut MemorySink::default(),
+    );
+    assert!(matches!(t.disposition, ReviewDisposition::InvalidOutput(_)));
+    assert!(!t.passed());
 }

@@ -147,12 +147,22 @@ pub mod wire;
 
 pub mod ports;
 pub use ports::{
-    ImplementerIdentity, ReviewRecordProposal, ReviewRecordSink, ReviewerCandidate,
-    ReviewerRequirements, ReviewerRoutingPort, ReviewerRoutingRefusal, ReviewerRunOutput,
-    ReviewerRuntime, reviewer_output_from_claude, reviewer_output_from_codex,
+    ImplementerIdentity, ReviewClaim, ReviewRecordProposal, ReviewRecordSink, ReviewerCandidate,
+    ReviewerQualityEvidence, ReviewerRequirements, ReviewerRoutingPort, ReviewerRoutingRefusal,
+    ReviewerRunOutput, ReviewerRuntime, SealedReview, reviewer_output_from_claude,
+    reviewer_output_from_codex, reviewer_tier_rank,
 };
 
 mod records;
+
+#[cfg(test)]
+mod dispositions_tests;
+
+pub mod dispositions;
+pub use dispositions::{
+    DispositionRefusal, FindingDisposition, FindingDispositionKind, disposition_claim_key,
+    disposition_proposal, undispositioned, validate_dispositions,
+};
 
 pub mod reproduction;
 pub use reproduction::{CheckRun, CheckRunStatus, CheckRunnerConfig, run_check};
@@ -168,7 +178,8 @@ pub use review_parse::{ReviewParseError, parse_reviewer_output};
 
 pub mod controller;
 pub use controller::{
-    AttemptFinished, ReviewController, ReviewDisposition, ReviewRefusal, ReviewTicket,
+    AttemptFinished, ReplayedReview, ReviewController, ReviewDisposition, ReviewRefusal,
+    ReviewTicket, effective_distinct_provider, effective_reviewer_floor, review_claim_key,
 };
 
 #[cfg(test)]
@@ -179,8 +190,8 @@ mod test_repo;
 
 pub mod acceptance_gate;
 pub use acceptance_gate::{
-    AcceptanceCheckId, AcceptanceCheckResult, AcceptanceGate, AcceptanceInput, FailureSeverity,
-    GateOutcome,
+    AcceptanceCheckId, AcceptanceCheckResult, AcceptanceGate, AcceptanceInput,
+    DependencySupersession, FailureSeverity, GateOutcome,
 };
 
 #[cfg(test)]
@@ -188,8 +199,8 @@ mod acceptance_gate_tests;
 
 pub mod repair_controller;
 pub use repair_controller::{
-    RepairController, RepairDecision, RepairEscalation, RepairInput, RepairOutcome, RepairRequest,
-    RepairTier,
+    RepairController, RepairDecision, RepairEscalation, RepairInput, RepairOutcome,
+    RepairPolicyTrigger, RepairRequest, RepairTier, ReviewerExclusions, repair_claim_key,
 };
 
 #[cfg(test)]

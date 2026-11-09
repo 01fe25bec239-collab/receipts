@@ -944,7 +944,7 @@ fn wrong_source_role_after_good_check_fails_in_every_channel() {
     }
 }
 #[test]
-fn absent_or_false_timeout_needs_explicit_pass_and_nonzero_exit_is_not_judged() {
+fn absent_or_false_timeout_needs_explicit_pass_and_pass_with_nonzero_exit_is_contradictory() {
     for record in CHANNELS {
         for timed_out in [None, Some(false)] {
             for exit_code in [0, 7] {
@@ -952,6 +952,18 @@ fn absent_or_false_timeout_needs_explicit_pass_and_nonzero_exit_is_not_judged() 
                     let mut evidence = Evidence::valid();
                     evidence.clear_checks(record);
                     evidence.push_check(record, role(record), exit_code, timed_out, passing);
+                    if passing == Some(true) && exit_code != 0 {
+                        // F4: a PASS that contradicts its own exit code is refused.
+                        assert_eq!(
+                            evidence.evaluate(),
+                            Err(Error::EvidenceContradictory {
+                                record,
+                                check_index: 0
+                            }),
+                            "{record:?} exit {exit_code}"
+                        );
+                        continue;
+                    }
                     assert_result(evidence.evaluate(), record, passing);
                 }
             }
