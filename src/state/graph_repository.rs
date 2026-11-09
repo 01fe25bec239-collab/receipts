@@ -1549,10 +1549,51 @@ pub(crate) fn verify_v18(conn: &Connection, phase: Phase) -> Result<(), StateErr
     Ok(())
 }
 /// The supported current State schema head.
-pub(crate) const CURRENT_SCHEMA_HEAD: i64 = 20;
+pub(crate) const CURRENT_SCHEMA_HEAD: i64 = 23;
 
-/// Verifies the exact current (v20) ledger, every v19 object and the v20 objects.
+/// Verifies the exact current ledger and all objects through v23.
 pub(crate) fn verify_current(conn: &Connection, phase: Phase) -> Result<(), StateError> {
+    verify_v22_objects(conn, phase)?;
+    verify_ledger(conn, 23, phase)?;
+    if !migrations::v0023_graph_publication_identity::objects_match(conn)
+        .map_err(|e| schema_error(phase, e))?
+    {
+        return Err(failure(phase, Code::CorruptStore, None));
+    }
+    Ok(())
+}
+pub(crate) fn verify_v22(conn: &Connection, phase: Phase) -> Result<(), StateError> {
+    verify_ledger(conn, 22, phase)?;
+    verify_v22_objects(conn, phase)
+}
+fn verify_v22_objects(conn: &Connection, phase: Phase) -> Result<(), StateError> {
+    verify_graph_encoding(conn, phase)?;
+    verify_v19_objects(conn, phase)?;
+    if !migrations::v0020_trusted_core::objects_match(conn).map_err(|e| schema_error(phase, e))?
+        || !migrations::v0021_publication_claims::objects_match(conn)
+            .map_err(|e| schema_error(phase, e))?
+        || !migrations::v0022_order_and_seal::objects_match(conn)
+            .map_err(|e| schema_error(phase, e))?
+    {
+        return Err(failure(phase, Code::CorruptStore, None));
+    }
+    Ok(())
+}
+/// Verifies an exact v21 store (the v22 migration's precondition).
+pub(crate) fn verify_v21(conn: &Connection, phase: Phase) -> Result<(), StateError> {
+    verify_graph_encoding(conn, phase)?;
+    verify_ledger(conn, 21, phase)?;
+    verify_v19_objects(conn, phase)?;
+    if !migrations::v0020_trusted_core::objects_match(conn).map_err(|e| schema_error(phase, e))?
+        || !migrations::v0021_publication_claims::objects_match(conn)
+            .map_err(|e| schema_error(phase, e))?
+    {
+        return Err(failure(phase, Code::CorruptStore, None));
+    }
+    Ok(())
+}
+/// Verifies an exact v20 store (the v21 migration's precondition).
+pub(crate) fn verify_v20(conn: &Connection, phase: Phase) -> Result<(), StateError> {
     verify_graph_encoding(conn, phase)?;
     verify_ledger(conn, 20, phase)?;
     verify_v19_objects(conn, phase)?;

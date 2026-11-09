@@ -70,6 +70,10 @@ use std::fmt;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+use crate::atomic_publication::{
+    DecisionPublicationReceiptV1, DecisionPublicationV1, GraphMutationPublicationV1,
+    GraphPublicationOutcomeV1,
+};
 use crate::attempt::{AttemptFinish, AttemptStart};
 use crate::availability_facts::{AvailabilityFactReceiptV1, AvailabilityFactV1};
 use crate::checkpoint_ref::CheckpointRecord;
@@ -86,6 +90,7 @@ use crate::event_proposal::{EventPersistReceiptV1, EventProposalV1};
 use crate::executor_binding::{ExecutorBinding, ReleaseReason};
 use crate::executor_binding_lease_expiry::{
     ExecutorLeaseExpiryOutcomeV1, ExecutorLeaseExpiryRequestV2,
+    ExecutorReleasedLifecycleAuthorityV1,
 };
 use crate::graph_history::StateGraphMutationV1;
 use crate::graph_node_result::StateGraphNodeResultV1;
@@ -93,7 +98,15 @@ use crate::graph_repository::{StateGraphGenesisV1, StateGraphSnapshotV1};
 use crate::logical_role::{LogicalRole, LogicalRoleStatus};
 use crate::logical_role_lifecycle::RoleChangeEvidenceV1;
 use crate::output_ref::OutputRef;
+use crate::recovery::{
+    ChangedSourceSuccessionRequestV1, ChangedSourceSuccessionV1, RehydrationRequiredV1,
+    RoleRebindRequestV1, StartupRecoveryReportV1,
+};
 use crate::repository::SqliteStateRepository;
+use crate::review_claim::{
+    ReviewClaimAbandonV1, ReviewClaimOutcomeV1, ReviewClaimRecordV1, ReviewClaimRequestV1,
+    ReviewClaimSettlementV1, ReviewClaimTicketV1, ReviewSealRecordV1, ReviewSealRequestV1,
+};
 use crate::trusted_time::TrustedClockV1;
 
 /// Closed operation families a single admission can authorize.
@@ -114,6 +127,10 @@ pub enum StateWriteOperationV1 {
     LogicalRole,
     ExecutorBinding,
     AvailabilityFact,
+    /// One atomic decision publication package (records, events, facts).
+    DecisionPublication,
+    /// Durable review claims (claim, settle, abandon).
+    ReviewClaim,
 }
 
 /// Why State refused a write admission or an exclusive open.
@@ -252,7 +269,7 @@ impl TrustedCoreStore {
         Self::finish(repo, held)
     }
 
-    /// Explicitly upgrades an existing v11–v19 store to the current schema and
+    /// Explicitly upgrades an existing v11–v21 store to the current schema and
     /// opens it, under the same ownership/lock checks. Returns the new head.
     pub fn migrate_exclusive(path: impl AsRef<Path>) -> Result<(Self, u32), StateError> {
         let held = secure::prepare(path.as_ref(), false)?;
@@ -804,6 +821,60 @@ impl TrustedCoreStore {
             .renew_executor_binding_lease(clock, binding_id, lease_expires_at)
     }
 
+    // ---- recovery (ST-W2) -------------------------------------------------------
+
+    /// Startup recovery scan for one project (ExecutorBinding family). See
+    /// [`crate::recovery`]: expired leases are released with their events,
+    /// every role's continuation requirement and the unfinished attempts are
+    /// reported from the same snapshot.
+    pub fn recover_startup(
+        &mut self,
+        admission: StateWriteAdmission,
+        clock: &dyn TrustedClockV1,
+        project_id: &str,
+        authority: &ExecutorReleasedLifecycleAuthorityV1,
+    ) -> Result<StartupRecoveryReportV1, StateError> {
+        self.check(
+            admission,
+            StateWriteOperationV1::ExecutorBinding,
+            Bound::project(project_id),
+        )?;
+        self.repo.recover_startup(clock, project_id, authority)
+    }
+
+    /// Atomic expected-current-CAS failover rebind (ExecutorBinding family);
+    /// the result names the rehydration the new executor must complete first.
+    pub fn rebind_role(
+        &mut self,
+        admission: StateWriteAdmission,
+        clock: &dyn TrustedClockV1,
+        request: &RoleRebindRequestV1,
+    ) -> Result<RehydrationRequiredV1, StateError> {
+        let project = self.role_project(&request.role_id)?;
+        self.check(
+            admission,
+            StateWriteOperationV1::ExecutorBinding,
+            Bound::project(&project),
+        )?;
+        self.repo.rebind_role(clock, request)
+    }
+
+    /// Changed-source epoch/successor transaction (ContextEpoch family).
+    pub fn succeed_changed_context_sources(
+        &mut self,
+        admission: StateWriteAdmission,
+        clock: &dyn TrustedClockV1,
+        request: &ChangedSourceSuccessionRequestV1,
+    ) -> Result<ChangedSourceSuccessionV1, StateError> {
+        let project = self.role_project(&request.role_id)?;
+        self.check(
+            admission,
+            StateWriteOperationV1::ContextEpoch,
+            Bound::project(&project),
+        )?;
+        self.repo.succeed_changed_context_sources(clock, request)
+    }
+
     // ---- availability (D5) -----------------------------------------------------
 
     /// Appends one durable availability fact with a State-assigned monotonic
@@ -820,6 +891,154 @@ impl TrustedCoreStore {
             Bound::project(fact.project_id()),
         )?;
         self.repo.append_availability_fact(clock, fact)
+    }
+
+    // ---- shared atomic publication and review claims ----------------------------
+
+    /// Publishes a graph mutation together with the node results it attaches,
+    /// its snapshot, history, seal, watermark and head CAS in one transaction
+    /// (GraphMutation family; the same project/graph/source/compiler/policy
+    /// binding as [`Self::append_graph_mutation_v1`]). Any failure writes
+    /// nothing. See [`crate::atomic_publication`].
+    pub fn publish_graph_mutation_v1(
+        &mut self,
+        admission: StateWriteAdmission,
+        clock: &dyn TrustedClockV1,
+        publication: &GraphMutationPublicationV1,
+    ) -> Result<GraphPublicationOutcomeV1, StateError> {
+        let content = publication.snapshot().content();
+        let provenance = content.genesis_provenance();
+        self.check(
+            admission,
+            StateWriteOperationV1::GraphMutation,
+            Bound {
+                project: content.project_id(),
+                graph: Some(publication.graph_id()),
+                source: Some(provenance.source_ref().as_str()),
+                compiler: Some(provenance.compiler_id().as_str()),
+                policy: Some(content.policy_id()),
+            },
+        )?;
+        self.repo.publish_graph_mutation_v1(clock, publication)
+    }
+
+    /// Publishes one decision package (records, events with receipts,
+    /// availability facts and an optional claim settlement) atomically
+    /// (DecisionPublication family, bound to the package's project). Exact
+    /// retries return the recorded outcome. See [`crate::atomic_publication`].
+    pub fn publish_decision_package_v1(
+        &mut self,
+        admission: StateWriteAdmission,
+        clock: &dyn TrustedClockV1,
+        package: &DecisionPublicationV1,
+    ) -> Result<DecisionPublicationReceiptV1, StateError> {
+        self.check(
+            admission,
+            StateWriteOperationV1::DecisionPublication,
+            Bound::project(package.project_id()),
+        )?;
+        if let Some((store_id, instance)) = package.claim_binding()
+            && (store_id != self.store_id || instance != self.instance)
+        {
+            return Err(refused(StateWriteRefusalV1::WrongStore));
+        }
+        let store_id = self.store_id.clone();
+        self.repo
+            .publish_decision_package_v1(clock, package, &store_id)
+    }
+
+    /// Claims one unit of review work BEFORE it is routed or executed. Only
+    /// [`ReviewClaimOutcomeV1::Claimed`] permits execution. See
+    /// [`crate::review_claim`].
+    pub fn claim_review_v1(
+        &mut self,
+        admission: StateWriteAdmission,
+        clock: &dyn TrustedClockV1,
+        request: &ReviewClaimRequestV1,
+    ) -> Result<ReviewClaimOutcomeV1, StateError> {
+        self.check(
+            admission,
+            StateWriteOperationV1::ReviewClaim,
+            Bound::project(request.project_id()),
+        )?;
+        let (inserted, record) = self.repo.claim_review_v1(clock, request)?;
+        Ok(if inserted {
+            ReviewClaimOutcomeV1::Claimed(ReviewClaimTicketV1 {
+                store_id: self.store_id.clone(),
+                instance: self.instance,
+                project_id: record.project_id,
+                claim_id: record.claim_id,
+            })
+        } else {
+            ReviewClaimOutcomeV1::Existing(record)
+        })
+    }
+
+    /// Settles the claim this live store instance issued `ticket` for.
+    pub fn settle_review_claim_v1(
+        &mut self,
+        admission: StateWriteAdmission,
+        clock: &dyn TrustedClockV1,
+        ticket: &ReviewClaimTicketV1,
+        settlement: &ReviewClaimSettlementV1,
+    ) -> Result<ReviewClaimRecordV1, StateError> {
+        self.check(
+            admission,
+            StateWriteOperationV1::ReviewClaim,
+            Bound::project(&ticket.project_id),
+        )?;
+        if ticket.store_id != self.store_id || ticket.instance != self.instance {
+            return Err(refused(StateWriteRefusalV1::WrongStore));
+        }
+        self.repo
+            .settle_review_claim_v1(clock, &ticket.project_id, &ticket.claim_id, settlement)
+    }
+
+    /// Durably seals the claimant's exact observed result BEFORE anything is
+    /// published. Only the live claimant (the `ticket` this instance issued)
+    /// can create the initial seal; an identical reseal returns the stored
+    /// seal and different content refuses. See [`crate::review_claim`].
+    pub fn seal_review_claim_v1(
+        &mut self,
+        admission: StateWriteAdmission,
+        clock: &dyn TrustedClockV1,
+        ticket: &ReviewClaimTicketV1,
+        request: &ReviewSealRequestV1,
+    ) -> Result<ReviewSealRecordV1, StateError> {
+        self.check(
+            admission,
+            StateWriteOperationV1::ReviewClaim,
+            Bound::project(&ticket.project_id),
+        )?;
+        if ticket.store_id != self.store_id || ticket.instance != self.instance {
+            return Err(refused(StateWriteRefusalV1::WrongStore));
+        }
+        if request.project_id() != ticket.project_id || request.claim_id() != ticket.claim_id {
+            return Err(StateError::Publication {
+                code: crate::PublicationFailureCode::InvalidShape,
+                kind: "review_claim",
+            });
+        }
+        if request.ticket_binding() != (self.store_id.as_str(), self.instance) {
+            return Err(refused(StateWriteRefusalV1::WrongStore));
+        }
+        self.repo.seal_review_claim_v1(clock, request)
+    }
+
+    /// Records the explicit, authority-named abandonment of an unfinished
+    /// claim. Never automatic; it re-runs nothing.
+    pub fn abandon_review_claim_v1(
+        &mut self,
+        admission: StateWriteAdmission,
+        clock: &dyn TrustedClockV1,
+        request: &ReviewClaimAbandonV1,
+    ) -> Result<ReviewClaimRecordV1, StateError> {
+        self.check(
+            admission,
+            StateWriteOperationV1::ReviewClaim,
+            Bound::project(request.project_id()),
+        )?;
+        self.repo.abandon_review_claim_v1(clock, request)
     }
 }
 
@@ -899,7 +1118,7 @@ mod secure {
     /// The facts checked for every object, from `fstat` or `fstatat`.
     #[derive(PartialEq)]
     struct Facts {
-        kind: u32,
+        kind: libc::mode_t,
         uid: u32,
         mode: u32,
         nlink: u64,
@@ -910,8 +1129,11 @@ mod secure {
     impl Facts {
         fn of(file: &File) -> Result<Self, StateError> {
             let m = file.metadata().map_err(io)?;
+            // MetadataExt uses u32; libc mode_t is u16 on macOS and u32 on Linux.
+            #[allow(clippy::unnecessary_cast)]
+            let mode = m.mode() as libc::mode_t;
             Ok(Self {
-                kind: m.mode() & libc::S_IFMT as u32,
+                kind: mode & libc::S_IFMT,
                 uid: m.uid(),
                 mode: m.mode() & 0o7777,
                 nlink: m.nlink(),
@@ -920,7 +1142,7 @@ mod secure {
             })
         }
         fn regular(&self) -> bool {
-            self.kind == libc::S_IFREG as u32
+            self.kind == libc::S_IFREG
         }
         fn same_object(&self, other: &Self) -> bool {
             (self.dev, self.ino) == (other.dev, other.ino)
@@ -967,7 +1189,7 @@ mod secure {
         // Field widths differ between platforms; the casts are not redundant everywhere.
         #[allow(clippy::unnecessary_cast)]
         Ok(Some(Facts {
-            kind: (st.st_mode & libc::S_IFMT) as u32,
+            kind: st.st_mode & libc::S_IFMT,
             uid: st.st_uid,
             mode: (st.st_mode & 0o7777) as u32,
             nlink: st.st_nlink as u64,
@@ -1007,7 +1229,7 @@ mod secure {
     /// An ancestor may be shared only if no other principal can replace the
     /// entry below it.
     fn protected_ancestor(dir: &Facts, child: &Facts) -> Result<(), StateError> {
-        if dir.kind != libc::S_IFDIR as u32 {
+        if dir.kind != libc::S_IFDIR {
             return Err(refused(R::InsecurePath));
         }
         if dir.uid != 0 && dir.uid != euid() {
@@ -1033,7 +1255,7 @@ mod secure {
             dir = child;
         }
         let facts = Facts::of(&dir)?;
-        if facts.kind != libc::S_IFDIR as u32 {
+        if facts.kind != libc::S_IFDIR {
             return Err(refused(R::InsecurePath));
         }
         facts.private()?;

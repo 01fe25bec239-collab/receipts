@@ -343,6 +343,44 @@ fn list_results(
         })
         .collect()
 }
+/// Whether [`insert_result_in_tx`] wrote a row or found the identical one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResultInsert {
+    Inserted,
+    Adopted,
+}
+
+/// Inserts one result row inside the caller's open transaction. With
+/// `adopt_identical`, a row already stored with the exact same version, node
+/// and bytes is accepted as is (immutable, so adopting it changes nothing);
+/// any other existing row is refused.
+pub(crate) fn insert_result_in_tx(
+    conn: &Connection,
+    project: &str,
+    version: &str,
+    reference: &str,
+    result: &StateGraphNodeResultV1,
+    raw: &str,
+    adopt_identical: bool,
+) -> Result<ResultInsert, StateError> {
+    if let Some(existing) = read_result(conn, project, result.graph_id(), reference)? {
+        if adopt_identical
+            && existing.graph_version() == version
+            && existing.result().node_id() == result.node_id()
+            && existing.result().to_json()? == raw
+        {
+            return Ok(ResultInsert::Adopted);
+        }
+        return Err(graph::failure(Phase::Write, Code::AlreadyExists, None));
+    }
+    if !node_exists(conn, project, result.graph_id(), version, result.node_id())? {
+        return Err(graph::failure(Phase::Write, Code::IdentityMismatch, None));
+    }
+    conn.execute("INSERT INTO graph_node_results(project_id,graph_id,result_ref,graph_version,node_id,result_json) VALUES (?1,?2,?3,?4,?5,?6)",params![project,result.graph_id(),reference,version,result.node_id(),raw]).map_err(|e|graph::sqlite_error(Phase::Write,e))?;
+    crate::write_fault::boundary()?;
+    Ok(ResultInsert::Inserted)
+}
+
 impl SqliteStateRepository {
     pub(crate) fn append_node_result_v1(
         &mut self,
@@ -356,14 +394,7 @@ impl SqliteStateRepository {
         }
         let raw = result.to_json()?;
         graph::write_transaction(self.connection(), |conn| {
-            if read_result(conn, project, result.graph_id(), reference)?.is_some() {
-                return Err(graph::failure(Phase::Write, Code::AlreadyExists, None));
-            }
-            if !node_exists(conn, project, result.graph_id(), version, result.node_id())? {
-                return Err(graph::failure(Phase::Write, Code::IdentityMismatch, None));
-            }
-            conn.execute("INSERT INTO graph_node_results(project_id,graph_id,result_ref,graph_version,node_id,result_json) VALUES (?1,?2,?3,?4,?5,?6)",params![project,result.graph_id(),reference,version,result.node_id(),raw]).map_err(|e|graph::sqlite_error(Phase::Write,e))?;
-            Ok(())
+            insert_result_in_tx(conn, project, version, reference, &result, &raw, false).map(|_| ())
         })
     }
     pub fn find_node_result_v1(
