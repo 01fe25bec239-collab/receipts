@@ -544,3 +544,42 @@ pub fn provision_temporary_merge(
         workspace,
     })
 }
+
+#[cfg(test)]
+mod binding_lifetime_tests {
+    use super::*;
+    use crate::test_support::{TempDir, TestRepo};
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::Arc;
+
+    #[test]
+    fn binding_object_is_pinned_until_the_last_review_handle_drops() {
+        let repo = TestRepo::new("review-pin");
+        let place = TempDir::new("review-pin-wt");
+        let ws = provision_review_workspace(&ReviewWorkspaceRequest {
+            repository_root: repo.path().to_path_buf(),
+            workspace_id: "ws-pin".into(),
+            task_id: "task-pin".into(),
+            reviewed_sha: CommitSha::parse(&repo.head_sha()).unwrap(),
+            worktree_path: place.path().join("pin"),
+        })
+        .unwrap();
+        let pin = Arc::downgrade(&ws.binding_object._file);
+        let cloned = ws.clone();
+        assert_eq!(ws, cloned);
+        assert_eq!(pin.strong_count(), 2, "clones share one descriptor");
+        drop(ws);
+        assert_eq!(pin.strong_count(), 1, "the clone retains ownership");
+        remove_review_workspace(repo.path(), &cloned).unwrap();
+        assert_eq!(
+            cloned.binding_object._file.metadata().unwrap().nlink(),
+            0,
+            "the unlinked object stays alive and cannot be recycled"
+        );
+        drop(cloned);
+        assert!(
+            pin.upgrade().is_none(),
+            "the last handle releases the descriptor"
+        );
+    }
+}

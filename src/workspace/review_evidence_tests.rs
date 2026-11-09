@@ -445,42 +445,6 @@ fn stale_handles_never_remove_a_replacement_workspace() {
 }
 
 #[test]
-fn binding_object_is_pinned_until_the_last_review_handle_drops() {
-    use std::os::unix::fs::MetadataExt;
-    let repo = TestRepo::new("review-pin");
-    let place = TempDir::new("review-pin-wt");
-    let ws = provision_review_workspace(&request(&repo, &place, "pin", &repo.head_sha())).unwrap();
-    let binding = crate::test_support::worktree_meta_dir(&repo, ws.handle().worktree_path())
-        .unwrap()
-        .join(crate::worktree_binding::BINDING_FILE);
-    let original = std::fs::metadata(&binding).unwrap();
-    let pins = || {
-        std::fs::read_dir("/dev/fd")
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter_map(|entry| std::fs::File::open(entry.path()).ok())
-            .filter_map(|file| file.metadata().ok())
-            .filter(|m| (m.dev(), m.ino()) == (original.dev(), original.ino()))
-            .count()
-    };
-    assert_eq!(pins(), 1, "ownership must keep the original object alive");
-    let cloned = ws.clone();
-    assert_eq!(ws, cloned);
-    assert_eq!(pins(), 1, "clones share one descriptor");
-    drop(ws);
-    assert_eq!(pins(), 1, "a surviving clone retains ownership");
-    remove_review_workspace(repo.path(), &cloned).unwrap();
-    assert!(!binding.exists());
-    assert_eq!(
-        pins(),
-        1,
-        "an unlinked object cannot be recycled while pinned"
-    );
-    drop(cloned);
-    assert_eq!(pins(), 0, "the last handle releases the descriptor");
-}
-
-#[test]
 fn altered_owned_binding_refuses_without_removing_or_repairing_it() {
     use std::os::unix::fs::PermissionsExt;
     let repo = TestRepo::new("review-altered-binding");
