@@ -44,13 +44,17 @@ A capsule is refused, never built, when:
 - a write pattern is not proven to lie inside the node's own adopted ownership;
 - a write pattern overlaps another workstream's ownership or a forbidden path;
 - the matcher cannot decide a write pattern;
-- any text looks credential-shaped.
+- any text the capsule would emit looks credential-shaped.
 
 Other workstreams' owned paths are added to `forbidden_write_paths`. The port only answers overlap, which cannot show containment: with own `src/core/**`, another owner `docs/**` and allowed `src/*/safe/**`, the pattern overlaps its owner and is disjoint from the other owner, yet it reaches `src/unowned/safe/x.rs`. So a pattern is built only when `capsules::containment` proves it lies inside the node's own ownership, and the port then proves it disjoint from every other ownership and forbidden path.
 
 The containment proof reuses the Workspace grammar (`WritePathPattern::parse` decides validity: whole-component `**`, `*` inside a component, no `?[]{}`). It is structural and sufficient, not complete. A union counts only when one owned pattern contains the whole pattern, and a `*` in the requested pattern is absorbed only by a `*` in the owner. Anything not shown contained is `OutsideWorkstream`; an invalid or oversized (over 1 KiB) pattern is `WriteScopeUndetermined`. Tests check every claimed containment against the real matcher over a bounded exhaustive path set. A repair must also pass this check; being a subset of the original's patterns is not enough on its own.
 
 The credential check is a heuristic (token prefixes, key headers, `key=value` secrets, long mixed-class high-entropy tokens). Passing it does not prove a value is secret-free. The structural rule is that no capsule field is a credential slot.
+
+The check covers every free-text value either capsule emits, whatever its source: requester text, values derived from the graph (task, workstream and dependency ids, branch, required capabilities), values read from the original capsule (a repair re-screens its objective, criteria and traps, because `TaskCapsule` is a public type and its builder is not proof), reference digests, criterion and finding ids, and the final `forbidden_write_paths` (requester paths, original traps and every other workstream's owned paths). Numeric, enum, boolean, timestamp and lowercase-hex fields are validated structurally by the capsule constructors and cannot hold a recognized token shape.
+
+The screen runs before any scope check. A refusal therefore does not echo a credential-shaped pattern: it is `CredentialShapedValue` naming the field family, not the value. Patterns, matcher witnesses and State messages that do reach a refusal payload (for example an overlap witness the screen could not see) are replaced with `<withheld: credential-shaped>` when they look credential-shaped, so `Display` and `Debug` of `CapsuleBuildError` carry no recognized token. Ordinary scope refusals keep their typed payloads. A credential-shaped value now takes precedence over a scope refusal for the same request.
 
 A repair (N4) is built only for a ready `REPAIR` node such that:
 

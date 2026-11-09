@@ -12,9 +12,16 @@
 //! - a write path is a root wildcard, is not proven to fall inside the node's
 //!   own adopted workstream ownership, overlaps another workstream's
 //!   ownership or a forbidden path, or the matcher cannot decide;
-//! - any text field looks credential-shaped (a heuristic, see
+//! - any text the capsule would emit looks credential-shaped (a heuristic, see
 //!   [`credential_scan`](super::credential_scan); it never proves a string
-//!   secret-free).
+//!   secret-free). That covers requester text, values derived from the graph,
+//!   values inherited from the original capsule and the final forbidden-path
+//!   collection, and the screen runs before any scope check so a refusal never
+//!   has to echo a credential-shaped pattern. Numeric, enum, boolean,
+//!   timestamp and lowercase-hex fields are structurally restricted and are
+//!   validated by the capsule constructors instead.
+//!   Payload text in a refusal (patterns, matcher witnesses, State messages)
+//!   is withheld when it looks credential-shaped.
 //!
 //! Every other workstream's owned paths are added to `forbidden_write_paths`
 //! as explicit traps. A pattern is built only when it is proven to lie
@@ -112,8 +119,22 @@ impl From<CapsuleError> for CapsuleBuildError {
 }
 
 impl std::fmt::Display for CapsuleBuildError {
+    // Payload strings reach this through `shown`, so Debug is safe to print.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "capsule not built: {self:?}")
+    }
+}
+
+/// What a refusal carries in place of a credential-shaped string.
+const WITHHELD: &str = "<withheld: credential-shaped>";
+
+/// Every string placed in a refusal passes through here: refusals are logged,
+/// and a matcher witness or State message is not covered by the input screen.
+fn shown(value: &str) -> String {
+    if looks_like_credential(value) {
+        WITHHELD.to_owned()
+    } else {
+        value.to_owned()
     }
 }
 
@@ -179,18 +200,51 @@ pub fn build_task_capsule_v1(
     let workstream = node.workstream_id().ok_or(E::NodeWithoutWorkstream)?;
     let epoch = current_epoch(context, &request.context_epoch)?;
     let epoch: i64 = epoch.parse().map_err(|_| E::EpochOutOfRange)?;
-    let forbidden = check_write_scope(
-        context,
-        port,
-        workstream,
-        &request.allowed_write_paths,
-        &request.forbidden_write_paths,
-    )?;
+    let task_id = node.node_id();
+    let attempt = match node.attempt_number() {
+        None => 1,
+        Some(n) => n.as_str().parse().map_err(|_| E::AttemptBoundExceeded)?,
+    };
+    let mut dependencies: Vec<String> = context
+        .envelope
+        .graph()
+        .precedence_edges()
+        .filter(|e| e.to_node() == task_id)
+        .map(|e| e.from_node().to_owned())
+        .collect();
+    dependencies.sort();
+    dependencies.dedup();
+    let branch = format!("runtime-a3/{task_id}");
+    let required = node.required_capabilities().unwrap_or_default();
+    let (own, forbidden) = scope_traps(context, workstream, &request.forbidden_write_paths)?;
+
+    // Everything the capsule emits, derived or supplied, is screened before any
+    // scope check can produce a payload-bearing refusal.
     let mut text: Vec<(&'static str, &str)> = vec![
+        ("task_id", task_id),
+        ("workstream_id", workstream),
+        ("branch", &branch),
         ("objective", &request.objective),
         ("worktree", context.worktree),
     ];
-    criteria_text(&request.acceptance_criteria, &mut text);
+    text.extend(dependencies.iter().map(|d| ("dependencies", d.as_str())));
+    text.extend(
+        required
+            .iter()
+            .map(|c| ("required_capabilities", c.as_str())),
+    );
+    text.extend(
+        request
+            .preferred_capabilities
+            .iter()
+            .flatten()
+            .map(|c| ("preferred_capabilities", c.as_str())),
+    );
+    criteria_text(
+        "acceptance_criteria",
+        &request.acceptance_criteria,
+        &mut text,
+    );
     for (field, values) in [
         (
             "non_goals",
@@ -198,7 +252,8 @@ pub fn build_task_capsule_v1(
         ),
         ("stop_conditions", &request.stop_conditions[..]),
         ("allowed_write_paths", &request.allowed_write_paths[..]),
-        ("forbidden_write_paths", &request.forbidden_write_paths[..]),
+        // Requester paths plus every other workstream's synthesized trap.
+        ("forbidden_write_paths", &forbidden[..]),
     ] {
         text.extend(values.iter().map(|v| (field, v.as_str())));
     }
@@ -222,23 +277,10 @@ pub fn build_task_capsule_v1(
         refs_text(field, refs.unwrap_or_default(), &mut text);
     }
     scan(&text)?;
+    check_write_scope(port, own, &request.allowed_write_paths, &forbidden)?;
 
-    let task_id = node.node_id().to_owned();
-    let attempt = match node.attempt_number() {
-        None => 1,
-        Some(n) => n.as_str().parse().map_err(|_| E::AttemptBoundExceeded)?,
-    };
-    let mut dependencies: Vec<String> = context
-        .envelope
-        .graph()
-        .precedence_edges()
-        .filter(|e| e.to_node() == task_id)
-        .map(|e| e.from_node().to_owned())
-        .collect();
-    dependencies.sort();
-    dependencies.dedup();
     Ok(TaskCapsule::try_new(
-        task_id.clone(),
+        task_id.to_owned(),
         workstream.to_owned(),
         None,
         attempt,
@@ -255,7 +297,7 @@ pub fn build_task_capsule_v1(
         request.contract_refs,
         Some(dependencies),
         request.quality_floor,
-        node.required_capabilities().unwrap_or_default().to_vec(),
+        required.to_vec(),
         request.preferred_capabilities,
         request.verification_plan,
         request.review_policy,
@@ -263,7 +305,7 @@ pub fn build_task_capsule_v1(
         request.cost_policy,
         request.time_budget_seconds,
         request.turn_budget,
-        format!("runtime-a3/{task_id}"),
+        branch,
         context.worktree.to_owned(),
         request.remote_publish_policy,
         request.stop_conditions,
@@ -367,39 +409,35 @@ pub fn build_repair_capsule_v1(
     if request.original_acceptance_criteria != original.acceptance_criteria() {
         return Err(E::CriteriaChanged);
     }
-    if let Some(pattern) = request
-        .allowed_write_paths
-        .iter()
-        .find(|p| !original.allowed_write_paths().contains(p))
-    {
-        return Err(E::RepairScopeWidened {
-            pattern: pattern.clone(),
-        });
-    }
-    if let Some(finding) = request.blocking_findings.iter().find(|f| !f.blocking()) {
-        return Err(E::NonBlockingFindingListedAsBlocking {
-            finding_id: finding.finding_id().to_owned(),
-        });
-    }
-    let epoch = current_epoch(context, &request.context_epoch)?;
+    // Screen before any check below can put a supplied pattern in a refusal.
     let mut forbidden: Vec<String> = original.forbidden_write_paths().to_vec();
     for path in request.forbidden_write_paths.iter().flatten() {
         if !forbidden.contains(path) {
             forbidden.push(path.clone());
         }
     }
-    let forbidden = check_write_scope(
-        context,
-        port,
-        original.workstream_id(),
-        &request.allowed_write_paths,
-        &forbidden,
-    )?;
-
+    let (own, forbidden) = scope_traps(context, original.workstream_id(), &forbidden)?;
+    let task_id = repair.node_id();
+    let branch = format!("runtime-a3/{task_id}");
     let mut text: Vec<(&'static str, &str)> = vec![
+        ("task_id", task_id),
+        ("original_task_id", original.task_id()),
+        ("branch", &branch),
+        ("original_objective", original.objective()),
         ("repair_scope", &request.repair_scope),
         ("worktree", context.worktree),
     ];
+    text.extend(
+        results
+            .attempt(project, graph.graph_id(), judged)
+            .map(|a| ("parent_attempt_id", a)),
+    );
+    // The original is a public type; its content is not assumed screened.
+    criteria_text(
+        "original_acceptance_criteria",
+        original.acceptance_criteria(),
+        &mut text,
+    );
     if let Some(summary) = &request.prior_attempt_summary {
         text.push(("prior_attempt_summary", summary));
     }
@@ -409,6 +447,7 @@ pub fn build_repair_capsule_v1(
         .flatten()
         .chain(&request.blocking_findings)
     {
+        text.push(("findings", finding.finding_id()));
         text.push(("findings", finding.description()));
         text.extend(finding.path().map(|p| ("findings", p)));
         refs_text(
@@ -447,11 +486,33 @@ pub fn build_repair_capsule_v1(
             .iter()
             .map(|p| ("allowed_write_paths", p.as_str())),
     );
+    // Original, requester and synthesized traps, as emitted.
+    text.extend(
+        forbidden
+            .iter()
+            .map(|p| ("forbidden_write_paths", p.as_str())),
+    );
     scan(&text)?;
 
-    let task_id = repair.node_id().to_owned();
+    if let Some(pattern) = request
+        .allowed_write_paths
+        .iter()
+        .find(|p| !original.allowed_write_paths().contains(p))
+    {
+        return Err(E::RepairScopeWidened {
+            pattern: shown(pattern),
+        });
+    }
+    if let Some(finding) = request.blocking_findings.iter().find(|f| !f.blocking()) {
+        return Err(E::NonBlockingFindingListedAsBlocking {
+            finding_id: shown(finding.finding_id()),
+        });
+    }
+    let epoch = current_epoch(context, &request.context_epoch)?;
+    check_write_scope(port, own, &request.allowed_write_paths, &forbidden)?;
+
     Ok(RepairCapsule::try_new(
-        task_id.clone(),
+        task_id.to_owned(),
         original.task_id().to_owned(),
         results
             .attempt(project, graph.graph_id(), judged)
@@ -469,7 +530,7 @@ pub fn build_repair_capsule_v1(
         request.allowed_write_paths,
         Some(forbidden),
         request.required_quality_floor,
-        format!("runtime-a3/{task_id}"),
+        branch,
         context.worktree.to_owned(),
         RepairContextEpochV1::try_new(epoch)?,
         original.quality_floor(),
@@ -500,7 +561,7 @@ fn current_epoch(
     let latest = context
         .state
         .find_latest_context_epoch(context.envelope.project_id())
-        .map_err(|e| CapsuleBuildError::State(e.to_string()))?
+        .map_err(|e| CapsuleBuildError::State(shown(&e.to_string())))?
         .ok_or(CapsuleBuildError::EpochUnavailable)?;
     if latest.epoch.as_str() != requested {
         return Err(CapsuleBuildError::StaleEpoch);
@@ -508,22 +569,19 @@ fn current_epoch(
     Ok(latest.epoch.as_str().to_owned())
 }
 
-/// Checks the write scope (containment in the workstream's ownership, then
-/// disjointness from everything else) and returns `forbidden` plus every other
-/// workstream's owned paths (deduplicated, input order then ownership order).
-fn check_write_scope(
-    context: &CapsuleContextV1<'_>,
-    port: &impl WriteScopePort,
+/// The workstream's adopted ownership and its traps: `forbidden` plus every
+/// other workstream's owned paths (deduplicated, input order then ownership
+/// order). Pure, so callers can screen the traps before judging the scope.
+fn scope_traps<'a>(
+    context: &CapsuleContextV1<'a>,
     workstream: &str,
-    allowed: &[String],
     forbidden: &[String],
-) -> Result<Vec<String>, CapsuleBuildError> {
-    use CapsuleBuildError as E;
+) -> Result<(&'a WorkstreamOwnershipV1, Vec<String>), CapsuleBuildError> {
     let own = context
         .ownership
         .iter()
         .find(|o| o.workstream_id == workstream)
-        .ok_or(E::OwnershipMissing)?;
+        .ok_or(CapsuleBuildError::OwnershipMissing)?;
     let mut traps: Vec<String> = forbidden.to_vec();
     for other in context
         .ownership
@@ -536,11 +594,23 @@ fn check_write_scope(
             }
         }
     }
+    Ok((own, traps))
+}
+
+/// Checks the write scope: containment in the workstream's ownership, then
+/// disjointness from every trap. Refusal payloads pass through [`shown`].
+fn check_write_scope(
+    port: &impl WriteScopePort,
+    own: &WorkstreamOwnershipV1,
+    allowed: &[String],
+    traps: &[String],
+) -> Result<(), CapsuleBuildError> {
+    use CapsuleBuildError as E;
     for pattern in allowed {
         let first = pattern.split('/').next().unwrap_or_default();
         if first.is_empty() || first.contains('*') {
             return Err(E::PermissiveWildcard {
-                pattern: pattern.clone(),
+                pattern: shown(pattern),
             });
         }
         let single = std::slice::from_ref(pattern);
@@ -548,12 +618,12 @@ fn check_write_scope(
             WriteScopeOverlapV1::Overlaps { .. } => {}
             WriteScopeOverlapV1::Disjoint => {
                 return Err(E::OutsideWorkstream {
-                    pattern: pattern.clone(),
+                    pattern: shown(pattern),
                 });
             }
             WriteScopeOverlapV1::Undetermined => {
                 return Err(E::WriteScopeUndetermined {
-                    pattern: pattern.clone(),
+                    pattern: shown(pattern),
                 });
             }
         }
@@ -563,45 +633,50 @@ fn check_write_scope(
             Containment::Contained => {}
             Containment::NotProven => {
                 return Err(E::OutsideWorkstream {
-                    pattern: pattern.clone(),
+                    pattern: shown(pattern),
                 });
             }
             Containment::Undecided => {
                 return Err(E::WriteScopeUndetermined {
-                    pattern: pattern.clone(),
+                    pattern: shown(pattern),
                 });
             }
         }
         if traps.is_empty() {
             continue;
         }
-        match port.overlap(single, &traps) {
+        match port.overlap(single, traps) {
             WriteScopeOverlapV1::Disjoint => {}
             WriteScopeOverlapV1::Overlaps { witness } => {
                 return Err(E::WriteScopeCollision {
-                    pattern: pattern.clone(),
-                    witness,
+                    pattern: shown(pattern),
+                    witness: shown(&witness),
                 });
             }
             WriteScopeOverlapV1::Undetermined => {
                 return Err(E::WriteScopeUndetermined {
-                    pattern: pattern.clone(),
+                    pattern: shown(pattern),
                 });
             }
         }
     }
-    Ok(traps)
+    Ok(())
 }
 
-fn criteria_text<'a>(criteria: &'a [Criterion], out: &mut Vec<(&'static str, &'a str)>) {
+fn criteria_text<'a>(
+    field: &'static str,
+    criteria: &'a [Criterion],
+    out: &mut Vec<(&'static str, &'a str)>,
+) {
     for c in criteria {
-        out.push(("acceptance_criteria", c.description()));
-        out.extend(c.rationale().map(|r| ("acceptance_criteria", r)));
+        out.push((field, c.id()));
+        out.push((field, c.description()));
+        out.extend(c.rationale().map(|r| (field, r)));
         out.extend(
             c.check_command()
                 .unwrap_or_default()
                 .iter()
-                .map(|a| ("acceptance_criteria", a.as_str())),
+                .map(|a| (field, a.as_str())),
         );
     }
 }
@@ -609,6 +684,7 @@ fn criteria_text<'a>(criteria: &'a [Criterion], out: &mut Vec<(&'static str, &'a
 fn refs_text<'a>(field: &'static str, refs: &'a [Ref], out: &mut Vec<(&'static str, &'a str)>) {
     for r in refs {
         out.push((field, r.target()));
+        out.extend(r.digest().map(|d| (field, d)));
         out.extend(r.section().map(|s| (field, s)));
     }
 }
