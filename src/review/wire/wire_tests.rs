@@ -879,26 +879,14 @@ fn unicode_escapes_require_four_hex_digits_in_every_codec() {
         assert_eq!(f.pop(), Some('}'));
         format!(r#"{f},"zz":"{escape}"}}"#)
     };
-    let fixtures: [(&str, String, fn(&str) -> bool); 7] = [
-        ("review_request", review_request_min(), |t| {
-            decode_review_request(t).is_ok()
-        }),
-        ("review_capsule", capsule_min(), |t| {
-            decode_review_capsule(t).is_ok()
-        }),
-        ("a3_handoff", handoff_min(), |t| {
-            decode_a3_handoff(t).is_ok()
-        }),
-        ("a4_review", a4_min(), |t| decode_a4_review(t).is_ok()),
-        ("integration_request", ireq_min(), |t| {
-            decode_integration_request(t).is_ok()
-        }),
-        ("integration_decision", idec_min(), |t| {
-            decode_integration_decision(t).is_ok()
-        }),
-        ("safety_interruption", safety_min(), |t| {
-            decode_safety_interruption(t).is_ok()
-        }),
+    let fixtures: [(&str, String); 7] = [
+        ("review_request", review_request_min()),
+        ("review_capsule", capsule_min()),
+        ("a3_handoff", handoff_min()),
+        ("a4_review", a4_min()),
+        ("integration_request", ireq_min()),
+        ("integration_decision", idec_min()),
+        ("safety_interruption", safety_min()),
     ];
     let kinds: [fn(&str) -> Option<K>; 7] = [
         |t| decode_review_request(t).err().map(|e| e.kind),
@@ -909,7 +897,7 @@ fn unicode_escapes_require_four_hex_digits_in_every_codec() {
         |t| decode_integration_decision(t).err().map(|e| e.kind),
         |t| decode_safety_interruption(t).err().map(|e| e.kind),
     ];
-    for ((name, fixture, _), kind_of_text) in fixtures.iter().zip(kinds) {
+    for ((name, fixture), kind_of_text) in fixtures.iter().zip(kinds) {
         for bad in [
             r"\u+041",
             r"\u-041",

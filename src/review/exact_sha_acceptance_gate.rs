@@ -303,6 +303,8 @@ impl ExactShaAcceptanceGate {
     }
 }
 
+// The arguments are the observable facts of one check record.
+#[allow(clippy::too_many_arguments)]
 fn validate_check(
     record: AcceptanceEvidenceRecord,
     check_index: usize,

@@ -112,6 +112,8 @@ pub enum RepairEscalation {
     FinderUnidentified,
 }
 
+// The issued request carries the policy detail; boxing would only churn callers.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepairDecision {
     NotRequired,
