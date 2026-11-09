@@ -292,6 +292,23 @@ pub(crate) fn expected_provenance(
     project_id: &str,
     released_at: &str,
 ) -> Result<EventPayloadReference, StateError> {
+    expected_release_provenance(
+        binding,
+        project_id,
+        released_at,
+        ReleaseReason::LeaseExpired,
+    )
+}
+
+/// The exact State-local `EXECUTOR_RELEASED` reference/digest for one
+/// recorded release reason (the lease-expiry form above is the
+/// `LEASE_EXPIRED` case, byte-for-byte unchanged).
+pub(crate) fn expected_release_provenance(
+    binding: &ExecutorBinding,
+    project_id: &str,
+    released_at: &str,
+    release_reason: ReleaseReason,
+) -> Result<EventPayloadReference, StateError> {
     let reference = serde_json_canonicalizer::to_string(&ExecutorReleasedProvenanceRefV1 {
         binding_id: &binding.binding_id,
         project_id,
@@ -309,7 +326,7 @@ pub(crate) fn expected_provenance(
             model_id: identity.model_id,
             project_id,
             provider_id: identity.provider_id,
-            release_reason: ReleaseReason::LeaseExpired.as_str(),
+            release_reason: release_reason.as_str(),
             released_at,
             role_id: &binding.role_id,
             runtime_id: identity.runtime_id,

@@ -395,8 +395,18 @@ fn stale_handles_never_remove_a_replacement_workspace() {
     // Identical workspace/task fields, but a new administrative record:
     // matching SHA and fields are not ownership.
     let _same_fields = reprovision(ws.handle().workspace_id(), "task-reviewed");
+    let replacement_binding = crate::test_support::worktree_meta_dir(&repo, &path)
+        .unwrap()
+        .join(crate::worktree_binding::BINDING_FILE);
+    let replacement_bytes = std::fs::read(&replacement_binding).unwrap();
     assert!(remove_review_workspace(repo.path(), &ws).is_err());
     assert!(path.exists() && branch_exists(&repo, ws.review_branch()));
+
+    assert!(worktree_registered(&repo, &path));
+    assert_eq!(
+        std::fs::read(&replacement_binding).unwrap(),
+        replacement_bytes
+    );
 
     // Altered, replaced or missing binding on a live workspace refuses.
     let live = provision_review_workspace(&request(&repo, &place, "live", &reviewed)).unwrap();
@@ -409,17 +419,49 @@ fn stale_handles_never_remove_a_replacement_workspace() {
     std::fs::remove_file(&binding).unwrap();
     std::fs::write(&binding, &original).unwrap();
     assert!(remove_review_workspace(repo.path(), &live).is_err());
+    assert!(live_path.exists() && worktree_registered(&repo, &live_path));
+    assert!(branch_exists(&repo, live.review_branch()));
+    assert_eq!(std::fs::read(&binding).unwrap(), original);
     // Altered content.
     std::fs::write(&binding, b"receipts-workspace-binding/v1\n").unwrap();
     assert!(remove_review_workspace(repo.path(), &live).is_err());
+    assert_eq!(
+        std::fs::read(&binding).unwrap(),
+        b"receipts-workspace-binding/v1\n"
+    );
+    assert!(live_path.exists() && branch_exists(&repo, live.review_branch()));
     // Missing.
     std::fs::remove_file(&binding).unwrap();
     assert!(remove_review_workspace(repo.path(), &live).is_err());
-    assert!(live_path.exists() && branch_exists(&repo, live.review_branch()));
+    assert!(!binding.exists(), "missing binding is not repaired");
+    assert!(live_path.exists() && worktree_registered(&repo, &live_path));
+    assert!(branch_exists(&repo, live.review_branch()));
 
     // A different repository root is refused before anything is inspected.
     let other = TestRepo::new("review-own-other");
     let owned = provision_review_workspace(&request(&repo, &place, "owned", &reviewed)).unwrap();
     assert!(remove_review_workspace(other.path(), &owned).is_err());
     remove_review_workspace(repo.path(), &owned).unwrap();
+}
+
+#[test]
+fn altered_owned_binding_refuses_without_removing_or_repairing_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = TestRepo::new("review-altered-binding");
+    let place = TempDir::new("review-altered-binding-wt");
+    let ws =
+        provision_review_workspace(&request(&repo, &place, "altered", &repo.head_sha())).unwrap();
+    let path = ws.handle().worktree_path();
+    let binding = crate::test_support::worktree_meta_dir(&repo, path)
+        .unwrap()
+        .join(crate::worktree_binding::BINDING_FILE);
+    let original = std::fs::read(&binding).unwrap();
+    std::fs::set_permissions(&binding, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::write(&binding, b"altered").unwrap();
+    assert!(remove_review_workspace(repo.path(), &ws).is_err());
+    assert_eq!(std::fs::read(&binding).unwrap(), b"altered");
+    assert!(path.exists() && worktree_registered(&repo, path));
+    assert!(branch_exists(&repo, ws.review_branch()));
+    std::fs::write(&binding, original).unwrap();
+    remove_review_workspace(repo.path(), &ws).unwrap();
 }

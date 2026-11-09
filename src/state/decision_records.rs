@@ -449,35 +449,7 @@ impl SqliteStateRepository {
         &mut self,
         record: &DecisionRecordV1,
     ) -> Result<(), StateError> {
-        self.run_transaction(|uow| {
-            let conn = uow.tx();
-            let exists = conn
-                .query_row(
-                    "SELECT 1 FROM decision_records WHERE project_id=?1 AND record_kind=?2 AND record_id=?3",
-                    params![record.project_id, record.kind.as_str(), record.record_id],
-                    |_| Ok(()),
-                )
-                .optional()
-                .map_err(|e| sql_failure(e, RECORD))?;
-            if exists.is_some() {
-                return Err(failure(Code::AlreadyExists, RECORD));
-            }
-            conn.execute(
-                "INSERT INTO decision_records(project_id,record_kind,record_id,task_id,link_id,subject_sha,record_json,record_sha256) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![
-                    record.project_id,
-                    record.kind.as_str(),
-                    record.record_id,
-                    record.task_id,
-                    record.link_id,
-                    record.subject_sha,
-                    record.record_json,
-                    record.record_sha256
-                ],
-            )
-            .map_err(|e| sql_failure(e, RECORD))?;
-            Ok(())
-        })
+        self.run_transaction(|uow| insert_record(uow.tx(), record))
     }
 
     /// Reads one record by exact project, kind and id.
@@ -588,6 +560,49 @@ impl SqliteStateRepository {
         tx.commit().map_err(|e| sql_failure(e, LINK))?;
         Ok(chain)
     }
+}
+
+/// Inserts one immutable record inside the caller's open transaction; a
+/// duplicate identity is refused.
+pub(crate) fn insert_record(
+    conn: &Connection,
+    record: &DecisionRecordV1,
+) -> Result<(), StateError> {
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM decision_records WHERE project_id=?1 AND record_kind=?2 AND record_id=?3",
+            params![record.project_id, record.kind.as_str(), record.record_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|e| sql_failure(e, RECORD))?;
+    if exists.is_some() {
+        return Err(failure(Code::AlreadyExists, RECORD));
+    }
+    conn.execute(
+        "INSERT INTO decision_records(project_id,record_kind,record_id,task_id,link_id,subject_sha,record_json,record_sha256) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![
+            record.project_id,
+            record.kind.as_str(),
+            record.record_id,
+            record.task_id,
+            record.link_id,
+            record.subject_sha,
+            record.record_json,
+            record.record_sha256
+        ],
+    )
+    .map_err(|e| sql_failure(e, RECORD))?;
+    Ok(())
+}
+
+pub(crate) fn find_record(
+    conn: &Connection,
+    project_id: &str,
+    kind: DecisionRecordKind,
+    record_id: &str,
+) -> Result<Option<DecisionRecordV1>, StateError> {
+    read_record(conn, project_id, kind, record_id)
 }
 
 fn build_chain(
