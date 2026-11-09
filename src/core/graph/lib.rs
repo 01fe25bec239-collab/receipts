@@ -191,5 +191,6 @@ pub use review_verdict_transition::{
 };
 pub use store::{
     GraphStoreErrorV1, load_current_graph_v1, load_graph_history_v1, load_graph_version_v1,
-    load_node_results_v1, persist_compiled_graph_v1, persist_mutation_v1,
+    load_node_results_v1, persist_compiled_graph_v1, persist_mutation_outcome_v1,
+    persist_mutation_v1,
 };

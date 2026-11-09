@@ -6,16 +6,20 @@
 //!
 //! - [`persist_compiled_graph_v1`]: the admitted genesis (version 1).
 //! - [`persist_mutation_v1`]: one apply-v1 outcome as the next version,
-//!   moved by State's parent compare-and-swap. Before anything is written
-//!   the stored head must be exactly the parent the outcome was derived
-//!   from (version and v1 child digest) and the mutation id unused, so a
+//!   published through State's single atomic graph operation: the newly
+//!   attached results, the successor snapshot, the mutation history, the seal,
+//!   the trusted-time watermark and the head CAS are written in ONE
+//!   transaction, so a failure leaves none of them (no orphan result rows).
+//!   Before anything is written the stored head must be exactly the parent
+//!   the outcome was derived from (version and v1 child digest), so a
 //!   concurrent or stale writer gets [`GraphStoreErrorV1::Conflict`]
-//!   (retryable after reload) and changes nothing. Results the outcome
-//!   newly attached are stored first, at the parent version, because
-//!   State requires them before the snapshot that references them. If the
-//!   later snapshot append fails, the head does not move and the result
-//!   row remains as immutable, unreferenced evidence; a retry with the same
-//!   reference and identical content reuses it, different content refuses.
+//!   (retryable after reload) and changes nothing. A mutation id already in
+//!   the history is an exact retry only when the stored mutation is
+//!   identical and State's recorded attachment membership matches: then the
+//!   publication is `Replayed` and writes nothing. Different content under
+//!   that id is [`GraphStoreErrorV1::MutationExists`], a different attachment
+//!   set (or a legacy mutation with no recorded membership) is
+//!   [`GraphStoreErrorV1::ConflictingRetry`].
 //!
 //! Reads project State's lossless rows back into an
 //! [`ExecutionGraphEnvelope`] and recompute the v1 child digest, refusing
@@ -28,10 +32,11 @@
 //! classification). Rehydrating them is the Wave3 resume path.
 
 use receipts_state::{
-    GraphGenesisReasonV1, PersistedCurrentGraphV1, SqliteStateRepository, StateEpochValueV1,
-    StateError, StateGraphEdgeRelationV1, StateGraphEdgeV1, StateGraphGenesisProvenanceV1,
-    StateGraphGenesisV1, StateGraphMutationV1, StateGraphNodeResultV1, StateGraphNodeV1,
-    StateGraphSnapshotV1, TrustedClockV1,
+    GraphGenesisReasonV1, GraphPublicationOutcomeV1, PersistedCurrentGraphV1,
+    PublicationFailureCode, SqliteStateRepository, StateEpochValueV1, StateError,
+    StateGraphEdgeRelationV1, StateGraphEdgeV1, StateGraphGenesisProvenanceV1, StateGraphGenesisV1,
+    StateGraphMutationV1, StateGraphNodeResultV1, StateGraphNodeV1, StateGraphSnapshotV1,
+    TrustedClockV1,
 };
 
 use crate::goal::GoalEvaluationContextEpoch;
@@ -56,8 +61,13 @@ pub enum GraphStoreErrorV1 {
         stored_version: String,
     },
     UnknownGraph,
-    /// The mutation id is already in the graph's history.
+    /// The mutation id is already in the graph's history with different
+    /// content.
     MutationExists,
+    /// The mutation is already stored but this is not an exact retry of its
+    /// publication (different attachment membership, or a legacy publication
+    /// whose membership was never recorded). Nothing was written.
+    ConflictingRetry,
     /// The outcome is not the exact successor of the supplied parent.
     NotASuccessor,
     /// A newly attached result is missing from the outcome's ledger.
@@ -120,6 +130,18 @@ pub fn persist_mutation_v1(
     mutation: &GraphMutation,
     outcome: &GraphMutationOutcomeV1,
 ) -> StoreResult<ExecutionGraphEnvelope> {
+    persist_mutation_outcome_v1(writer, clock, parent, mutation, outcome).map(|(graph, _)| graph)
+}
+
+/// As [`persist_mutation_v1`], also reporting whether State wrote the
+/// publication (`Applied`) or recognized an exact retry (`Replayed`).
+pub fn persist_mutation_outcome_v1(
+    writer: &mut CoreStateWriter,
+    clock: &dyn TrustedClockV1,
+    parent: &ExecutionGraphEnvelope,
+    mutation: &GraphMutation,
+    outcome: &GraphMutationOutcomeV1,
+) -> StoreResult<(ExecutionGraphEnvelope, GraphPublicationOutcomeV1)> {
     use GraphStoreErrorV1 as E;
     let next = &outcome.envelope;
     let (project, graph_id) = (parent.project_id(), parent.graph_id());
@@ -137,26 +159,30 @@ pub fn persist_mutation_v1(
         .load_current_graph_v1(project, graph_id)
         .map_err(E::Read)?
         .ok_or(E::UnknownGraph)?;
-    let parent_digest =
-        graph_content_digest_v1(parent.graph()).map_err(|_| E::Encoding("parent digest"))?;
-    if stored.current_version() != parent.graph_version().as_str()
-        || stored.resulting_digest() != parent_digest
-    {
-        return Err(E::Conflict {
-            stored_version: stored.current_version().to_owned(),
-        });
-    }
-    if reader
-        .list_graph_mutations_v1(project, graph_id)
-        .map_err(E::Read)?
-        .iter()
-        .any(|m| m.mutation_id() == mutation.mutation_id())
-    {
-        return Err(E::MutationExists);
-    }
     let state_mutation =
         StateGraphMutationV1::parse_json(&GraphMutationWireV1::from_mutation(mutation).to_json())
             .map_err(|_| E::Encoding("mutation"))?;
+    let stored_same_id = reader
+        .list_graph_mutations_v1(project, graph_id)
+        .map_err(E::Read)?
+        .into_iter()
+        .find(|m| m.mutation_id() == mutation.mutation_id());
+    match &stored_same_id {
+        // An exact retry skips the head check: the head has moved on.
+        Some(existing) if existing.to_json().ok() == state_mutation.to_json().ok() => {}
+        Some(_) => return Err(E::MutationExists),
+        None => {
+            let parent_digest = graph_content_digest_v1(parent.graph())
+                .map_err(|_| E::Encoding("parent digest"))?;
+            if stored.current_version() != parent.graph_version().as_str()
+                || stored.resulting_digest() != parent_digest
+            {
+                return Err(E::Conflict {
+                    stored_version: stored.current_version().to_owned(),
+                });
+            }
+        }
+    }
     let provenance = stored.genesis_provenance().clone();
     let content = state_content_v1(next, provenance, false).map_err(|_| E::Encoding("snapshot"))?;
     let snapshot = StateGraphSnapshotV1::new(
@@ -166,7 +192,8 @@ pub fn persist_mutation_v1(
     )
     .map_err(|_| E::Encoding("snapshot"))?;
 
-    // Results newly attached by this outcome, stored at the parent version.
+    // Results newly attached by this outcome, bound to the parent version.
+    let mut attachments = Vec::new();
     for node in next.graph().nodes() {
         let Some(reference) = node.result_ref() else {
             continue;
@@ -187,35 +214,43 @@ pub fn persist_mutation_v1(
         let json = GraphNodeResultWireV1::from_graph_node_result(result).to_json();
         let state_result =
             StateGraphNodeResultV1::parse_json(&json).map_err(|_| E::Encoding("result"))?;
-        match writer
+        // A row already stored under this reference must be this very result
+        // (State adopts an identical one and rolls everything back otherwise;
+        // this names the conflict).
+        if let Some(existing) = writer
             .reader()
             .find_node_result_v1(project, graph_id, reference)
             .map_err(E::Read)?
         {
-            Some(existing) => {
-                let same = existing.result().to_json().ok() == state_result.to_json().ok()
-                    && existing.graph_version() == parent.graph_version().as_str();
-                if !same {
-                    return Err(E::ResultConflict {
-                        result_ref: reference.to_owned(),
-                    });
-                }
+            let same = existing.result().to_json().ok() == state_result.to_json().ok()
+                && existing.graph_version() == parent.graph_version().as_str();
+            if !same {
+                return Err(E::ResultConflict {
+                    result_ref: reference.to_owned(),
+                });
             }
-            None => writer.append_node_result(
-                project,
-                parent.graph_version().as_str(),
-                reference,
-                state_result,
-            )?,
         }
+        attachments.push((
+            parent.graph_version().as_str().to_owned(),
+            reference.to_owned(),
+            state_result,
+        ));
     }
-    writer.append_graph_mutation(clock, state_mutation, snapshot)?;
-    let reloaded =
-        load_current_graph_v1(writer.reader(), project, graph_id)?.ok_or(E::UnknownGraph)?;
+    let published = writer
+        .publish_graph_mutation(clock, attachments, state_mutation, snapshot)
+        .map_err(|error| match error {
+            CoreStateWriteError::State(StateError::Publication {
+                code: PublicationFailureCode::ConflictingRetry,
+                ..
+            }) => E::ConflictingRetry,
+            other => E::Write(other),
+        })?;
+    let reloaded = load_graph_version_v1(writer.reader(), project, graph_id, next.graph_version())?
+        .ok_or(E::UnknownGraph)?;
     if reloaded.resulting_digest() != next.resulting_digest() || reloaded.graph() != next.graph() {
         return Err(E::DigestMismatch);
     }
-    Ok(reloaded)
+    Ok((reloaded, published))
 }
 
 /// The current version, or `None` when the graph is not stored.
