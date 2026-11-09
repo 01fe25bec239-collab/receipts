@@ -7,8 +7,16 @@
 //! validates that set and produces one finding-specific FINDING_DISPOSITIONED
 //! event per finding. It records nothing silently and drops nothing.
 
-use crate::records::{ProposalBuilder, derived_id};
-use crate::{A4ReviewNonTemporalCore, A4ReviewVerdict, ReviewRequest, ports::ReviewRecordProposal};
+use crate::claims::{
+    ReviewClaimBinding, ReviewClaimScope, ReviewOperation, request_identity_json, request_sha256,
+};
+use crate::ports::ReviewRecordSink;
+use crate::record::{Recorded, record_proposal};
+use crate::records::ProposalBuilder;
+use crate::wire::encode_a4_review;
+use crate::{
+    A4Review, A4ReviewNonTemporalCore, A4ReviewVerdict, ReviewRequest, ports::ReviewRecordProposal,
+};
 use receipts_state::{EventType, SubjectKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,9 +126,60 @@ pub fn validate_dispositions(
     Ok(())
 }
 
-/// Durable identity of one review's disposition set.
-pub fn disposition_claim_key(project_id: &str, review_id: &str) -> String {
-    derived_id("finding-disposition", &[project_id, review_id])
+fn disposition_json(d: &FindingDisposition) -> String {
+    let detail = match &d.kind {
+        FindingDispositionKind::FixNow { task_id } => serde_json::json!({"task_id": task_id}),
+        FindingDispositionKind::Defer {
+            issue_id,
+            revisit_point,
+        } => serde_json::json!({"issue_id": issue_id, "revisit_point": revisit_point}),
+        FindingDispositionKind::Reject { reason } => serde_json::json!({"reason": reason}),
+    };
+    serde_json::json!({
+        "finding_id": d.finding_id,
+        "disposition": d.kind.label(),
+        "detail": detail,
+        "decided_by": d.decided_by,
+    })
+    .to_string()
+}
+
+/// Durable identity of one review's disposition set: project, task, the
+/// reviewed SHA, the digest of the request (without `requested_at`), the
+/// review and every disposition in finding order, and the trusted
+/// composition's generation.
+pub fn disposition_claim_binding(
+    project_id: &str,
+    request: &ReviewRequest,
+    review: &A4ReviewNonTemporalCore,
+    dispositions: &[FindingDisposition],
+    generation: u32,
+) -> Result<ReviewClaimBinding, String> {
+    let mut sorted: Vec<&FindingDisposition> = dispositions.iter().collect();
+    sorted.sort_by(|a, b| a.finding_id.cmp(&b.finding_id));
+    let mut parts = vec![
+        request_identity_json(request),
+        encode_a4_review(&A4Review::new(review.clone(), None)),
+    ];
+    parts.extend(sorted.into_iter().map(disposition_json));
+    let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+    let scope = ReviewClaimScope::new(
+        project_id,
+        request.core().task_id(),
+        Some(review.reviewed_sha()),
+        &request_sha256(ReviewOperation::Disposition, &parts),
+        generation,
+    )?;
+    Ok(ReviewClaimBinding::new(ReviewOperation::Disposition, scope))
+}
+
+/// Records a disposition proposal durably through the sink: claim, seal,
+/// publish (see [`record_proposal`]).
+pub fn record_dispositions(
+    sink: &mut dyn ReviewRecordSink,
+    proposal: &ReviewRecordProposal,
+) -> Result<Recorded, String> {
+    record_proposal(sink, proposal, "DISPOSITIONS")
 }
 
 /// One FINDING_DISPOSITIONED event per finding, each with its own payload.
@@ -129,17 +188,15 @@ pub fn disposition_proposal(
     request: &ReviewRequest,
     review: &A4ReviewNonTemporalCore,
     dispositions: &[FindingDisposition],
+    generation: u32,
 ) -> Result<ReviewRecordProposal, DispositionRefusal> {
     validate_dispositions(review, dispositions)?;
     let core = request.core();
     let records = |e: String| DispositionRefusal::Records(e);
-    let mut b = ProposalBuilder::new(
-        project_id,
-        core.task_id(),
-        core.context_epoch().decimal_digits(),
-        &disposition_claim_key(project_id, review.review_id()),
-    )
-    .map_err(records)?;
+    let binding = disposition_claim_binding(project_id, request, review, dispositions, generation)
+        .map_err(records)?;
+    let mut b =
+        ProposalBuilder::new(&binding, core.context_epoch().decimal_digits()).map_err(records)?;
     for finding in review.nonblocking_findings() {
         let Some(d) = dispositions
             .iter()

@@ -145,23 +145,29 @@ mod a4_review_tests;
 
 pub mod wire;
 
+pub mod claims;
+pub use claims::{ReviewClaimBinding, ReviewClaimScope, ReviewOperation, request_sha256};
+
 pub mod ports;
 pub use ports::{
     ImplementerIdentity, ReviewClaim, ReviewRecordProposal, ReviewRecordSink, ReviewerCandidate,
     ReviewerQualityEvidence, ReviewerRequirements, ReviewerRoutingPort, ReviewerRoutingRefusal,
-    ReviewerRunOutput, ReviewerRuntime, SealedReview, reviewer_output_from_claude,
-    reviewer_output_from_codex, reviewer_tier_rank,
+    ReviewerRunOutput, ReviewerRuntime, SEALED_REVIEW_KIND, SealedReview,
+    reviewer_output_from_claude, reviewer_output_from_codex, reviewer_tier_rank,
 };
 
 mod records;
+
+pub mod record;
+pub use record::{Recorded, record_proposal};
 
 #[cfg(test)]
 mod dispositions_tests;
 
 pub mod dispositions;
 pub use dispositions::{
-    DispositionRefusal, FindingDisposition, FindingDispositionKind, disposition_claim_key,
-    disposition_proposal, undispositioned, validate_dispositions,
+    DispositionRefusal, FindingDisposition, FindingDispositionKind, disposition_claim_binding,
+    disposition_proposal, record_dispositions, undispositioned, validate_dispositions,
 };
 
 pub mod reproduction;
@@ -179,7 +185,7 @@ pub use review_parse::{ReviewParseError, parse_reviewer_output};
 pub mod controller;
 pub use controller::{
     AttemptFinished, ReplayedReview, ReviewController, ReviewDisposition, ReviewRefusal,
-    ReviewTicket, effective_distinct_provider, effective_reviewer_floor, review_claim_key,
+    ReviewTicket, effective_distinct_provider, effective_reviewer_floor, review_claim_binding,
 };
 
 #[cfg(test)]
@@ -200,7 +206,7 @@ mod acceptance_gate_tests;
 pub mod repair_controller;
 pub use repair_controller::{
     RepairController, RepairDecision, RepairEscalation, RepairInput, RepairOutcome,
-    RepairPolicyTrigger, RepairRequest, RepairTier, ReviewerExclusions, repair_claim_key,
+    RepairPolicyTrigger, RepairRequest, RepairTier, ReviewerExclusions, repair_claim_binding,
 };
 
 #[cfg(test)]

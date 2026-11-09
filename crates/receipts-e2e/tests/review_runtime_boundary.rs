@@ -5,21 +5,28 @@
 //! Proven here (portable): without a Workspace protected launch, or with a
 //! writable policy, both adapters refuse the Review with `PolicyBlocked`
 //! before any process starts, and the controller records POLICY_BLOCKED →
-//! HUMAN_REQUIRED without dispatching another provider.
+//! HUMAN_REQUIRED without dispatching another provider. The outcome is
+//! persisted through the real Core sink into a real State store and is read
+//! back from it.
 //! NOT RUN here: a successful protected review launch (needs the Linux
 //! protected launcher) and any real provider review.
 
+use receipts_e2e::CoreReviewSink;
+use receipts_orchestration::orchestration::{CoreAdmissionIdentity, CoreStateWriter};
 use receipts_review_integration::runtime::{
     ClaudeAdapter, CodexAdapter, FailureClass, RuntimeAdapter, RuntimeExecutionPolicy,
+};
+use receipts_review_integration::state::{
+    EventQuery, EventType, GraphCompilerRefV1, GraphSourceEvidenceRefV1, ReviewClaimStateV1,
+    StateError, TrustedClockV1, TrustedTimeSampleV1,
 };
 use receipts_review_integration::{
     AssuranceProfile, AttemptFinished, CheckRunnerConfig, ImplementerIdentity,
     ReviewCapsuleCriterion, ReviewCapsuleCriterionKind, ReviewCapsuleNonTemporalCore,
-    ReviewCapsuleReviewScope, ReviewClaim, ReviewController, ReviewDateTimeV1, ReviewDisposition,
-    ReviewRecordProposal, ReviewRecordSink, ReviewRequest, ReviewRequestNonNegativeInteger,
-    ReviewRequestNonTemporalCore, ReviewRequestReviewerFloor, ReviewerCandidate,
-    ReviewerQualityEvidence, ReviewerRequirements, ReviewerRoutingPort, ReviewerRoutingRefusal,
-    ReviewerRunOutput, ReviewerRuntime, SealedReview, reviewer_output_from_claude,
+    ReviewCapsuleReviewScope, ReviewController, ReviewDateTimeV1, ReviewDisposition, ReviewRequest,
+    ReviewRequestNonNegativeInteger, ReviewRequestNonTemporalCore, ReviewRequestReviewerFloor,
+    ReviewerCandidate, ReviewerQualityEvidence, ReviewerRequirements, ReviewerRoutingPort,
+    ReviewerRoutingRefusal, ReviewerRunOutput, ReviewerRuntime, reviewer_output_from_claude,
     reviewer_output_from_codex,
 };
 use receipts_runtime_bindings::RuntimeCapsuleFamily;
@@ -99,34 +106,6 @@ impl ReviewerRoutingPort for Pick {
                 basis_ref: "registry:boundary-frontier".into(),
             }),
         })
-    }
-}
-
-/// In-memory conforming sink (these tests prove refusal behaviour only;
-/// durability is proven in `review_core_persistence`).
-#[derive(Default)]
-struct Sink {
-    published: Vec<ReviewRecordProposal>,
-    claims: std::collections::BTreeMap<String, Option<SealedReview>>,
-}
-impl ReviewRecordSink for Sink {
-    fn claim(&mut self, key: &str) -> Result<ReviewClaim, String> {
-        Ok(match self.claims.get(key) {
-            None => {
-                self.claims.insert(key.to_owned(), None);
-                ReviewClaim::Acquired
-            }
-            Some(None) => ReviewClaim::InFlight,
-            Some(Some(s)) => ReviewClaim::Sealed(s.clone()),
-        })
-    }
-    fn seal(&mut self, key: &str, sealed: &SealedReview) -> Result<(), String> {
-        self.claims.insert(key.to_owned(), Some(sealed.clone()));
-        Ok(())
-    }
-    fn publish(&mut self, _: &str, p: &ReviewRecordProposal) -> Result<(), String> {
-        self.published.push(p.clone());
-        Ok(())
     }
 }
 
@@ -226,6 +205,7 @@ fn review_with(
     f: &Fixture,
     routing: &Pick,
     runtimes: &[&dyn ReviewerRuntime],
+    sink: &mut CoreReviewSink,
 ) -> receipts_review_integration::ReviewTicket {
     let checks = CheckRunnerConfig {
         executables: vec![],
@@ -252,8 +232,43 @@ fn review_with(
             },
             worker_checks: &[],
             review_worktree: &f.dir.join("review-wt"),
+            generation: 1,
         },
-        &mut Sink::default(),
+        sink,
+    )
+}
+
+struct Clock;
+impl TrustedClockV1 for Clock {
+    fn sample(&self) -> Result<TrustedTimeSampleV1, StateError> {
+        Ok(TrustedTimeSampleV1 {
+            canonical_utc_timestamp: "2026-11-08T10:00:00.000000000Z".into(),
+            clock_source_id: "synthetic-clock".into(),
+            clock_contract_version: "1".into(),
+        })
+    }
+}
+
+/// The real Core sink over a real State store under the fixture directory.
+fn core_sink(f: &Fixture) -> CoreReviewSink {
+    use std::os::unix::fs::DirBuilderExt;
+    let state = f.dir.join("state");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&state)
+        .unwrap();
+    let identity = CoreAdmissionIdentity::new(
+        GraphCompilerRefV1::parse("compiler:01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
+        "policy".into(),
+    )
+    .unwrap()
+    .with_project(
+        "project",
+        GraphSourceEvidenceRefV1::parse("evidence:01ARZ3NDEKTSV4RRFFQ69G5FAW").unwrap(),
+    );
+    CoreReviewSink::new(
+        CoreStateWriter::open(state.join("state.db"), identity).unwrap(),
+        Clock,
     )
 }
 
@@ -276,7 +291,8 @@ fn real_adapters_refuse_unprotected_review_and_controller_never_shops() {
             read_only: true,
             starts: Cell::new(0),
         };
-        let t = review_with(&f, &Pick(provider, runtime), &[&claude, &codex]);
+        let mut sink = core_sink(&f);
+        let t = review_with(&f, &Pick(provider, runtime), &[&claude, &codex], &mut sink);
         let ReviewDisposition::PolicyBlocked(i) = &t.disposition else {
             panic!(
                 "{runtime}: expected POLICY_BLOCKED, got {:?}",
@@ -295,6 +311,43 @@ fn real_adapters_refuse_unprotected_review_and_controller_never_shops() {
             matches!(t.cleanup, Some(Ok(()))),
             "{runtime}: review worktree removed"
         );
+        // The policy refusal is sealed, published and retained in State: the
+        // claim is a REFUSED POLICY_BLOCKED, with the HUMAN_REQUIRED events.
+        assert!(t.persisted.is_ok(), "{runtime}: {:?}", t.persisted);
+        let reader = sink.writer().reader();
+        let mut types: Vec<_> = reader
+            .list_events(&EventQuery {
+                project_id: "project".into(),
+                subject: None,
+                event_types: None,
+                limit: 100,
+            })
+            .unwrap()
+            .iter()
+            .map(|e| e.event_type.as_str())
+            .collect();
+        types.sort_unstable();
+        assert_eq!(
+            types,
+            [
+                EventType::HumanRequired.as_str(),
+                EventType::PolicyBlocked.as_str(),
+                EventType::ReviewDispatched.as_str()
+            ]
+        );
+        // A repeated callback recovers it and starts no adapter again.
+        let again = review_with(&f, &Pick(provider, runtime), &[&claude, &codex], &mut sink);
+        assert!(matches!(again.disposition, ReviewDisposition::Replayed(_)));
+        assert_eq!(claude.starts.get() + codex.starts.get(), 1);
+        let claim_id = CoreReviewSink::claim_id(t.proposal.as_ref().unwrap().binding()).unwrap();
+        let claim = sink
+            .writer()
+            .reader()
+            .find_review_claim("project", &claim_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.state, ReviewClaimStateV1::Refused);
+        assert_eq!(claim.outcome_kind.as_deref(), Some("POLICY_BLOCKED"));
     }
 }
 
@@ -307,7 +360,8 @@ fn real_adapters_refuse_a_writable_review_policy() {
         read_only: false,
         starts: Cell::new(0),
     };
-    let t = review_with(&f, &Pick("openai", "claude"), &[&claude]);
+    let mut sink = core_sink(&f);
+    let t = review_with(&f, &Pick("openai", "claude"), &[&claude], &mut sink);
     assert!(
         matches!(t.disposition, ReviewDisposition::PolicyBlocked(_)),
         "{:?}",

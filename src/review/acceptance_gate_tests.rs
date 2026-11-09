@@ -196,6 +196,7 @@ fn scenario_json(
             },
             worker_checks: &checks,
             review_worktree: &repo.scratch("review-wt"),
+            generation: 1,
         },
         &mut MemorySink::default(),
     );
@@ -277,6 +278,7 @@ fn evaluate(s: &Scenario, k: &Knobs<'_>) -> GateOutcome {
         component_suite: &k.suite,
         scratch: s.scratch.path(),
         clock: &clock,
+        generation: 1,
     })
 }
 
@@ -1289,4 +1291,51 @@ fn dependency_without_a_recorded_start_is_uncertain() {
     });
     let o = dep_gate(&s, &reader, vec![]);
     assert_eq!(o.outcome, IntegrationDecisionOutcome::Blocked);
+}
+
+#[test]
+fn sealed_acceptance_refuses_a_consistently_rebound_foreign_subject() {
+    let s = scenario();
+    let outcome = evaluate(&s, &knobs(&s));
+    let proposal = outcome.proposal.unwrap();
+    let sealed = crate::SealedReview::new(&proposal, "ACCEPTANCE_EVALUATED", true, 0);
+    assert!(sealed.settlement().is_ok());
+    let scope = proposal.binding().scope();
+    let moved = crate::ReviewClaimBinding::new(
+        crate::ReviewOperation::Acceptance,
+        crate::ReviewClaimScope::new(
+            scope.project_id(),
+            scope.task_id(),
+            Some(&"1".repeat(40)),
+            scope.request_sha256(),
+            scope.generation(),
+        )
+        .unwrap(),
+    );
+    let mut spec: serde_json::Value = serde_json::from_slice(&proposal.to_journal()).unwrap();
+    spec["binding"]["subject_sha"] = "1".repeat(40).into();
+    spec["binding"]["key"] = moved.key().into();
+    // Rebuild event keys as well, so the refusal must come from scope validation.
+    for (index, event) in spec["events"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .enumerate()
+    {
+        event["key"] = crate::records::derived_id(
+            "revent",
+            &[
+                moved.key(),
+                &index.to_string(),
+                event["event_type"].as_str().unwrap(),
+            ],
+        )
+        .into();
+    }
+    let rebound = crate::ReviewRecordProposal::from_journal(spec.to_string().as_bytes()).unwrap();
+    assert!(
+        crate::SealedReview::new(&rebound, "ACCEPTANCE_EVALUATED", true, 0)
+            .settlement()
+            .is_err()
+    );
 }

@@ -20,7 +20,9 @@
 //!    a cost cap defers; it is never treated as free).
 //! 4. Concurrency: global, then the node's workstream, then the D11-selected
 //!    provider. A workstream or provider without a configured limit defers.
-//! 5. Write collision against every in-flight writer, then every writer
+//! 5. Validate the complete candidate scope through [`WriteScopePort`]; an
+//!    unvalidated scope defers without becoming a writer or consuming capacity.
+//! 6. Write collision against every in-flight writer, then every writer
 //!    admitted earlier in this round, through [`WriteScopePort`]. Only proven
 //!    disjointness admits; an overlap defers with its witness and an
 //!    undetermined answer defers.
@@ -114,6 +116,8 @@ pub enum SchedulingRefusalV1 {
 /// Concurrency and budget axes a deferral can name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeferralV1 {
+    /// The candidate scope could not be validated, independently of peers.
+    WriteScopeUnvalidated,
     WorkerBudgetExhausted,
     CostEstimateUnknown,
     CostBudgetExhausted,
@@ -335,6 +339,9 @@ pub fn schedule_dispatch_v1(
                                 });
                             }
                             Some(_) => {}
+                        }
+                        if !port.validate(&candidate.write_paths) {
+                            return Some(DeferralV1::WriteScopeUnvalidated);
                         }
                         writers.iter().find_map(|writer| {
                             match classify_write_collision(

@@ -18,6 +18,9 @@ pub enum WriteScopeOverlapV1 {
 
 /// Consumer-owned port; implementations translate their engine's answer.
 pub trait WriteScopePort {
+    /// Proves every pattern in a nonempty candidate scope is valid.
+    /// False includes invalid input and inability to validate; never assume validity.
+    fn validate(&self, paths: &[String]) -> bool;
     fn overlap(&self, left: &[String], right: &[String]) -> WriteScopeOverlapV1;
 }
 

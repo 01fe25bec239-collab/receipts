@@ -153,17 +153,97 @@ fn disposition_events_are_finding_specific_and_deterministic() {
         ),
         fix("a"),
     ];
-    let p = disposition_proposal("project", &req, &r, &ds).unwrap();
+    let p = disposition_proposal("project", &req, &r, &ds, 1).unwrap();
     let types: Vec<_> = p.events.iter().map(|e| e.event_type()).collect();
     assert_eq!(types, [EventType::FindingDispositioned; 2]);
     // Order follows the review's findings, not the caller's.
     assert!(String::from_utf8_lossy(&p.content[0].1).contains("\"finding_id\":\"a\""));
     assert!(String::from_utf8_lossy(&p.content[1].1).contains("\"disposition\":\"REJECT\""));
-    let again = disposition_proposal("project", &req, &r, &ds).unwrap();
+    let again = disposition_proposal("project", &req, &r, &ds, 1).unwrap();
     assert_eq!(again.to_journal(), p.to_journal());
-    assert_eq!(p.claim_key(), disposition_claim_key("project", "review-1"));
+    assert_eq!(
+        p.binding(),
+        &disposition_claim_binding("project", &req, &r, &ds, 1).unwrap()
+    );
     assert!(
-        disposition_proposal("project", &req, &r, &[fix("a")]).is_err(),
+        disposition_proposal("project", &req, &r, &[fix("a")], 1).is_err(),
         "an incomplete set records nothing"
     );
+}
+
+// ---- Recording through the sink contract.
+
+#[test]
+fn dispositions_publish_once_through_claim_seal_publish_and_a_new_generation_is_new_work() {
+    use crate::record::{Recorded, record_proposal};
+    use crate::test_repo::MemorySink;
+    let (req, r) = (
+        request(
+            BASE,
+            &format!("{:040x}", 1),
+            AssuranceProfile::Standard,
+            None,
+        ),
+        review(A4ReviewVerdict::PassWithNonblockingFindings, &["a", "b"]),
+    );
+    let ds = [fix("a"), fix("b")];
+    let p = disposition_proposal("project", &req, &r, &ds, 1).unwrap();
+    let mut sink = MemorySink::default();
+    assert_eq!(record_dispositions(&mut sink, &p), Ok(Recorded::Published));
+    // An exact retry completes (publication is idempotent) and adds nothing.
+    assert_eq!(record_dispositions(&mut sink, &p), Ok(Recorded::Published));
+    assert_eq!(sink.proposals.len(), 1);
+    assert_eq!(sink.claims.len(), 1);
+    // The same decisions under another generation are a separate claim.
+    let g2 = disposition_proposal("project", &req, &r, &ds, 2).unwrap();
+    assert_ne!(g2.claim_key(), p.claim_key());
+    assert_eq!(g2.binding().scope().generation(), 2);
+    assert_eq!(record_dispositions(&mut sink, &g2), Ok(Recorded::Published));
+    assert_eq!(sink.claims.len(), 2);
+    // Different decisions are a different scope even with the same review.
+    let rejected = [
+        fix("a"),
+        d(
+            "b",
+            FindingDispositionKind::Reject {
+                reason: "no".into(),
+            },
+        ),
+    ];
+    let other = disposition_proposal("project", &req, &r, &rejected, 1).unwrap();
+    assert_ne!(other.claim_key(), p.claim_key());
+    assert_eq!(
+        other.binding().operation(),
+        crate::ReviewOperation::Disposition
+    );
+
+    // A label of another operation settles nothing and claims nothing.
+    let mut fresh = MemorySink::default();
+    assert!(record_proposal(&mut fresh, &p, "REPAIR_ISSUED").is_err());
+    assert!(fresh.claims.is_empty());
+    // An unfinished, abandoned or terminal claim is never published over.
+    for (case, mark) in [("in-flight", 0), ("abandoned", 1), ("terminal", 2)] {
+        let mut blocked = MemorySink::default();
+        match mark {
+            0 => {
+                blocked.claims.insert(p.claim_key().to_owned(), None);
+            }
+            1 => {
+                blocked.abandoned.insert(p.claim_key().to_owned());
+            }
+            _ => {
+                blocked.terminal.insert(p.claim_key().to_owned());
+            }
+        }
+        assert!(record_dispositions(&mut blocked, &p).is_err(), "{case}");
+        assert!(blocked.proposals.is_empty(), "{case}");
+    }
+    // A claim sealed with anything else conflicts.
+    let mut conflicting = MemorySink::default();
+    conflicting.claims.insert(
+        p.claim_key().to_owned(),
+        Some(crate::SealedReview::new(&other, "DISPOSITIONS", true, 0)),
+    );
+    assert!(record_dispositions(&mut conflicting, &p).is_err());
+    assert!(conflicting.proposals.is_empty());
 }

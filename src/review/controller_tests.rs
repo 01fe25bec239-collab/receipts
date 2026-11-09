@@ -4,7 +4,7 @@
 //! provider or native protected-launch execution.
 
 use crate::controller::*;
-use crate::ports::{ImplementerIdentity, ReviewerCandidate, ReviewerRoutingRefusal};
+use crate::ports::{ImplementerIdentity, ReviewerCandidate, ReviewerRoutingRefusal, SealedReview};
 use crate::test_repo::*;
 use crate::{
     A4ReviewFindingCategory, A4ReviewReproductionCheckResult, A4ReviewVerdict, AssuranceProfile,
@@ -55,6 +55,17 @@ fn run(
     timeout: Duration,
     sink: &mut MemorySink,
 ) -> ReviewTicket {
+    run_generation(c, routing, runtimes, timeout, sink, 1)
+}
+
+fn run_generation(
+    c: &Case,
+    routing: &FixedRouting,
+    runtimes: &[&dyn crate::ReviewerRuntime],
+    timeout: Duration,
+    sink: &mut MemorySink,
+    generation: u32,
+) -> ReviewTicket {
     let checks = runner(timeout);
     let controller = ReviewController {
         routing,
@@ -72,6 +83,7 @@ fn run(
             implementer: &implementer(),
             worker_checks: &c.checks,
             review_worktree: &worktree,
+            generation,
         },
         sink,
     )
@@ -1201,7 +1213,7 @@ fn nonblocking_ordinary_findings_stay_pending_until_dispositioned() {
             decided_by: "a2".into(),
         },
     ];
-    let package = disposition_proposal("project", &c.request, &r, &dispositions).unwrap();
+    let package = disposition_proposal("project", &c.request, &r, &dispositions, 1).unwrap();
     let kinds: Vec<_> = package.events.iter().map(|e| e.event_type()).collect();
     assert_eq!(
         kinds,
@@ -1238,4 +1250,315 @@ fn reviewer_output_with_a_signed_unicode_escape_is_invalid_output() {
     );
     assert!(matches!(t.disposition, ReviewDisposition::InvalidOutput(_)));
     assert!(!t.passed());
+}
+
+// ---- Typed claim scope, operation binding, generation and claim states.
+
+fn binding_of(
+    c: &Case,
+    implementer: &ImplementerIdentity,
+    generation: u32,
+) -> Result<crate::ReviewClaimBinding, String> {
+    let root = c.repo.root();
+    let worktree = c.repo.scratch("unused");
+    review_claim_binding(&AttemptFinished {
+        project_id: "project",
+        request: &c.request,
+        repository_root: &root,
+        implementer,
+        worker_checks: &c.checks,
+        review_worktree: &worktree,
+        generation,
+    })
+}
+
+#[test]
+fn claim_scope_is_typed_and_covers_the_semantic_request_and_generation() {
+    let c = case(AssuranceProfile::Standard, None, "ok\n");
+    let b1 = binding_of(&c, &implementer(), 1).unwrap();
+    assert_eq!(b1, binding_of(&c, &implementer(), 1).unwrap());
+    let scope = b1.scope();
+    assert_eq!(b1.operation(), crate::ReviewOperation::Review);
+    assert_eq!(scope.project_id(), "project");
+    assert_eq!(scope.task_id(), c.request.core().task_id());
+    assert_eq!(scope.subject_sha(), Some(c.implementation.as_str()));
+    assert_eq!(scope.generation(), 1);
+    assert_eq!(scope.request_sha256().len(), 64);
+    // The key is derived from the scope and operation, never parsed back.
+    assert_eq!(
+        crate::ReviewClaimBinding::from_parts(b1.operation(), scope.clone(), b1.key()).unwrap(),
+        b1
+    );
+    assert!(
+        crate::ReviewClaimBinding::from_parts(b1.operation(), scope.clone(), "review-claim-x")
+            .is_err()
+    );
+    // Generation is part of the claim, and only the composition supplies it.
+    let b2 = binding_of(&c, &implementer(), 2).unwrap();
+    assert_ne!(b1.key(), b2.key());
+    assert_eq!(b2.scope().request_sha256(), scope.request_sha256());
+    assert!(binding_of(&c, &implementer(), 0).is_err());
+    // The same request id with different semantics is a different claim.
+    let policy = ReviewRequestPolicy::new(None, Some(DistinctProviderPolicy::Required), None, None);
+    let stricter = case(AssuranceProfile::Standard, Some(policy), "ok\n");
+    assert_eq!(
+        stricter.request.core().request_id(),
+        c.request.core().request_id()
+    );
+    let other = binding_of(&stricter, &implementer(), 1).unwrap();
+    assert_ne!(other.scope().request_sha256(), scope.request_sha256());
+    assert_ne!(other.key(), b1.key());
+    // So is another implementer identity.
+    let mut changed = implementer();
+    changed.provider_id = "provider-z".into();
+    assert_ne!(
+        binding_of(&c, &changed, 1)
+            .unwrap()
+            .scope()
+            .request_sha256(),
+        scope.request_sha256()
+    );
+    // `requested_at` says when, not what: a redelivered callback is the same work.
+    let late = crate::ReviewRequest::new(c.request.core().clone(), Some(clock()));
+    let redelivered = Case {
+        repo: Repo::new(),
+        implementation: c.implementation.clone(),
+        request: late,
+        checks: c.checks.clone(),
+    };
+    assert_eq!(
+        binding_of(&redelivered, &implementer(), 1).unwrap().key(),
+        b1.key()
+    );
+}
+
+#[test]
+fn an_invalid_scope_refuses_before_any_claim_routing_or_dispatch() {
+    let c = case(AssuranceProfile::Standard, None, "ok\n");
+    let routing = FixedRouting::candidate("provider-b", "runtime-b");
+    let reviewer = pass_reviewer("runtime-b");
+    let mut sink = MemorySink::default();
+    let t = run_generation(&c, &routing, &[&reviewer], time_limit(), &mut sink, 0);
+    assert!(matches!(
+        t.disposition,
+        ReviewDisposition::Refused(ReviewRefusal::Scope(_))
+    ));
+    assert!(sink.claims.is_empty(), "no claim was taken");
+    assert!(reviewer.calls.borrow().is_empty());
+    assert!(routing.asked.borrow().is_empty());
+}
+
+#[test]
+fn terminal_and_abandoned_claims_never_authorize_execution() {
+    for abandoned in [false, true] {
+        let c = case(AssuranceProfile::Standard, None, "ok\n");
+        let routing = FixedRouting::candidate("provider-b", "runtime-b");
+        let reviewer = pass_reviewer("runtime-b");
+        let key = binding_of(&c, &implementer(), 1).unwrap().key().to_owned();
+        let mut sink = MemorySink::default();
+        if abandoned {
+            sink.abandoned.insert(key);
+        } else {
+            sink.terminal.insert(key);
+        }
+        let t = run(&c, &routing, &[&reviewer], time_limit(), &mut sink);
+        assert!(
+            matches!(
+                (&t.disposition, abandoned),
+                (
+                    ReviewDisposition::Refused(ReviewRefusal::ClaimAbandoned),
+                    true
+                ) | (
+                    ReviewDisposition::Refused(ReviewRefusal::ClaimTerminal(_)),
+                    false
+                )
+            ),
+            "{:?}",
+            t.disposition
+        );
+        assert!(t.persisted.is_err() && !t.passed());
+        assert!(reviewer.calls.borrow().is_empty(), "no execution");
+        assert!(routing.asked.borrow().is_empty());
+    }
+}
+
+#[test]
+fn a_new_generation_runs_the_work_again_and_the_same_generation_never_does() {
+    let c = case(AssuranceProfile::Standard, None, "ok\n");
+    let routing = FixedRouting::candidate("provider-b", "runtime-b");
+    let reviewer = pass_reviewer("runtime-b");
+    let mut sink = MemorySink::default();
+    run_generation(&c, &routing, &[&reviewer], time_limit(), &mut sink, 1);
+    run_generation(&c, &routing, &[&reviewer], time_limit(), &mut sink, 1);
+    assert_eq!(reviewer.calls.borrow().len(), 1);
+    let again = run_generation(&c, &routing, &[&reviewer], time_limit(), &mut sink, 2);
+    assert_eq!(reviewer.calls.borrow().len(), 2, "generation 2 is new work");
+    assert!(again.persisted.is_ok());
+    assert_eq!(sink.claims.len(), 2);
+}
+
+#[test]
+fn a_sealed_package_for_another_scope_is_never_published() {
+    let c = case(AssuranceProfile::Standard, None, "ok\n");
+    let routing = FixedRouting::candidate("provider-b", "runtime-b");
+    let reviewer = pass_reviewer("runtime-b");
+    let mut other = MemorySink::default();
+    let t = run_generation(&c, &routing, &[&reviewer], time_limit(), &mut other, 2);
+    let foreign = SealedReview::new(t.proposal.as_ref().unwrap(), "REVIEWED", true, 1);
+    let key1 = binding_of(&c, &implementer(), 1).unwrap().key().to_owned();
+    let mut sink = MemorySink::default();
+    sink.claims.insert(key1, Some(foreign));
+    let before = reviewer.calls.borrow().len();
+    let t = run_generation(&c, &routing, &[&reviewer], time_limit(), &mut sink, 1);
+    assert!(matches!(
+        t.disposition,
+        ReviewDisposition::Refused(ReviewRefusal::SealedScopeMismatch)
+    ));
+    assert!(sink.proposals.is_empty(), "nothing was published");
+    assert_eq!(reviewer.calls.borrow().len(), before, "nothing executed");
+}
+
+#[test]
+fn a_sealed_outcome_must_belong_to_its_operation_and_its_records() {
+    let c = case(AssuranceProfile::Standard, None, "ok\n");
+    let routing = FixedRouting::candidate("provider-b", "runtime-b");
+    let reviewer = pass_reviewer("runtime-b");
+    let mut sink = MemorySink::default();
+    let t = run(&c, &routing, &[&reviewer], time_limit(), &mut sink);
+    let proposal = t.proposal.unwrap();
+    let good = SealedReview::new(&proposal, "REVIEWED", true, 1);
+    assert_eq!(good.settlement().unwrap().outcome_kind(), "PASS");
+    assert!(good.settlement().unwrap().is_completed());
+    // Another operation's label, a label that contradicts the records and a
+    // refusal label over a reviewed package are all refused.
+    for label in [
+        "DISPOSITIONS",
+        "REPAIR_ISSUED",
+        "INVALID_OUTPUT",
+        "POLICY_BLOCKED",
+    ] {
+        assert!(
+            SealedReview::new(&proposal, label, true, 1)
+                .settlement()
+                .is_err(),
+            "{label}"
+        );
+        assert!(
+            SealedReview::from_bytes(&SealedReview::new(&proposal, label, true, 1).to_bytes())
+                .is_err()
+        );
+    }
+    // Bytes that do not round-trip are refused: a flipped scope field breaks
+    // the digest, and a digest repaired over a wrong key breaks the binding.
+    let bytes = good.to_bytes();
+    assert!(SealedReview::from_bytes(&bytes).is_ok());
+    let text = String::from_utf8(bytes).unwrap();
+    let flipped = text.replacen("project", "projecx", 1);
+    assert!(SealedReview::from_bytes(flipped.as_bytes()).is_err());
+}
+
+/// Re-signs a sealed review after `edit` changed its journal: the journal
+/// digest is repaired, so only the package's own validators can refuse it.
+fn resigned(sealed: &SealedReview, edit: impl FnOnce(&mut serde_json::Value)) -> Vec<u8> {
+    let mut outer: serde_json::Value = serde_json::from_slice(&sealed.to_bytes()).unwrap();
+    let mut journal: serde_json::Value =
+        serde_json::from_str(outer["journal"].as_str().unwrap()).unwrap();
+    edit(&mut journal);
+    let text = journal.to_string();
+    outer["journal_sha256"] = crate::records::sha256_hex(text.as_bytes()).into();
+    outer["journal"] = text.into();
+    serde_json::to_vec(&outer).unwrap()
+}
+
+#[test]
+fn a_resigned_sealed_package_that_contradicts_its_scope_or_content_is_refused() {
+    let c = case(AssuranceProfile::Standard, None, "ok\n");
+    let routing = FixedRouting::candidate("provider-b", "runtime-b");
+    let reviewer = pass_reviewer("runtime-b");
+    let t = run(
+        &c,
+        &routing,
+        &[&reviewer],
+        time_limit(),
+        &mut MemorySink::default(),
+    );
+    let good = SealedReview::new(t.proposal.as_ref().unwrap(), "REVIEWED", true, 1);
+    assert!(
+        SealedReview::from_bytes(&resigned(&good, |_| {})).is_ok(),
+        "control"
+    );
+
+    let other_sha = "1".repeat(40);
+    type Edit = Box<dyn FnOnce(&mut serde_json::Value)>;
+    let edits: Vec<(&str, Edit)> = vec![
+        (
+            "key",
+            Box::new(|j| j["binding"]["key"] = "review-claim-x".into()),
+        ),
+        (
+            "operation",
+            Box::new(|j| j["binding"]["operation"] = "REPAIR".into()),
+        ),
+        (
+            "generation",
+            Box::new(|j| j["binding"]["generation"] = 2.into()),
+        ),
+        (
+            "zero generation",
+            Box::new(|j| j["binding"]["generation"] = 0.into()),
+        ),
+        (
+            "request digest",
+            Box::new(|j| j["binding"]["request_sha256"] = "2".repeat(64).into()),
+        ),
+        (
+            "project",
+            Box::new(|j| j["binding"]["project_id"] = "other".into()),
+        ),
+        (
+            "decision json",
+            Box::new(|j| {
+                let text = j["decisions"][0]["json"]
+                    .as_str()
+                    .unwrap()
+                    .replace("PASS", "REJECT");
+                j["decisions"][0]["json"] = text.into();
+            }),
+        ),
+        (
+            "event content",
+            Box::new(|j| j["content"][0]["hex"] = "00".repeat(8).into()),
+        ),
+        (
+            "dropped record",
+            Box::new(|j| j["decisions"] = serde_json::json!([])),
+        ),
+        (
+            "unknown event type",
+            Box::new(|j| j["events"][0]["event_type"] = "NOT_AN_EVENT".into()),
+        ),
+    ];
+    for (name, edit) in edits {
+        assert!(
+            SealedReview::from_bytes(&resigned(&good, edit)).is_err(),
+            "{name} was accepted"
+        );
+    }
+    // A consistent binding for a different subject (key recomputed) still
+    // contradicts the sealed A4Review record's reviewed SHA.
+    let scope = good.binding().unwrap().scope().clone();
+    let moved = crate::ReviewClaimScope::new(
+        scope.project_id(),
+        scope.task_id(),
+        Some(&other_sha),
+        scope.request_sha256(),
+        scope.generation(),
+    )
+    .unwrap();
+    let rebound = crate::ReviewClaimBinding::new(crate::ReviewOperation::Review, moved.clone());
+    let bytes = resigned(&good, |j| {
+        j["binding"]["subject_sha"] = other_sha.clone().into();
+        j["binding"]["key"] = rebound.key().into();
+    });
+    assert!(SealedReview::from_bytes(&bytes).is_err(), "foreign subject");
 }

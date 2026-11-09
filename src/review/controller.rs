@@ -41,6 +41,10 @@
 //! each nonblocking finding has an explicit disposition.
 
 use crate::capsule_builder::{CapsuleBuildRefusal, ReviewCapsuleBuildInput, build_review_capsule};
+use crate::claims::{
+    ReviewClaimBinding, ReviewClaimScope, ReviewOperation, check_identity_json,
+    request_identity_json, request_sha256,
+};
 use crate::ports::{
     ImplementerIdentity, ReviewClaim, ReviewRecordProposal, ReviewRecordSink, ReviewerCandidate,
     ReviewerRequirements, ReviewerRoutingPort, ReviewerRoutingRefusal, ReviewerRuntime,
@@ -83,6 +87,10 @@ pub struct AttemptFinished<'a> {
     pub worker_checks: &'a [ReviewCapsuleCheck],
     /// Fresh absolute path for the separate review worktree.
     pub review_worktree: &'a Path,
+    /// Claim generation, supplied by the trusted composition (at least 1).
+    /// Review never increments it: a new generation is the explicit way to
+    /// run work again after its claim was abandoned.
+    pub generation: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,9 +114,21 @@ pub enum ReviewRefusal {
     Workspace(String),
     /// The durable claim could not be taken or the package not persisted.
     Records(String),
+    /// The attempt does not name a valid claim scope (for example a zero
+    /// generation); refused before any claim, routing or dispatch.
+    Scope(String),
     /// An earlier or concurrent run holds the claim without a sealed
     /// result; nothing is executed again (operator recovery).
     ClaimInFlight,
+    /// The claim finished without a sealed result (a retained terminal
+    /// refusal, carrying its recorded outcome); nothing is executed again.
+    ClaimTerminal(String),
+    /// The claim was explicitly abandoned; nothing is executed under this
+    /// generation.
+    ClaimAbandoned,
+    /// The sealed package found for the claim belongs to another scope or
+    /// operation; nothing is published.
+    SealedScopeMismatch,
 }
 
 /// Terminal review disposition. Only `Reviewed` with a passing verdict can
@@ -294,19 +314,37 @@ fn independence(
     Ok(())
 }
 
-/// Durable identity of one finished attempt's review.
-pub fn review_claim_key(attempt: &AttemptFinished<'_>) -> String {
+/// Durable identity of one finished attempt's review: project, task, the
+/// implementation SHA, the digest of the validated semantic request (the
+/// request without its `requested_at`, the implementer identity and the
+/// worker check evidence, all deterministically encoded) and the trusted
+/// composition's generation.
+pub fn review_claim_binding(attempt: &AttemptFinished<'_>) -> Result<ReviewClaimBinding, String> {
     let core = attempt.request.core();
-    derived_id(
-        "review-claim",
-        &[
-            attempt.project_id,
-            core.request_id(),
-            core.task_id(),
-            core.attempt_id(),
-            core.implementation_sha().as_str(),
-        ],
-    )
+    let implementer = &attempt.implementer;
+    let implementer_json = serde_json::json!([
+        implementer.provider_id,
+        implementer.runtime_id,
+        implementer.model_id,
+        implementer.session_ref
+    ])
+    .to_string();
+    let request_json = request_identity_json(attempt.request);
+    let checks: Vec<String> = attempt
+        .worker_checks
+        .iter()
+        .map(check_identity_json)
+        .collect();
+    let mut parts = vec![request_json.as_str(), implementer_json.as_str()];
+    parts.extend(checks.iter().map(String::as_str));
+    let scope = ReviewClaimScope::new(
+        attempt.project_id,
+        core.task_id(),
+        Some(core.implementation_sha().as_str()),
+        &request_sha256(ReviewOperation::Review, &parts),
+        attempt.generation,
+    )?;
+    Ok(ReviewClaimBinding::new(ReviewOperation::Review, scope))
 }
 
 fn refused_ticket(refusal: ReviewRefusal, persisted: Result<(), String>) -> ReviewTicket {
@@ -326,8 +364,12 @@ impl ReviewController<'_> {
         attempt: AttemptFinished<'_>,
         sink: &mut dyn ReviewRecordSink,
     ) -> ReviewTicket {
-        let key = review_claim_key(&attempt);
-        match sink.claim(&key) {
+        // An invalid scope refuses before any claim, routing or dispatch.
+        let binding = match review_claim_binding(&attempt) {
+            Ok(b) => b,
+            Err(e) => return refused_ticket(ReviewRefusal::Scope(e.clone()), Err(e)),
+        };
+        match sink.claim(&binding) {
             // No claim: nothing was executed, nothing is retried elsewhere.
             Err(e) => refused_ticket(ReviewRefusal::Records(e.clone()), Err(e)),
             Ok(ReviewClaim::InFlight) => refused_ticket(
@@ -337,8 +379,16 @@ impl ReviewController<'_> {
                         .into(),
                 ),
             ),
-            Ok(ReviewClaim::Sealed(sealed)) => self.recover(&key, &sealed, sink),
-            Ok(ReviewClaim::Acquired) => self.execute(&key, attempt, sink),
+            Ok(ReviewClaim::Terminal(outcome)) => refused_ticket(
+                ReviewRefusal::ClaimTerminal(outcome),
+                Err("the claim finished without a sealed result".into()),
+            ),
+            Ok(ReviewClaim::Abandoned) => refused_ticket(
+                ReviewRefusal::ClaimAbandoned,
+                Err("the claim was abandoned; a new generation is a trusted decision".into()),
+            ),
+            Ok(ReviewClaim::Sealed(sealed)) => self.recover(&binding, &sealed, sink),
+            Ok(ReviewClaim::Acquired) => self.execute(&binding, attempt, sink),
         }
     }
 
@@ -346,11 +396,20 @@ impl ReviewController<'_> {
     /// returns its recorded disposition. Executes nothing.
     fn recover(
         &self,
-        key: &str,
+        binding: &ReviewClaimBinding,
         sealed: &SealedReview,
         sink: &mut dyn ReviewRecordSink,
     ) -> ReviewTicket {
-        let rebuilt = sealed.proposal();
+        let rebuilt = sealed
+            .proposal()
+            .and_then(|p| sealed.settlement().map(|_| p));
+        // A sealed package for another scope or operation is never published.
+        if rebuilt.as_ref().is_ok_and(|p| p.binding() != binding) {
+            return refused_ticket(
+                ReviewRefusal::SealedScopeMismatch,
+                Err("the sealed package belongs to another claim scope".into()),
+            );
+        }
         let review = rebuilt.as_ref().ok().and_then(|p| {
             p.decision_records
                 .iter()
@@ -358,7 +417,7 @@ impl ReviewController<'_> {
                 .and_then(|r| decode_a4_review(r.record_json()).ok())
         });
         let persisted = match &rebuilt {
-            Ok(p) => sink.publish(key, p),
+            Ok(p) => sink.publish(binding, p),
             Err(e) => Err(e.clone()),
         };
         ReviewTicket {
@@ -377,7 +436,7 @@ impl ReviewController<'_> {
 
     fn execute(
         &self,
-        key: &str,
+        binding: &ReviewClaimBinding,
         attempt: AttemptFinished<'_>,
         sink: &mut dyn ReviewRecordSink,
     ) -> ReviewTicket {
@@ -397,7 +456,7 @@ impl ReviewController<'_> {
             Ok(c) => c,
             Err(e) => {
                 ticket.disposition = ReviewDisposition::Refused(ReviewRefusal::Capsule(e));
-                return self.finish(ticket, &attempt, key, sink);
+                return self.finish(ticket, &attempt, binding, sink);
             }
         };
         ticket.capsule = Some(capsule.clone());
@@ -412,15 +471,15 @@ impl ReviewController<'_> {
                     None,
                     SafetyInterruptionDetectionConfidence::Unknown,
                 );
-                return self.finish(ticket, &attempt, key, sink);
+                return self.finish(ticket, &attempt, binding, sink);
             }
             Err(ReviewerRoutingRefusal::NoEligibleReviewer) => {
-                return self.finish(ticket, &attempt, key, sink);
+                return self.finish(ticket, &attempt, binding, sink);
             }
         };
         if let Err(refusal) = independence(&candidate, &req, attempt.implementer) {
             ticket.disposition = ReviewDisposition::Refused(refusal);
-            return self.finish(ticket, &attempt, key, sink);
+            return self.finish(ticket, &attempt, binding, sink);
         }
         let Some(runtime) = self
             .runtimes
@@ -430,7 +489,7 @@ impl ReviewController<'_> {
             ticket.disposition = ReviewDisposition::Refused(ReviewRefusal::UnknownRuntime(
                 candidate.runtime_id.clone(),
             ));
-            return self.finish(ticket, &attempt, key, sink);
+            return self.finish(ticket, &attempt, binding, sink);
         };
         let workspace = match provision_review_workspace(&ReviewWorkspaceRequest {
             repository_root: attempt.repository_root.to_path_buf(),
@@ -443,7 +502,7 @@ impl ReviewController<'_> {
             Err(e) => {
                 ticket.disposition =
                     ReviewDisposition::Refused(ReviewRefusal::Workspace(e.to_string()));
-                return self.finish(ticket, &attempt, key, sink);
+                return self.finish(ticket, &attempt, binding, sink);
             }
         };
         ticket.dispatches = 1;
@@ -452,7 +511,7 @@ impl ReviewController<'_> {
         ticket.cleanup = Some(
             remove_review_workspace(attempt.repository_root, &workspace).map_err(|e| e.to_string()),
         );
-        self.finish(ticket, &attempt, key, sink)
+        self.finish(ticket, &attempt, binding, sink)
     }
 
     fn review_in(
@@ -765,10 +824,10 @@ impl ReviewController<'_> {
         &self,
         mut ticket: ReviewTicket,
         attempt: &AttemptFinished<'_>,
-        key: &str,
+        binding: &ReviewClaimBinding,
         sink: &mut dyn ReviewRecordSink,
     ) -> ReviewTicket {
-        match records(&ticket, attempt, key) {
+        match records(&ticket, attempt, binding) {
             Ok(proposal) => {
                 let cleanup_ok = matches!(ticket.cleanup, Some(Ok(())));
                 let sealed = SealedReview::new(
@@ -778,8 +837,8 @@ impl ReviewController<'_> {
                     ticket.dispatches,
                 );
                 ticket.persisted = sink
-                    .seal(key, &sealed)
-                    .and_then(|()| sink.publish(key, &proposal));
+                    .seal(binding, &sealed)
+                    .and_then(|()| sink.publish(binding, &proposal));
                 ticket.proposal = Some(proposal);
             }
             Err(e) => ticket.persisted = Err(e),
@@ -801,15 +860,10 @@ fn outcome_label(d: &ReviewDisposition) -> &'static str {
 fn records(
     ticket: &ReviewTicket,
     attempt: &AttemptFinished<'_>,
-    claim_key: &str,
+    binding: &ReviewClaimBinding,
 ) -> Result<ReviewRecordProposal, String> {
     let core = attempt.request.core();
-    let mut b = ProposalBuilder::new(
-        attempt.project_id,
-        core.task_id(),
-        core.context_epoch().decimal_digits(),
-        claim_key,
-    )?;
+    let mut b = ProposalBuilder::new(binding, core.context_epoch().decimal_digits())?;
     let task = (SubjectKind::Task, core.task_id());
     if let Some(capsule) = &ticket.capsule
         && ticket.dispatches > 0

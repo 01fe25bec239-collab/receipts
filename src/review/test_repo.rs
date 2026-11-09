@@ -1,6 +1,7 @@
 //! Test-only temporary Git repositories and fakes for Review controls.
 //! Product code never runs Git directly; these helpers only set up fixtures.
 
+use crate::claims::ReviewClaimBinding;
 use crate::ports::{
     ReviewClaim, ReviewRecordProposal, ReviewRecordSink, ReviewerCandidate,
     ReviewerQualityEvidence, ReviewerRequirements, ReviewerRoutingPort, ReviewerRoutingRefusal,
@@ -387,7 +388,7 @@ pub(crate) fn all_dimensions_json() -> String {
 
 /// Test fake of a conforming sink. It is in-memory, so it proves controller
 /// behaviour against the sink contract; durability across restart is proven
-/// in `receipts-e2e` against a file journal and the real Core writer.
+/// in `receipts-e2e` against the real Core writer and State.
 #[derive(Default)]
 pub(crate) struct MemorySink {
     /// Published packages, once each (publication is idempotent by claim key).
@@ -399,12 +400,23 @@ pub(crate) struct MemorySink {
     pub(crate) fail_seal: bool,
     /// Remaining `publish` calls that fail before succeeding.
     pub(crate) fail_publish: usize,
+    /// Keys whose claim was abandoned.
+    pub(crate) abandoned: BTreeSet<String>,
+    /// Keys whose claim finished without a sealed result.
+    pub(crate) terminal: BTreeSet<String>,
 }
 
 impl ReviewRecordSink for MemorySink {
-    fn claim(&mut self, key: &str) -> Result<ReviewClaim, String> {
+    fn claim(&mut self, binding: &ReviewClaimBinding) -> Result<ReviewClaim, String> {
+        let key = binding.key();
         if self.refuse {
             return Err("sink refused".into());
+        }
+        if self.abandoned.contains(key) {
+            return Ok(ReviewClaim::Abandoned);
+        }
+        if self.terminal.contains(key) {
+            return Ok(ReviewClaim::Terminal("REFUSED".into()));
         }
         Ok(match self.claims.get(key) {
             None => {
@@ -415,11 +427,16 @@ impl ReviewRecordSink for MemorySink {
             Some(Some(sealed)) => ReviewClaim::Sealed(sealed.clone()),
         })
     }
-    fn seal(&mut self, key: &str, sealed: &SealedReview) -> Result<(), String> {
+    fn seal(&mut self, binding: &ReviewClaimBinding, sealed: &SealedReview) -> Result<(), String> {
         if self.fail_seal {
             return Err("seal failed".into());
         }
-        match self.claims.get_mut(key) {
+        // The contract: a sealed package must belong to the claim it seals.
+        if sealed.binding()? != *binding {
+            return Err("sealed package is for another scope".into());
+        }
+        sealed.settlement()?;
+        match self.claims.get_mut(binding.key()) {
             Some(slot @ None) => {
                 *slot = Some(sealed.clone());
                 Ok(())
@@ -429,12 +446,20 @@ impl ReviewRecordSink for MemorySink {
             None => Err("no claim".into()),
         }
     }
-    fn publish(&mut self, key: &str, proposal: &ReviewRecordProposal) -> Result<(), String> {
+    fn publish(
+        &mut self,
+        binding: &ReviewClaimBinding,
+        proposal: &ReviewRecordProposal,
+    ) -> Result<(), String> {
         if self.fail_publish > 0 {
             self.fail_publish -= 1;
             return Err("publish failed".into());
         }
-        if self.published.insert(key.to_owned()) {
+        match self.claims.get(binding.key()) {
+            Some(Some(sealed)) if sealed.proposal()?.to_journal() == proposal.to_journal() => {}
+            _ => return Err("publish needs the sealed package of this claim".into()),
+        }
+        if self.published.insert(binding.key().to_owned()) {
             self.proposals.push(proposal.clone());
         }
         Ok(())

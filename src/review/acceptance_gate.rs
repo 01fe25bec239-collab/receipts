@@ -18,10 +18,18 @@
 //! Outcome precedence: HUMAN_REQUIRED > BLOCKED > REPAIR > ACCEPT.
 
 use crate::capsule_builder::review_id;
+use crate::claims::{
+    ReviewClaimBinding, ReviewClaimScope, ReviewOperation, request_identity_json, request_sha256,
+};
 use crate::dispositions::{FindingDisposition, validate_dispositions};
+use crate::ports::ReviewRecordSink;
+use crate::record::{Recorded, record_proposal};
 use crate::records::{ProposalBuilder, derived_id};
 use crate::reproduction::{CheckRunStatus, CheckRunnerConfig, run_check};
-use crate::wire::{decode_a4_review, encode_integration_decision, encode_review_capsule};
+use crate::wire::{
+    decode_a4_review, encode_integration_decision, encode_integration_request,
+    encode_review_capsule,
+};
 use crate::{
     A3HandoffCheckResult, A3HandoffNonTemporalCore, A4ReviewFindingCategory,
     A4ReviewNonTemporalCore, A4ReviewReproductionCheckResult, AssuranceProfile,
@@ -153,6 +161,8 @@ pub struct AcceptanceInput<'a> {
     /// Empty directory for owned temporary worktrees.
     pub scratch: &'a Path,
     pub clock: &'a dyn Fn() -> ReviewDateTimeV1,
+    /// Claim generation, supplied by the trusted composition (at least 1).
+    pub generation: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +175,12 @@ pub struct GateOutcome {
 }
 
 impl GateOutcome {
+    /// Records the decision durably through the sink: claim, seal, publish.
+    pub fn record(&self, sink: &mut dyn ReviewRecordSink) -> Result<Recorded, String> {
+        let proposal = self.proposal.as_ref().map_err(Clone::clone)?;
+        record_proposal(sink, proposal, "ACCEPTANCE_EVALUATED")
+    }
+
     pub fn failed(&self) -> Vec<AcceptanceCheckId> {
         self.checks
             .iter()
@@ -934,11 +950,23 @@ fn proposal(
     d: &IntegrationDecision,
 ) -> Result<ReviewRecordProposal, String> {
     let core = i.review_request.core();
-    let mut b = ProposalBuilder::new(
+    let integration = encode_integration_request(i.integration_request);
+    let parts = [
+        request_identity_json(i.review_request),
+        integration,
+        d.core().decision_id().to_owned(),
+    ];
+    let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+    let scope = ReviewClaimScope::new(
         i.project_id,
         core.task_id(),
+        Some(i.capsule.implementation_sha().as_str()),
+        &request_sha256(ReviewOperation::Acceptance, &parts),
+        i.generation,
+    )?;
+    let mut b = ProposalBuilder::new(
+        &ReviewClaimBinding::new(ReviewOperation::Acceptance, scope),
         core.context_epoch().decimal_digits(),
-        &derived_id("acceptance-claim", &[i.project_id, d.core().decision_id()]),
     )?;
     let json = encode_integration_decision(d);
     let id = d.core().decision_id();

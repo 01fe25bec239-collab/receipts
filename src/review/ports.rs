@@ -3,12 +3,16 @@
 //! reached only through these traits, which the trusted composition (HI-W4-1)
 //! binds. Nothing here imports Orchestration or Routing.
 
+use crate::claims::{ReviewClaimBinding, ReviewOperation};
 use crate::records::{PackageSpec, ProposalBuilder};
+use crate::wire::{decode_a4_review, decode_integration_decision};
 use crate::{DistinctProviderPolicy, ReviewCapsuleNonTemporalCore, ReviewRequestReviewerFloor};
 use receipts_runtime_adapters::{
     ClaudeAttemptResult, ClaudeProviderResult, CodexAttemptResult, FailureClass,
 };
-use receipts_state::{DecisionRecordV1, EventProposalV1};
+use receipts_state::{
+    DecisionRecordKind, DecisionRecordV1, EventProposalV1, ReviewClaimSettlementV1,
+};
 use receipts_workspace_execution::WorkspaceHandle;
 use serde::{Deserialize, Serialize};
 
@@ -172,7 +176,7 @@ pub fn reviewer_output_from_codex(
 /// and the exact bytes each proposal's payload digest names. `event_keys[i]`
 /// is the stable idempotency identity of `events[i]`: publishing the same
 /// package again must name the same events.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReviewRecordProposal {
     pub project_id: String,
     pub decision_records: Vec<DecisionRecordV1>,
@@ -180,13 +184,19 @@ pub struct ReviewRecordProposal {
     pub event_keys: Vec<String>,
     /// `(payload reference, exact bytes)` for every event payload.
     pub content: Vec<(String, Vec<u8>)>,
+    pub(crate) binding: ReviewClaimBinding,
     pub(crate) spec: PackageSpec,
 }
 
 impl ReviewRecordProposal {
-    /// The durable identity of this package (the claim it completes).
+    /// The typed identity of this package: operation, scope and claim key.
+    pub fn binding(&self) -> &ReviewClaimBinding {
+        &self.binding
+    }
+
+    /// The opaque claim key of [`Self::binding`].
     pub fn claim_key(&self) -> &str {
-        &self.spec.claim_key
+        self.binding.key()
     }
 
     /// Plain-data journal form: a sink stores these bytes and can rebuild
@@ -204,25 +214,37 @@ impl ReviewRecordProposal {
     }
 }
 
-/// The result of claiming one attempt (or one disposition set) durably.
+/// The result of claiming one unit of work (one [`ReviewClaimBinding`])
+/// durably. Only `Acquired` authorizes execution.
 #[derive(Debug, Clone)]
 pub enum ReviewClaim {
     /// This caller now holds the claim and may execute exactly once.
     Acquired,
     /// An earlier or concurrent caller holds the claim and has sealed no
     /// result. Nothing may be executed again: the earlier run may have
-    /// reached the reviewer. Needs operator recovery.
+    /// reached the reviewer. Needs operator recovery (authorized abandonment,
+    /// then a new generation).
     InFlight,
     /// An earlier run sealed its result; complete publication from it.
     Sealed(SealedReview),
+    /// The claim finished without a sealed result (a retained terminal
+    /// refusal): the recorded outcome token. Nothing to execute or publish.
+    Terminal(String),
+    /// The claim was explicitly abandoned under an authority. It is not run
+    /// again under this generation.
+    Abandoned,
 }
+
+/// State token naming the format of [`SealedReview::to_bytes`].
+pub const SEALED_REVIEW_KIND: &str = "REVIEW_SEALED_V1";
 
 /// A sealed result: the exact package plus the facts a recovering caller
 /// needs. Sealed packages are never replaced.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SealedReview {
     /// Terminal disposition label (`REVIEWED`, `POLICY_BLOCKED`,
-    /// `INVALID_OUTPUT`, `REFUSED`, `DISPOSITIONS`, ...).
+    /// `INVALID_OUTPUT`, `REFUSED`, `DISPOSITIONS`, ...). Which labels a
+    /// package may carry depends on its [`ReviewOperation`].
     pub outcome: String,
     /// The owned review worktree was removed.
     pub cleanup_ok: bool,
@@ -257,15 +279,102 @@ impl SealedReview {
         ReviewRecordProposal::from_journal(self.journal.as_bytes())
     }
 
-    /// Durable byte form for the sink's journal.
+    /// The scope and operation the sealed package was built for.
+    pub fn binding(&self) -> Result<ReviewClaimBinding, String> {
+        Ok(self.proposal()?.binding().clone())
+    }
+
+    /// The disposition the claim takes when this package is published,
+    /// derived only from the package and its outcome label. Refuses a label
+    /// the package's operation does not allow, an empty package and a
+    /// package whose records do not belong to its scope.
+    pub fn settlement(&self) -> Result<ReviewClaimSettlementV1, String> {
+        let proposal = self.proposal()?;
+        let (operation, scope) = (proposal.binding.operation(), proposal.binding.scope());
+        if !operation.outcomes().contains(&self.outcome.as_str()) {
+            return Err(format!(
+                "outcome {} is not a {} outcome",
+                self.outcome,
+                operation.as_str()
+            ));
+        }
+        if proposal.decision_records.is_empty() && proposal.events.is_empty() {
+            return Err("sealed package holds nothing to publish".into());
+        }
+        let wanted = match operation {
+            ReviewOperation::Review if self.outcome == "REVIEWED" => {
+                Some(DecisionRecordKind::A4Review)
+            }
+            ReviewOperation::Acceptance => Some(DecisionRecordKind::IntegrationDecision),
+            _ => None,
+        };
+        let records = &proposal.decision_records;
+        if records.len() != usize::from(wanted.is_some())
+            || records.first().map(DecisionRecordV1::kind) != wanted
+        {
+            return Err("sealed package holds the wrong decision records for its outcome".into());
+        }
+        let (mut kind, mut reference, mut digest) = (self.outcome.clone(), None, None);
+        if let Some(record) = records.first() {
+            // The event payload that names the record must carry exactly the
+            // record's bytes: the package cannot say two different things.
+            let payload = match record.kind() {
+                DecisionRecordKind::A4Review => format!("review:a4:{}", record.record_id()),
+                _ => format!("review:acceptance:{}", record.record_id()),
+            };
+            if !proposal
+                .content
+                .iter()
+                .any(|(r, bytes)| *r == payload && bytes == record.record_json().as_bytes())
+            {
+                return Err("sealed record and its event payload disagree".into());
+            }
+            reference = Some(record.record_id());
+            digest = Some(record.record_sha256());
+            if wanted == Some(DecisionRecordKind::A4Review) {
+                let review = decode_a4_review(record.record_json())
+                    .map_err(|e| format!("sealed review record does not decode: {e:?}"))?;
+                let core = review.core();
+                if core.reviewed_sha() != scope.subject_sha().unwrap_or_default()
+                    || core.task_id() != scope.task_id()
+                    || core.review_id() != record.record_id()
+                {
+                    return Err("sealed review record is not for the claim's scope".into());
+                }
+                kind = core.verdict().as_str().to_owned();
+            } else {
+                let decision = decode_integration_decision(record.record_json())
+                    .map_err(|e| format!("sealed acceptance record does not decode: {e:?}"))?;
+                let chain = decision.core().provenance_chain().unwrap_or_default();
+                if chain.len() != 1
+                    || chain[0].task_id() != scope.task_id()
+                    || Some(chain[0].implementation_sha().as_str()) != scope.subject_sha()
+                {
+                    return Err("sealed acceptance record is not for the claim's scope".into());
+                }
+            }
+        }
+        let refused = matches!(self.outcome.as_str(), "POLICY_BLOCKED" | "REFUSED");
+        if refused {
+            ReviewClaimSettlementV1::refused(&kind, reference, digest)
+        } else {
+            ReviewClaimSettlementV1::completed(&kind, reference, digest)
+        }
+        .map_err(|e| e.to_string())
+    }
+
+    /// Durable byte form for the sink's journal: the exact recovery bytes the
+    /// trusted core seals ([`SEALED_REVIEW_KIND`]).
     pub fn to_bytes(&self) -> Vec<u8> {
         serde_json::to_vec(self).unwrap_or_default()
     }
 
+    /// Decodes and fully validates recovery bytes: digest, journal rebuilt
+    /// through State's validators, scope/key binding and settlement.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         let sealed: Self =
             serde_json::from_slice(bytes).map_err(|e| format!("not a sealed review: {e}"))?;
-        sealed.proposal()?;
+        sealed.settlement()?;
         Ok(sealed)
     }
 }
@@ -273,23 +382,32 @@ impl SealedReview {
 /// Durable persistence through the trusted core (`CoreStateWriter` in the
 /// composition). Review never holds a State writer.
 ///
-/// Contract (the conformance every composition's sink must keep):
-/// 1. `claim` is an atomic, durable compare-and-set keyed by `claim_key`.
-///    Exactly one caller of a new key receives [`ReviewClaim::Acquired`];
-///    the claim survives restart. Any later or concurrent caller gets
-///    `InFlight` (nothing sealed yet) or `Sealed`. `Err` means no claim was
+/// Contract (the conformance every composition's sink must keep). Every
+/// method names its work by the typed [`ReviewClaimBinding`]; a sink derives
+/// everything it stores from the binding's scope and operation and refuses a
+/// sealed package whose own binding differs.
+/// 1. `claim` is an atomic, durable compare-and-set. Exactly one caller of a
+///    new binding receives [`ReviewClaim::Acquired`]; the claim survives
+///    restart. Any later or concurrent caller gets `InFlight` (nothing sealed
+///    yet), `Sealed`, `Terminal` or `Abandoned`. `Err` means no claim was
 ///    taken and the caller executes nothing.
 /// 2. `seal` durably stores the exact package under the claim BEFORE any
 ///    record is published. Re-sealing identical bytes is a no-op; sealing
-///    different bytes is refused. A sealed package is never replaced.
-/// 3. `publish` applies a sealed package completely and idempotently:
-///    each decision record and each event (by `event_keys`) is inserted
-///    once, an identical existing one counts as done, and a conflicting
-///    existing one is an error. It may be called again after any failure
-///    or restart, and returns `Ok` only when the whole package is
-///    published. It never replaces a stored record.
+///    different bytes, or bytes for another scope, is refused. A sealed
+///    package is never replaced.
+/// 3. `publish` applies the sealed package completely and idempotently:
+///    each decision record and each event (by its stable key) is inserted
+///    once with the claim settlement, an identical existing one counts as
+///    done, and a conflicting one (including a `proposal` that is not the
+///    sealed package) is an error with nothing written. It may be called
+///    again after any failure or restart, and returns `Ok` only when the
+///    whole package is published. It never replaces a stored record.
 pub trait ReviewRecordSink {
-    fn claim(&mut self, claim_key: &str) -> Result<ReviewClaim, String>;
-    fn seal(&mut self, claim_key: &str, sealed: &SealedReview) -> Result<(), String>;
-    fn publish(&mut self, claim_key: &str, proposal: &ReviewRecordProposal) -> Result<(), String>;
+    fn claim(&mut self, binding: &ReviewClaimBinding) -> Result<ReviewClaim, String>;
+    fn seal(&mut self, binding: &ReviewClaimBinding, sealed: &SealedReview) -> Result<(), String>;
+    fn publish(
+        &mut self,
+        binding: &ReviewClaimBinding,
+        proposal: &ReviewRecordProposal,
+    ) -> Result<(), String>;
 }

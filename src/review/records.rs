@@ -1,5 +1,6 @@
 //! Builds the immutable record proposals Review hands to the trusted core.
 
+use crate::claims::{ReviewClaimBinding, ReviewClaimScope, ReviewOperation};
 use crate::ports::ReviewRecordProposal;
 use receipts_state::{
     ActorKind, DecisionRecordKind, DecisionRecordV1, EventActor, EventPayloadReference,
@@ -14,13 +15,52 @@ use sha2::{Digest, Sha256};
 /// replay a package byte-for-byte (see `ReviewRecordProposal::to_journal`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub(crate) struct PackageSpec {
-    pub(crate) claim_key: String,
-    pub(crate) project_id: String,
-    pub(crate) task_id: String,
+    pub(crate) binding: BindingSpec,
     pub(crate) context_epoch: String,
     pub(crate) decisions: Vec<DecisionSpec>,
     pub(crate) events: Vec<EventSpec>,
     pub(crate) content: Vec<ContentSpec>,
+}
+
+/// Plain-data form of a [`ReviewClaimBinding`]: operation, typed scope and the
+/// key, which `replay` re-derives and refuses on any difference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub(crate) struct BindingSpec {
+    pub(crate) operation: String,
+    pub(crate) project_id: String,
+    pub(crate) task_id: String,
+    pub(crate) subject_sha: Option<String>,
+    pub(crate) request_sha256: String,
+    pub(crate) generation: u32,
+    pub(crate) key: String,
+}
+
+impl BindingSpec {
+    fn of(binding: &ReviewClaimBinding) -> Self {
+        let scope = binding.scope();
+        Self {
+            operation: binding.operation().as_str().to_owned(),
+            project_id: scope.project_id().to_owned(),
+            task_id: scope.task_id().to_owned(),
+            subject_sha: scope.subject_sha().map(str::to_owned),
+            request_sha256: scope.request_sha256().to_owned(),
+            generation: scope.generation(),
+            key: binding.key().to_owned(),
+        }
+    }
+
+    fn binding(&self) -> Result<ReviewClaimBinding, String> {
+        let operation = ReviewOperation::parse(&self.operation)
+            .ok_or_else(|| format!("journal names unknown operation {}", self.operation))?;
+        let scope = ReviewClaimScope::new(
+            &self.project_id,
+            &self.task_id,
+            self.subject_sha.as_deref(),
+            &self.request_sha256,
+            self.generation,
+        )?;
+        ReviewClaimBinding::from_parts(operation, scope, &self.key)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,37 +142,30 @@ pub(crate) fn derived_id(prefix: &str, parts: &[&str]) -> String {
 /// Accumulates one proposal; every event cites registered content.
 pub(crate) struct ProposalBuilder {
     proposal: ReviewRecordProposal,
-    task_id: String,
     epoch: StateEpochValueV1,
     spec: PackageSpec,
 }
 
 impl ProposalBuilder {
-    /// `claim_key` is the durable identity of this package: every event key
-    /// derives from it, so a replayed publication names the same events.
-    pub(crate) fn new(
-        project_id: &str,
-        task_id: &str,
-        context_epoch: &str,
-        claim_key: &str,
-    ) -> Result<Self, String> {
+    /// `binding` is the durable identity of this package: project and task come
+    /// from its scope, and every event key derives from its claim key, so a
+    /// replayed publication names the same events.
+    pub(crate) fn new(binding: &ReviewClaimBinding, context_epoch: &str) -> Result<Self, String> {
         let epoch = StateEpochValueV1::try_from(context_epoch)
             .map_err(|e| format!("context epoch is not a State epoch: {e}"))?;
         Ok(Self {
             proposal: ReviewRecordProposal {
-                project_id: project_id.to_owned(),
+                project_id: binding.scope().project_id().to_owned(),
                 decision_records: Vec::new(),
                 events: Vec::new(),
                 event_keys: Vec::new(),
                 content: Vec::new(),
+                binding: binding.clone(),
                 spec: PackageSpec::default(),
             },
-            task_id: task_id.to_owned(),
             epoch,
             spec: PackageSpec {
-                claim_key: claim_key.to_owned(),
-                project_id: project_id.to_owned(),
-                task_id: task_id.to_owned(),
+                binding: BindingSpec::of(binding),
                 context_epoch: context_epoch.to_owned(),
                 ..PackageSpec::default()
             },
@@ -141,12 +174,7 @@ impl ProposalBuilder {
 
     /// Rebuilds a package from its journal, through the same validators.
     pub(crate) fn replay(spec: &PackageSpec) -> Result<ReviewRecordProposal, String> {
-        let mut b = Self::new(
-            &spec.project_id,
-            &spec.task_id,
-            &spec.context_epoch,
-            &spec.claim_key,
-        )?;
+        let mut b = Self::new(&spec.binding.binding()?, &spec.context_epoch)?;
         for d in &spec.decisions {
             let kind = DECISION_KINDS
                 .into_iter()
@@ -238,7 +266,7 @@ impl ProposalBuilder {
         let key = derived_id(
             "revent",
             &[
-                &self.spec.claim_key,
+                &self.spec.binding.key,
                 &self.proposal.events.len().to_string(),
                 event_type.as_str(),
             ],
@@ -266,7 +294,7 @@ impl ProposalBuilder {
                 id: subject.1.to_owned(),
             },
             payload,
-            self.task_id.clone(),
+            self.spec.binding.task_id.clone(),
             self.epoch.clone(),
             None,
         )

@@ -22,12 +22,20 @@
 //! The `RepairRequest` is Review's output contract; building the
 //! Orchestration RepairCapsule from it is later composition (OR-W2-3).
 
+use crate::claims::{
+    ReviewClaimBinding, ReviewClaimScope, ReviewOperation, interruption_identity_json,
+    request_identity_json, request_sha256,
+};
+use crate::ports::ReviewRecordSink;
+use crate::record::{Recorded, record_proposal};
 use crate::records::{ProposalBuilder, derived_id};
+use crate::wire::{encode_a3_handoff, encode_a4_review};
 use crate::{
-    A3HandoffNonTemporalCore, A4ReviewFinding, A4ReviewFindingCategory, A4ReviewNonTemporalCore,
-    A4ReviewVerdict, DEFAULT_MAX_REPAIR_ATTEMPTS, DeterministicRepairCycleControlCore,
-    DistinctProviderPolicy, RepairCycleControlError, RepairCycleDisposition, ReviewRequest,
-    SafetyInterruption, is_assurance_profile_blocking_floor, ports::ReviewRecordProposal,
+    A3HandoffNonTemporalCore, A4Review, A4ReviewFinding, A4ReviewFindingCategory,
+    A4ReviewNonTemporalCore, A4ReviewVerdict, DEFAULT_MAX_REPAIR_ATTEMPTS,
+    DeterministicRepairCycleControlCore, DistinctProviderPolicy, RepairCycleControlError,
+    RepairCycleDisposition, ReviewRequest, SafetyInterruption, is_assurance_profile_blocking_floor,
+    ports::ReviewRecordProposal,
 };
 use receipts_state::{EventType, SubjectKind};
 use receipts_workspace_execution::CommitSha;
@@ -132,12 +140,28 @@ pub struct RepairInput<'a> {
     pub completed_repair_attempts: usize,
     /// A safety interruption for the current attempt, if any.
     pub interruption: Option<&'a SafetyInterruption>,
+    /// Claim generation, supplied by the trusted composition (at least 1).
+    pub generation: u32,
 }
 
 #[derive(Debug, Clone)]
 pub struct RepairOutcome {
     pub decision: RepairDecision,
     pub proposal: Result<ReviewRecordProposal, String>,
+}
+
+impl RepairOutcome {
+    /// Records the decision durably through the sink: claim, seal, publish.
+    /// `NotRequired` holds nothing to record and claims nothing.
+    pub fn record(&self, sink: &mut dyn ReviewRecordSink) -> Result<Recorded, String> {
+        let label = match &self.decision {
+            RepairDecision::NotRequired => return Ok(Recorded::NothingToRecord),
+            RepairDecision::Issue(_) => "REPAIR_ISSUED",
+            RepairDecision::HumanRequired { .. } => "REPAIR_ESCALATED",
+        };
+        let proposal = self.proposal.as_ref().map_err(Clone::clone)?;
+        record_proposal(sink, proposal, label)
+    }
 }
 
 fn rank(f: &A4ReviewFinding) -> u8 {
@@ -370,32 +394,44 @@ pub fn repair_request_json(r: &RepairRequest) -> String {
     .to_string()
 }
 
-/// Durable identity of one repair decision (idempotent publication).
-pub fn repair_claim_key(input: &RepairInput<'_>) -> String {
+/// Durable identity of one repair decision: project, task, the last
+/// reviewed SHA, the digest of every input that shapes the decision (the
+/// request without `requested_at`, each retained review and handoff, the
+/// completed repair count and any interruption, deterministically encoded)
+/// and the trusted composition's generation.
+pub fn repair_claim_binding(input: &RepairInput<'_>) -> Result<ReviewClaimBinding, String> {
     let core = input.request.core();
-    let last = input
-        .reviews
-        .last()
-        .map(|r| r.review_id())
-        .unwrap_or_default();
-    derived_id(
-        "repair-claim",
-        &[
-            input.project_id,
-            core.task_id(),
-            last,
-            &input.completed_repair_attempts.to_string(),
-        ],
-    )
+    let mut parts = vec![
+        request_identity_json(input.request),
+        input.completed_repair_attempts.to_string(),
+        input
+            .interruption
+            .map_or_else(String::new, interruption_identity_json),
+        input.reviews.len().to_string(),
+    ];
+    parts.extend(
+        input
+            .reviews
+            .iter()
+            .map(|r| encode_a4_review(&A4Review::new(r.clone(), None))),
+    );
+    parts.extend(input.handoffs.iter().map(encode_a3_handoff));
+    let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+    let scope = ReviewClaimScope::new(
+        input.project_id,
+        core.task_id(),
+        input.reviews.last().map(|r| r.reviewed_sha()),
+        &request_sha256(ReviewOperation::Repair, &parts),
+        input.generation,
+    )?;
+    Ok(ReviewClaimBinding::new(ReviewOperation::Repair, scope))
 }
 
 fn records(input: &RepairInput<'_>, d: &RepairDecision) -> Result<ReviewRecordProposal, String> {
     let core = input.request.core();
     let mut b = ProposalBuilder::new(
-        input.project_id,
-        core.task_id(),
+        &repair_claim_binding(input)?,
         core.context_epoch().decimal_digits(),
-        &repair_claim_key(input),
     )?;
     let task = (SubjectKind::Task, core.task_id());
     match d {

@@ -139,6 +139,7 @@ fn decide(
         reviews: &reviews,
         completed_repair_attempts: n_rejections - 1,
         interruption,
+        generation: 1,
     })
 }
 
@@ -178,7 +179,8 @@ fn bounded_repair_terminates_with_ladder() {
             handoffs: &handoffs,
             reviews: &reviews,
             completed_repair_attempts: 4,
-            interruption: None
+            interruption: None,
+            generation: 1,
         })
         .err(),
         Some(RepairCycleControlError::RepairAttemptBoundExceeded)
@@ -398,6 +400,7 @@ fn decide_with(profile: AssuranceProfile, reviews: Vec<A4ReviewNonTemporalCore>)
         reviews: &reviews,
         completed_repair_attempts: n - 1,
         interruption: None,
+        generation: 1,
     })
     .unwrap()
 }
@@ -562,4 +565,38 @@ fn bound_exhaustion_emits_the_a2_escalation_before_human_required() {
     assert_eq!(p.event_keys.len(), 3);
     let distinct: std::collections::BTreeSet<_> = p.event_keys.iter().collect();
     assert_eq!(distinct.len(), 3);
+}
+
+// ---- Recording through the sink contract.
+
+#[test]
+fn repair_decisions_publish_once_through_the_sink_and_cover_every_input() {
+    use crate::record::Recorded;
+    use crate::test_repo::MemorySink;
+    let issued = decide(2, A4ReviewVerdict::Reject, None).unwrap();
+    let mut sink = MemorySink::default();
+    assert_eq!(issued.record(&mut sink), Ok(Recorded::Published));
+    assert_eq!(issued.record(&mut sink), Ok(Recorded::Published));
+    assert_eq!(sink.proposals.len(), 1);
+    let binding = issued.proposal.as_ref().unwrap().binding().clone();
+    assert_eq!(binding.operation(), crate::ReviewOperation::Repair);
+    assert_eq!(binding.scope().task_id(), "task-1");
+    assert_eq!(binding.scope().generation(), 1);
+    // Another review history is another scope; so is the completed count.
+    let more = decide(3, A4ReviewVerdict::Reject, None).unwrap();
+    assert_ne!(more.proposal.as_ref().unwrap().claim_key(), binding.key());
+    // The bound-exhausted escalation records too (a distinct outcome label).
+    let escalated = decide(4, A4ReviewVerdict::Reject, None).unwrap();
+    assert!(matches!(
+        escalated.decision,
+        RepairDecision::HumanRequired { .. }
+    ));
+    assert_eq!(escalated.record(&mut sink), Ok(Recorded::Published));
+    assert_eq!(sink.claims.len(), 2);
+    // No repair needed: nothing to claim or publish.
+    let none = decide(1, A4ReviewVerdict::Pass, None).unwrap();
+    assert!(matches!(none.decision, RepairDecision::NotRequired));
+    let mut empty = MemorySink::default();
+    assert_eq!(none.record(&mut empty), Ok(Recorded::NothingToRecord));
+    assert!(empty.claims.is_empty());
 }
