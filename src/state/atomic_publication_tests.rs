@@ -1051,12 +1051,12 @@ fn v20_store_migrates_to_v21_and_a_failed_step_leaves_exact_v20() {
     conn.execute_batch("DROP TRIGGER fail21").unwrap();
     drop(conn);
     let (store, version) = TrustedCoreStore::migrate_exclusive(dir.db()).unwrap();
-    assert_eq!(version, 22);
-    assert_eq!(store.reader().schema_version().unwrap(), 22);
+    assert_eq!(version, 23);
+    assert_eq!(store.reader().schema_version().unwrap(), 23);
     drop(store);
     // Idempotent on a current store.
     let (store, version) = TrustedCoreStore::migrate_exclusive(dir.db()).unwrap();
-    assert_eq!(version, 22);
+    assert_eq!(version, 23);
     drop(store);
     // A removed v21 guard is detected as corruption on open.
     let conn = Connection::open(dir.db()).unwrap();
@@ -1083,4 +1083,73 @@ fn publication_tables_reject_direct_updates_deletes_and_replacements() {
     }
     assert_eq!(rows(&store, "atomic_publication"), 1);
     assert_eq!(rows(&store, "atomic_publication_availability"), 2);
+}
+
+#[test]
+fn repair_graph_replay_binds_complete_attachment_set() {
+    let (dir, mut store) = graph_store("repair-membership");
+    publish_graph(&mut store, &G1, &publication("m2", "attach", "PASS")).unwrap();
+    drop(store);
+    let mut store = TrustedCoreStore::open_exclusive(dir.db()).unwrap();
+    assert_eq!(
+        publish_graph(&mut store, &T1, &publication("m2", "attach", "PASS")).unwrap(),
+        GraphPublicationOutcomeV1::Replayed
+    );
+    for refs in [vec![], vec!["r1"], vec!["r1", "r2", "r3"]] {
+        let p = GraphMutationPublicationV1::new(
+            refs.iter()
+                .map(|r| {
+                    GraphResultAttachmentV1::new(
+                        "1",
+                        r,
+                        result_json(if *r == "r1" { "PASS" } else { "FAIL" }),
+                    )
+                    .unwrap()
+                })
+                .collect(),
+            StateGraphMutationV1::parse_json(&mutation_json("m2", "1", "2", "attach")).unwrap(),
+            StateGraphSnapshotV1::new("2".into(), "1".into(), content(Some("r1"))).unwrap(),
+        )
+        .unwrap();
+        let before = fingerprint(&store);
+        assert_eq!(
+            publication_code(publish_graph(&mut store, &T1, &p).unwrap_err()),
+            PCode::ConflictingRetry
+        );
+        assert_eq!(before, fingerprint(&store));
+    }
+}
+
+#[test]
+fn repair_v22_upgrade_keeps_legacy_membership_unknown_and_guards_identity() {
+    let (dir, mut store) = graph_store("repair-upgrade");
+    publish_graph(&mut store, &G1, &publication("m2", "attach", "PASS")).unwrap();
+    drop(store);
+    let conn = Connection::open(dir.db()).unwrap();
+    conn.execute_batch(
+        "DROP TABLE graph_publication_identity; DELETE FROM state_schema_version WHERE version=23;",
+    )
+    .unwrap();
+    crate::graph_repository::verify_v22(&conn, crate::GraphPhase::Read).unwrap();
+    conn.execute_batch("CREATE TRIGGER fail23 BEFORE INSERT ON state_schema_version WHEN NEW.version=23 BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+    assert!(TrustedCoreStore::migrate_exclusive(dir.db()).is_err());
+    crate::graph_repository::verify_v22(&conn, crate::GraphPhase::Read).unwrap();
+    conn.execute_batch("DROP TRIGGER fail23").unwrap();
+    drop(conn);
+    let (mut store, version) = TrustedCoreStore::migrate_exclusive(dir.db()).unwrap();
+    assert_eq!(version, 23);
+    let before = fingerprint(&store);
+    assert_eq!(
+        publication_code(
+            publish_graph(&mut store, &T1, &publication("m2", "attach", "PASS")).unwrap_err()
+        ),
+        PCode::ConflictingRetry
+    );
+    assert_eq!(before, fingerprint(&store));
+    drop(store);
+    let conn = Connection::open(dir.db()).unwrap();
+    conn.execute_batch("DROP TRIGGER graph_publication_identity_no_update")
+        .unwrap();
+    drop(conn);
+    assert!(TrustedCoreStore::open_exclusive(dir.db()).is_err());
 }

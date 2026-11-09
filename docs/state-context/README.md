@@ -197,7 +197,7 @@ Concurrency model: `rehydrate_context` reads sources outside any transaction and
 
 ## Shared atomic publication and review claims (schema v21)
 
-Migration 21 (`publication_claims`) adds `atomic_publication`, `atomic_publication_availability` and `review_claim`, all `WITHOUT ROWID` with immutability and no-replace triggers like v20. It verifies the exact v20 store before and the v21 store after. Migrations 1–20 SQL is unchanged; v20's own apply now verifies exact v20 (not "current"), and `verify_current` checks the v21 objects too. `migrate_exclusive` upgrades any exact v11–v21 store to the current head (v22) in resumable steps (a failed v21 step leaves the exact v20 store; v21's own apply now verifies exact v21). Every operation below is a typed `TrustedCoreStore` method that consumes one admission. There is no public SQL, transaction closure or generic batch.
+Migration 21 (`publication_claims`) adds `atomic_publication`, `atomic_publication_availability` and `review_claim`, all `WITHOUT ROWID` with immutability and no-replace triggers like v20. It verifies the exact v20 store before and the v21 store after. Migrations 1–20 SQL is unchanged; v20's own apply now verifies exact v20 (not "current"), and `verify_current` checks the v21 objects too. `migrate_exclusive` upgrades any exact v11–v21 store to the current head (v23) in resumable steps (a failed v21 step leaves the exact v20 store; v21's own apply now verifies exact v21). Every operation below is a typed `TrustedCoreStore` method that consumes one admission. There is no public SQL, transaction closure or generic batch.
 
 ### Graph mutation with its results (`GraphMutation` family)
 
@@ -301,3 +301,9 @@ if let Some(seal) = store.reader().find_review_seal(project, claim_id)? {
 - Routing, Registry, Availability and Review sinks should hand the Core one package per outcome instead of record-then-events, and Review should claim before routing. Event ids must be minted before the package is built; they are part of its digest.
 - Provenance links are not part of a package; they stay separate immutable writes.
 - Old stores may already hold records without their events (written by the one-write-per-transaction path). This change prevents new ones and does not repair existing ones.
+
+### Repair: evidence and graph replay identity (schema v23)
+
+Continuation checks every success receipt against its immutable manifest: complete ordered source coverage, type/class/expected digest and project/target identity, matching observed digest and a valid reread disposition. Mandatory sources require REREAD; an untouched CONSUMED source may be UNCHANGED and an undemanded REFERENCE may be DEFERRED. Contradictory success evidence counts as a failure for the existing State sequence/fence decision, including upgraded history. A fresh valid reread can recover; CHANGED remains sticky until succession. Startup uses the same decision.
+
+Migration 23 adds immutable `graph_publication_identity`, recording a digest of the complete attachment set (reference, version and canonical result bytes) in the graph publication transaction. Attachment order is immaterial. Replay requires this identity plus the original mutation/snapshot/result checks. Graph v1 digests are unchanged. Historical mutations without this identity refuse retry with ConflictingRetry: membership cannot be reconstructed from unrelated result rows. The migration leaves historical records untouched and creates no inferred identities.

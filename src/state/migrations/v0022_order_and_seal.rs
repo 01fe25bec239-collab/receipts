@@ -81,7 +81,7 @@ pub(crate) fn apply(conn: &Connection) -> Result<(), StateError> {
         graph::verify_v21(conn, phase)?;
         conn.execute_batch(SQL)
             .map_err(|e| graph::sqlite_error(phase, e))?;
-        graph::verify_current(conn, phase)
+        graph::verify_v22(conn, phase)
     })
 }
 

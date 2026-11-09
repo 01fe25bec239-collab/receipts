@@ -174,7 +174,7 @@ fn check_values(sql: &str, column: &str) -> Vec<String> {
 fn t01_fresh_database_bootstraps_to_schema_version_7() {
     let tmp = TempDir::new("ev-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 22);
+    assert_eq!(repo.schema_version().expect("version read"), 23);
     assert!(
         repo.table_exists("event").expect("table check"),
         "event must exist after migration 4"
@@ -182,7 +182,7 @@ fn t01_fresh_database_bootstraps_to_schema_version_7() {
     // Exactly one metadata row per applied migration.
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        22
+        23
     );
 }
 
@@ -192,10 +192,10 @@ fn t02_version_7_database_reopens() {
     let tmp = TempDir::new("ev-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 22);
+        assert_eq!(repo.schema_version().expect("version read"), 23);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            22,
+            23,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -218,7 +218,7 @@ fn t03_ordinary_open_of_version_3_database_fails() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 3,
-                supported: 22
+                supported: 23
             }
         ),
         "unexpected error: {error}"
@@ -584,7 +584,7 @@ fn t21_malformed_ulid_rejected_before_persistence() {
 fn t22_event_id_persists_byte_for_byte() {
     let tmp = TempDir::new("ev-t22");
     let mut repo = SqliteStateRepository::open(tmp.db_path()).expect("bootstrap");
-    let supplied = ulid_for(22);
+    let supplied = ulid_for(23);
     repo.append_event(minimal_event(&supplied)).expect("append");
     let found = repo.find_event(&supplied).expect("find").expect("present");
     assert_eq!(found.event_id, supplied);
@@ -1046,6 +1046,7 @@ fn t47_migration4_creates_only_event_schema() {
         "review_claim",
         "context_rehydration_order",
         "review_claim_seal",
+        "graph_publication_identity",
     ];
     expected.sort_unstable();
     assert_eq!(

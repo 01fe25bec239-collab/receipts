@@ -650,7 +650,21 @@ fn clearance(
     if invalidated_after(conn, role)? {
         return Ok(Err(R::ContextInvalidated));
     }
-    let attempts = scope_attempts(conn, role, manifest_id, binding_id)?;
+    let mut attempts = scope_attempts(conn, role, manifest_id, binding_id)?;
+    let Some(manifest) = read_context_manifest(conn, manifest_id)? else {
+        return Ok(Err(R::DurableInconsistency));
+    };
+    for attempt in &mut attempts {
+        if !attempt.failed && !attempt.changed {
+            attempt.failed = match read_attempt(conn, &role.project_id, &attempt.attempt_id) {
+                Ok(Some(evidence)) => {
+                    !crate::context_rehydration::supports_continuation(&evidence, &manifest)
+                }
+                Ok(None) | Err(StateError::ContextRehydrationDecodeFailed { .. }) => true,
+                Err(error) => return Err(error),
+            };
+        }
+    }
     // An attempt with no State-assigned order cannot be placed against the
     // others: fail closed rather than guess.
     if attempts.iter().any(|a| a.order.is_none()) {

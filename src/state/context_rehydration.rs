@@ -1091,7 +1091,7 @@ impl UnitOfWork<'_> {
     /// `fence` is the project's rehydration high-water mark taken before the
     /// attempt began reading (`None`: nothing was read, so the fence is the
     /// mark at insertion).
-    fn insert_context_rehydration_attempt(
+    pub(crate) fn insert_context_rehydration_attempt(
         &self,
         attempt: &ContextRehydrationAttempt,
         fence: Option<i64>,
@@ -1756,6 +1756,63 @@ fn attempt_from_request(
         source_evidence,
         failure_code,
     }
+}
+
+/// Validate the evidence that can authorize continuation, including legacy receipts.
+pub(crate) fn supports_continuation(a: &ContextRehydrationAttempt, m: &ContextManifest) -> bool {
+    a.status == ContextRehydrationStatus::Succeeded
+        && a.project_id == m.project_id
+        && a.durable_role_id == m.role_id
+        && a.context_manifest_id == m.manifest_id
+        && a.context_epoch_id == m.epoch
+        && a.source_evidence.len() == m.sources.len()
+        && a.source_evidence
+            .iter()
+            .zip(&m.sources)
+            .enumerate()
+            .all(|(ordinal, (e, source))| {
+                let Ok(identity) =
+                    serde_json::from_str::<serde_json::Value>(&e.canonical_source_identity)
+                else {
+                    return false;
+                };
+                let target_key = match source.r#ref.ref_type {
+                    ContextSourceRefType::RepoPath => "logical_relative_path",
+                    ContextSourceRefType::ArtifactId => "artifact_id",
+                    ContextSourceRefType::StateQuery => "query_id",
+                };
+                if identity.get("project_id").and_then(|v| v.as_str())
+                    != Some(a.project_id.as_str())
+                    || identity.get(target_key).and_then(|v| v.as_str())
+                        != Some(source.r#ref.target.as_str())
+                {
+                    return false;
+                }
+                if e.source_ordinal != ordinal
+                    || e.ref_type != source.r#ref.ref_type.as_str()
+                    || e.source_class != source.source_class.as_str()
+                    || e.expected_digest != source.digest
+                    || e.failure_code.is_some()
+                    || e.failure_detail.is_some()
+                {
+                    return false;
+                }
+                if source.source_class == SourceClass::Reference
+                    && e.disposition == SourceDisposition::Deferred
+                {
+                    return e.comparison == SourceDigestComparison::NotChecked
+                        && e.observed_digest.is_none();
+                }
+                e.comparison == SourceDigestComparison::Matched
+                    && e.observed_digest.as_deref() == Some(source.digest.as_str())
+                    && (e.disposition == SourceDisposition::Reread
+                        || (source.source_class == SourceClass::Consumed
+                            && e.disposition == SourceDisposition::Unchanged
+                            && e.touch_evidence.is_none()))
+                    && e.materializer_id.as_ref().is_some_and(|v| !v.is_empty())
+                    && e.provenance.as_ref().is_some_and(|v| !v.is_empty())
+                    && e.materialized_at.as_ref().is_some_and(|v| !v.is_empty())
+            })
 }
 
 fn validate_attempt(attempt: &ContextRehydrationAttempt) -> Result<(), StateError> {

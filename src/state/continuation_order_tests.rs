@@ -512,7 +512,7 @@ fn upgraded_history_is_ambiguous_only_when_a_failure_sits_beside_a_success() {
         drop(conn);
         assert_eq!(
             SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).unwrap(),
-            22
+            23
         );
         SqliteStateRepository::open(tmp.db_path()).unwrap()
     };
@@ -585,11 +585,11 @@ fn v21_store_migrates_to_v22_and_a_failed_step_leaves_exact_v21() {
     drop(conn);
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).unwrap(),
-        22
+        23
     );
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).unwrap(),
-        22,
+        23,
         "idempotent on a current store"
     );
     let conn = rusqlite::Connection::open(tmp.db_path()).unwrap();
@@ -597,4 +597,97 @@ fn v21_store_migrates_to_v22_and_a_failed_step_leaves_exact_v21() {
         .unwrap();
     drop(conn);
     assert!(SqliteStateRepository::open(tmp.db_path()).is_err());
+}
+
+#[test]
+fn repair_success_evidence_must_match_manifest() {
+    for defect in 0..10 {
+        let (tmp, mut repo) = seeded_a2("repair-evidence");
+        let (_template, mut other) = seeded_a2("repair-template");
+        let mut attempt = good(&mut other, "original", "manifest-role-1", 0, "b1");
+        attempt.rehydration_attempt_id = "contradiction".into();
+        let e = &mut attempt.source_evidence[0];
+        match defect {
+            0 => {
+                e.comparison = SourceDigestComparison::Failed;
+                e.disposition = crate::SourceDisposition::Failed;
+                e.failure_code = Some("ARTIFACT_UNREADABLE".into());
+                e.observed_digest = None;
+            }
+            1 => e.expected_digest = digest_of("artifact-arch", b"wrong"),
+            2 => e.source_class = "REFERENCE".into(),
+            3 => e.disposition = crate::SourceDisposition::Unchanged,
+            4 => e.source_ordinal = 1,
+            5 => e.observed_digest = None,
+            6 => {
+                e.canonical_source_identity =
+                    r#"{"project_id":"wrong","artifact_id":"artifact-arch"}"#.into()
+            }
+            7 => e.ref_type = "REPO_PATH".into(),
+            9 => {}
+            _ => {
+                let mut extra = e.clone();
+                extra.source_id = "extra".into();
+                extra.source_ordinal = 1;
+                attempt.source_evidence.push(extra);
+            }
+        }
+        repo.run_transaction(|u| u.insert_context_rehydration_attempt(&attempt, None))
+            .unwrap();
+        drop(repo);
+        let conn = rusqlite::Connection::open(tmp.db_path()).unwrap();
+        if defect == 9 {
+            let triggers: Vec<(String,String)> = conn.prepare("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name='context_rehydration_source_evidence'").unwrap().query_map([], |r| Ok((r.get(0)?,r.get(1)?))).unwrap().map(Result::unwrap).collect();
+            for (name, _) in &triggers {
+                conn.execute_batch(&format!("DROP TRIGGER {name}")).unwrap();
+            }
+            conn.execute_batch("DELETE FROM context_rehydration_source_evidence")
+                .unwrap();
+            for (_, sql) in triggers {
+                conn.execute_batch(&sql).unwrap();
+            }
+        }
+        crate::decision_records_tests::remove_v22(&conn);
+        drop(conn);
+        SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).unwrap();
+        let mut repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
+        assert!(clear(&repo).is_err(), "defect {defect}");
+        good(&mut repo, "fresh", "manifest-role-1", 0, "b1");
+        assert!(clear(&repo).is_ok(), "fresh recovery {defect}");
+    }
+}
+
+#[test]
+fn repair_optional_source_dispositions_and_missing_evidence() {
+    let (_tmp, mut repo) = seeded_a2("repair-optional");
+    let mut attempt = good(&mut repo, "good", "manifest-role-1", 0, "b1");
+    let mut manifest = repo
+        .find_context_manifest("manifest-role-1")
+        .unwrap()
+        .unwrap();
+    assert!(crate::context_rehydration::supports_continuation(
+        &attempt, &manifest
+    ));
+    manifest.sources[0].source_class = crate::SourceClass::Consumed;
+    attempt.source_evidence[0].source_class = "CONSUMED".into();
+    attempt.source_evidence[0].disposition = crate::SourceDisposition::Unchanged;
+    assert!(crate::context_rehydration::supports_continuation(
+        &attempt, &manifest
+    ));
+    manifest.sources[0].source_class = crate::SourceClass::Reference;
+    let e = &mut attempt.source_evidence[0];
+    e.source_class = "REFERENCE".into();
+    e.disposition = crate::SourceDisposition::Deferred;
+    e.comparison = SourceDigestComparison::NotChecked;
+    e.observed_digest = None;
+    e.materializer_id = None;
+    e.provenance = None;
+    e.materialized_at = None;
+    assert!(crate::context_rehydration::supports_continuation(
+        &attempt, &manifest
+    ));
+    attempt.source_evidence.clear();
+    assert!(!crate::context_rehydration::supports_continuation(
+        &attempt, &manifest
+    ));
 }

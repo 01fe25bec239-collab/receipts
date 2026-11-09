@@ -160,6 +160,18 @@ impl GraphMutationPublicationV1 {
     }
 }
 
+fn attachment_digest(p: &GraphMutationPublicationV1) -> Result<String, StateError> {
+    let mut rows: Vec<_> = p
+        .results
+        .iter()
+        .map(|r| (&r.reference, &r.version, &r.raw))
+        .collect();
+    rows.sort();
+    let bytes =
+        serde_json_canonicalizer::to_vec(&rows).map_err(|_| fail(Code::InvalidShape, GRAPH))?;
+    Ok(hex(&Sha256::digest(bytes)))
+}
+
 /// What a graph publication did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GraphPublicationOutcomeV1 {
@@ -192,7 +204,13 @@ fn graph_replay(conn: &Connection, p: &GraphMutationPublicationV1) -> Result<boo
         )
         .optional()
         .map_err(|e| graph::sqlite_error(Phase::Write, e))?;
-    let mut exact = json == p.raw_mutation
+    // Legacy mutations have no membership evidence; never infer it from result rows.
+    let attachments: Option<String> = conn.query_row(
+        "SELECT attachments_sha256 FROM graph_publication_identity WHERE project_id=?1 AND graph_id=?2 AND mutation_id=?3",
+        params![p.project_id(),p.graph_id(),p.mutation.mutation_id()], |r| r.get(0)
+    ).optional().map_err(|e| graph::sqlite_error(Phase::Write,e))?;
+    let mut exact = attachments.as_deref() == Some(attachment_digest(p)?.as_str())
+        && json == p.raw_mutation
         && version == p.snapshot.graph_version()
         && digest.as_deref() == Some(content.resulting_digest());
     for attached in &p.results {
@@ -255,6 +273,17 @@ impl SqliteStateRepository {
                 &sample,
                 &time,
             )?;
+            conn.execute(
+                "INSERT INTO graph_publication_identity VALUES (?1,?2,?3,?4)",
+                params![
+                    p.project_id(),
+                    p.graph_id(),
+                    p.mutation.mutation_id(),
+                    attachment_digest(p)?
+                ],
+            )
+            .map_err(|e| graph::sqlite_error(Phase::Write, e))?;
+            crate::write_fault::boundary()?;
             Ok(GraphPublicationOutcomeV1::Applied)
         })
     }
