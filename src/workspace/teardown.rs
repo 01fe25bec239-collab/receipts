@@ -55,6 +55,9 @@ use crate::error::WorkspaceError;
 use crate::git;
 use crate::handle::{CommitSha, WorkspaceHandle, WorkspaceState};
 
+/// Caller ownership proof over the canonical root and worktree.
+pub(crate) type OwnershipProof<'a> = dyn Fn(&Path, &Path) -> Result<(), WorkspaceError> + 'a;
+
 /// A request to tear down one provisioned local task worktree.
 ///
 /// The only caller-supplied input is the local repository root whose
@@ -105,7 +108,27 @@ impl WorkspaceTeardownRequest {
             None => return Err(WorkspaceError::TeardownHeadEvidenceMissing),
         };
 
-        self.teardown_verified_head(handle, &expected_head)
+        self.teardown_verified_head(handle, &expected_head, None)
+    }
+
+    /// [`Self::teardown`] with an extra ownership proof evaluated against the
+    /// canonical root and worktree immediately before removal, after every
+    /// identity, HEAD, configuration and cleanliness check passed. A refusal
+    /// leaves everything in place.
+    pub(crate) fn teardown_owned(
+        &self,
+        handle: &WorkspaceHandle,
+        owned: &OwnershipProof<'_>,
+    ) -> Result<WorkspaceHandle, WorkspaceError> {
+        if !handle.state().may_transition_to(WorkspaceState::TornDown) {
+            return Err(WorkspaceError::TeardownUnsupportedState {
+                state: handle.state().as_str(),
+            });
+        }
+        let Some(expected_head) = handle.head_sha() else {
+            return Err(WorkspaceError::TeardownHeadEvidenceMissing);
+        };
+        self.teardown_verified_head(handle, expected_head, Some(owned))
     }
 
     /// Removes a finalized worktree using only the evidence's handle and final SHA.
@@ -125,13 +148,14 @@ impl WorkspaceTeardownRequest {
                 state: handle.state().as_str(),
             });
         }
-        self.teardown_verified_head(handle, evidence.final_sha())
+        self.teardown_verified_head(handle, evidence.final_sha(), None)
     }
 
     fn teardown_verified_head(
         &self,
         handle: &WorkspaceHandle,
         expected_head: &CommitSha,
+        owned: Option<&OwnershipProof<'_>>,
     ) -> Result<WorkspaceHandle, WorkspaceError> {
         // Step 2: resolve the requested repository root to its canonical
         // (realpath) location before any Git command runs, so registration
@@ -261,6 +285,10 @@ impl WorkspaceTeardownRequest {
             return Err(WorkspaceError::TeardownWorktreeDirty {
                 status: status.stdout.trim().to_string(),
             });
+        }
+
+        if let Some(owned) = owned {
+            owned(root, &canonical_worktree)?;
         }
 
         // Step 8: perform the registered-worktree removal through the

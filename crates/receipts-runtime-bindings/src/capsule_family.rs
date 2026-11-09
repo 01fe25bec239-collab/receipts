@@ -5,5 +5,5 @@ pub enum RuntimeCapsuleFamily {
     /// Current canonical in-process non-temporal Review representation only.
     /// This does not close `started_at`, `finished_at`, `test_results`, full
     /// temporal semantics, or the complete wire/serialization representation.
-    Review(receipts_review_integration::ReviewCapsuleNonTemporalCore),
+    Review(receipts_review_contracts::ReviewCapsuleNonTemporalCore),
 }

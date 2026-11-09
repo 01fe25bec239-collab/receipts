@@ -9,7 +9,11 @@ use crate::{
     HostCapabilityReportSelectionCompositionOutcome, HostCapabilityStaleReason,
     compose_host_capability_report_selection,
     host_capability_observation::{
-        HostCapabilityObservation, HostCapabilityObservationRequest, observe_host_capabilities,
+        HostCapabilityObservation, HostCapabilityObservationRequest,
+        observe_host_capabilities_with_fingerprint,
+    },
+    host_probe_port::{
+        HostCapabilityCacheEntryV1, HostObservationFingerprintV1, HostProbeProcessPort,
     },
 };
 
@@ -65,6 +69,12 @@ pub struct HostCapabilityReportRefreshOutcome {
         HostCapabilityReportSelectionCompositionOutcome,
         HostCapabilityReportSelectionCompositionError,
     >,
+    /// Digest-only fingerprint of this observation, for diagnostics. It
+    /// authorizes nothing on its own; `None` for injected test observers.
+    pub fingerprint: Option<HostObservationFingerprintV1>,
+    /// Minted here only when the fingerprint is complete and a report was
+    /// selected from this same observation and mode override.
+    pub cache_entry: Option<HostCapabilityCacheEntryV1>,
 }
 
 /// Performs the integrated observation on EVERY call, then delegates adaptation
@@ -75,8 +85,26 @@ pub struct HostCapabilityReportRefreshOutcome {
 /// ```
 pub fn refresh_host_capability_report(
     request: &HostCapabilityReportRefreshRequest,
+    port: &dyn HostProbeProcessPort,
 ) -> HostCapabilityReportRefreshOutcome {
-    refresh_with_observer(request, observe_host_capabilities)
+    let (observation, fingerprint) =
+        observe_host_capabilities_with_fingerprint(&request.observation, port);
+    let outcome = refresh_with_observer(request, |_| observation);
+    let cache_entry = match &outcome.report_selection {
+        Ok(HostCapabilityReportSelectionCompositionOutcome::Selected { report }) => {
+            HostCapabilityCacheEntryV1::mint(
+                fingerprint.clone(),
+                request.mode_override.clone(),
+                (**report).clone(),
+            )
+        }
+        _ => None,
+    };
+    HostCapabilityReportRefreshOutcome {
+        fingerprint: Some(fingerprint),
+        cache_entry,
+        ..outcome
+    }
 }
 
 fn refresh_with_observer(
@@ -93,6 +121,8 @@ fn refresh_with_observer(
     HostCapabilityReportRefreshOutcome {
         observation,
         report_selection,
+        fingerprint: None,
+        cache_entry: None,
     }
 }
 

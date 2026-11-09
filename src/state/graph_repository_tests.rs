@@ -63,7 +63,7 @@ fn node(graph: &str, id: &str) -> StateGraphNodeV1 {
     )
     .unwrap()
 }
-fn request(project: &str, graph: &str) -> StateGraphGenesisV1 {
+pub(crate) fn request(project: &str, graph: &str) -> StateGraphGenesisV1 {
     let provenance = StateGraphGenesisProvenanceV1::new(
         GraphCompilerRefV1::parse("compiler:01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
         GraphSourceEvidenceRefV1::parse("evidence:01ARZ3NDEKTSV4RRFFQ69G5FAW").unwrap(),
@@ -152,11 +152,11 @@ fn explicit_migration_and_missing_store() {
     drop(repo);
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
-        19
+        20
     );
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
-        19
+        20
     );
     assert!(
         ReadOnlyGraphReader::open_existing(&db.0)
@@ -419,7 +419,7 @@ fn v11_graph_maintenance_preserves_typed_busy_and_durable_state() {
         drop(blocker);
         assert_eq!(
             SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
-            19
+            20
         );
     }
 }
@@ -634,9 +634,9 @@ fn stale_v11_graph_step_refuses_valid_advanced_store_without_rebuild() {
             );
             assert_eq!(
                 SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
-                19
+                20
             );
-            assert_eq!(migration_ledger(&db.0).len(), 19);
+            assert_eq!(migration_ledger(&db.0).len(), 20);
             drop(SqliteStateRepository::open(&db.0).unwrap());
         }
     }
@@ -727,7 +727,7 @@ fn simultaneous_public_v11_maintenance_keeps_one_exact_ledger() {
     barrier.wait();
     for result in handles.into_iter().map(|handle| handle.join().unwrap()) {
         match result {
-            Ok(19) => (),
+            Ok(20) => (),
             Err(StateError::GraphPersistence {
                 phase: Phase::Migration,
                 code: Code::StoreBusy | Code::UnsupportedSchema | Code::CorruptStore,
@@ -738,7 +738,7 @@ fn simultaneous_public_v11_maintenance_keeps_one_exact_ledger() {
     }
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
-        19
+        20
     );
     let expected: Vec<_> = crate::migrations::registered()
         .iter()
@@ -789,7 +789,7 @@ fn graph_v11_commit_busy_rolls_back_and_restores_foreign_keys() {
     reader.execute_batch("ROLLBACK").unwrap();
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
-        19
+        20
     );
 }
 

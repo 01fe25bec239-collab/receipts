@@ -17,6 +17,7 @@
 
 pub mod attempt;
 pub mod authority;
+pub mod availability_facts;
 pub mod canonical_timestamp;
 pub mod context_epoch;
 pub mod context_manifest;
@@ -27,6 +28,7 @@ pub mod entitlement;
 pub mod epoch_value;
 pub mod error;
 pub mod event;
+pub mod event_proposal;
 pub mod executor_binding;
 pub mod executor_binding_lease_expiry;
 pub mod graph_history;
@@ -41,6 +43,7 @@ pub mod logical_role;
 pub mod logical_role_lifecycle;
 pub mod repository;
 pub mod startup_recovery;
+pub mod trusted_core;
 pub mod trusted_time;
 pub mod wire;
 
@@ -128,6 +131,9 @@ mod startup_recovery_tests;
 mod two_writer_tests;
 
 #[cfg(test)]
+mod trusted_core_tests;
+
+#[cfg(test)]
 mod trusted_time_watermark_tests;
 
 #[cfg(test)]
@@ -136,6 +142,10 @@ mod tests;
 pub use attempt::{AttemptFinish, AttemptId, AttemptRecord, AttemptRole, AttemptStart};
 pub use authority::{
     StatePublisherV1, StateReader, authoritative_event_publisher, context_epoch_advance_publisher,
+};
+pub use availability_facts::{
+    AvailabilityFactKindV1, AvailabilityFactReceiptV1, AvailabilityFactSourceV1,
+    AvailabilityFactV1, AvailabilityLifecycleStatusV1, AvailabilityLifecycleV1,
 };
 pub use canonical_timestamp::CanonicalTimestampV1;
 pub use context_epoch::{
@@ -167,6 +177,7 @@ pub use event::{
     ActorKind, EventActor, EventEnvelope, EventPayloadReference, EventQuery, EventSubject,
     EventTimeQueryV1, EventType, SubjectKind,
 };
+pub use event_proposal::{EventPersistReceiptV1, EventProposalOriginV1, EventProposalV1};
 pub use executor_binding::{ExecutorBinding, ReleaseReason};
 pub use executor_binding_lease_expiry::{
     ExecutorLeaseExpiryOutcomeV1, ExecutorLeaseExpiryRequestV2,
@@ -185,6 +196,10 @@ pub use repository::SqliteStateRepository;
 pub use startup_recovery::{
     DurableBindingState, StartupDurableInconsistency, StartupReconciliationRequirement,
     StartupRecoveryClassification, StartupRecoverySnapshot, classify_startup_recovery,
+};
+pub use trusted_core::{
+    StateWriteAdmission, StateWriteOperationV1, StateWriteRefusalV1, StateWriteSubjectV1,
+    TrustedCoreStore,
 };
 pub use trusted_time::{TrustedClockV1, TrustedTimeSampleV1, TrustedTimeWatermarkV1};
 

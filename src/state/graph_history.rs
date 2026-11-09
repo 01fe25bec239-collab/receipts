@@ -270,7 +270,7 @@ fn mutations(
 }
 impl SqliteStateRepository {
     /// Stores the supplied physical successor and moves the mutable head by parent CAS.
-    pub fn append_graph_mutation_v1(
+    pub(crate) fn append_graph_mutation_v1(
         &mut self,
         clock: &dyn TrustedClockV1,
         mutation: StateGraphMutationV1,

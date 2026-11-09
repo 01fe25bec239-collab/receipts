@@ -124,20 +124,20 @@ fn t01_fresh_database_bootstraps_to_schema_version_7() {
     let registered = migrations::registered();
     assert_eq!(
         registered.len(),
-        19,
-        "exactly nineteen registered migrations may exist"
+        20,
+        "exactly twenty registered migrations may exist"
     );
     assert_eq!(
         registered.last().expect("chain is non-empty").version,
-        19,
-        "the registered chain must end at version 19"
+        20,
+        "the registered chain must end at version 20"
     );
     let tmp = TempDir::new("cm-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 19);
+    assert_eq!(repo.schema_version().expect("version read"), 20);
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        19,
+        20,
         "one metadata row per applied migration"
     );
 }
@@ -148,10 +148,10 @@ fn t02_version_7_database_reopens_idempotently() {
     let tmp = TempDir::new("cm-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 19);
+        assert_eq!(repo.schema_version().expect("version read"), 20);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            19,
+            20,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -174,7 +174,7 @@ fn t03_ordinary_open_of_version_5_fails_closed() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 5,
-                supported: 19
+                supported: 20
             }
         ),
         "unexpected error: {error}"

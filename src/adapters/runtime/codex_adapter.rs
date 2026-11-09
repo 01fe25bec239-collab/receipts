@@ -147,7 +147,10 @@ fn prompt(
         return Err(FailureClass::PolicyBlocked);
     }
     let mut prompt = Prompt(String::new());
-    prompt.write_str("Execute the complete capsule below. All fields are instructions or context; read referenced repository sections at the supplied start SHA. Respect criteria, non-goals, write boundaries, verification, stop conditions and handoff requirements. The capsule is a JSON object; decode JSON strings exactly as data. Sandbox selection is not proof of confinement.\n")
+    prompt.write_str(match task {
+        RuntimeCapsuleFamily::Review(_) => crate::review_prompt::REVIEW_INSTRUCTIONS,
+        _ => "Execute the complete capsule below. All fields are instructions or context; read referenced repository sections at the supplied start SHA. Respect criteria, non-goals, write boundaries, verification, stop conditions and handoff requirements. The capsule is a JSON object; decode JSON strings exactly as data. Sandbox selection is not proof of confinement.\n",
+    })
         .map_err(|_| FailureClass::PolicyBlocked)?;
     match task {
         RuntimeCapsuleFamily::Task(c) => {
@@ -210,9 +213,15 @@ fn prompt(
             });
             write!(prompt, "{capsule}").map_err(|_| FailureClass::PolicyBlocked)?;
         }
-        // Complete Review wire/temporal context is not available in this binding.
+        // Review: protected read-only path only, exact task/SHA/review-branch
+        // binding; never converted into a Task and never an ordinary fallback.
+        RuntimeCapsuleFamily::Review(c) => {
+            crate::review_prompt::admit_review(c, workspace, policy)?;
+            write!(prompt, "{}", crate::review_prompt::review_capsule_json(c))
+                .map_err(|_| FailureClass::PolicyBlocked)?;
+        }
         // Repair support awaits enforcement of its inherited task constraints.
-        RuntimeCapsuleFamily::Review(_) | RuntimeCapsuleFamily::Repair(_) => {
+        RuntimeCapsuleFamily::Repair(_) => {
             return Err(FailureClass::PolicyBlocked);
         }
     }

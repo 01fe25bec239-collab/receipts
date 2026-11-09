@@ -8,9 +8,10 @@ use std::path::PathBuf;
 
 use crate::{
     HostAdapter, HostCapabilityFreshnessDisposition, HostCapabilityModeOverride,
-    HostCapabilityReportNonTemporalCore, HostCapabilityReportRefreshOutcome,
-    HostCapabilityReportRefreshRequest, HostDetectionError, HostDetectionSignals, HostId,
-    freshness_disposition, host_capability_observation::HostCapabilityObservationRequest,
+    HostCapabilityReportRefreshOutcome, HostCapabilityReportRefreshRequest, HostDetectionError,
+    HostDetectionSignals, HostId, freshness_disposition,
+    host_capability_observation::HostCapabilityObservationRequest,
+    host_probe_port::{HostCapabilityCacheEntryV1, HostProbeProcessPort},
     refresh_host_capability_report, resolve_host,
 };
 
@@ -89,7 +90,8 @@ pub struct HostSessionActivationRequest<'a> {
     pub explicit_host_override: Option<HostId>,
     pub project_root: PathBuf,
     pub mode_override: Option<HostCapabilityModeOverride>,
-    pub cached_report: Option<&'a HostCapabilityReportNonTemporalCore>,
+    /// A previously minted coupled entry; never current evidence by itself.
+    pub cached: Option<&'a HostCapabilityCacheEntryV1>,
 }
 
 /// Identity reconciled and capability refresh attempted, not unconditional readiness.
@@ -151,8 +153,11 @@ impl std::error::Error for HostSessionActivationError {
 pub fn prepare_host_session<A: HostAdapter>(
     adapter: &A,
     request: &HostSessionActivationRequest<'_>,
+    port: &dyn HostProbeProcessPort,
 ) -> Result<HostSessionActivationOutcome, HostSessionActivationError> {
-    prepare_with_refresh(adapter, request, refresh_host_capability_report)
+    prepare_with_refresh(adapter, request, |r| {
+        refresh_host_capability_report(r, port)
+    })
 }
 
 fn prepare_with_refresh<A: HostAdapter>(
@@ -170,10 +175,10 @@ fn prepare_with_refresh<A: HostAdapter>(
         });
     }
 
-    // SESSION_START_OR_RESUME: every candidate's validity is unproven. Neither
-    // its contents nor its absence can supply the missing physical proof.
-    // ponytail: always refresh until an authoritative fingerprint proof is integrated.
-    let freshness_disposition = freshness_disposition(false);
+    // SESSION_START_OR_RESUME: always observe fresh. A cached entry is
+    // reusable only when this fresh observation minted an identical entry
+    // (complete fingerprint, same override, same report); caller flags never
+    // count and independently supplied reports/fingerprints are not accepted.
     let capability_refresh = refresh(&HostCapabilityReportRefreshRequest {
         observation: HostCapabilityObservationRequest {
             host: resolved_host,
@@ -181,6 +186,11 @@ fn prepare_with_refresh<A: HostAdapter>(
         },
         mode_override: request.mode_override.clone(),
     });
+    let reusable = match (&capability_refresh.cache_entry, request.cached) {
+        (Some(current), Some(cached)) => cached.permits_reuse_by(current),
+        _ => false,
+    };
+    let freshness_disposition = freshness_disposition(reusable);
     Ok(HostSessionActivationOutcome {
         resolved_host,
         freshness_disposition,

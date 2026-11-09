@@ -5,6 +5,7 @@ mod feature_admission_decision;
 mod feature_capability_set;
 mod json_value;
 mod remote_policy;
+mod state_write_authority;
 
 pub use date_time::{OrchestrationDateTimeError, OrchestrationDateTimeV1};
 pub use feature_admission_decision::{
@@ -19,6 +20,10 @@ pub use json_value::{
     OrchestrationJsonParseError, OrchestrationJsonValueV1,
 };
 pub use remote_policy::{ProjectRemotePolicy, WorkspaceCompositionLevel};
+pub use state_write_authority::{
+    CoreAdmissionIdentity, CoreContentResolverV1, CorePolicyRefusal, CoreStateWriteError,
+    CoreStateWriter,
+};
 
 #[cfg(test)]
 mod date_time_tests;
@@ -34,3 +39,6 @@ mod json_value_tests;
 
 #[cfg(test)]
 mod remote_policy_tests;
+
+#[cfg(test)]
+mod state_write_authority_tests;

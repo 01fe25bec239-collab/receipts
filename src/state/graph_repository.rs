@@ -951,7 +951,7 @@ pub(crate) fn verify_schema(
 
 impl SqliteStateRepository {
     /// Atomically creates the first durable graph version and accepts its clock sample.
-    pub fn create_initial_graph_v1(
+    pub(crate) fn create_initial_graph_v1(
         &mut self,
         clock: &dyn TrustedClockV1,
         request: StateGraphGenesisV1,
@@ -1044,7 +1044,7 @@ impl ReadOnlyGraphReader {
         if head.is_some_and(|version| version < 0) {
             return Err(corrupt());
         }
-        if head != Some(19) {
+        if head != Some(CURRENT_SCHEMA_HEAD) {
             return Err(failure(Phase::Read, Code::UnsupportedSchema, None));
         }
         verify_current(&self.conn, Phase::Read)
@@ -1548,9 +1548,27 @@ pub(crate) fn verify_v18(conn: &Connection, phase: Phase) -> Result<(), StateErr
     }
     Ok(())
 }
+/// The supported current State schema head.
+pub(crate) const CURRENT_SCHEMA_HEAD: i64 = 20;
+
+/// Verifies the exact current (v20) ledger, every v19 object and the v20 objects.
 pub(crate) fn verify_current(conn: &Connection, phase: Phase) -> Result<(), StateError> {
     verify_graph_encoding(conn, phase)?;
+    verify_ledger(conn, 20, phase)?;
+    verify_v19_objects(conn, phase)?;
+    if !migrations::v0020_trusted_core::objects_match(conn).map_err(|e| schema_error(phase, e))? {
+        return Err(failure(phase, Code::CorruptStore, None));
+    }
+    Ok(())
+}
+/// Verifies an exact v19 store (the v20 migration's precondition).
+pub(crate) fn verify_v19(conn: &Connection, phase: Phase) -> Result<(), StateError> {
+    verify_graph_encoding(conn, phase)?;
     verify_ledger(conn, 19, phase)?;
+    verify_v19_objects(conn, phase)
+}
+fn verify_v19_objects(conn: &Connection, phase: Phase) -> Result<(), StateError> {
+    verify_graph_encoding(conn, phase)?;
     verify_v16_objects(conn, phase)?;
     if !migrations::v0019_row_identity::objects_match(conn).map_err(|e| schema_error(phase, e))? {
         return Err(failure(phase, Code::CorruptStore, None));
@@ -1598,6 +1616,10 @@ pub struct StateGraphSnapshotV1 {
     pub(crate) content: StateGraphGenesisV1,
 }
 impl StateGraphSnapshotV1 {
+    /// The checked successor content this snapshot carries.
+    pub fn content(&self) -> &StateGraphGenesisV1 {
+        &self.content
+    }
     pub fn new(
         version: String,
         parent: String,

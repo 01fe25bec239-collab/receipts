@@ -937,7 +937,7 @@ fn finalized_teardown_has_only_local_git_operations() {
             "forbidden Git command: {command}"
         );
     }
-    assert!(source.contains("self.teardown_verified_head(handle, evidence.final_sha())"));
+    assert!(source.contains("self.teardown_verified_head(handle, evidence.final_sha(), None)"));
     assert!(!source.contains("std::process::Command"));
 }
 

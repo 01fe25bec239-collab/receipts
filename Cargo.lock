@@ -603,12 +603,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 
 [[package]]
+name = "receipts-cli"
+version = "0.1.0"
+dependencies = [
+ "receipts-host-integration",
+ "receipts-workspace-execution",
+ "sha2",
+]
+
+[[package]]
+name = "receipts-e2e"
+version = "0.1.0"
+dependencies = [
+ "receipts-orchestration",
+ "receipts-review-contracts",
+ "receipts-review-integration",
+ "receipts-runtime-bindings",
+ "receipts-workspace-execution",
+]
+
+[[package]]
 name = "receipts-host-integration"
 version = "0.1.0"
 dependencies = [
  "receipts-orchestration",
  "serde",
  "serde_json",
+ "sha2",
  "toml",
 ]
 
@@ -616,6 +637,8 @@ dependencies = [
 name = "receipts-model-routing"
 version = "0.1.0"
 dependencies = [
+ "receipts-runtime-adapters",
+ "receipts-state",
  "serde",
  "serde_json",
 ]
@@ -633,10 +656,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "receipts-review-integration"
+name = "receipts-review-contracts"
 version = "0.1.0"
 dependencies = [
  "receipts-workspace-execution",
+]
+
+[[package]]
+name = "receipts-review-integration"
+version = "0.1.0"
+dependencies = [
+ "receipts-review-contracts",
+ "receipts-runtime-adapters",
+ "receipts-state",
+ "receipts-workspace-execution",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -653,7 +689,7 @@ name = "receipts-runtime-bindings"
 version = "0.1.0"
 dependencies = [
  "receipts-orchestration",
- "receipts-review-integration",
+ "receipts-review-contracts",
 ]
 
 [[package]]
@@ -663,6 +699,7 @@ dependencies = [
  "base64",
  "ed25519-dalek",
  "jsonschema",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

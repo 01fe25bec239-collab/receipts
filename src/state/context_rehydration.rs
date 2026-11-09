@@ -476,7 +476,7 @@ pub struct ContextRehydrationOutcome {
 
 impl SqliteStateRepository {
     /// Rehydrates one exact immutable manifest/epoch scope.
-    pub fn rehydrate_context(
+    pub(crate) fn rehydrate_context(
         &mut self,
         request: ContextRehydrationRequest,
         repository_materializer: &mut impl RepositorySnapshotMaterializer,

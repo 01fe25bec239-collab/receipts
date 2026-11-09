@@ -289,7 +289,10 @@ impl SqliteStateRepository {
     /// schema's primary-key, foreign-key, uniqueness, CHECK, and NOT NULL
     /// constraints re-enforce the same rules as durable backstops. All
     /// caller values reach SQL through bound parameters.
-    pub fn create_context_manifest(&mut self, manifest: ContextManifest) -> Result<(), StateError> {
+    pub(crate) fn create_context_manifest(
+        &mut self,
+        manifest: ContextManifest,
+    ) -> Result<(), StateError> {
         validate_for_create(&manifest)?;
         self.run_serialized_transaction(|uow| uow.insert_context_manifest(&manifest))
     }

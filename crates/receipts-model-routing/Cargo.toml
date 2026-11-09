@@ -10,5 +10,7 @@ license = "Apache-2.0"
 path = "../../src/routing/lib.rs"
 
 [dependencies]
+receipts-state = { path = "../.." }
+receipts-runtime-adapters = { path = "../receipts-runtime-adapters" }
 serde = { version = "=1.0.229", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "=1.0.151", default-features = false, features = ["std"] }

@@ -97,7 +97,7 @@ fn decode(row: &rusqlite::Row<'_>) -> Result<OutputRef, StateError> {
         .map_err(|_| graph::corrupt())
 }
 impl SqliteStateRepository {
-    pub fn append_output_ref(&mut self, value: OutputRef) -> Result<(), StateError> {
+    pub(crate) fn append_output_ref(&mut self, value: OutputRef) -> Result<(), StateError> {
         graph::write_transaction(self.connection(), |conn| {
             let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM output_refs WHERE project_id=?1 AND output_ref=?2)", params![value.project_id,value.output_ref], |r|r.get(0)).map_err(|e|graph::sqlite_error(Phase::Write,e))?;
             if exists {

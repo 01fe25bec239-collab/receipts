@@ -14,9 +14,10 @@ pub use receipts_orchestration::capsules::{
     RepairFindingCategoryV1, RepairFindingSeverityV1, TaskCapsule, TaskType,
     VerificationPlanEntryV1,
 };
-pub use receipts_review_integration::{
-    ReviewCapsuleCriterion, ReviewCapsuleCriterionKind, ReviewCapsuleNonTemporalCore,
-    ReviewCapsuleReviewScope, ReviewCapsuleSeverityPolicy,
+pub use receipts_review_contracts::{
+    ReviewCapsuleCheck, ReviewCapsuleCheckResult, ReviewCapsuleCriterion,
+    ReviewCapsuleCriterionKind, ReviewCapsuleNonTemporalCore, ReviewCapsuleReviewScope,
+    ReviewCapsuleSeverityPolicy, ReviewDateTimeV1, ReviewRequestNonNegativeInteger,
 };
 
 pub use receipts_orchestration::graph::CapabilityName;

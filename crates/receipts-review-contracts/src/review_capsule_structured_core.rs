@@ -115,33 +115,33 @@ impl ReviewCapsuleCheckResult {
 /// Existing `new` omits both timestamps; `new_with_timestamps` preserves supplied values.
 ///
 /// ```
-/// use receipts_review_integration::{ReviewCapsuleCheck, ReviewDateTimeV1};
+/// use receipts_review_contracts::{ReviewCapsuleCheck, ReviewDateTimeV1};
 /// fn timestamps(value: &ReviewCapsuleCheck) -> (Option<&ReviewDateTimeV1>, Option<&ReviewDateTimeV1>) {
 ///     (value.started_at(), value.finished_at())
 /// }
 /// ```
 ///
 /// ```compile_fail
-/// # fn forbidden(value: &mut receipts_review_integration::ReviewCapsuleCheck) {
-/// let _: Option<&mut receipts_review_integration::ReviewDateTimeV1> = value.started_at();
+/// # fn forbidden(value: &mut receipts_review_contracts::ReviewCapsuleCheck) {
+/// let _: Option<&mut receipts_review_contracts::ReviewDateTimeV1> = value.started_at();
 /// # }
 /// ```
 ///
 /// ```compile_fail
-/// # fn forbidden(value: receipts_review_integration::ReviewCapsuleCheck) {
-/// let _ = receipts_review_integration::ReviewCapsuleCheck { started_at: None, ..value };
+/// # fn forbidden(value: receipts_review_contracts::ReviewCapsuleCheck) {
+/// let _ = receipts_review_contracts::ReviewCapsuleCheck { started_at: None, ..value };
 /// # }
 /// ```
 ///
 /// ```compile_fail
-/// # fn forbidden(value: &mut receipts_review_integration::ReviewCapsuleCheck) {
+/// # fn forbidden(value: &mut receipts_review_contracts::ReviewCapsuleCheck) {
 /// value.set_started_at(None);
 /// # }
 /// ```
 ///
 /// ```compile_fail
 /// # fn forbidden(core: receipts_workspace_execution::WorkspaceCheckpointExecutedCheckCore) {
-/// let _ = receipts_review_integration::ReviewCapsuleCheck::new_with_timestamps(
+/// let _ = receipts_review_contracts::ReviewCapsuleCheck::new_with_timestamps(
 ///     core, None, Some(None), None,
 /// );
 /// # }
@@ -149,33 +149,33 @@ impl ReviewCapsuleCheckResult {
 ///
 /// ```compile_fail
 /// # fn forbidden(core: receipts_workspace_execution::WorkspaceCheckpointExecutedCheckCore) {
-/// let _ = receipts_review_integration::ReviewCapsuleCheck::new_with_timestamps(
+/// let _ = receipts_review_contracts::ReviewCapsuleCheck::new_with_timestamps(
 ///     core, None, Some(String::from("2026-09-08T00:00:00Z")), None,
 /// );
 /// # }
 /// ```
 ///
 /// ```compile_fail
-/// # fn forbidden(value: &mut receipts_review_integration::ReviewCapsuleCheck) {
-/// let _: Option<&mut receipts_review_integration::ReviewDateTimeV1> = value.finished_at();
+/// # fn forbidden(value: &mut receipts_review_contracts::ReviewCapsuleCheck) {
+/// let _: Option<&mut receipts_review_contracts::ReviewDateTimeV1> = value.finished_at();
 /// # }
 /// ```
 ///
 /// ```compile_fail
-/// # fn forbidden(value: receipts_review_integration::ReviewCapsuleCheck) {
-/// let _ = receipts_review_integration::ReviewCapsuleCheck { finished_at: None, ..value };
+/// # fn forbidden(value: receipts_review_contracts::ReviewCapsuleCheck) {
+/// let _ = receipts_review_contracts::ReviewCapsuleCheck { finished_at: None, ..value };
 /// # }
 /// ```
 ///
 /// ```compile_fail
-/// # fn forbidden(value: &mut receipts_review_integration::ReviewCapsuleCheck) {
+/// # fn forbidden(value: &mut receipts_review_contracts::ReviewCapsuleCheck) {
 /// value.set_finished_at(None);
 /// # }
 /// ```
 ///
 /// ```compile_fail
 /// # fn forbidden(core: receipts_workspace_execution::WorkspaceCheckpointExecutedCheckCore) {
-/// let _ = receipts_review_integration::ReviewCapsuleCheck::new_with_timestamps(
+/// let _ = receipts_review_contracts::ReviewCapsuleCheck::new_with_timestamps(
 ///     core, None, None, Some(None),
 /// );
 /// # }
@@ -183,7 +183,7 @@ impl ReviewCapsuleCheckResult {
 ///
 /// ```compile_fail
 /// # fn forbidden(core: receipts_workspace_execution::WorkspaceCheckpointExecutedCheckCore) {
-/// let _ = receipts_review_integration::ReviewCapsuleCheck::new_with_timestamps(
+/// let _ = receipts_review_contracts::ReviewCapsuleCheck::new_with_timestamps(
 ///     core, None, None, Some(String::from("2026-09-08T00:00:00Z")),
 /// );
 /// # }
@@ -379,14 +379,14 @@ impl std::error::Error for ReviewCapsuleConstructionError {}
 /// and private fields prevent construction or mutation around validation.
 ///
 /// ```compile_fail
-/// use receipts_review_integration::ReviewCapsuleNonTemporalCore;
+/// use receipts_review_contracts::ReviewCapsuleNonTemporalCore;
 /// let _ = ReviewCapsuleNonTemporalCore::new();
 /// ```
 ///
 /// No reconciled-away or aggregate-level check APIs exist:
 ///
 /// ```compile_fail
-/// # fn inspect(value: &receipts_review_integration::ReviewCapsuleNonTemporalCore) {
+/// # fn inspect(value: &receipts_review_contracts::ReviewCapsuleNonTemporalCore) {
 /// let _ = value.test_results();
 /// let _ = value.started_at();
 /// let _ = value.finished_at();
@@ -396,13 +396,13 @@ impl std::error::Error for ReviewCapsuleConstructionError {}
 /// The shared integer carrier cannot be replaced or mutated through this API:
 ///
 /// ```compile_fail
-/// # fn forbidden(value: &mut receipts_review_integration::ReviewCapsuleNonTemporalCore) {
-/// value.context_epoch = receipts_review_integration::ReviewRequestNonNegativeInteger::from_decimal("0").unwrap();
+/// # fn forbidden(value: &mut receipts_review_contracts::ReviewCapsuleNonTemporalCore) {
+/// value.context_epoch = receipts_review_contracts::ReviewRequestNonNegativeInteger::from_decimal("0").unwrap();
 /// # }
 /// ```
 /// ```compile_fail
-/// # fn forbidden(value: &mut receipts_review_integration::ReviewCapsuleNonTemporalCore) {
-/// let _: &mut receipts_review_integration::ReviewRequestNonNegativeInteger = value.context_epoch();
+/// # fn forbidden(value: &mut receipts_review_contracts::ReviewCapsuleNonTemporalCore) {
+/// let _: &mut receipts_review_contracts::ReviewRequestNonNegativeInteger = value.context_epoch();
 /// # }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]

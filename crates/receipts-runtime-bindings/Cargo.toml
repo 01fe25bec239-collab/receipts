@@ -8,4 +8,4 @@ license = "Apache-2.0"
 
 [dependencies]
 receipts-orchestration = { path = "../receipts-orchestration" }
-receipts-review-integration = { path = "../receipts-review-integration" }
+receipts-review-contracts = { path = "../receipts-review-contracts" }

@@ -604,6 +604,85 @@ fn symlink_redirects_are_not_followed() {
     assert_eq!(io::read_document(&path), Err(Error::NotRegularFile));
 }
 
+#[test]
+fn no_follow_open_flags_are_selected_per_os_and_architecture() {
+    // Expected values: macOS SDK sys/fcntl.h + sys/errno.h; libc 0.2.189
+    // linux_like/{linux/{gnu,musl},android}/<arch> O_NONBLOCK|O_NOFOLLOW, ELOOP.
+    let cases = [
+        ("macos", "aarch64", Some((0x4 | 0x100, 62))),
+        ("macos", "x86_64", Some((0x4 | 0x100, 62))),
+        ("linux", "x86_64", Some((0x800 | 0x2_0000, 40))),
+        ("linux", "x86", Some((0x800 | 0x2_0000, 40))),
+        ("linux", "aarch64", Some((0x800 | 0x8000, 40))),
+        ("linux", "arm", Some((0x800 | 0x8000, 40))),
+        ("android", "aarch64", Some((0x800 | 0x8000, 40))),
+        ("android", "x86_64", Some((0x800 | 0x2_0000, 40))),
+        // Unverified or divergent: refused rather than guessed.
+        ("linux", "riscv64", None),
+        ("linux", "mips", None),
+        ("linux", "sparc64", None),
+        ("linux", "powerpc64", None),
+        ("freebsd", "x86_64", None),
+        ("windows", "x86_64", None),
+    ];
+    for (os, arch, expected) in cases {
+        assert_eq!(io::no_follow_open(os, arch), expected, "{os} {arch}");
+    }
+    let native = io::no_follow_open(std::env::consts::OS, std::env::consts::ARCH);
+    assert_eq!(io::open_flags(), native.ok_or(Error::Unsupported));
+}
+
+/// Replaces the accepted regular final entry after `regular_path` and before
+/// the open: the deterministic schedule of a final-component race.
+#[cfg(unix)]
+fn replaced_after_validation(replace: impl FnOnce(&Path)) -> Result<Vec<u8>, Error> {
+    let directory = Directory::new();
+    let path = directory.0.join("settings.json");
+    std::fs::write(&path, b"{}").unwrap();
+    let flags = io::open_flags().unwrap();
+    io::regular_path(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    replace(&path);
+    io::open_document(&path, flags)
+}
+
+#[cfg(unix)]
+#[test]
+fn final_entry_replaced_by_a_symlink_is_refused_before_reading_the_target() {
+    let outside = Directory::new();
+    let target = outside.0.join("secret.json");
+    std::fs::write(&target, br#"{"substituted":"SECRET"}"#).unwrap();
+    let result = replaced_after_validation(|path| {
+        std::os::unix::fs::symlink(&target, path).unwrap();
+    });
+    assert_eq!(result, Err(Error::NotRegularFile));
+}
+
+#[cfg(unix)]
+fn mkfifo(path: &Path) {
+    let status = std::process::Command::new("/usr/bin/mkfifo")
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn fifo_entries_are_refused_without_blocking() {
+    // Replaced after validation: the nonblocking open returns at once and the
+    // descriptor check refuses it (a blocking open would hang here).
+    assert_eq!(
+        replaced_after_validation(mkfifo),
+        Err(Error::NotRegularFile)
+    );
+    // Present before validation: refused before any open.
+    let directory = Directory::new();
+    let path = directory.0.join("settings.json");
+    mkfifo(&path);
+    assert_eq!(io::read_document(&path), Err(Error::NotRegularFile));
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn managed_drop_in_enumeration_has_a_file_count_bound() {
@@ -618,96 +697,8 @@ fn managed_drop_in_enumeration_has_a_file_count_bound() {
     assert_eq!(io::drop_ins(&directory.0), Err(Error::TooManyFiles));
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn child(mode: &str, timeout: Duration) -> Result<Vec<u8>, Error> {
-    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-    command
-        .args([
-            "--ignored",
-            "--exact",
-            "host_capability_observation::tests::probe_child",
-            "--nocapture",
-        ])
-        .env("RECEIPTS_HOST_TEST_PROBE", mode);
-    io::process::capture(command, timeout)
-}
-
-#[test]
-#[ignore = "invoked in an isolated subprocess by transport tests"]
-fn probe_child() {
-    use std::io::Write;
-    let Ok(mode) = std::env::var("RECEIPTS_HOST_TEST_PROBE") else {
-        return;
-    };
-    match mode.as_str() {
-        "stdout-overflow" => std::io::stdout()
-            .write_all(&vec![b'x'; HOST_PROBE_STDOUT_MAX_BYTES + 1])
-            .unwrap(),
-        "stderr-overflow" => std::io::stderr()
-            .write_all(&vec![b'x'; HOST_PROBE_STDERR_MAX_BYTES + 1])
-            .unwrap(),
-        "both" => {
-            let writer =
-                std::thread::spawn(|| std::io::stderr().write_all(&vec![b'e'; 524288]).unwrap());
-            std::io::stdout().write_all(&vec![b'o'; 524288]).unwrap();
-            writer.join().unwrap();
-        }
-        "timeout" => {
-            std::io::stdout().write_all(b"[]").unwrap();
-            std::thread::sleep(Duration::from_secs(60));
-        }
-        "failure" => {
-            std::io::stdout().write_all(b"[]").unwrap();
-            std::process::exit(7);
-        }
-        "stderr-json" => {
-            std::io::stdout().write_all(b"INVALID").unwrap();
-            std::io::stderr()
-                .write_all(br#"[{"id":"receipts"}]"#)
-                .unwrap();
-        }
-        _ => panic!("unknown synthetic probe"),
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-#[test]
-fn process_drains_both_pipes_and_bounds_each_stream() {
-    assert_eq!(
-        child("stdout-overflow", HOST_PROBE_TIMEOUT),
-        Err(Error::ProbeStdoutTooLarge)
-    );
-    assert_eq!(
-        child("stderr-overflow", HOST_PROBE_TIMEOUT),
-        Err(Error::ProbeStderrTooLarge)
-    );
-    let bytes = child("both", HOST_PROBE_TIMEOUT).unwrap();
-    assert!(bytes.len() >= 524288 && bytes.len() <= HOST_PROBE_STDOUT_MAX_BYTES);
-    assert!(!bytes.windows(16).any(|part| part == [b'e'; 16]));
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-#[test]
-fn timeout_and_nonzero_exit_discard_partial_positive_stdout() {
-    let start = std::time::Instant::now();
-    assert_eq!(
-        child("timeout", Duration::from_millis(200)),
-        Err(Error::ProbeTimeout)
-    );
-    assert!(start.elapsed() < Duration::from_secs(3));
-    assert_eq!(
-        child("failure", HOST_PROBE_TIMEOUT),
-        Err(Error::ProbeFailed)
-    );
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-#[test]
-fn json_stderr_cannot_rescue_invalid_stdout() {
-    let bytes = child("stderr-json", HOST_PROBE_TIMEOUT).unwrap();
-    assert!(!bytes.windows(8).any(|part| part == b"receipts"));
-    assert_eq!(decode::claude_plugins(&bytes), Err(Error::InvalidJson));
-}
+// Probe process transport (bounds, timeout, non-zero exit, descendant
+// cleanup) is owned by the admitted composition; see receipts-cli tests.
 
 #[test]
 fn observation_has_no_fingerprint_serialization_hash_or_mutation_path() {
@@ -743,10 +734,162 @@ fn observation_has_no_fingerprint_serialization_hash_or_mutation_path() {
         );
     }
     assert!(implementation.contains("[\"plugin\", \"list\", \"--json\"]"));
+    // Host never spawns a process: no PATH-resolved or direct child launch.
+    assert!(!implementation.contains("Command::new("));
+    assert!(!implementation.contains("process::Command"));
     for shell in ["sh", "bash", "zsh", "fish", "cmd.exe", "powershell"] {
         assert!(!implementation.contains(&format!("Command::new(\"{shell}\")")));
     }
     assert_eq!(HOST_STRUCTURED_OBSERVATION_MAX_BYTES, 1048576);
     assert_eq!(HOST_PROBE_TIMEOUT, Duration::from_secs(10));
     assert_eq!(crate::HostCapabilityValidityInput::ALL.len(), 7);
+}
+
+mod fingerprint {
+    use super::*;
+    use crate::host_probe_port::HostObservationFingerprintV1;
+    use crate::{HostExecutableIdentityV1, HostProbeCommandV1, HostProbeProcessPort};
+    use std::cell::RefCell;
+
+    struct Recording(RefCell<Vec<Vec<String>>>);
+    impl HostProbeProcessPort for Recording {
+        fn executable(&self) -> Result<HostExecutableIdentityV1, Error> {
+            Ok(identity())
+        }
+        fn run(&self, command: &HostProbeCommandV1) -> Result<Vec<u8>, Error> {
+            assert_eq!(command.timeout, HOST_PROBE_TIMEOUT);
+            assert_eq!(command.stdout_max_bytes, HOST_PROBE_STDOUT_MAX_BYTES);
+            self.0.borrow_mut().push(command.args.clone());
+            Ok(b"[]".to_vec())
+        }
+    }
+
+    #[test]
+    fn plugin_probe_runs_only_through_the_port_with_fixed_read_only_argv() {
+        let port = Recording(RefCell::new(Vec::new()));
+        let bytes = io::LocalSources(&port)
+            .plugins(Path::new("/project"))
+            .unwrap();
+        assert_eq!(bytes, b"[]");
+        assert_eq!(
+            io::probe_command(Path::new("/project"), &["--version"]).current_dir,
+            Path::new("/project")
+        );
+        assert_eq!(*port.0.borrow(), vec![vec!["plugin", "list", "--json"]]);
+    }
+
+    fn m(bytes: &[u8]) -> crate::host_probe_port::Material {
+        crate::host_probe_port::digest(&Ok(bytes.to_vec()))
+    }
+
+    fn identity() -> HostExecutableIdentityV1 {
+        HostExecutableIdentityV1 {
+            canonical_path: "/opt/claude".into(),
+            content_sha256: "a".repeat(64),
+            probe_policy: "policy".into(),
+        }
+    }
+
+    fn fp() -> HostObservationFingerprintV1 {
+        HostObservationFingerprintV1 {
+            host: HostId::ClaudeCode,
+            project_root: "/project".into(),
+            executable: Some(Ok(identity())),
+            version: Some(m(b"2.1.0 (Claude Code)")),
+            plugins: Some(m(b"[]")),
+            sources: vec![
+                (Source::ClaudeUserSettings, m(b"{}")),
+                (Source::ClaudeProjectSettings, Err(Error::Missing)),
+            ],
+        }
+    }
+
+    #[test]
+    fn any_material_or_context_drift_changes_the_fingerprint() {
+        let cached = fp();
+        assert!(fp().is_complete());
+        assert_eq!(fp(), cached);
+        let drifts: [fn(&mut HostObservationFingerprintV1); 8] = [
+            |f| f.sources[0].1 = m(b"{ }"),
+            |f| f.sources[1].1 = m(b"{}"),
+            |f| f.version = Some(m(b"2.1.1 (Claude Code)")),
+            |f| f.plugins = Some(m(b"[{}]")),
+            |f| {
+                f.executable
+                    .as_mut()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .content_sha256 = "b".repeat(64)
+            },
+            |f| {
+                f.executable
+                    .as_mut()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .probe_policy = "other".into()
+            },
+            |f| f.project_root = "/other".into(),
+            |f| f.host = HostId::Codex,
+        ];
+        for drift in drifts {
+            let mut current = fp();
+            drift(&mut current);
+            assert_ne!(current, cached, "drift must change the fingerprint");
+        }
+        // Retained uncertainty is incomplete, so no cache entry is minted.
+        for uncertain in [
+            |f: &mut HostObservationFingerprintV1| f.sources[0].1 = Err(Error::PermissionDenied),
+            |f: &mut HostObservationFingerprintV1| f.plugins = Some(Err(Error::ProbeTimeout)),
+            |f: &mut HostObservationFingerprintV1| f.executable = Some(Err(Error::Unavailable)),
+            |f: &mut HostObservationFingerprintV1| {
+                f.executable = Some(Err(Error::ExecutableChanged))
+            },
+        ] {
+            let mut both = fp();
+            uncertain(&mut both);
+            assert!(!both.is_complete());
+        }
+    }
+
+    /// Reports a different executable after the first identity query.
+    struct Swapping(std::cell::Cell<u32>);
+    impl HostProbeProcessPort for Swapping {
+        fn executable(&self) -> Result<HostExecutableIdentityV1, Error> {
+            self.0.set(self.0.get() + 1);
+            let mut id = identity();
+            if self.0.get() > 1 {
+                id.content_sha256 = "b".repeat(64);
+            }
+            Ok(id)
+        }
+        fn run(&self, _: &HostProbeCommandV1) -> Result<Vec<u8>, Error> {
+            Ok(b"[]".to_vec())
+        }
+    }
+
+    #[test]
+    fn identity_change_across_probes_leaves_the_fingerprint_incomplete() {
+        let (_, fingerprint) = observe_host_capabilities_with_fingerprint(
+            &HostCapabilityObservationRequest {
+                host: HostId::ClaudeCode,
+                project_root: "/nonexistent-receipts-project".into(),
+            },
+            &Swapping(std::cell::Cell::new(0)),
+        );
+        assert_eq!(fingerprint.executable, Some(Err(Error::ExecutableChanged)));
+        assert!(!fingerprint.is_complete());
+    }
+
+    #[test]
+    fn fingerprint_retains_digests_not_payload_bytes() {
+        let marker = "PRIVATE-MARKER-7f3a";
+        let mut f = fp();
+        f.sources[0].1 = m(format!("{{\"env\":{{\"K\":\"{marker}\"}}}}").as_bytes());
+        f.plugins = Some(m(marker.as_bytes()));
+        let rendered = format!("{f:?}");
+        assert!(!rendered.contains(marker), "{rendered}");
+        assert!(rendered.contains(":sha256:"));
+    }
 }

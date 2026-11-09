@@ -259,7 +259,10 @@ impl SqliteStateRepository {
     /// behavior is offered, and persisting a binding does not make that
     /// executor active, authoritative, rehydrated, or permitted to mutate
     /// State.
-    pub fn create_executor_binding(&mut self, binding: ExecutorBinding) -> Result<(), StateError> {
+    pub(crate) fn create_executor_binding(
+        &mut self,
+        binding: ExecutorBinding,
+    ) -> Result<(), StateError> {
         validate_for_create(&binding)?;
         self.run_transaction(|uow| uow.insert_executor_binding(&binding))
     }
@@ -317,7 +320,7 @@ impl SqliteStateRepository {
     ///   access;
     /// * storage, transaction, and corrupt-row failures surface as explicit
     ///   errors and never persist a partial release pair.
-    pub fn release_executor_binding(
+    pub(crate) fn release_executor_binding(
         &mut self,
         binding_id: &str,
         released_at: &str,

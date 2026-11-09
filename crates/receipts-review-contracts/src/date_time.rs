@@ -24,24 +24,24 @@ impl std::error::Error for ReviewDateTimeError {}
 /// Whitespace is rejected and no accepted component is normalized.
 ///
 /// ```
-/// use receipts_review_integration::ReviewDateTimeV1;
+/// use receipts_review_contracts::ReviewDateTimeV1;
 /// let value = ReviewDateTimeV1::try_new("2026-09-08t00:00:00.100z")?;
 /// assert_eq!(value.as_str(), "2026-09-08t00:00:00.100z");
-/// # Ok::<(), receipts_review_integration::ReviewDateTimeError>(())
+/// # Ok::<(), receipts_review_contracts::ReviewDateTimeError>(())
 /// ```
 /// Validation cannot be bypassed or the backing string mutated externally.
 ///
 /// ```compile_fail
-/// use receipts_review_integration::ReviewDateTimeV1;
+/// use receipts_review_contracts::ReviewDateTimeV1;
 /// let _ = ReviewDateTimeV1(String::from("invalid"));
 /// ```
 /// ```compile_fail
-/// # fn forbidden(value: &mut receipts_review_integration::ReviewDateTimeV1) {
+/// # fn forbidden(value: &mut receipts_review_contracts::ReviewDateTimeV1) {
 /// value.0.clear();
 /// # }
 /// ```
 /// ```compile_fail
-/// # fn forbidden(value: &mut receipts_review_integration::ReviewDateTimeV1) {
+/// # fn forbidden(value: &mut receipts_review_contracts::ReviewDateTimeV1) {
 /// let _: &mut str = value.as_str();
 /// # }
 /// ```
@@ -49,11 +49,11 @@ impl std::error::Error for ReviewDateTimeError {}
 ///
 /// ```compile_fail
 /// fn requires_ord<T: Ord>() {}
-/// requires_ord::<receipts_review_integration::ReviewDateTimeV1>();
+/// requires_ord::<receipts_review_contracts::ReviewDateTimeV1>();
 /// ```
 /// ```compile_fail
 /// fn requires_partial_ord<T: PartialOrd>() {}
-/// requires_partial_ord::<receipts_review_integration::ReviewDateTimeV1>();
+/// requires_partial_ord::<receipts_review_contracts::ReviewDateTimeV1>();
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ReviewDateTimeV1(String);

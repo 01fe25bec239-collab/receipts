@@ -72,6 +72,7 @@ mod protected_linux;
 pub mod provision;
 pub mod recovery_preparation;
 pub mod remote_publish_policy;
+pub mod review_evidence;
 pub mod teardown;
 mod worktree_binding;
 pub mod worktree_create;
@@ -113,6 +114,8 @@ mod provision_tests;
 mod recovery_preparation_tests;
 #[cfg(test)]
 mod remote_publish_policy_tests;
+#[cfg(test)]
+mod review_evidence_tests;
 #[cfg(test)]
 mod teardown_tests;
 #[cfg(test)]
@@ -164,6 +167,12 @@ pub use recovery_preparation::{
     WorkspaceRecoveryPreparationRequest, prepare_workspace_checkpoint_recovery,
 };
 pub use remote_publish_policy::WorkspaceRemotePublishPolicy;
+pub use review_evidence::{
+    MAX_REVIEW_RANGE_COMMITS, REVIEW_BRANCH_PREFIX, ReviewCommitRangeV1, ReviewDiffEvidenceV1,
+    ReviewWorkspace, ReviewWorkspaceIntegrityV1, ReviewWorkspaceRequest, TemporaryMergeV1,
+    provision_review_workspace, provision_temporary_merge, remove_review_workspace,
+    review_commit_range, review_diff, verify_review_workspace,
+};
 pub use teardown::WorkspaceTeardownRequest;
 pub use write_scope::{
     ForbiddenWriteMatch, WriteScopeGitOperation, WriteScopePatternSet, WriteScopeVerification,

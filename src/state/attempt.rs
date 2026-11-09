@@ -133,6 +133,12 @@ pub struct AttemptStart {
     started_at: CanonicalTimestampV1,
 }
 impl AttemptStart {
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+    pub fn graph_id(&self) -> &str {
+        &self.graph_id
+    }
     /// `attempt_number` is a positive decimal of any length; `start_sha` is a
     /// lowercase 40-hex Git SHA; `started_at` is a canonical UTC timestamp.
     /// `runtime_ref` is opaque and preserved exactly; it grants no admission or authority.
@@ -185,6 +191,9 @@ pub struct AttemptFinish {
     failure_class: Option<String>,
 }
 impl AttemptFinish {
+    pub fn attempt_id(&self) -> &AttemptId {
+        &self.attempt_id
+    }
     /// Optional strings are opaque and preserved exactly, including empty values.
     /// Callers must supply references/classes rather than raw output or error text.
     pub fn new(
@@ -309,10 +318,10 @@ pub(crate) fn schema_matches(conn: &Connection) -> Result<bool, rusqlite::Error>
 fn verify_store(conn: &Connection) -> Result<(), StateError> {
     let head = graph_repository::schema_head(conn, crate::error::GraphPhase::Read)
         .map_err(verification_error)?;
-    if head != Some(19) {
+    if head != Some(graph_repository::CURRENT_SCHEMA_HEAD) {
         return Err(failure(Code::UnsupportedSchema, None));
     }
-    graph_repository::verify_ledger(conn, 19, crate::error::GraphPhase::Read)
+    graph_repository::verify_ledger(conn, 20, crate::error::GraphPhase::Read)
         .map_err(verification_error)?;
     if !schema_matches(conn).map_err(sqlite_error)? {
         return Err(corrupt());
@@ -388,7 +397,7 @@ fn write<T>(
 
 impl SqliteStateRepository {
     /// Appends the immutable start row of an attempt. A repeated `attempt_id` is refused.
-    pub fn append_attempt_started(&mut self, start: AttemptStart) -> Result<(), StateError> {
+    pub(crate) fn append_attempt_started(&mut self, start: AttemptStart) -> Result<(), StateError> {
         write(self.connection(), |conn| {
             let duplicate: i64 = conn
                 .query_row(
@@ -413,7 +422,10 @@ impl SqliteStateRepository {
     /// Appends the immutable finish row of a started attempt. A finish without
     /// a start, or a second finish (identical or different), is refused and
     /// leaves the stored rows unchanged.
-    pub fn append_attempt_finished(&mut self, finish: AttemptFinish) -> Result<(), StateError> {
+    pub(crate) fn append_attempt_finished(
+        &mut self,
+        finish: AttemptFinish,
+    ) -> Result<(), StateError> {
         write(self.connection(), |conn| {
             let started: Option<String> = conn
                 .query_row(

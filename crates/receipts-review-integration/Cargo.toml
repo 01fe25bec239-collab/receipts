@@ -10,4 +10,10 @@ license = "Apache-2.0"
 path = "../../src/review/lib.rs"
 
 [dependencies]
+receipts-review-contracts = { path = "../receipts-review-contracts" }
+receipts-runtime-adapters = { path = "../receipts-runtime-adapters" }
+receipts-state = { path = "../.." }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+sha2 = "=0.11.0"
 receipts-workspace-execution = { path = "../receipts-workspace-execution" }

@@ -25,13 +25,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use receipts_state::{
     GraphCompilerRefV1, GraphGenesisReasonV1, GraphSourceEvidenceRefV1, PersistedCurrentGraphV1,
-    ReadOnlyGraphReader, SqliteStateRepository, StateError, StateGraphEdgeRelationV1,
-    StateGraphEdgeV1, StateGraphGenesisProvenanceV1, StateGraphGenesisV1, StateGraphNodeV1,
+    ReadOnlyGraphReader, StateError, StateGraphEdgeRelationV1, StateGraphEdgeV1,
+    StateGraphGenesisProvenanceV1, StateGraphGenesisV1, StateGraphNodeV1, StateReader,
     TrustedClockV1, TrustedTimeSampleV1, TrustedTimeWatermarkV1,
 };
 
 use super::*;
-use crate::orchestration::OrchestrationDateTimeV1;
+use crate::orchestration::{CoreAdmissionIdentity, CoreStateWriter, OrchestrationDateTimeV1};
 
 use GraphSnapshotProjectionErrorV1 as E;
 
@@ -395,27 +395,44 @@ impl TrustedClockV1 for SyntheticClock {
 
 static NEXT_STORE: AtomicU64 = AtomicU64::new(0);
 
-/// Temporary State store, removed with its WAL/SHM files on drop.
+/// Temporary private State directory (0700), removed with its store on drop.
 struct Store(PathBuf);
 
 impl Store {
     fn new() -> Self {
+        use std::os::unix::fs::DirBuilderExt;
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_nanos());
-        Self(std::env::temp_dir().join(format!(
-            "receipts-a3-038-{}-{nonce}-{}.db",
+        let dir = std::env::temp_dir().join(format!(
+            "receipts-a3-038-{}-{nonce}-{}",
             std::process::id(),
             NEXT_STORE.fetch_add(1, Ordering::Relaxed)
-        )))
+        ));
+        ok(
+            std::fs::DirBuilder::new().mode(0o700).create(&dir),
+            "create private State directory",
+        );
+        Self(dir.join("state.db"))
     }
 
+    /// Writes through the real trusted-core issuer, never a test authority.
     fn create(&self, fixture: &Fixture, digest: &str) {
-        let mut repository = ok(SqliteStateRepository::open(&self.0), "open State");
-        ok(
-            repository.create_initial_graph_v1(&SyntheticClock, fixture.genesis(digest)),
-            "create genesis",
+        let genesis = fixture.genesis(digest);
+        let identity = CoreAdmissionIdentity::new(
+            genesis.genesis_provenance().compiler_id().clone(),
+            genesis.policy_id().to_owned(),
+        )
+        .unwrap_or_else(|| panic!("admission identity"))
+        // The fixture composition admits the project with the source it compiled.
+        .with_project(
+            genesis.project_id(),
+            genesis.genesis_provenance().source_ref().clone(),
         );
+        let mut writer = ok(CoreStateWriter::open(&self.0, identity), "open core writer");
+        if let Err(error) = writer.create_initial_graph(&SyntheticClock, genesis) {
+            panic!("create genesis: {error}");
+        }
     }
 
     fn read(&self, project: &str, graph: &str) -> PersistedCurrentGraphV1 {
@@ -425,9 +442,9 @@ impl Store {
     }
 
     fn watermark(&self, project: &str) -> Option<TrustedTimeWatermarkV1> {
-        let repository = ok(SqliteStateRepository::open(&self.0), "open State");
+        let reader = ok(StateReader::open_existing(&self.0), "open reader");
         ok(
-            repository.find_trusted_time_watermark(project),
+            reader.find_trusted_time_watermark(project),
             "read watermark",
         )
     }
@@ -441,8 +458,8 @@ impl Store {
 
 impl Drop for Store {
     fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", self.0.display()));
+        if let Some(dir) = self.0.parent() {
+            let _ = std::fs::remove_dir_all(dir);
         }
     }
 }

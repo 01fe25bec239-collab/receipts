@@ -1,0 +1,19 @@
+[package]
+name = "receipts-e2e"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+publish = false
+license = "Apache-2.0"
+
+# Review-owned (D13) integration layer: binds consumer-owned ports to the
+# real merged implementations for library integration tests. Nothing in the
+# product depends on this crate.
+[dependencies]
+receipts-orchestration = { path = "../receipts-orchestration" }
+receipts-workspace-execution = { path = "../receipts-workspace-execution" }
+
+[dev-dependencies]
+receipts-review-contracts = { path = "../receipts-review-contracts" }
+receipts-review-integration = { path = "../receipts-review-integration" }
+receipts-runtime-bindings = { path = "../receipts-runtime-bindings" }

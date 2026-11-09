@@ -179,7 +179,7 @@ impl SqliteStateRepository {
     ///
     /// This is the create half of the create/read-only slice: no status,
     /// context-epoch, or binding mutation, and no deletion, is offered.
-    pub fn create_logical_role(&mut self, role: LogicalRole) -> Result<(), StateError> {
+    pub(crate) fn create_logical_role(&mut self, role: LogicalRole) -> Result<(), StateError> {
         validate_for_create(&role)?;
         self.run_transaction(|uow| uow.insert_logical_role(&role))
     }

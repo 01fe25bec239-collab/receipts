@@ -63,7 +63,7 @@ pub(crate) struct FencedTrustedTimeV1 {
 
 impl SqliteStateRepository {
     /// Evaluates and, when expired, atomically records release plus event.
-    pub fn expire_executor_binding_lease(
+    pub(crate) fn expire_executor_binding_lease(
         &mut self,
         clock: &dyn TrustedClockV1,
         request: ExecutorLeaseExpiryRequestV2,
@@ -80,7 +80,7 @@ impl SqliteStateRepository {
     /// time. Every refusal rolls back, leaving the prior watermark and
     /// binding unchanged. An unsupported stored deadline is refused without
     /// being rewritten.
-    pub fn renew_executor_binding_lease(
+    pub(crate) fn renew_executor_binding_lease(
         &mut self,
         clock: &dyn TrustedClockV1,
         binding_id: &str,
