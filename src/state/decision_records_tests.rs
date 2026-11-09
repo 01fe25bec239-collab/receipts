@@ -546,7 +546,7 @@ fn v16_store_migrates_to_v17_preserving_rows_and_rejects_partial_v17() {
     drop(conn);
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).unwrap(),
-        20
+        23
     );
     let repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
     assert_eq!(repo.count_table_rows("logical_role").unwrap(), 1);
@@ -922,7 +922,34 @@ pub(crate) fn remove_v18(conn: &Connection) {
     conn.execute_batch(&format!("{create}; INSERT INTO context_manifest_v18 SELECT * FROM context_manifest; DROP TABLE context_manifest; ALTER TABLE context_manifest_v18 RENAME TO context_manifest; DELETE FROM state_schema_version WHERE version=18; PRAGMA foreign_keys=ON;")).unwrap();
 }
 
+pub(crate) fn remove_v22(conn: &Connection) {
+    conn.execute_batch("DROP TABLE IF EXISTS graph_publication_identity; DELETE FROM state_schema_version WHERE version=23;").unwrap();
+    let head: i64 = conn
+        .query_row("SELECT MAX(version) FROM state_schema_version", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    if head < 22 {
+        return;
+    }
+    conn.execute_batch("DROP TABLE review_claim_seal; DROP TABLE context_rehydration_order; DELETE FROM state_schema_version WHERE version=22;").unwrap();
+}
+
+pub(crate) fn remove_v21(conn: &Connection) {
+    remove_v22(conn);
+    let head: i64 = conn
+        .query_row("SELECT MAX(version) FROM state_schema_version", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    if head < 21 {
+        return;
+    }
+    conn.execute_batch("DROP TABLE atomic_publication_availability; DROP TABLE atomic_publication; DROP TABLE review_claim; DELETE FROM state_schema_version WHERE version=21;").unwrap();
+}
+
 pub(crate) fn remove_v20(conn: &Connection) {
+    remove_v21(conn);
     let head: i64 = conn
         .query_row("SELECT MAX(version) FROM state_schema_version", [], |r| {
             r.get(0)

@@ -74,7 +74,7 @@ pub(crate) fn apply(conn: &Connection) -> Result<(), StateError> {
             params![store_id],
         )
         .map_err(|e| graph::sqlite_error(phase, e))?;
-        graph::verify_current(conn, phase)
+        graph::verify_v20(conn, phase)
     })
 }
 

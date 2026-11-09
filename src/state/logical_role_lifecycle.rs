@@ -189,43 +189,7 @@ impl SqliteStateRepository {
             ensure_identifier("binding_id", id)?;
         }
         self.run_serialized_transaction(|uow| {
-            let conn = uow.tx();
-            let role = current_role_any(conn, role_id)?;
-            if role.active_binding_id.as_deref() != expected {
-                return Err(refused(role_id, RoleChangeRefusal::StaleExpectation));
-            }
-            if role.status == LogicalRoleStatus::Retired {
-                return Err(refused(role_id, RoleChangeRefusal::RoleRetired));
-            }
-            if new == expected {
-                return Err(refused(role_id, RoleChangeRefusal::NoChange));
-            }
-            if let Some(current) = expected {
-                let binding = read_executor_binding(conn, current)?
-                    .ok_or_else(|| refused(role_id, RoleChangeRefusal::CurrentBindingDangling))?;
-                if binding.role_id != role_id {
-                    return Err(refused(role_id, RoleChangeRefusal::BindingRoleMismatch));
-                }
-                if binding.released_at.is_none() || binding.release_reason.is_none() {
-                    return Err(refused(
-                        role_id,
-                        RoleChangeRefusal::CurrentBindingUnreleased,
-                    ));
-                }
-            }
-            if let Some(selected) = new {
-                let binding = read_executor_binding(conn, selected)?
-                    .ok_or_else(|| refused(role_id, RoleChangeRefusal::BindingNotFound))?;
-                if binding.role_id != role_id {
-                    return Err(refused(role_id, RoleChangeRefusal::BindingRoleMismatch));
-                }
-                if binding.released_at.is_some() || binding.release_reason.is_some() {
-                    return Err(refused(role_id, RoleChangeRefusal::BindingNotUnreleased));
-                }
-            }
-            let mut next = pointers(&role);
-            next.binding = new.map(str::to_string);
-            apply(conn, &role, RoleChangeKind::Binding, next, evidence)
+            change_binding(uow.tx(), role_id, expected, new, evidence)
         })
     }
 
@@ -385,6 +349,53 @@ impl SqliteStateRepository {
     }
 }
 
+/// The binding-pointer CAS plus history row, on the caller's serialized
+/// transaction (shared with the recovery rebind transaction).
+pub(crate) fn change_binding(
+    conn: &Connection,
+    role_id: &str,
+    expected: Option<&str>,
+    new: Option<&str>,
+    evidence: &RoleChangeEvidenceV1,
+) -> Result<(), StateError> {
+    let role = current_role_any(conn, role_id)?;
+    if role.active_binding_id.as_deref() != expected {
+        return Err(refused(role_id, RoleChangeRefusal::StaleExpectation));
+    }
+    if role.status == LogicalRoleStatus::Retired {
+        return Err(refused(role_id, RoleChangeRefusal::RoleRetired));
+    }
+    if new == expected {
+        return Err(refused(role_id, RoleChangeRefusal::NoChange));
+    }
+    if let Some(current) = expected {
+        let binding = read_executor_binding(conn, current)?
+            .ok_or_else(|| refused(role_id, RoleChangeRefusal::CurrentBindingDangling))?;
+        if binding.role_id != role_id {
+            return Err(refused(role_id, RoleChangeRefusal::BindingRoleMismatch));
+        }
+        if binding.released_at.is_none() || binding.release_reason.is_none() {
+            return Err(refused(
+                role_id,
+                RoleChangeRefusal::CurrentBindingUnreleased,
+            ));
+        }
+    }
+    if let Some(selected) = new {
+        let binding = read_executor_binding(conn, selected)?
+            .ok_or_else(|| refused(role_id, RoleChangeRefusal::BindingNotFound))?;
+        if binding.role_id != role_id {
+            return Err(refused(role_id, RoleChangeRefusal::BindingRoleMismatch));
+        }
+        if binding.released_at.is_some() || binding.release_reason.is_some() {
+            return Err(refused(role_id, RoleChangeRefusal::BindingNotUnreleased));
+        }
+    }
+    let mut next = pointers(&role);
+    next.binding = new.map(str::to_string);
+    apply(conn, &role, RoleChangeKind::Binding, next, evidence)
+}
+
 fn validate_input(role_id: &str, evidence: &RoleChangeEvidenceV1) -> Result<(), StateError> {
     ensure_identifier("role_id", role_id)?;
     if evidence.reason.as_deref().is_some_and(str::is_empty) {
@@ -521,7 +532,7 @@ fn apply(
     Ok(())
 }
 
-fn refused(role_id: &str, reason: RoleChangeRefusal) -> StateError {
+pub(crate) fn refused(role_id: &str, reason: RoleChangeRefusal) -> StateError {
     StateError::LogicalRoleChangeRefused {
         role_id: role_id.to_string(),
         reason,
@@ -546,7 +557,7 @@ fn query_failure(error: rusqlite::Error) -> StateError {
     }
 }
 
-fn change_context(
+pub(crate) fn change_context(
     conn: &Connection,
     role_id: &str,
     expected_epoch: &StateEpochValueV1,

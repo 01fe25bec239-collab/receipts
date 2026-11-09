@@ -424,18 +424,14 @@ impl SqliteStateRepository {
         ensure_non_empty("advanced_at", advanced_at)?;
         validate_invalidated_role_ids(invalidated_role_ids)?;
         self.run_transaction(|uow| {
-            let latest = uow.read_latest_context_epoch(project_id)?;
-            let epoch = derive_next_epoch(latest.as_ref().map(|record| &record.epoch))?;
-            validate_invalidated_roles(uow.tx(), project_id, invalidated_role_ids)?;
-            let created = ContextEpoch {
-                project_id: project_id.to_string(),
-                epoch: epoch.clone(),
-                advanced_at: advanced_at.to_string(),
+            advance_in_transaction(
+                uow.tx(),
+                project_id,
+                advanced_at,
                 trigger,
-            };
-            insert_context_epoch(uow.tx(), &created, &changed_sources)?;
-            insert_invalidated_roles(uow.tx(), project_id, &epoch, invalidated_role_ids)?;
-            Ok(created)
+                invalidated_role_ids,
+                &changed_sources,
+            )
         })
     }
 
@@ -608,6 +604,36 @@ FROM context_epoch_invalidated_role
 WHERE project_id = ?1 AND epoch = ?2
 ORDER BY role_id";
 
+/// Derives, inserts and returns the next epoch with its changed sources and
+/// invalidated roles on the caller's open transaction. Inputs must already
+/// be validated by the caller (shared with the recovery succession
+/// transaction, which validates the same way).
+pub(crate) fn advance_in_transaction(
+    conn: &Connection,
+    project_id: &str,
+    advanced_at: &str,
+    trigger: ContextEpochTrigger,
+    invalidated_role_ids: &[String],
+    changed_sources: &ChangedSources,
+) -> Result<ContextEpoch, StateError> {
+    validate_changed_sources(changed_sources)?;
+    validate_project_id(project_id)?;
+    ensure_non_empty("advanced_at", advanced_at)?;
+    validate_invalidated_role_ids(invalidated_role_ids)?;
+    let latest = query_latest_context_epoch(conn, project_id)?;
+    let epoch = derive_next_epoch(latest.as_ref().map(|record| &record.epoch))?;
+    validate_invalidated_roles(conn, project_id, invalidated_role_ids)?;
+    let created = ContextEpoch {
+        project_id: project_id.to_string(),
+        epoch: epoch.clone(),
+        advanced_at: advanced_at.to_string(),
+        trigger,
+    };
+    insert_context_epoch(conn, &created, changed_sources)?;
+    insert_invalidated_roles(conn, project_id, &epoch, invalidated_role_ids)?;
+    Ok(created)
+}
+
 fn validate_invalidated_role_ids(role_ids: &[String]) -> Result<(), StateError> {
     let mut seen = HashSet::with_capacity(role_ids.len());
     for role_id in role_ids {
@@ -715,7 +741,7 @@ fn read_invalidated_role_ids(
 /// fail-closed contract decode: `Ok(None)` when the project has no
 /// history, and a corrupt selected row is an error — never a silent
 /// fallback to an older valid row.
-fn query_latest_context_epoch(
+pub(crate) fn query_latest_context_epoch(
     conn: &Connection,
     project_id: &str,
 ) -> Result<Option<ContextEpoch>, StateError> {
