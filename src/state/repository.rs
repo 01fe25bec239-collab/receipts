@@ -69,7 +69,7 @@ impl SqliteStateRepository {
         Ok(repo)
     }
 
-    /// Explicitly upgrades an exact v11–v19 State database to v20.
+    /// Explicitly upgrades an exact v11–v20 State database to v21.
     pub(crate) fn migrate_existing_to_current(path: impl AsRef<Path>) -> Result<u32, StateError> {
         let mut conn =
             Connection::open_with_flags(path.as_ref(), OpenFlags::SQLITE_OPEN_READ_WRITE)
@@ -101,11 +101,16 @@ impl SqliteStateRepository {
             Some(18) => graph_repository::verify_v18(&conn, GraphPhase::Migration)?,
             Some(19) => {
                 migrations::v0020_trusted_core::apply(&conn)?;
-                return Ok(20);
+                migrations::v0021_publication_claims::apply(&conn)?;
+                return Ok(21);
             }
             Some(20) => {
+                migrations::v0021_publication_claims::apply(&conn)?;
+                return Ok(21);
+            }
+            Some(21) => {
                 graph_repository::verify_current(&conn, GraphPhase::Migration)?;
-                return Ok(20);
+                return Ok(21);
             }
             // v1–v10 and unknown heads are typed unsupported legacy: no
             // automatic migration and no corruption misclassification.
@@ -141,7 +146,8 @@ impl SqliteStateRepository {
         }
         migrations::v0019_row_identity::apply(&conn)?;
         migrations::v0020_trusted_core::apply(&conn)?;
-        Ok(20)
+        migrations::v0021_publication_claims::apply(&conn)?;
+        Ok(21)
     }
 
     /// Version-reconciliation core of [`Self::open`], parameterized by the
@@ -584,6 +590,10 @@ fn bootstrap(conn: &mut Connection, chain: &[Migration]) -> Result<(), StateErro
         }
         if migration.version == 20 && migration.name == "trusted_core" {
             migrations::v0020_trusted_core::apply(conn)?;
+            continue;
+        }
+        if migration.version == 21 && migration.name == "publication_claims" {
+            migrations::v0021_publication_claims::apply(conn)?;
             continue;
         }
         let tx = conn

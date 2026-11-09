@@ -138,7 +138,7 @@ Limits: this is an object-capability boundary inside the trusted core process. I
 
 ## Recovery and rehydration (ST-W2-1/2)
 
-No new DDL: schema head stays 20. Everything below uses existing tables, and each action is one serialized transaction that commits rows, role history and its frozen event together, or writes nothing.
+No new DDL of its own (it was written against schema v20). Everything below uses existing tables, and each action is one serialized transaction that commits rows, role history and its frozen event together, or writes nothing.
 
 | `TrustedCoreStore` method | Admission family | What it does |
 | --- | --- | --- |
@@ -175,3 +175,78 @@ Materializers (`receipts_state::materializers`):
 - `MaterializerRegistryV1::ports()` supplies the repository-blob port and the artifact port to `rehydrate_context`. An unplugged port fails with `MATERIALIZER_NOT_REGISTERED`. State queries keep their existing closed registry. Workspace's real `GitBlobMaterializer` is WE-W3-4 and is not implemented here; tests use a fake blob port only.
 
 Missing Core interface: Orchestration's `CoreStateWriter` does not yet forward `recover_startup`, `rebind_role` or `succeed_changed_context_sources`. The State side and its admission checks are complete; Core needs three forwarding methods using its existing `admit`/`admit_role` with the families above.
+
+## Shared atomic publication and review claims (schema v21)
+
+Migration 21 (`publication_claims`) adds `atomic_publication`, `atomic_publication_availability` and `review_claim`, all `WITHOUT ROWID` with immutability and no-replace triggers like v20. It verifies the exact v20 store before and the v21 store after. Migrations 1–20 SQL is unchanged; v20's own apply now verifies exact v20 (not "current"), and `verify_current` checks the v21 objects too. `migrate_exclusive` upgrades any exact v11–v20 store to v21 in resumable steps (a failed v21 step leaves the exact v20 store). Every operation below is a typed `TrustedCoreStore` method that consumes one admission. There is no public SQL, transaction closure or generic batch.
+
+### Graph mutation with its results (`GraphMutation` family)
+
+```rust
+let publication = GraphMutationPublicationV1::new(
+    vec![GraphResultAttachmentV1::new("1", "r1", result)?],   // (version holding the node, reference, result)
+    mutation, snapshot,
+)?;
+let admission = store.admit(graph_subject /* Op::GraphMutation, project, graph, source, compiler, policy */);
+match store.publish_graph_mutation_v1(admission, &clock, &publication)? {
+    GraphPublicationOutcomeV1::Applied => { /* results, snapshot, history, seal, watermark, head: all written */ }
+    GraphPublicationOutcomeV1::Replayed => { /* exact earlier publication; nothing written */ }
+}
+```
+
+One serialized transaction writes the result rows, snapshot, mutation history, seal, trusted-time watermark and the head CAS. Any failure (clock regression, missing or conflicting result, stale parent, storage error) leaves none of them, including the result rows and the watermark. The admission binds project, graph, source, compiler and policy exactly as `append_graph_mutation_v1`; every result must belong to the mutation's graph. An exact retry (same mutation bytes, same snapshot digest, same result bytes) returns `Replayed` without touching the watermark; the same mutation id with different content is `PublicationFailureCode::ConflictingRetry`. A result row already stored with identical version, node and bytes (left by the older one-row writer) is adopted, never replaced; any different existing row refuses and the whole publication rolls back. The snapshot digest remains a Core-supplied content identity that State does not recompute.
+
+### Decision publication (`DecisionPublication` family)
+
+```rust
+let package = DecisionPublicationV1::new(
+    "project", "publication-id",
+    vec![a4_review_record],                         // DecisionRecordV1 (REJECT included)
+    vec![PublicationEventV1::new(proposal, "01ARZ…")?],   // proposals + core-minted ULIDs
+    vec![availability_fact],                        // AvailabilityFactV1, State assigns sequences in order
+)?
+.with_claim_settlement(&ticket, ReviewClaimSettlementV1::completed("REJECT", Some("rev-1"), None)?)?; // optional
+let admission = store.admit(project_subject /* Op::DecisionPublication */);
+let receipt = store.publish_decision_package_v1(admission, &clock, &package)?; // DecisionPublicationReceiptV1
+```
+
+One trusted-clock sample and one serialized transaction write the publication identity, the records, each event with its receipt, the availability facts (each follows the exact latest sequence, including facts earlier in the same package) and the claim settlement. The identity `(project, publication_id)` is bound to the package SHA-256. Outcomes:
+
+- first call: `replayed = false`, with the event receipts and availability sequences;
+- exact retry, also after close/reopen: `replayed = true` with the same recorded `recorded_at`, event receipts, availability sequences and settled claim, and no write at all (the watermark does not move);
+- the same identity with different content: `ConflictingRetry`, nothing written;
+- a record or proposal whose own identity already exists outside a recorded publication (for example a record left by the older non-atomic writer): the original `AlreadyExists` error, the whole package rolled back. State does not "adopt" such partial legacy state; reconciling it needs an explicit disposition.
+
+Records, receipts and facts stay immutable: a stored `REJECT` review can never be replaced by a later package, and a failed or conflicting package leaves no event or watermark change. State checks shape, project and identity; **referenced-content validation stays with the trusted core**, which must resolve and hash every event payload (as `CoreStateWriter::persist_event_proposal` does) before it builds the package.
+
+### Durable review claims (`ReviewClaim` family)
+
+```rust
+let admission = store.admit(project_subject /* Op::ReviewClaim */);
+match store.claim_review_v1(admission, &clock, &ReviewClaimRequestV1::new(project, claim_id, task_id, Some(sha), &request_sha256)?)? {
+    ReviewClaimOutcomeV1::Claimed(ticket) => { /* ONLY here may routing/provider/execution run */ }
+    ReviewClaimOutcomeV1::Existing(record) => { /* never execute; record.state says why */ }
+}
+```
+
+The claim is inserted before routing or execution. `claim_id` must be the deterministic identity of the unit of work (for example the review request or attempt id), never a fresh random value per callback. States:
+
+| State | Meaning | Exits |
+| --- | --- | --- |
+| `CLAIMED` | unfinished or uncertain (a crash may have lost a provider response) | settle, or explicit abandon |
+| `COMPLETED` | recorded disposition (`outcome_kind` token, optional `outcome_ref`, `outcome_sha256`) | none |
+| `REFUSED` | retained terminal policy or safety refusal (for example `POLICY_BLOCKED`) | none |
+| `ABANDONED` | explicit, authority-named end | none |
+
+- Concurrent or repeated callbacks in one process serialize through the exclusive store (and below it through SQLite `BEGIN IMMEDIATE`); exactly one gets `Claimed`. A restart yields `Existing(Claimed)` with no ticket, so nothing resumes it. There is no TTL, expiry or automatic reopening anywhere; a trigger lets a claim leave `CLAIMED` exactly once.
+- `settle_review_claim_v1(admission, clock, &ticket, &settlement)` records `completed(..)` or `refused(..)`. The ticket is non-`Clone` and bound to the live store instance; a ticket from another instance or store is `WrongStore`. Settling again with the identical disposition returns the record; a different one is `ClaimNotUnfinished`. Passing the ticket to `DecisionPublicationV1::with_claim_settlement` settles the claim in the same transaction as the verdict records and events, so they can never be observed apart.
+- `abandon_review_claim_v1` is the only way to stop waiting on an unfinished claim. It is never automatic, names the human or policy authority, and runs nothing. An abandoned id stays terminal; deliberately running the work again is a new `claim_id` (for example `<claim>/generation-2`), so every repeated provider call is a separately recorded decision.
+- Reusing a `claim_id` with a different task, SHA or request digest is `ConflictingRetry`. `outcome_kind` is an opaque `[A-Z][A-Z0-9_]{0,63}` token that State never interprets.
+- `SqliteStateRepository::find_review_claim(project, claim_id)` reads a claim.
+
+### Remaining integration requirements
+
+- Orchestration's `CoreStateWriter` needs forwarders: `publish_graph_mutation` (admit like `append_graph_mutation`, then `publish_graph_mutation_v1`), `publish_decision_package` (verify each event's content through the resolver as `persist_event_proposal` does, check the project is admitted, `admit(Op::DecisionPublication, project, None)`), and `claim_review` / `settle_review_claim` / `abandon_review_claim` (`Op::ReviewClaim`). Core's graph store should call the single graph operation instead of `append_node_result` plus `append_graph_mutation`.
+- Routing, Registry, Availability and Review sinks should hand the Core one package per outcome instead of record-then-events, and Review should claim before routing. Event ids must be minted before the package is built; they are part of its digest.
+- Provenance links are not part of a package; they stay separate immutable writes.
+- Old stores may already hold records without their events (written by the one-write-per-transaction path). This change prevents new ones and does not repair existing ones.

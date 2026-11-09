@@ -70,6 +70,10 @@ use std::fmt;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+use crate::atomic_publication::{
+    DecisionPublicationReceiptV1, DecisionPublicationV1, GraphMutationPublicationV1,
+    GraphPublicationOutcomeV1,
+};
 use crate::attempt::{AttemptFinish, AttemptStart};
 use crate::availability_facts::{AvailabilityFactReceiptV1, AvailabilityFactV1};
 use crate::checkpoint_ref::CheckpointRecord;
@@ -99,6 +103,10 @@ use crate::recovery::{
     RoleRebindRequestV1, StartupRecoveryReportV1,
 };
 use crate::repository::SqliteStateRepository;
+use crate::review_claim::{
+    ReviewClaimAbandonV1, ReviewClaimOutcomeV1, ReviewClaimRecordV1, ReviewClaimRequestV1,
+    ReviewClaimSettlementV1, ReviewClaimTicketV1,
+};
 use crate::trusted_time::TrustedClockV1;
 
 /// Closed operation families a single admission can authorize.
@@ -119,6 +127,10 @@ pub enum StateWriteOperationV1 {
     LogicalRole,
     ExecutorBinding,
     AvailabilityFact,
+    /// One atomic decision publication package (records, events, facts).
+    DecisionPublication,
+    /// Durable review claims (claim, settle, abandon).
+    ReviewClaim,
 }
 
 /// Why State refused a write admission or an exclusive open.
@@ -257,7 +269,7 @@ impl TrustedCoreStore {
         Self::finish(repo, held)
     }
 
-    /// Explicitly upgrades an existing v11–v19 store to the current schema and
+    /// Explicitly upgrades an existing v11–v20 store to the current schema and
     /// opens it, under the same ownership/lock checks. Returns the new head.
     pub fn migrate_exclusive(path: impl AsRef<Path>) -> Result<(Self, u32), StateError> {
         let held = secure::prepare(path.as_ref(), false)?;
@@ -879,6 +891,123 @@ impl TrustedCoreStore {
             Bound::project(fact.project_id()),
         )?;
         self.repo.append_availability_fact(clock, fact)
+    }
+
+    // ---- shared atomic publication and review claims ----------------------------
+
+    /// Publishes a graph mutation together with the node results it attaches,
+    /// its snapshot, history, seal, watermark and head CAS in one transaction
+    /// (GraphMutation family; the same project/graph/source/compiler/policy
+    /// binding as [`Self::append_graph_mutation_v1`]). Any failure writes
+    /// nothing. See [`crate::atomic_publication`].
+    pub fn publish_graph_mutation_v1(
+        &mut self,
+        admission: StateWriteAdmission,
+        clock: &dyn TrustedClockV1,
+        publication: &GraphMutationPublicationV1,
+    ) -> Result<GraphPublicationOutcomeV1, StateError> {
+        let content = publication.snapshot().content();
+        let provenance = content.genesis_provenance();
+        self.check(
+            admission,
+            StateWriteOperationV1::GraphMutation,
+            Bound {
+                project: content.project_id(),
+                graph: Some(publication.graph_id()),
+                source: Some(provenance.source_ref().as_str()),
+                compiler: Some(provenance.compiler_id().as_str()),
+                policy: Some(content.policy_id()),
+            },
+        )?;
+        self.repo.publish_graph_mutation_v1(clock, publication)
+    }
+
+    /// Publishes one decision package (records, events with receipts,
+    /// availability facts and an optional claim settlement) atomically
+    /// (DecisionPublication family, bound to the package's project). Exact
+    /// retries return the recorded outcome. See [`crate::atomic_publication`].
+    pub fn publish_decision_package_v1(
+        &mut self,
+        admission: StateWriteAdmission,
+        clock: &dyn TrustedClockV1,
+        package: &DecisionPublicationV1,
+    ) -> Result<DecisionPublicationReceiptV1, StateError> {
+        self.check(
+            admission,
+            StateWriteOperationV1::DecisionPublication,
+            Bound::project(package.project_id()),
+        )?;
+        if let Some((store_id, instance)) = package.claim_binding()
+            && (store_id != self.store_id || instance != self.instance)
+        {
+            return Err(refused(StateWriteRefusalV1::WrongStore));
+        }
+        let store_id = self.store_id.clone();
+        self.repo
+            .publish_decision_package_v1(clock, package, &store_id)
+    }
+
+    /// Claims one unit of review work BEFORE it is routed or executed. Only
+    /// [`ReviewClaimOutcomeV1::Claimed`] permits execution. See
+    /// [`crate::review_claim`].
+    pub fn claim_review_v1(
+        &mut self,
+        admission: StateWriteAdmission,
+        clock: &dyn TrustedClockV1,
+        request: &ReviewClaimRequestV1,
+    ) -> Result<ReviewClaimOutcomeV1, StateError> {
+        self.check(
+            admission,
+            StateWriteOperationV1::ReviewClaim,
+            Bound::project(request.project_id()),
+        )?;
+        let (inserted, record) = self.repo.claim_review_v1(clock, request)?;
+        Ok(if inserted {
+            ReviewClaimOutcomeV1::Claimed(ReviewClaimTicketV1 {
+                store_id: self.store_id.clone(),
+                instance: self.instance,
+                project_id: record.project_id,
+                claim_id: record.claim_id,
+            })
+        } else {
+            ReviewClaimOutcomeV1::Existing(record)
+        })
+    }
+
+    /// Settles the claim this live store instance issued `ticket` for.
+    pub fn settle_review_claim_v1(
+        &mut self,
+        admission: StateWriteAdmission,
+        clock: &dyn TrustedClockV1,
+        ticket: &ReviewClaimTicketV1,
+        settlement: &ReviewClaimSettlementV1,
+    ) -> Result<ReviewClaimRecordV1, StateError> {
+        self.check(
+            admission,
+            StateWriteOperationV1::ReviewClaim,
+            Bound::project(&ticket.project_id),
+        )?;
+        if ticket.store_id != self.store_id || ticket.instance != self.instance {
+            return Err(refused(StateWriteRefusalV1::WrongStore));
+        }
+        self.repo
+            .settle_review_claim_v1(clock, &ticket.project_id, &ticket.claim_id, settlement)
+    }
+
+    /// Records the explicit, authority-named abandonment of an unfinished
+    /// claim. Never automatic; it re-runs nothing.
+    pub fn abandon_review_claim_v1(
+        &mut self,
+        admission: StateWriteAdmission,
+        clock: &dyn TrustedClockV1,
+        request: &ReviewClaimAbandonV1,
+    ) -> Result<ReviewClaimRecordV1, StateError> {
+        self.check(
+            admission,
+            StateWriteOperationV1::ReviewClaim,
+            Bound::project(request.project_id()),
+        )?;
+        self.repo.abandon_review_claim_v1(clock, request)
     }
 }
 

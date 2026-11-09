@@ -321,8 +321,12 @@ fn verify_store(conn: &Connection) -> Result<(), StateError> {
     if head != Some(graph_repository::CURRENT_SCHEMA_HEAD) {
         return Err(failure(Code::UnsupportedSchema, None));
     }
-    graph_repository::verify_ledger(conn, 20, crate::error::GraphPhase::Read)
-        .map_err(verification_error)?;
+    graph_repository::verify_ledger(
+        conn,
+        graph_repository::CURRENT_SCHEMA_HEAD as usize,
+        crate::error::GraphPhase::Read,
+    )
+    .map_err(verification_error)?;
     if !schema_matches(conn).map_err(sqlite_error)? {
         return Err(corrupt());
     }

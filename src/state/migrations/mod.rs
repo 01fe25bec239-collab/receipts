@@ -25,6 +25,7 @@ pub(crate) mod v0017_decision_records;
 pub(crate) mod v0018_manifest_successors;
 pub(crate) mod v0019_row_identity;
 pub(crate) mod v0020_trusted_core;
+pub(crate) mod v0021_publication_claims;
 
 use crate::error::StateError;
 
@@ -62,6 +63,7 @@ static REGISTERED: &[Migration] = &[
     v0018_manifest_successors::MIGRATION,
     v0019_row_identity::MIGRATION,
     v0020_trusted_core::MIGRATION,
+    v0021_publication_claims::MIGRATION,
 ];
 
 /// The registered migration chain in application order.

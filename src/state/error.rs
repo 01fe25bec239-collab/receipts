@@ -694,6 +694,12 @@ pub enum StateError {
         code: RecordFailureCode,
         kind: &'static str,
     },
+    /// Closed, content-free atomic-publication / review-claim diagnostic.
+    /// Whatever raised it, nothing of the operation was written.
+    Publication {
+        code: PublicationFailureCode,
+        kind: &'static str,
+    },
     /// A State wire document was not admitted by its schema codec.
     WireDecode { schema: &'static str },
     /// An admitted wire value has no representation in the operational domain.
@@ -701,6 +707,36 @@ pub enum StateError {
         schema: &'static str,
         field: &'static str,
     },
+}
+
+/// Closed atomic-publication / review-claim failure reason. Never carries input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicationFailureCode {
+    /// A package, claim request or settlement is malformed or empty.
+    InvalidShape,
+    /// A publication or claim identity was reused with different content.
+    ConflictingRetry,
+    /// The named review claim does not exist.
+    ClaimNotFound,
+    /// The claim already left `CLAIMED` with a different outcome (or the
+    /// settlement is not allowed from its state).
+    ClaimNotUnfinished,
+    StoreBusy,
+    CorruptStore,
+    StorageFailure,
+}
+impl PublicationFailureCode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::InvalidShape => "INVALID_SHAPE",
+            Self::ConflictingRetry => "CONFLICTING_RETRY",
+            Self::ClaimNotFound => "CLAIM_NOT_FOUND",
+            Self::ClaimNotUnfinished => "CLAIM_NOT_UNFINISHED",
+            Self::StoreBusy => "STORE_BUSY",
+            Self::CorruptStore => "CORRUPT_STORE",
+            Self::StorageFailure => "STORAGE_FAILURE",
+        }
+    }
 }
 
 /// Closed decision/provenance record failure reason. Never carries input.
@@ -1075,6 +1111,9 @@ impl fmt::Display for StateError {
             ),
             StateError::DecisionRecord { code, kind } => {
                 write!(f, "decision record {kind} {}", code.label())
+            }
+            StateError::Publication { code, kind } => {
+                write!(f, "publication {kind} {}", code.label())
             }
             StateError::WireDecode { schema } => write!(f, "{schema} wire document refused"),
             StateError::WireConversionUnsupported { schema, field } => write!(

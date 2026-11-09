@@ -268,6 +268,76 @@ fn mutations(
     }
     Ok(result)
 }
+/// Stores the supplied physical successor and moves the head by parent CAS
+/// inside the caller's open transaction: every referenced result must already
+/// be stored, the watermark accepts the sample, and the snapshot, mutation and
+/// seal rows are inserted. Any error leaves the caller to roll back.
+pub(crate) fn append_mutation_in_tx(
+    conn: &Connection,
+    mutation: &StateGraphMutationV1,
+    snapshot: &StateGraphSnapshotV1,
+    raw: &str,
+    sample: &crate::trusted_time::TrustedTimeSampleV1,
+    time: &crate::canonical_timestamp::CanonicalTimestampV1,
+) -> Result<(), StateError> {
+    let content = &snapshot.content;
+    let genesis = version_projection(conn, content.project_id(), content.graph_id(), "1")?
+        .ok_or_else(|| graph::failure(Phase::Write, Code::IdentityMismatch, None))?;
+    if genesis.genesis_provenance() != content.genesis_provenance() {
+        return Err(graph::failure(Phase::Write, Code::IdentityMismatch, None));
+    }
+    let existing:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM graph_mutations WHERE project_id=?1 AND graph_id=?2 AND mutation_id=?3)",params![content.project_id(),content.graph_id(),mutation.mutation_id()],|r|r.get(0)).map_err(|e|graph::sqlite_error(Phase::Write,e))?;
+    if existing {
+        return Err(graph::failure(Phase::Write, Code::AlreadyExists, None));
+    }
+    for node in content.nodes() {
+        if let Some(reference) = node.result_ref() {
+            let result = crate::graph_node_result::read_result(
+                conn,
+                content.project_id(),
+                content.graph_id(),
+                reference,
+            )?
+            .ok_or_else(|| graph::failure(Phase::Write, Code::IdentityMismatch, None))?;
+            if result.result().node_id() != node.node_id() {
+                return Err(graph::failure(Phase::Write, Code::IdentityMismatch, None));
+            }
+        }
+    }
+    let moved=conn.execute("UPDATE graphs SET current_version=?1 WHERE project_id=?2 AND graph_id=?3 AND current_version=?4",params![snapshot.graph_version(),content.project_id(),content.graph_id(),snapshot.parent_version()]).map_err(|e|graph::sqlite_error(Phase::Write,e))?;
+    if moved != 1 {
+        return Err(graph::failure(Phase::Write, Code::ParentConflict, None));
+    }
+    crate::write_fault::boundary()?;
+    graph::accept_graph_sample(conn, content.project_id(), sample, time)?;
+    crate::write_fault::boundary()?;
+    graph::insert_snapshot(conn, content, snapshot.graph_version(), sample)?;
+    crate::write_fault::boundary()?;
+    conn.execute("INSERT INTO graph_mutations(project_id,graph_id,mutation_id,parent_version,resulting_version,mutation_json) VALUES (?1,?2,?3,?4,?5,?6)",params![content.project_id(),content.graph_id(),mutation.mutation_id(),mutation.parent_version(),mutation.resulting_version(),raw]).map_err(|e|graph::sqlite_error(Phase::Write,e))?;
+    crate::write_fault::boundary()?;
+    graph::seal_snapshot(conn, content, snapshot.graph_version())?;
+    crate::write_fault::boundary()?;
+    Ok(())
+}
+
+/// The mutation, snapshot and head must describe one successor.
+pub(crate) fn check_mutation_matches_snapshot(
+    mutation: &StateGraphMutationV1,
+    snapshot: &StateGraphSnapshotV1,
+) -> Result<(), StateError> {
+    let content = &snapshot.content;
+    if mutation.graph_id() != content.graph_id()
+        || mutation.parent_version() != snapshot.parent_version()
+        || mutation.resulting_version() != snapshot.graph_version()
+        || mutation
+            .resulting_digest()
+            .is_some_and(|d| d != content.resulting_digest())
+    {
+        return Err(graph::failure(Phase::Input, Code::IdentityMismatch, None));
+    }
+    Ok(())
+}
+
 impl SqliteStateRepository {
     /// Stores the supplied physical successor and moves the mutable head by parent CAS.
     pub(crate) fn append_graph_mutation_v1(
@@ -276,16 +346,7 @@ impl SqliteStateRepository {
         mutation: StateGraphMutationV1,
         snapshot: StateGraphSnapshotV1,
     ) -> Result<(), StateError> {
-        let content = &snapshot.content;
-        if mutation.graph_id() != content.graph_id()
-            || mutation.parent_version() != snapshot.parent_version()
-            || mutation.resulting_version() != snapshot.graph_version()
-            || mutation
-                .resulting_digest()
-                .is_some_and(|d| d != content.resulting_digest())
-        {
-            return Err(graph::failure(Phase::Input, Code::IdentityMismatch, None));
-        }
+        check_mutation_matches_snapshot(&mutation, &snapshot)?;
         let raw = mutation.to_json()?;
         let sample = clock
             .sample()
@@ -293,38 +354,7 @@ impl SqliteStateRepository {
         let (sample, time) = trusted_time::validate_sample(sample)
             .map_err(|e| graph::legacy_error(Phase::Clock, e))?;
         graph::write_transaction(self.connection(), |conn| {
-            let genesis = version_projection(conn, content.project_id(), content.graph_id(), "1")?
-                .ok_or_else(|| graph::failure(Phase::Write, Code::IdentityMismatch, None))?;
-            if genesis.genesis_provenance() != content.genesis_provenance() {
-                return Err(graph::failure(Phase::Write, Code::IdentityMismatch, None));
-            }
-            let existing:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM graph_mutations WHERE project_id=?1 AND graph_id=?2 AND mutation_id=?3)",params![content.project_id(),content.graph_id(),mutation.mutation_id()],|r|r.get(0)).map_err(|e|graph::sqlite_error(Phase::Write,e))?;
-            if existing {
-                return Err(graph::failure(Phase::Write, Code::AlreadyExists, None));
-            }
-            for node in content.nodes() {
-                if let Some(reference) = node.result_ref() {
-                    let result = crate::graph_node_result::read_result(
-                        conn,
-                        content.project_id(),
-                        content.graph_id(),
-                        reference,
-                    )?
-                    .ok_or_else(|| graph::failure(Phase::Write, Code::IdentityMismatch, None))?;
-                    if result.result().node_id() != node.node_id() {
-                        return Err(graph::failure(Phase::Write, Code::IdentityMismatch, None));
-                    }
-                }
-            }
-            let moved=conn.execute("UPDATE graphs SET current_version=?1 WHERE project_id=?2 AND graph_id=?3 AND current_version=?4",params![snapshot.graph_version(),content.project_id(),content.graph_id(),snapshot.parent_version()]).map_err(|e|graph::sqlite_error(Phase::Write,e))?;
-            if moved != 1 {
-                return Err(graph::failure(Phase::Write, Code::ParentConflict, None));
-            }
-            graph::accept_graph_sample(conn, content.project_id(), &sample, &time)?;
-            graph::insert_snapshot(conn, content, snapshot.graph_version(), &sample)?;
-            conn.execute("INSERT INTO graph_mutations(project_id,graph_id,mutation_id,parent_version,resulting_version,mutation_json) VALUES (?1,?2,?3,?4,?5,?6)",params![content.project_id(),content.graph_id(),mutation.mutation_id(),mutation.parent_version(),mutation.resulting_version(),raw]).map_err(|e|graph::sqlite_error(Phase::Write,e))?;
-            graph::seal_snapshot(conn, content, snapshot.graph_version())?;
-            Ok(())
+            append_mutation_in_tx(conn, &mutation, &snapshot, &raw, &sample, &time)
         })
     }
     pub fn load_graph_version_v1(

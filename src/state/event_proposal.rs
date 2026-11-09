@@ -196,15 +196,8 @@ impl SqliteStateRepository {
             .map_err(|e| graph::legacy_error(crate::GraphPhase::Clock, e))?;
         let (sample, timestamp) = trusted_time::validate_sample(sample)
             .map_err(|e| graph::legacy_error(crate::GraphPhase::Clock, e))?;
-        let event = proposal.envelope(event_id, &sample.canonical_utc_timestamp);
-        validate_for_append(&event)?;
-        let receipt = EventPersistReceiptV1 {
-            event_id: event_id.to_owned(),
-            proposal_sha256: proposal.sha256(),
-            origin: proposal.origin,
-            store_id: store_id.to_owned(),
-            occurred_at: sample.canonical_utc_timestamp.clone(),
-        };
+        let (event, receipt) =
+            proposal.prepare(event_id, &sample.canonical_utc_timestamp, store_id)?;
         graph::write_transaction(self.connection(), |conn| {
             if receipt_exists(conn, &proposal.project_id, &receipt.proposal_sha256)? {
                 return Err(graph::failure(
@@ -214,21 +207,7 @@ impl SqliteStateRepository {
                 ));
             }
             graph::accept_graph_sample(conn, &proposal.project_id, &sample, &timestamp)?;
-            insert_event(conn, &event)?;
-            conn.execute(
-                "INSERT INTO event_proposal_receipt(event_id,project_id,proposal_sha256,origin,claimed_observed_at,store_id,occurred_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                params![
-                    receipt.event_id,
-                    proposal.project_id,
-                    receipt.proposal_sha256,
-                    receipt.origin.as_str(),
-                    proposal.claimed_observed_at,
-                    receipt.store_id,
-                    receipt.occurred_at
-                ],
-            )
-            .map_err(|e| graph::sqlite_error(crate::GraphPhase::Write, e))?;
-            Ok(())
+            insert_event_and_receipt(conn, proposal, &event, &receipt)
         })?;
         Ok(receipt)
     }
@@ -265,7 +244,59 @@ impl SqliteStateRepository {
     }
 }
 
-fn receipt_exists(conn: &Connection, project: &str, digest: &str) -> Result<bool, StateError> {
+/// Inserts one validated event and its receipt inside the caller's open
+/// transaction. The caller has already checked [`receipt_exists`] and accepted
+/// the trusted sample.
+pub(crate) fn insert_event_and_receipt(
+    conn: &Connection,
+    proposal: &EventProposalV1,
+    event: &EventEnvelope,
+    receipt: &EventPersistReceiptV1,
+) -> Result<(), StateError> {
+    insert_event(conn, event)?;
+    conn.execute(
+        "INSERT INTO event_proposal_receipt(event_id,project_id,proposal_sha256,origin,claimed_observed_at,store_id,occurred_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        params![
+            receipt.event_id,
+            proposal.project_id,
+            receipt.proposal_sha256,
+            receipt.origin.as_str(),
+            proposal.claimed_observed_at,
+            receipt.store_id,
+            receipt.occurred_at
+        ],
+    )
+    .map_err(|e| graph::sqlite_error(crate::GraphPhase::Write, e))?;
+    Ok(())
+}
+
+impl EventProposalV1 {
+    /// The envelope and receipt this proposal would persist at `occurred_at`
+    /// (validated; nothing is written).
+    pub(crate) fn prepare(
+        &self,
+        event_id: &str,
+        occurred_at: &str,
+        store_id: &str,
+    ) -> Result<(EventEnvelope, EventPersistReceiptV1), StateError> {
+        let event = self.envelope(event_id, occurred_at);
+        validate_for_append(&event)?;
+        let receipt = EventPersistReceiptV1 {
+            event_id: event_id.to_owned(),
+            proposal_sha256: self.sha256(),
+            origin: self.origin,
+            store_id: store_id.to_owned(),
+            occurred_at: occurred_at.to_owned(),
+        };
+        Ok((event, receipt))
+    }
+}
+
+pub(crate) fn receipt_exists(
+    conn: &Connection,
+    project: &str,
+    digest: &str,
+) -> Result<bool, StateError> {
     conn.query_row(
         "SELECT COUNT(*) FROM event_proposal_receipt WHERE project_id=?1 AND proposal_sha256=?2",
         params![project, digest],

@@ -138,6 +138,14 @@ mod startup_recovery_tests;
 #[cfg(test)]
 mod two_writer_tests;
 
+pub mod atomic_publication;
+#[cfg(test)]
+mod atomic_publication_tests;
+pub mod review_claim;
+#[cfg(test)]
+mod review_claim_tests;
+mod write_fault;
+
 #[cfg(test)]
 mod trusted_core_tests;
 
@@ -147,6 +155,10 @@ mod trusted_time_watermark_tests;
 #[cfg(test)]
 mod tests;
 
+pub use atomic_publication::{
+    DecisionPublicationReceiptV1, DecisionPublicationV1, GraphMutationPublicationV1,
+    GraphPublicationOutcomeV1, GraphResultAttachmentV1, PublicationEventV1,
+};
 pub use attempt::{AttemptFinish, AttemptId, AttemptRecord, AttemptRole, AttemptStart};
 pub use authority::{
     StatePublisherV1, StateReader, authoritative_event_publisher, context_epoch_advance_publisher,
@@ -178,8 +190,8 @@ pub use decision_records::{
 };
 pub use epoch_value::StateEpochValueV1;
 pub use error::{
-    AttemptFailureCode, AttemptField, GraphFailureCode, GraphField, GraphPhase, RecordFailureCode,
-    StateError,
+    AttemptFailureCode, AttemptField, GraphFailureCode, GraphField, GraphPhase,
+    PublicationFailureCode, RecordFailureCode, StateError,
 };
 pub use event::{
     ActorKind, EventActor, EventEnvelope, EventPayloadReference, EventQuery, EventSubject,
@@ -210,6 +222,10 @@ pub use recovery::{
     StartupRecoveryReportV1,
 };
 pub use repository::SqliteStateRepository;
+pub use review_claim::{
+    ReviewClaimAbandonV1, ReviewClaimOutcomeV1, ReviewClaimRecordV1, ReviewClaimRequestV1,
+    ReviewClaimResolutionV1, ReviewClaimSettlementV1, ReviewClaimStateV1, ReviewClaimTicketV1,
+};
 pub use startup_recovery::{
     DurableBindingState, StartupDurableInconsistency, StartupReconciliationRequirement,
     StartupRecoveryClassification, StartupRecoverySnapshot, classify_startup_recovery,

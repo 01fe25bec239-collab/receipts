@@ -210,16 +210,16 @@ fn direct_exec(repo: &mut SqliteStateRepository, sql: &str, params: &[&dyn ToSql
 #[test]
 fn t01_schema_remains_version_8() {
     let (tmp, mut repo) = opened_repo("cea-t01");
-    assert_eq!(repo.schema_version().expect("version read"), 20);
+    assert_eq!(repo.schema_version().expect("version read"), 21);
     advance(&mut repo, "project-1", ContextEpochTrigger::A1Init).expect("advance");
     assert_eq!(
         repo.schema_version().expect("version read"),
-        20,
+        21,
         "advancement must not change the schema version"
     );
     drop(repo);
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("reopen");
-    assert_eq!(repo.schema_version().expect("version read"), 20);
+    assert_eq!(repo.schema_version().expect("version read"), 21);
 }
 
 // T02 — migration v11 is the exact registered chain head.
@@ -228,14 +228,14 @@ fn t02_migration_v8_registered() {
     let registered = migrations::registered();
     assert_eq!(
         registered.len(),
-        20,
-        "exactly twenty registered migrations may exist"
+        21,
+        "exactly twenty-one registered migrations may exist"
     );
     let versions: Vec<u32> = registered.iter().map(|m| m.version).collect();
     assert_eq!(
         versions,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21
         ]
     );
 }
@@ -1276,6 +1276,9 @@ fn t64_no_new_schema_object() {
         "state_store_identity",
         "event_proposal_receipt",
         "availability_fact",
+        "atomic_publication",
+        "atomic_publication_availability",
+        "review_claim",
     ];
     expected.sort_unstable();
     let tables_before = repo.list_tables().expect("tables");
