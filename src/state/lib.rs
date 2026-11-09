@@ -130,6 +130,9 @@ mod logical_role_tests;
 mod materializers_tests;
 
 #[cfg(test)]
+mod continuation_order_tests;
+
+#[cfg(test)]
 mod recovery_tests;
 
 #[cfg(test)]
@@ -144,6 +147,8 @@ mod atomic_publication_tests;
 pub mod review_claim;
 #[cfg(test)]
 mod review_claim_tests;
+#[cfg(test)]
+mod review_seal_tests;
 mod write_fault;
 
 #[cfg(test)]
@@ -225,6 +230,7 @@ pub use repository::SqliteStateRepository;
 pub use review_claim::{
     ReviewClaimAbandonV1, ReviewClaimOutcomeV1, ReviewClaimRecordV1, ReviewClaimRequestV1,
     ReviewClaimResolutionV1, ReviewClaimSettlementV1, ReviewClaimStateV1, ReviewClaimTicketV1,
+    ReviewRecoveryDataV1, ReviewSealRecordV1, ReviewSealRequestV1,
 };
 pub use startup_recovery::{
     DurableBindingState, StartupDurableInconsistency, StartupReconciliationRequirement,

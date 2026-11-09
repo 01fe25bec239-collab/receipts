@@ -721,6 +721,12 @@ pub enum PublicationFailureCode {
     /// The claim already left `CLAIMED` with a different outcome (or the
     /// settlement is not allowed from its state).
     ClaimNotUnfinished,
+    /// A sealed claim can only be completed by publishing its sealed package.
+    ClaimSealed,
+    /// The package being published is not the package sealed for its claim.
+    SealMismatch,
+    /// A restart publication names a claim that has no seal.
+    SealNotFound,
     StoreBusy,
     CorruptStore,
     StorageFailure,
@@ -732,6 +738,9 @@ impl PublicationFailureCode {
             Self::ConflictingRetry => "CONFLICTING_RETRY",
             Self::ClaimNotFound => "CLAIM_NOT_FOUND",
             Self::ClaimNotUnfinished => "CLAIM_NOT_UNFINISHED",
+            Self::ClaimSealed => "CLAIM_SEALED",
+            Self::SealMismatch => "SEAL_MISMATCH",
+            Self::SealNotFound => "SEAL_NOT_FOUND",
             Self::StoreBusy => "STORE_BUSY",
             Self::CorruptStore => "CORRUPT_STORE",
             Self::StorageFailure => "STORAGE_FAILURE",

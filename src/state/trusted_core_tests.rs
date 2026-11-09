@@ -112,7 +112,7 @@ fn exclusive_open_creates_identified_store_and_holds_the_writer_lock() {
         id.bytes()
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
     );
-    assert_eq!(store.reader().schema_version().unwrap(), 21);
+    assert_eq!(store.reader().schema_version().unwrap(), 22);
     assert_eq!(
         refusal(TrustedCoreStore::open_exclusive(dir.db()).unwrap_err()),
         R::WriterLockHeld
@@ -801,8 +801,8 @@ fn migrate_exclusive_upgrades_a_v19_store_and_a_failed_v20_leaves_exact_v19() {
     drop(conn);
 
     let (store, version) = TrustedCoreStore::migrate_exclusive(dir.db()).unwrap();
-    assert_eq!(version, 21);
-    assert_eq!(store.reader().schema_version().unwrap(), 21);
+    assert_eq!(version, 22);
+    assert_eq!(store.reader().schema_version().unwrap(), 22);
     assert_eq!(store.store_id().len(), 32);
 }
 

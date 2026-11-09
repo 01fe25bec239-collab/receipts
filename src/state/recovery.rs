@@ -650,34 +650,137 @@ fn clearance(
     if invalidated_after(conn, role)? {
         return Ok(Err(R::ContextInvalidated));
     }
-    let mut changed_only = false;
-    for attempt_id in succeeded_attempt_ids(conn, role, manifest_id, binding_id)? {
-        let attempt =
-            read_attempt(conn, &role.project_id, &attempt_id)?.ok_or_else(query_corrupt)?;
-        if attempt.context_epoch_id != role.current_context_epoch {
-            continue;
-        }
-        if attempt
-            .source_evidence
-            .iter()
-            .any(|e| e.comparison == SourceDigestComparison::Changed)
-        {
-            changed_only = true;
-            continue;
-        }
-        return Ok(Ok(ContinuationClearanceV1 {
-            role_id: role.role_id.clone(),
-            binding_id: binding_id.to_string(),
-            context_manifest_id: manifest_id.to_string(),
-            context_epoch: role.current_context_epoch.clone(),
-            rehydration_attempt_id: attempt_id,
-        }));
+    let attempts = scope_attempts(conn, role, manifest_id, binding_id)?;
+    // An attempt with no State-assigned order cannot be placed against the
+    // others: fail closed rather than guess.
+    if attempts.iter().any(|a| a.order.is_none()) {
+        return Ok(Err(R::DurableInconsistency));
     }
-    Ok(Err(if changed_only {
-        R::ChangedSourcesPending
-    } else {
-        R::RehydrationRequired
+    // CHANGED evidence stays pending for this epoch whatever came later: only
+    // the changed-source succession (a new epoch + manifest) reconciles it.
+    if attempts.iter().any(|a| a.changed) {
+        return Ok(Err(R::ChangedSourcesPending));
+    }
+    // A FAILED reread invalidates every success that began reading before it
+    // committed (`fence < sequence`). Ordering is State's commit sequence only.
+    let newest_failure = attempts
+        .iter()
+        .filter(|a| a.failed)
+        .filter_map(|a| a.order)
+        .map(|o| o.sequence)
+        .max()
+        .unwrap_or(0);
+    let legacy_failure = attempts
+        .iter()
+        .any(|a| a.failed && a.order.is_some_and(|o| o.sequence == 0));
+    let best = attempts
+        .iter()
+        .filter(|a| !a.failed)
+        .filter_map(|a| a.order.map(|o| (a, o)))
+        .filter(|(_, o)| {
+            if o.sequence == 0 {
+                // Upgraded history has no recorded order: it clears only when
+                // the scope holds no failure at all (nothing ambiguous).
+                !legacy_failure && newest_failure == 0
+            } else {
+                o.fence >= newest_failure
+            }
+        })
+        .max_by(|(a, x), (b, y)| {
+            (x.sequence, a.attempt_id.as_str()).cmp(&(y.sequence, b.attempt_id.as_str()))
+        });
+    let Some((attempt, _)) = best else {
+        return Ok(Err(R::RehydrationRequired));
+    };
+    // Re-validates the stored attempt and its evidence before relying on it.
+    read_attempt(conn, &role.project_id, &attempt.attempt_id)?.ok_or_else(query_corrupt)?;
+    Ok(Ok(ContinuationClearanceV1 {
+        role_id: role.role_id.clone(),
+        binding_id: binding_id.to_string(),
+        context_manifest_id: manifest_id.to_string(),
+        context_epoch: role.current_context_epoch.clone(),
+        rehydration_attempt_id: attempt.attempt_id.clone(),
     }))
+}
+
+/// State's durable position of one rehydration attempt.
+#[derive(Clone, Copy)]
+struct Order {
+    /// Per-project commit sequence (0 = recorded before ordering existed).
+    sequence: i64,
+    /// The highest sequence committed when the attempt began reading.
+    fence: i64,
+}
+
+/// One attempt of exactly the role's project/role/manifest/epoch/binding.
+struct ScopeAttempt {
+    attempt_id: String,
+    failed: bool,
+    changed: bool,
+    order: Option<Order>,
+}
+
+fn scope_attempts(
+    conn: &Connection,
+    role: &LogicalRole,
+    manifest_id: &str,
+    binding_id: &str,
+) -> Result<Vec<ScopeAttempt>, StateError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT a.rehydration_attempt_id, a.status = 'FAILED',
+                    EXISTS (SELECT 1 FROM context_rehydration_source_evidence e
+                            WHERE e.project_id = a.project_id
+                              AND e.rehydration_attempt_id = a.rehydration_attempt_id
+                              AND e.comparison = 'CHANGED'),
+                    o.sequence, o.fence_sequence
+             FROM context_rehydration_attempt a
+             LEFT JOIN context_rehydration_order o
+               ON o.project_id = a.project_id AND o.rehydration_attempt_id = a.rehydration_attempt_id
+             WHERE a.project_id = ?1 AND a.durable_role_id = ?2 AND a.context_manifest_id = ?3
+               AND a.context_epoch_id = ?4 AND a.executor_binding_id = ?5
+             ORDER BY a.rehydration_attempt_id COLLATE BINARY",
+        )
+        .map_err(query_failure)?;
+    statement
+        .query_map(
+            params![
+                role.project_id,
+                role.role_id,
+                manifest_id,
+                role.current_context_epoch.as_str(),
+                binding_id
+            ],
+            |r| {
+                let sequence: Option<i64> = r.get(3)?;
+                let fence: Option<i64> = r.get(4)?;
+                Ok(ScopeAttempt {
+                    attempt_id: r.get(0)?,
+                    failed: r.get(1)?,
+                    changed: r.get(2)?,
+                    order: sequence
+                        .zip(fence)
+                        .map(|(sequence, fence)| Order { sequence, fence }),
+                })
+            },
+        )
+        .map_err(query_failure)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(query_failure)
+}
+
+/// The highest rehydration commit sequence in `project_id` (0 when none).
+/// A reread records it BEFORE it reads, as the fence of its own attempt.
+pub(crate) fn rehydration_high_water(
+    conn: &Connection,
+    project_id: &str,
+) -> Result<i64, StateError> {
+    conn.query_row(
+        "SELECT COALESCE(MAX(sequence), 0) FROM context_rehydration_order WHERE project_id = ?1",
+        [project_id],
+        |r| r.get(0),
+    )
+    .map_err(query_failure)
 }
 
 fn classify(
@@ -780,25 +883,6 @@ fn invalidated_after(conn: &Connection, role: &LogicalRole) -> Result<bool, Stat
         }
     }
     Ok(false)
-}
-
-fn succeeded_attempt_ids(
-    conn: &Connection,
-    role: &LogicalRole,
-    manifest_id: &str,
-    binding_id: &str,
-) -> Result<Vec<String>, StateError> {
-    let mut statement = conn
-        .prepare("SELECT rehydration_attempt_id FROM context_rehydration_attempt WHERE project_id=?1 AND durable_role_id=?2 AND context_manifest_id=?3 AND executor_binding_id=?4 AND status='SUCCEEDED' ORDER BY rehydration_attempt_id COLLATE BINARY")
-        .map_err(query_failure)?;
-    statement
-        .query_map(
-            params![role.project_id, role.role_id, manifest_id, binding_id],
-            |r| r.get::<_, String>(0),
-        )
-        .map_err(query_failure)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(query_failure)
 }
 
 /// Releases `binding` with `reason` at trusted now and appends its exact

@@ -58,8 +58,8 @@ use crate::graph_node_result::{StateGraphNodeResultV1, insert_result_in_tx};
 use crate::graph_repository::{self as graph, StateGraphSnapshotV1, positive};
 use crate::repository::SqliteStateRepository;
 use crate::review_claim::{
-    ReviewClaimRecordV1, ReviewClaimSettlementV1, ReviewClaimTicketV1, bounded_id, read_claim,
-    settle_in_tx,
+    ReviewClaimRecordV1, ReviewClaimSettlementV1, ReviewClaimTicketV1, ReviewSealRecordV1,
+    bounded_id, read_claim, read_seal, settle_in_tx,
 };
 use crate::trusted_time::{self, TrustedClockV1};
 
@@ -281,13 +281,39 @@ impl PublicationEventV1 {
             event_id: event_id.to_owned(),
         })
     }
+
+    /// The event id derived from the publication identity and a stable,
+    /// caller-owned `event_key` (for example the Review package's event key),
+    /// so rebuilding the package after a retry or restart can never mint a
+    /// different id and therefore never a different package digest.
+    pub fn stable(
+        proposal: EventProposalV1,
+        publication_id: &str,
+        event_key: &str,
+    ) -> Result<Self, StateError> {
+        if !bounded_id(publication_id) || !bounded_id(event_key) {
+            return Err(fail(Code::InvalidShape, PUBLICATION));
+        }
+        let event_id = crate::recovery::derived_event_id(&[
+            "PUBLICATION_EVENT",
+            proposal.project_id(),
+            publication_id,
+            event_key,
+        ]);
+        Self::new(proposal, &event_id)
+    }
+
+    pub fn event_id(&self) -> &str {
+        &self.event_id
+    }
 }
 
 /// The claim settlement a package carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ClaimBinding {
-    store_id: String,
-    instance: u64,
+    /// `Some` when the live claimant's ticket attached the settlement; `None`
+    /// when a sealed claim is being finished (after a restart).
+    ticket: Option<(String, u64)>,
     claim_id: String,
     settlement: ReviewClaimSettlementV1,
 }
@@ -356,10 +382,25 @@ impl DecisionPublicationV1 {
             return Err(fail(Code::InvalidShape, PUBLICATION));
         }
         self.claim = Some(ClaimBinding {
-            store_id: ticket.store_id.clone(),
-            instance: ticket.instance,
+            ticket: Some((ticket.store_id.clone(), ticket.instance)),
             claim_id: ticket.claim_id.clone(),
             settlement,
+        });
+        Ok(self)
+    }
+
+    /// Finishes a SEALED claim without a ticket (the restart path): the claim
+    /// and its settlement come from the seal read back from State, so the
+    /// caller cannot choose a different disposition. Publication refuses
+    /// unless this package's digest equals the digest sealed for the claim.
+    pub fn with_sealed_claim(mut self, seal: &ReviewSealRecordV1) -> Result<Self, StateError> {
+        if seal.project_id != self.project_id {
+            return Err(fail(Code::InvalidShape, PUBLICATION));
+        }
+        self.claim = Some(ClaimBinding {
+            ticket: None,
+            claim_id: seal.claim_id.clone(),
+            settlement: seal.settlement.clone(),
         });
         Ok(self)
     }
@@ -375,7 +416,15 @@ impl DecisionPublicationV1 {
     pub(crate) fn claim_binding(&self) -> Option<(&str, u64)> {
         self.claim
             .as_ref()
-            .map(|c| (c.store_id.as_str(), c.instance))
+            .and_then(|c| c.ticket.as_ref())
+            .map(|(store_id, instance)| (store_id.as_str(), *instance))
+    }
+
+    /// The claim this package settles and the disposition it applies.
+    pub(crate) fn claim_identity(&self) -> Option<(&str, &ReviewClaimSettlementV1)> {
+        self.claim
+            .as_ref()
+            .map(|c| (c.claim_id.as_str(), &c.settlement))
     }
 
     /// Lowercase SHA-256 over the whole package: the publication identity's
@@ -562,6 +611,19 @@ impl SqliteStateRepository {
                     return Err(fail(Code::ConflictingRetry, PUBLICATION));
                 }
                 return recorded_receipt(conn, p, recorded_at);
+            }
+            // A claim that was sealed is finished only by its sealed package;
+            // a restart publication needs the seal it names.
+            if let Some(binding) = &p.claim {
+                match read_seal(conn, &p.project_id, &binding.claim_id)? {
+                    Some(seal) if seal.package_sha256 != digest => {
+                        return Err(fail(Code::SealMismatch, PUBLICATION));
+                    }
+                    None if binding.ticket.is_none() => {
+                        return Err(fail(Code::SealNotFound, PUBLICATION));
+                    }
+                    _ => {}
+                }
             }
             for event in &p.events {
                 if receipt_exists(conn, &p.project_id, &event.proposal.sha256())? {

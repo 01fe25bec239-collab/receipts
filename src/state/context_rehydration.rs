@@ -502,6 +502,10 @@ impl SqliteStateRepository {
             return self.persist_request_failure(request, closed_request_error(&error));
         }
 
+        // State's own fence: anything that commits after this point is newer
+        // than the reread begun here, whatever the caller's timestamps claim.
+        let fence =
+            crate::recovery::rehydration_high_water(self.connection(), &request.project_id)?;
         let mut evidence = Vec::with_capacity(manifest.sources.len());
         let mut sources = Vec::new();
         let mut failure_code = None;
@@ -718,7 +722,9 @@ impl SqliteStateRepository {
         validate_boundary_b(&attempt)?;
 
         if status == ContextRehydrationStatus::Failed {
-            self.run_transaction(|uow| uow.insert_context_rehydration_attempt(&attempt))?;
+            self.run_transaction(|uow| {
+                uow.insert_context_rehydration_attempt(&attempt, Some(fence))
+            })?;
             return Ok(ContextRehydrationOutcome {
                 attempt,
                 sources: Vec::new(),
@@ -732,7 +738,9 @@ impl SqliteStateRepository {
                 failure_code: Some("CONTEXT_REHYDRATED_EVENT_INVALID".to_string()),
                 ..attempt
             };
-            self.run_transaction(|uow| uow.insert_context_rehydration_attempt(&failed))?;
+            self.run_transaction(|uow| {
+                uow.insert_context_rehydration_attempt(&failed, Some(fence))
+            })?;
             return Ok(ContextRehydrationOutcome {
                 attempt: failed,
                 sources: Vec::new(),
@@ -747,7 +755,7 @@ impl SqliteStateRepository {
             if latest.epoch != attempt.context_epoch_id {
                 return validation_failure("STALE_CONTEXT_EPOCH");
             }
-            uow.insert_context_rehydration_attempt(&attempt)?;
+            uow.insert_context_rehydration_attempt(&attempt, Some(fence))?;
             uow.insert_event(&success_event)
         }) {
             let failed = ContextRehydrationAttempt {
@@ -763,7 +771,7 @@ impl SqliteStateRepository {
                 ..attempt
             };
             if self
-                .run_transaction(|uow| uow.insert_context_rehydration_attempt(&failed))
+                .run_transaction(|uow| uow.insert_context_rehydration_attempt(&failed, Some(fence)))
                 .is_ok()
             {
                 return Ok(ContextRehydrationOutcome {
@@ -799,7 +807,7 @@ impl SqliteStateRepository {
         failed.repository_snapshot_references.clear();
         validate_attempt(&failed)?;
         validate_boundary_b(&failed)?;
-        self.run_transaction(|uow| uow.insert_context_rehydration_attempt(&failed))?;
+        self.run_transaction(|uow| uow.insert_context_rehydration_attempt(&failed, None))?;
         Ok(ContextRehydrationOutcome {
             attempt: failed,
             sources: Vec::new(),
@@ -1080,13 +1088,17 @@ impl SqliteStateRepository {
 }
 
 impl UnitOfWork<'_> {
+    /// `fence` is the project's rehydration high-water mark taken before the
+    /// attempt began reading (`None`: nothing was read, so the fence is the
+    /// mark at insertion).
     fn insert_context_rehydration_attempt(
         &self,
         attempt: &ContextRehydrationAttempt,
+        fence: Option<i64>,
     ) -> Result<(), StateError> {
         validate_attempt(attempt)?;
         validate_boundary_b(attempt)?;
-        insert_attempt(self.tx(), attempt)
+        insert_attempt(self.tx(), attempt, fence)
     }
 }
 
@@ -2340,6 +2352,7 @@ fn decode_failure(detail: impl Into<String>) -> StateError {
 fn insert_attempt(
     conn: &Connection,
     attempt: &ContextRehydrationAttempt,
+    fence: Option<i64>,
 ) -> Result<(), StateError> {
     let inserted = conn.execute(
         "INSERT INTO context_rehydration_attempt (
@@ -2389,6 +2402,16 @@ fn insert_attempt(
             detail: error.to_string(),
         });
     }
+    // The write lock is held from the attempt insert onward, so the next
+    // sequence is assigned in commit order. The fence can never exceed what
+    // existed before this attempt.
+    conn.execute(
+        "INSERT INTO context_rehydration_order (project_id, rehydration_attempt_id, sequence, fence_sequence)
+         SELECT ?1, ?2, m + 1, MIN(COALESCE(?3, m), m)
+         FROM (SELECT COALESCE(MAX(sequence), 0) AS m FROM context_rehydration_order WHERE project_id = ?1)",
+        params![attempt.project_id, attempt.rehydration_attempt_id, fence],
+    )
+    .map_err(write_failure)?;
     for (ordinal, reference) in attempt.repository_snapshot_references.iter().enumerate() {
         conn.execute(
             "INSERT INTO context_rehydration_repository_snapshot (

@@ -152,7 +152,7 @@ No new DDL of its own (it was written against schema v20). Everything below uses
 - its pointer names an unreleased binding;
 - trusted now is before that binding's lease deadline;
 - no later epoch invalidated the role;
-- a SUCCEEDED rehydration with no `CHANGED` source exists for exactly that binding, the role's current manifest and its current epoch.
+- a SUCCEEDED rehydration with no `CHANGED` source exists for exactly that binding, the role's current manifest and its current epoch, **and it is not superseded by later failed evidence** (see "Rehydration order and continuation invalidation" below).
 
 Every other case is a typed `RecoveryRefusalV1`. "Needs rebind" is `NO_ACTIVE_BINDING`, `BINDING_RELEASED` or `LEASE_EXPIRED` (see `requires_rebind`). Changed digests give `CHANGED_SOURCES_PENDING`. The frozen role status set is unchanged.
 
@@ -176,9 +176,28 @@ Materializers (`receipts_state::materializers`):
 
 Missing Core interface: Orchestration's `CoreStateWriter` does not yet forward `recover_startup`, `rebind_role` or `succeed_changed_context_sources`. The State side and its admission checks are complete; Core needs three forwarding methods using its existing `admit`/`admit_role` with the families above.
 
+## Rehydration order and continuation invalidation (schema v22)
+
+Continuation used to pick any matching SUCCEEDED attempt, ordered by caller-chosen attempt id, and ignored FAILED attempts, so an old success could clear a role after a later CHANGED or unreadable reread. Migration 22 (`order_and_seal`) adds `context_rehydration_order`, one immutable row per attempt, assigned by State inside the attempt's own transaction:
+
+- `sequence`: the next per-project commit sequence (1, 2, 3, ...; a unique partial index and an append-only trigger enforce it). Attempt ids, `started_at` and `completed_at` are caller data and never decide order.
+- `fence_sequence`: the project's highest sequence at the moment the reread began (read before any materializer runs). It is always strictly behind the attempt's own `sequence`.
+
+`continuation_clearance` and `recover_startup` share one decision over the attempts of exactly the role's project, role, **current binding**, **current manifest** and **current epoch** (attempts for any other binding, manifest, epoch, role or project never matter):
+
+1. an attempt with no order row (not expected after v22; a raw insert) is `DURABLE_INCONSISTENCY`;
+2. any attempt that observed a `CHANGED` source makes the scope `CHANGED_SOURCES_PENDING` for this epoch, whatever came later. A later matching reread at the same epoch does not undo it; only `succeed_changed_context_sources` (a new epoch and manifest) followed by a successful reread there clears;
+3. otherwise a SUCCEEDED attempt clears only if its `fence_sequence` is at or after the newest FAILED attempt's `sequence` in the scope, i.e. the success began reading after the last failure had committed. A success that was still reading when a newer failure committed (the delayed stale outcome) is kept as honest immutable history but never clears; a fresh reread restores clearance. Among clearing attempts the highest `sequence` is reported.
+
+History is never rewritten or deleted: all attempts stay readable. A failure does not block forever; one fresh verified reread of the exact scope restores clearance.
+
+Upgrade: attempts that exist when a store is migrated to v22 are backfilled at sequence 0, because their relative order was never recorded. A lone upgraded success with no failure beside it still clears. If the scope holds an upgraded failure beside an upgraded success, or any post-upgrade failure, upgraded successes do not clear: the role fails closed (`REHYDRATION_REQUIRED`) until one fresh rehydration succeeds. Upgraded `CHANGED` evidence stays pending.
+
+Concurrency model: `rehydrate_context` reads sources outside any transaction and commits its attempt in one `run_transaction`, with other connections or processes free to commit in between. The fence closes that window: whatever commits after the fence was taken is newer than the reread, whatever the timestamps claim.
+
 ## Shared atomic publication and review claims (schema v21)
 
-Migration 21 (`publication_claims`) adds `atomic_publication`, `atomic_publication_availability` and `review_claim`, all `WITHOUT ROWID` with immutability and no-replace triggers like v20. It verifies the exact v20 store before and the v21 store after. Migrations 1–20 SQL is unchanged; v20's own apply now verifies exact v20 (not "current"), and `verify_current` checks the v21 objects too. `migrate_exclusive` upgrades any exact v11–v20 store to v21 in resumable steps (a failed v21 step leaves the exact v20 store). Every operation below is a typed `TrustedCoreStore` method that consumes one admission. There is no public SQL, transaction closure or generic batch.
+Migration 21 (`publication_claims`) adds `atomic_publication`, `atomic_publication_availability` and `review_claim`, all `WITHOUT ROWID` with immutability and no-replace triggers like v20. It verifies the exact v20 store before and the v21 store after. Migrations 1–20 SQL is unchanged; v20's own apply now verifies exact v20 (not "current"), and `verify_current` checks the v21 objects too. `migrate_exclusive` upgrades any exact v11–v21 store to the current head (v22) in resumable steps (a failed v21 step leaves the exact v20 store; v21's own apply now verifies exact v21). Every operation below is a typed `TrustedCoreStore` method that consumes one admission. There is no public SQL, transaction closure or generic batch.
 
 ### Graph mutation with its results (`GraphMutation` family)
 
@@ -244,8 +263,40 @@ The claim is inserted before routing or execution. `claim_id` must be the determ
 - Reusing a `claim_id` with a different task, SHA or request digest is `ConflictingRetry`. `outcome_kind` is an opaque `[A-Z][A-Z0-9_]{0,63}` token that State never interprets.
 - `SqliteStateRepository::find_review_claim(project, claim_id)` reads a claim.
 
+### Durable seal and restart publication (`ReviewClaim` + `DecisionPublication`, schema v22)
+
+Review's contract is: claim once, seal the exact observed result and package, then publish atomically. The seal is the smallest typed State boundary for the middle step; it is not a blob store.
+
+```rust
+// 1. claim (unchanged): Claimed(ticket) is the ONLY execution permission.
+// 2. After the reviewer ran, BEFORE publishing anything:
+let package = DecisionPublicationV1::new(project, publication_id, records, events, facts)?
+    .with_claim_settlement(&ticket, ReviewClaimSettlementV1::completed("REJECT", Some("rev-1"), None)?)?;
+let recovery = ReviewRecoveryDataV1::new("REVIEW_SEALED_V1", sealed_bytes, &sha256_hex_of_bytes)?; // State recomputes the digest
+let request = ReviewSealRequestV1::new(&claim_request, &package, recovery)?;
+let seal: ReviewSealRecordV1 = store.seal_review_claim_v1(admission /* Op::ReviewClaim */, &clock, &ticket, &request)?;
+// 3. publish (live): store.publish_decision_package_v1(admission /* Op::DecisionPublication */, &clock, &package)?
+// 3'. publish (after a restart, no ticket):
+let claim = match store.claim_review_v1(..)? { Existing(r) => r, .. };            // CLAIMED: never execute
+if let Some(seal) = store.reader().find_review_seal(project, claim_id)? {
+    let package = rebuild_from(&seal.recovery_data)?.with_sealed_claim(&seal)?;      // Core validates, rebuilds, same stable ids
+    store.publish_decision_package_v1(admission, &clock, &package)?;                 // refuses unless package.sha256() == seal.package_sha256
+}
+```
+
+- **Seal contents.** project, claim id, task, subject SHA and request digest (verified equal to the stored claim, and enforced again by a schema trigger), `publication_id`, `package_sha256` (State's digest of the whole package, which includes the claim settlement), the settlement (`COMPLETED`/`REFUSED`, kind, ref, digest) and the exact recovery bytes (1 byte to 4 MiB) with a kind token and their SHA-256. The package identity and settlement are derived from the `DecisionPublicationV1`, never supplied separately. The seal's own identity digest covers everything except `sealed_at` and is re-verified on every read; any drift is `CorruptStore`.
+- **Only the claimant seals.** `seal_review_claim_v1` needs the live, non-`Clone` ticket and the package must have been built with that ticket. After a restart nobody can create the initial seal, so an unsealed claim stays `CLAIMED`/uncertain. A foreign, stale or other-claim ticket is `WrongStore`/`InvalidShape`. The claim must be `CLAIMED`.
+- **Reseal.** The identical request returns the stored seal and writes nothing, even after the claim completed. Different recovery bytes, package or disposition are `ConflictingRetry`. A publication id already sealed for another claim, or recorded with another digest, is `ConflictingRetry`.
+- **Publish.** A claim that has a seal is completed only by publishing the sealed package: a different package is `SealMismatch`, a plain `settle_review_claim_v1` is `ClaimSealed`, and a restart package built with `with_sealed_claim` for a claim with no seal is `SealNotFound`. The settlement of a restart package comes from the seal, so the caller cannot choose another disposition. Records, events with receipts, availability facts, the publication identity and the claim settlement are still one transaction. Exact retries are replays with the same receipts.
+- **Stable ids.** Event ids are part of the package digest. `PublicationEventV1::stable(proposal, publication_id, event_key)` derives the id from the publication id and a caller-owned stable key, so rebuilding the package after a retry or restart cannot mint different ids. (A random id minted per build would change the digest and the publication would be refused.)
+- **Terminal and abandoned.** Completed/refused/abandoned claims accept no new seal and no different publication. Abandoning a sealed claim is allowed (it is the trusted decision to stop waiting); the seal stays as history and the sealed package can no longer be published (`ClaimNotUnfinished`).
+- **Immutability.** A stored `REJECT` is never replaced: a later sealed `PASS` under the same review id seals fine but its publication fails with the original `AlreadyExists` and writes nothing. A sealed `POLICY_BLOCKED` publishes as a `REFUSED` claim and later callbacks see it.
+- **What State does not claim.** An external reviewer execution and SQLite are not one transaction. A crash before the seal commits leaves the claim `CLAIMED` and uncertain forever (until an explicit abandon); State cannot know whether the reviewer ran. Content correctness is the trusted core's job: it validates the recovery bytes before sealing and again before rebuilding a package from them. State only proves the rebuilt package is byte-identical in digest to what was sealed.
+- **Abandonment authority.** `abandon_review_claim_v1` still records an `authority_ref` string. State does not authenticate any person or policy behind it; the trusted core must decide who may abandon before it issues the admission.
+
 ### Remaining integration requirements
 
+- Orchestration's `CoreStateWriter` also needs `seal_review_claim` (`Op::ReviewClaim`, consuming the live ticket) and a sealed-claim reader; see the seal section.
 - Orchestration's `CoreStateWriter` needs forwarders: `publish_graph_mutation` (admit like `append_graph_mutation`, then `publish_graph_mutation_v1`), `publish_decision_package` (verify each event's content through the resolver as `persist_event_proposal` does, check the project is admitted, `admit(Op::DecisionPublication, project, None)`), and `claim_review` / `settle_review_claim` / `abandon_review_claim` (`Op::ReviewClaim`). Core's graph store should call the single graph operation instead of `append_node_result` plus `append_graph_mutation`.
 - Routing, Registry, Availability and Review sinks should hand the Core one package per outcome instead of record-then-events, and Review should claim before routing. Event ids must be minted before the package is built; they are part of its digest.
 - Provenance links are not part of a package; they stay separate immutable writes.

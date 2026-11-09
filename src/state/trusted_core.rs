@@ -105,7 +105,7 @@ use crate::recovery::{
 use crate::repository::SqliteStateRepository;
 use crate::review_claim::{
     ReviewClaimAbandonV1, ReviewClaimOutcomeV1, ReviewClaimRecordV1, ReviewClaimRequestV1,
-    ReviewClaimSettlementV1, ReviewClaimTicketV1,
+    ReviewClaimSettlementV1, ReviewClaimTicketV1, ReviewSealRecordV1, ReviewSealRequestV1,
 };
 use crate::trusted_time::TrustedClockV1;
 
@@ -269,7 +269,7 @@ impl TrustedCoreStore {
         Self::finish(repo, held)
     }
 
-    /// Explicitly upgrades an existing v11–v20 store to the current schema and
+    /// Explicitly upgrades an existing v11–v21 store to the current schema and
     /// opens it, under the same ownership/lock checks. Returns the new head.
     pub fn migrate_exclusive(path: impl AsRef<Path>) -> Result<(Self, u32), StateError> {
         let held = secure::prepare(path.as_ref(), false)?;
@@ -992,6 +992,37 @@ impl TrustedCoreStore {
         }
         self.repo
             .settle_review_claim_v1(clock, &ticket.project_id, &ticket.claim_id, settlement)
+    }
+
+    /// Durably seals the claimant's exact observed result BEFORE anything is
+    /// published. Only the live claimant (the `ticket` this instance issued)
+    /// can create the initial seal; an identical reseal returns the stored
+    /// seal and different content refuses. See [`crate::review_claim`].
+    pub fn seal_review_claim_v1(
+        &mut self,
+        admission: StateWriteAdmission,
+        clock: &dyn TrustedClockV1,
+        ticket: &ReviewClaimTicketV1,
+        request: &ReviewSealRequestV1,
+    ) -> Result<ReviewSealRecordV1, StateError> {
+        self.check(
+            admission,
+            StateWriteOperationV1::ReviewClaim,
+            Bound::project(&ticket.project_id),
+        )?;
+        if ticket.store_id != self.store_id || ticket.instance != self.instance {
+            return Err(refused(StateWriteRefusalV1::WrongStore));
+        }
+        if request.project_id() != ticket.project_id || request.claim_id() != ticket.claim_id {
+            return Err(StateError::Publication {
+                code: crate::PublicationFailureCode::InvalidShape,
+                kind: "review_claim",
+            });
+        }
+        if request.ticket_binding() != (self.store_id.as_str(), self.instance) {
+            return Err(refused(StateWriteRefusalV1::WrongStore));
+        }
+        self.repo.seal_review_claim_v1(clock, request)
     }
 
     /// Records the explicit, authority-named abandonment of an unfinished

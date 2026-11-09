@@ -26,6 +26,21 @@
 //! State stores what the Review owner defines. `outcome_kind` is an opaque
 //! bounded token (for example `PASS`, `REJECT`, `POLICY_BLOCKED`); State
 //! never interprets it.
+//!
+//! # Seal
+//!
+//! Only the live claimant (the holder of the ticket) can, after its reviewer
+//! returned and BEFORE it publishes anything, seal the exact result:
+//! [`ReviewSealRequestV1`] binds the claim, the digest and settlement of the
+//! one [`DecisionPublicationV1`](crate::DecisionPublicationV1) it will publish
+//! and the exact recovery bytes ([`ReviewRecoveryDataV1`]). After a restart
+//! [`SqliteStateRepository::find_review_seal`] returns the sealed result and
+//! `DecisionPublicationV1::with_sealed_claim` finishes exactly that
+//! publication, with no ticket, routing or reviewer run. A sealed claim is
+//! completed only by its sealed package. An unsealed claim stays `CLAIMED`
+//! and uncertain: a crash between the external execution and the seal commit
+//! is never resolved automatically, because an external execution and a
+//! SQLite commit are not one transaction.
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -254,6 +269,20 @@ impl ReviewClaimSettlementV1 {
         )
     }
 
+    /// `true` for `completed`, `false` for `refused`.
+    pub fn is_completed(&self) -> bool {
+        self.resolution == ReviewClaimResolutionV1::Completed
+    }
+    pub fn outcome_kind(&self) -> &str {
+        &self.outcome_kind
+    }
+    pub fn outcome_ref(&self) -> Option<&str> {
+        self.outcome_ref.as_deref()
+    }
+    pub fn outcome_sha256(&self) -> Option<&str> {
+        self.outcome_sha256.as_deref()
+    }
+
     pub(crate) fn canonical(&self) -> serde_json::Value {
         serde_json::json!([
             match self.resolution {
@@ -306,6 +335,290 @@ impl ReviewClaimAbandonV1 {
     pub fn project_id(&self) -> &str {
         &self.project_id
     }
+}
+
+// ---- durable seal -------------------------------------------------------------
+
+/// Upper bound of one seal's recovery data (the schema enforces the same).
+pub const MAX_RECOVERY_BYTES: usize = 4 * 1024 * 1024;
+
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The exact observed result a claimant needs to finish its publication after
+/// a restart, as opaque bytes plus a token naming their format (for example
+/// `REVIEW_SEALED_V1`). State never parses it: the trusted core validates the
+/// bytes before sealing and again before it rebuilds a package from them.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ReviewRecoveryDataV1 {
+    kind: String,
+    bytes: Vec<u8>,
+    sha256: String,
+}
+
+impl std::fmt::Debug for ReviewRecoveryDataV1 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReviewRecoveryDataV1")
+    }
+}
+
+impl ReviewRecoveryDataV1 {
+    /// `kind` matches `[A-Z][A-Z0-9_]{0,63}`; `bytes` is 1..=[`MAX_RECOVERY_BYTES`];
+    /// `declared_sha256` must be the lowercase SHA-256 of `bytes` (State
+    /// recomputes it and refuses a mismatch).
+    pub fn new(kind: &str, bytes: Vec<u8>, declared_sha256: &str) -> Result<Self, StateError> {
+        if !token(kind)
+            || bytes.is_empty()
+            || bytes.len() > MAX_RECOVERY_BYTES
+            || !lower_hex(declared_sha256, 64)
+            || sha256_hex(&bytes) != declared_sha256
+        {
+            return Err(failure(Code::InvalidShape));
+        }
+        Ok(Self {
+            kind: kind.to_owned(),
+            bytes,
+            sha256: declared_sha256.to_owned(),
+        })
+    }
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+}
+
+/// What the claimant seals: the claim it holds, the identity and settlement of
+/// the one package it will publish, and the exact recovery data. The package
+/// identity and settlement are derived from the [`DecisionPublicationV1`]
+/// itself, never supplied separately.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewSealRequestV1 {
+    project_id: String,
+    claim_id: String,
+    task_id: String,
+    subject_sha: Option<String>,
+    request_sha256: String,
+    publication_id: String,
+    package_sha256: String,
+    settlement: ReviewClaimSettlementV1,
+    ticket_store_id: String,
+    ticket_instance: u64,
+    recovery: ReviewRecoveryDataV1,
+}
+
+impl ReviewSealRequestV1 {
+    /// `claim` is the request the claimant claimed with (State verifies it
+    /// equals the stored claim); `package` must settle that same claim through
+    /// [`DecisionPublicationV1::with_claim_settlement`].
+    pub fn new(
+        claim: &ReviewClaimRequestV1,
+        package: &crate::DecisionPublicationV1,
+        recovery: ReviewRecoveryDataV1,
+    ) -> Result<Self, StateError> {
+        let (claim_id, settlement) = package
+            .claim_identity()
+            .ok_or_else(|| failure(Code::InvalidShape))?;
+        let (ticket_store_id, ticket_instance) = package
+            .claim_binding()
+            .ok_or_else(|| failure(Code::InvalidShape))?;
+        if claim_id != claim.claim_id || package.project_id() != claim.project_id {
+            return Err(failure(Code::InvalidShape));
+        }
+        Ok(Self {
+            project_id: claim.project_id.clone(),
+            claim_id: claim.claim_id.clone(),
+            task_id: claim.task_id.clone(),
+            subject_sha: claim.subject_sha.clone(),
+            request_sha256: claim.request_sha256.clone(),
+            publication_id: package.publication_id().to_owned(),
+            package_sha256: package.sha256(),
+            settlement: settlement.clone(),
+            ticket_store_id: ticket_store_id.to_owned(),
+            ticket_instance,
+            recovery,
+        })
+    }
+
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+    pub fn claim_id(&self) -> &str {
+        &self.claim_id
+    }
+    pub(crate) fn ticket_binding(&self) -> (&str, u64) {
+        (&self.ticket_store_id, self.ticket_instance)
+    }
+
+    fn seal_sha256(&self) -> String {
+        seal_digest(&SealIdentity {
+            project_id: &self.project_id,
+            claim_id: &self.claim_id,
+            task_id: &self.task_id,
+            subject_sha: self.subject_sha.as_deref(),
+            request_sha256: &self.request_sha256,
+            publication_id: &self.publication_id,
+            package_sha256: &self.package_sha256,
+            settlement: &self.settlement,
+            recovery_kind: &self.recovery.kind,
+            recovery_sha256: &self.recovery.sha256,
+        })
+    }
+}
+
+struct SealIdentity<'a> {
+    project_id: &'a str,
+    claim_id: &'a str,
+    task_id: &'a str,
+    subject_sha: Option<&'a str>,
+    request_sha256: &'a str,
+    publication_id: &'a str,
+    package_sha256: &'a str,
+    settlement: &'a ReviewClaimSettlementV1,
+    recovery_kind: &'a str,
+    recovery_sha256: &'a str,
+}
+
+fn seal_digest(s: &SealIdentity<'_>) -> String {
+    sha256_hex(
+        serde_json::json!([
+            "receipts.review-claim-seal.v1",
+            s.project_id,
+            s.claim_id,
+            s.task_id,
+            s.subject_sha,
+            s.request_sha256,
+            s.publication_id,
+            s.package_sha256,
+            s.settlement.canonical(),
+            s.recovery_kind,
+            s.recovery_sha256,
+        ])
+        .to_string()
+        .as_bytes(),
+    )
+}
+
+/// The durable, immutable seal read back from State. Reading verifies the
+/// recovery bytes against their digest and the whole seal against its identity
+/// digest; any drift is `CorruptStore`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewSealRecordV1 {
+    pub project_id: String,
+    pub claim_id: String,
+    pub task_id: String,
+    pub subject_sha: Option<String>,
+    pub request_sha256: String,
+    /// The publication identity the sealed package must be published under.
+    pub publication_id: String,
+    /// [`DecisionPublicationV1::sha256`](crate::DecisionPublicationV1::sha256)
+    /// of the sealed package (it includes the claim settlement below).
+    pub package_sha256: String,
+    /// The disposition the claim takes when the sealed package is published.
+    pub settlement: ReviewClaimSettlementV1,
+    pub recovery_kind: String,
+    pub recovery_data: Vec<u8>,
+    pub recovery_sha256: String,
+    /// The identity digest of everything above except `sealed_at`.
+    pub seal_sha256: String,
+    pub sealed_at: String,
+}
+
+const SEAL_SELECT: &str = "SELECT task_id,subject_sha,request_sha256,publication_id,package_sha256,resolution,outcome_kind,outcome_ref,outcome_sha256,recovery_kind,recovery_data,recovery_sha256,seal_sha256,sealed_at FROM review_claim_seal WHERE project_id=?1 AND claim_id=?2";
+
+pub(crate) fn read_seal(
+    conn: &Connection,
+    project: &str,
+    claim_id: &str,
+) -> Result<Option<ReviewSealRecordV1>, StateError> {
+    type Row = (
+        String,
+        Option<String>,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        Vec<u8>,
+        String,
+        String,
+        String,
+    );
+    let row: Option<Row> = conn
+        .query_row(SEAL_SELECT, params![project, claim_id], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+                r.get(10)?,
+                r.get(11)?,
+                r.get(12)?,
+                r.get(13)?,
+            ))
+        })
+        .optional()
+        .map_err(|e| graph::sqlite_error(Phase::Read, e))?;
+    let Some(row) = row else { return Ok(None) };
+    let corrupt = || failure(Code::CorruptStore);
+    let settlement = match row.5.as_str() {
+        "COMPLETED" => {
+            ReviewClaimSettlementV1::completed(&row.6, row.7.as_deref(), row.8.as_deref())
+        }
+        "REFUSED" => ReviewClaimSettlementV1::refused(&row.6, row.7.as_deref(), row.8.as_deref()),
+        _ => return Err(corrupt()),
+    }
+    .map_err(|_| corrupt())?;
+    let record = ReviewSealRecordV1 {
+        project_id: project.to_owned(),
+        claim_id: claim_id.to_owned(),
+        task_id: row.0,
+        subject_sha: row.1,
+        request_sha256: row.2,
+        publication_id: row.3,
+        package_sha256: row.4,
+        settlement,
+        recovery_kind: row.9,
+        recovery_data: row.10,
+        recovery_sha256: row.11,
+        seal_sha256: row.12,
+        sealed_at: row.13,
+    };
+    let identity = seal_digest(&SealIdentity {
+        project_id: &record.project_id,
+        claim_id: &record.claim_id,
+        task_id: &record.task_id,
+        subject_sha: record.subject_sha.as_deref(),
+        request_sha256: &record.request_sha256,
+        publication_id: &record.publication_id,
+        package_sha256: &record.package_sha256,
+        settlement: &record.settlement,
+        recovery_kind: &record.recovery_kind,
+        recovery_sha256: &record.recovery_sha256,
+    });
+    if sha256_hex(&record.recovery_data) != record.recovery_sha256 || identity != record.seal_sha256
+    {
+        return Err(corrupt());
+    }
+    Ok(Some(record))
 }
 
 const SELECT: &str = "SELECT project_id,claim_id,task_id,subject_sha,request_sha256,state,outcome_kind,outcome_ref,outcome_sha256,authority_ref,claimed_at,finished_at FROM review_claim WHERE project_id=?1 AND claim_id=?2";
@@ -452,6 +765,10 @@ impl SqliteStateRepository {
             if current.state != ReviewClaimStateV1::Claimed {
                 return settle_in_tx(conn, project, claim_id, settlement, "");
             }
+            // A sealed claim is completed only by publishing its sealed package.
+            if read_seal(conn, project, claim_id)?.is_some() {
+                return Err(failure(Code::ClaimSealed));
+            }
             graph::accept_graph_sample(conn, project, &sample, &timestamp)?;
             crate::write_fault::boundary()?;
             settle_in_tx(
@@ -462,6 +779,94 @@ impl SqliteStateRepository {
                 &sample.canonical_utc_timestamp,
             )
         })
+    }
+
+    /// Seals the claimant's exact result (idempotent for identical content).
+    pub(crate) fn seal_review_claim_v1(
+        &mut self,
+        clock: &dyn TrustedClockV1,
+        request: &ReviewSealRequestV1,
+    ) -> Result<ReviewSealRecordV1, StateError> {
+        let (sample, timestamp) = sample(clock)?;
+        let digest = request.seal_sha256();
+        graph::write_transaction(self.connection(), |conn| {
+            let claim = read_claim(conn, &request.project_id, &request.claim_id)?
+                .ok_or_else(|| failure(Code::ClaimNotFound))?;
+            if claim.task_id != request.task_id
+                || claim.subject_sha != request.subject_sha
+                || claim.request_sha256 != request.request_sha256
+            {
+                return Err(failure(Code::ConflictingRetry));
+            }
+            if let Some(existing) = read_seal(conn, &request.project_id, &request.claim_id)? {
+                return if existing.seal_sha256 == digest {
+                    Ok(existing)
+                } else {
+                    Err(failure(Code::ConflictingRetry))
+                };
+            }
+            if claim.state != ReviewClaimStateV1::Claimed {
+                return Err(failure(Code::ClaimNotUnfinished));
+            }
+            // The publication identity belongs to this one claim and package.
+            let taken: Option<String> = conn
+                .query_row(
+                    "SELECT package_sha256 FROM atomic_publication WHERE project_id=?1 AND publication_id=?2",
+                    params![request.project_id, request.publication_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| graph::sqlite_error(Phase::Write, e))?;
+            let other_seal: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM review_claim_seal WHERE project_id=?1 AND publication_id=?2)",
+                    params![request.project_id, request.publication_id],
+                    |r| r.get(0),
+                )
+                .map_err(|e| graph::sqlite_error(Phase::Write, e))?;
+            if other_seal || taken.is_some_and(|stored| stored != request.package_sha256) {
+                return Err(failure(Code::ConflictingRetry));
+            }
+            graph::accept_graph_sample(conn, &request.project_id, &sample, &timestamp)?;
+            crate::write_fault::boundary()?;
+            conn.execute(
+                "INSERT INTO review_claim_seal(project_id,claim_id,task_id,subject_sha,request_sha256,publication_id,package_sha256,resolution,outcome_kind,outcome_ref,outcome_sha256,recovery_kind,recovery_data,recovery_sha256,seal_sha256,sealed_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                params![
+                    request.project_id,
+                    request.claim_id,
+                    request.task_id,
+                    request.subject_sha,
+                    request.request_sha256,
+                    request.publication_id,
+                    request.package_sha256,
+                    request.settlement.state().as_str(),
+                    request.settlement.outcome_kind,
+                    request.settlement.outcome_ref,
+                    request.settlement.outcome_sha256,
+                    request.recovery.kind,
+                    request.recovery.bytes,
+                    request.recovery.sha256,
+                    digest,
+                    sample.canonical_utc_timestamp
+                ],
+            )
+            .map_err(|e| graph::sqlite_error(Phase::Write, e))?;
+            crate::write_fault::boundary()?;
+            read_seal(conn, &request.project_id, &request.claim_id)?
+                .ok_or_else(|| failure(Code::CorruptStore))
+        })
+    }
+
+    /// Reads one claim's seal by exact project and id (reads never write).
+    pub fn find_review_seal(
+        &self,
+        project_id: &str,
+        claim_id: &str,
+    ) -> Result<Option<ReviewSealRecordV1>, StateError> {
+        if !bounded_id(project_id) || !bounded_id(claim_id) {
+            return Err(failure(Code::InvalidShape));
+        }
+        read_seal(self.connection(), project_id, claim_id)
     }
 
     /// Records the explicit abandonment of an unfinished claim.

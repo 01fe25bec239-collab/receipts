@@ -69,7 +69,7 @@ impl SqliteStateRepository {
         Ok(repo)
     }
 
-    /// Explicitly upgrades an exact v11–v20 State database to v21.
+    /// Explicitly upgrades an exact v11–v21 State database to v22.
     pub(crate) fn migrate_existing_to_current(path: impl AsRef<Path>) -> Result<u32, StateError> {
         let mut conn =
             Connection::open_with_flags(path.as_ref(), OpenFlags::SQLITE_OPEN_READ_WRITE)
@@ -102,15 +102,21 @@ impl SqliteStateRepository {
             Some(19) => {
                 migrations::v0020_trusted_core::apply(&conn)?;
                 migrations::v0021_publication_claims::apply(&conn)?;
-                return Ok(21);
+                migrations::v0022_order_and_seal::apply(&conn)?;
+                return Ok(22);
             }
             Some(20) => {
                 migrations::v0021_publication_claims::apply(&conn)?;
-                return Ok(21);
+                migrations::v0022_order_and_seal::apply(&conn)?;
+                return Ok(22);
             }
             Some(21) => {
+                migrations::v0022_order_and_seal::apply(&conn)?;
+                return Ok(22);
+            }
+            Some(22) => {
                 graph_repository::verify_current(&conn, GraphPhase::Migration)?;
-                return Ok(21);
+                return Ok(22);
             }
             // v1–v10 and unknown heads are typed unsupported legacy: no
             // automatic migration and no corruption misclassification.
@@ -147,7 +153,8 @@ impl SqliteStateRepository {
         migrations::v0019_row_identity::apply(&conn)?;
         migrations::v0020_trusted_core::apply(&conn)?;
         migrations::v0021_publication_claims::apply(&conn)?;
-        Ok(21)
+        migrations::v0022_order_and_seal::apply(&conn)?;
+        Ok(22)
     }
 
     /// Version-reconciliation core of [`Self::open`], parameterized by the
@@ -594,6 +601,10 @@ fn bootstrap(conn: &mut Connection, chain: &[Migration]) -> Result<(), StateErro
         }
         if migration.version == 21 && migration.name == "publication_claims" {
             migrations::v0021_publication_claims::apply(conn)?;
+            continue;
+        }
+        if migration.version == 22 && migration.name == "order_and_seal" {
+            migrations::v0022_order_and_seal::apply(conn)?;
             continue;
         }
         let tx = conn
