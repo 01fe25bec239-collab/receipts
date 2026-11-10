@@ -114,6 +114,28 @@ const TX_PROBE_DDL: &str = "CREATE TABLE tx_probe (
     value TEXT NOT NULL
 );";
 
+#[test]
+fn linked_sqlite_meets_the_bundled_security_floor() {
+    let tmp = TempDir::new("sqlite-version");
+    let repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
+    let (version, source): (String, String) = repo
+        .connection()
+        .query_row("SELECT sqlite_version(), sqlite_source_id()", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    println!(
+        "linked SQLite {version}; source {source}; numeric {}",
+        rusqlite::version_number()
+    );
+    assert_eq!(version, rusqlite::version());
+    // RUSTSEC-2026-0459: mismatched WAL page sizes expose memory before 3.54.0.
+    assert!(
+        rusqlite::version_number() >= 3_054_000,
+        "unpatched SQLite {version}"
+    );
+}
+
 // T1 — a brand-new database bootstraps through the migration mechanism.
 #[test]
 fn t01_new_database_bootstrap() {
