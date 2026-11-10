@@ -63,14 +63,14 @@ past the backoff attempt or chain bound.
 `RoutingStatePort` is State's read-only repository plus ONE write callback,
 `publish(&Publication)`, where a `Publication` is the records, the event
 proposals (with the exact content each digest covers) and the D5 fact of one
-outcome. The contract is atomic: on `Err` nothing is visible (live or after a
-restart); on `Ok` everything is. An exact retry returns the original receipts
-(`replayed`) and writes nothing; a conflicting retry (a stored id reused with
-different content) is refused. Routing builds the whole publication first,
-sends it once, and advances its memory (registry, availability manager) only
-after `Ok`, so a lost acknowledgement is recovered by repeating the identical
-call and a restart always rebuilds what the store holds. A runtime probe
-report is one publication. The composition root implements the port over the
+outcome. A transaction failure publishes nothing; a success publishes everything.
+Interruption or a lost acknowledgement can leave the complete package committed,
+so an error alone cannot prove that nothing was written. An exact retry returns
+the original receipts (`replayed`) without duplicate writes; conflicting content
+under the same logical identity refuses. Routing advances registry/availability
+memory only after a proposal-bound receipt matching State’s stored receipt,
+or rebuilds it from State.
+A runtime probe report is one publication. The composition root implements the port over the
 core's `CoreStateWriter`. Every event payload is the exact content its digest
 names: a persisted record (`state-query:decision_record/<KIND>/<id>`,
 `sha256:` State digest) or, for ROUTING_REQUESTED, the request's canonical
@@ -121,16 +121,36 @@ the numeric expectation tables come from an independent CPython oracle.
 `USER_ROUTING_INPUT`/modes/pinning (MR-W5-3), live policy gate (MR-W5-1),
 calibration/cost/refresh/discovery (MR-W5-2).
 
-## Shared dependencies still outstanding
+## Core/State library composition
 
-* State/Core must supply the transaction that implements
-  `RoutingStatePort::publish` over `CoreStateWriter`: records, resolver-
-  verified event proposals with core-minted ids, and the availability fact in
-  one unit of work, plus lookup of an existing receipt by proposal digest (to
-  answer an exact retry) and a distinct conflict refusal. The test
-  composition honours the contract but is not that transaction.
-* The composition's `CoreContentResolverV1` must resolve
-  `routing-request:<request_id>` to the admitted request bytes.
-* Optional: a public State digest helper would retire Routing's local
-  `sha256_hex` (checked against the standard vectors and State's record
-  digests).
+`receipts_e2e::CoreRoutingState::new(writer, clock, requests, project_id)`
+implements `RoutingStatePort` using the real
+`CoreStateWriter::publish_decision_package`. The composition supplies the
+admitted Core writer, trusted clock, fixed project and project-scoped
+`CoreContentResolverV1` for admitted requests. Merely attaching request bytes
+to a proposal never admits them. The resolver must retain or reconstruct the
+exact canonical `encode_routing_request` bytes for retry after restart.
+
+The adapter resolves record references from the typed records in the current
+publication, so newly written content needs no stale resolver cache. Core
+independently resolves and hashes every event payload before building the State
+package. State writes records, events/receipts and the availability fact in one
+SQLite transaction and owns the durable retry identity; there is no second
+journal. The project-scoped publication key is `routing-v1-<sha256>` of the first
+record's reference (the registry/availability append slot or decision id), or
+of the request reference for a request-only publication. Event keys are
+`routing-event-<zero-based ordinal>`. Payload bytes, payload digests and sibling
+counts do not define identity, so altered retries cannot become new operations.
+Rebuild the same ordered publication for an exact retry. After a lost
+acknowledgement, retry it before assessing a new jittered effect or allocating
+a new append slot, or authoritatively reload the committed history.
+
+Real SQLite controls in `crates/receipts-e2e/tests/routing_state.rs` cover late
+transaction rollback, request/record content refusals, conflicting retries,
+original receipt recovery after reopen, whole probe reports, availability facts
+and unchanged memory on unconfirmed success. `sha256_hex` uses the pinned
+`sha2` crate; all seven codecs and their exact numeric rules are unchanged.
+
+This is the authorized library adapter. Production composition-root wiring,
+deployed authority/isolation, authenticated D5/N6 recovery producers and
+independent cumulative A3/Q06 remain separate boundaries.

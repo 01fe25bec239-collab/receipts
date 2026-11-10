@@ -19,8 +19,9 @@
 //! invariant is re-checked and the reloaded registry equals the one written.
 //! Each change is validated on a copy first and published (record + event)
 //! as one atomic [`Publication`]; memory advances only after the port reports
-//! success, so a refused or failed publish leaves live and restarted state
-//! equal, and repeating the identical call after a lost acknowledgement
+//! success. A transaction failure leaves no partial state; a lost
+//! acknowledgement can leave memory behind the committed history. Repeating
+//! the identical call after a lost acknowledgement
 //! returns the original receipt.
 
 use receipts_runtime_adapters::{
@@ -325,8 +326,8 @@ impl PersistentRegistry {
     /// Persists `changes` (validated in order on a copy) as ONE publication:
     /// all records and events become durable together or not at all. Memory
     /// advances only after the port reports success, so a failed publish
-    /// leaves the live registry equal to what a restart would rebuild; the
-    /// identical call retried after a lost acknowledgement returns the
+    /// leaves no partial publication. Lost acknowledgement may leave memory
+    /// behind State; the identical call retried returns the
     /// original receipts.
     fn append_all<P: RoutingStatePort>(
         &mut self,

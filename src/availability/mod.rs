@@ -456,8 +456,8 @@ impl AvailabilityManager {
     /// Persists an assessed effect — every record, its event and the D5
     /// demotion fact — as ONE publication, then commits it. The manager
     /// advances only after the port reports success, so a failed publish
-    /// leaves memory equal to what a restart rebuilds, and the identical call
-    /// retried after a lost acknowledgement returns the original receipts
+    /// leaves no partial publication. Lost acknowledgement may leave memory
+    /// behind State; retrying the identical effect returns the original receipts
     /// without a second demotion fact. Holds and non-signals persist nothing.
     pub fn persist_and_commit<P: RoutingStatePort>(
         &mut self,
