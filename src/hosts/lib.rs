@@ -57,6 +57,7 @@ pub mod normalized_host_event;
 pub mod normalized_host_event_emission;
 pub mod normalized_host_event_source_class;
 pub mod normalized_host_event_source_policy;
+pub mod private_fs;
 pub mod wire;
 
 #[cfg(test)]

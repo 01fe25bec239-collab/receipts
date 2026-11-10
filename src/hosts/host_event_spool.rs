@@ -20,19 +20,16 @@
 //!   never grows past [`HOST_EVENT_SPOOL_MAX_BYTES`];
 //! * data is synced before success is reported.
 //!
-//! Limits: ancestor checks are sequential pathname checks, not descriptor
-//! anchored; the owner/mode checks are controls, not proof that same-user
-//! hostile code is excluded. The effective uid is learned without libc by
-//! creating (then removing) one private probe file in the inbox.
-
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+//! Directory traversal and creation are descriptor-relative; each append locks
+//! the opened inode through tail/size checks, write and sync. A partial tail is
+//! retained and refuses append. Same-user hostile writers are outside custody.
 
 use crate::NormalizedHostEvent;
-use crate::host_capability_observation::no_follow_open_flags;
+use crate::private_fs::{HostDirectory, lock};
 use crate::wire::normalized_host_event_to_json;
+use std::fs;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
 pub const HOST_EVENT_SPOOL_LINE_MAX_BYTES: usize = 65_536;
 pub const HOST_EVENT_SPOOL_MAX_BYTES: u64 = 64 * 1024 * 1024;
@@ -53,6 +50,8 @@ pub enum HostEventSpoolError {
     Permissions,
     LineTooLarge,
     SpoolFull,
+    /// Existing bytes lack a complete newline-terminated tail; no bytes were changed.
+    IncompleteTail,
     /// No checked no-follow constant for this target.
     Unsupported,
     Io,
@@ -70,10 +69,18 @@ impl std::error::Error for HostEventSpoolError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostEventSpool {
     project_root: PathBuf,
+    directory: std::sync::Arc<HostDirectory>,
 }
 
-fn io(_: std::io::Error) -> HostEventSpoolError {
-    HostEventSpoolError::Io
+fn io(e: std::io::Error) -> HostEventSpoolError {
+    match e.kind() {
+        std::io::ErrorKind::PermissionDenied => HostEventSpoolError::Permissions,
+        std::io::ErrorKind::InvalidInput => HostEventSpoolError::UnsafeEntry,
+        _ if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => {
+            HostEventSpoolError::UnsafeEntry
+        }
+        _ => HostEventSpoolError::Io,
+    }
 }
 
 impl HostEventSpool {
@@ -82,8 +89,10 @@ impl HostEventSpool {
         if !project_root.is_absolute() || canonical != project_root {
             return Err(HostEventSpoolError::RootNotCanonical);
         }
+        let directory = std::sync::Arc::new(HostDirectory::open(&canonical).map_err(io)?);
         Ok(Self {
             project_root: canonical,
+            directory,
         })
     }
 
@@ -93,97 +102,40 @@ impl HostEventSpool {
 
     /// Appends one event as one complete line.
     pub fn append(&self, event: &NormalizedHostEvent) -> Result<(), HostEventSpoolError> {
-        let (flags, eloop) =
-            no_follow_open_flags().map_err(|_| HostEventSpoolError::Unsupported)?;
         let mut line = normalized_host_event_to_json(event);
         line.push('\n');
         if line.len() > HOST_EVENT_SPOOL_LINE_MAX_BYTES {
             return Err(HostEventSpoolError::LineTooLarge);
         }
-        let receipts = self.project_root.join(".receipts");
-        let inbox = receipts.join("inbox");
-        for dir in [&receipts, &inbox] {
-            match fs::DirBuilder::new().mode(0o700).create(dir) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(io(e)),
-            }
-            if !fs::symlink_metadata(dir).map_err(io)?.is_dir() {
-                return Err(HostEventSpoolError::UnsafeEntry);
-            }
-        }
-        let uid = effective_uid(&inbox)?;
-        for dir in [&receipts, &inbox] {
-            let meta = fs::symlink_metadata(dir).map_err(io)?;
-            if !meta.is_dir() {
-                return Err(HostEventSpoolError::UnsafeEntry);
-            }
-            if meta.uid() != uid {
-                return Err(HostEventSpoolError::NotOwned);
-            }
-            if meta.mode() & 0o022 != 0 {
-                return Err(HostEventSpoolError::Permissions);
-            }
-        }
-        // Stable non-regular entries are refused before open (a FIFO with
-        // no reader would otherwise surface as a generic error); the
-        // no-follow open and descriptor checks below still close the race.
-        match fs::symlink_metadata(self.path()) {
-            Ok(meta) if !meta.is_file() => return Err(HostEventSpoolError::UnsafeEntry),
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(io(e)),
-        }
-        let mut file = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(flags)
-            .open(self.path())
-            .map_err(|e| match e.raw_os_error() {
-                Some(code) if code == eloop => HostEventSpoolError::UnsafeEntry,
-                _ => HostEventSpoolError::Io,
-            })?;
+        let root = &self.directory;
+        root.verify().map_err(io)?;
+        let receipts = root
+            .child(std::ffi::OsStr::new(".receipts"), true)
+            .map_err(io)?;
+        let inbox = receipts
+            .child(std::ffi::OsStr::new("inbox"), true)
+            .map_err(io)?;
+        let name = std::ffi::OsStr::new("host-events.jsonl");
+        let mut file = inbox.open_file(name, true, true).map_err(io)?;
+        lock(&file).map_err(io)?;
+        inbox.verify_file(name, &file, true).map_err(io)?;
         let meta = file.metadata().map_err(io)?;
-        if !meta.is_file() || meta.nlink() != 1 {
-            return Err(HostEventSpoolError::UnsafeEntry);
-        }
-        if meta.uid() != uid {
-            return Err(HostEventSpoolError::NotOwned);
-        }
-        if meta.mode() & 0o777 != 0o600 {
-            return Err(HostEventSpoolError::Permissions);
-        }
         if meta.len() + line.len() as u64 > HOST_EVENT_SPOOL_MAX_BYTES {
             return Err(HostEventSpoolError::SpoolFull);
+        }
+        if meta.len() != 0 {
+            file.seek(SeekFrom::End(-1)).map_err(io)?;
+            let mut tail = [0u8];
+            file.read_exact(&mut tail).map_err(io)?;
+            if tail[0] != b'\n' {
+                return Err(HostEventSpoolError::IncompleteTail);
+            }
         }
         if file.write(line.as_bytes()).map_err(io)? != line.len() {
             return Err(HostEventSpoolError::Io);
         }
         file.sync_data().map_err(io)
     }
-}
-
-/// The uid of a file this process creates is its effective uid.
-fn effective_uid(dir: &Path) -> Result<u32, HostEventSpoolError> {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.subsec_nanos());
-    let probe = dir.join(format!(".uid-probe-{}-{n}-{nanos}", std::process::id()));
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&probe)
-        .map_err(io)?;
-    let uid = file.metadata().map(|m| m.uid()).map_err(io);
-    drop(file);
-    let removed = fs::remove_file(&probe).map_err(io);
-    let uid = uid?;
-    removed?;
-    Ok(uid)
 }
 
 #[cfg(test)]

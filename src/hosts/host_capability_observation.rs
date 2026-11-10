@@ -6,14 +6,9 @@
 //! settings), project trust, or Receipts hook ownership, so they can only
 //! REFUTE native hooks (`disableAllHooks`, `allowManagedHooksOnly`, a plugin
 //! the host reports disabled), never prove them enabled or admin-allowed.
-//! For Claude Code the positive facts come from:
-//! * the plugin-list probe (plugin and hook support of the probed version);
-//! * the installed Receipts plugin's own `hooks/hooks.json`, read no-follow
-//!   from the probe-reported `installPath` (configured events, required
-//!   lifecycle coverage, hook definition digest);
-//! * [`HostHookExecutionEvidenceV1`]: a Receipts hook process the host
-//!   actually launched for that same installed plugin root. Only that proves
-//!   hooks are currently enabled and admitted by policy.
+//! Plugin-list and plugin definitions establish observations only. Hook JSON,
+//! environment markers and matching paths never prove effective permission.
+//! Positive enablement/admin authority needs a later admitted trusted supplier.
 //!
 //! Claude Code has no hook trust model (frozen fixture 02):
 //! `hook_trust_required` is known false and `hooks_trusted` stays unknown.
@@ -134,30 +129,21 @@ pub struct HostConfigurationObservation {
 pub struct HostCapabilityObservationRequest {
     pub host: HostId,
     pub project_root: PathBuf,
-    /// Present only inside a hook process the host launched.
+    /// Legacy hook observation; it conveys no positive authority.
     pub hook_execution: Option<HostHookExecutionEvidenceV1>,
 }
 
-/// A Receipts hook process the host launched for one plugin root.
-///
-/// Minted only by the Claude hook bridge from an accepted hook invocation
-/// (`claude::ClaudeHookInvocation::execution_evidence`); there is no public
-/// constructor, so a caller cannot assert hook health. It counts only when
-/// its plugin root is the installed Receipts plugin the probe reports.
-///
-/// ```compile_fail,E0451
-/// use receipts_host_integration::host_capability_observation::HostHookExecutionEvidenceV1;
-/// let _ = HostHookExecutionEvidenceV1 { plugin_root: "/p".into() };
-/// ```
+/// Legacy plugin-root observation. Even a matching root conveys no permission.
+/// No production constructor exists; the retained request field is compatibility only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostHookExecutionEvidenceV1 {
     pub(crate) plugin_root: PathBuf,
 }
 
-/// Claude lifecycle hooks Receipts requires for EMBEDDED: every hook whose
-/// frozen normalized mapping is permitted for its source class
-/// (`CLAUDE_HOST_ADAPTER.md` table filtered by `source_class_allowed`).
-pub const CLAUDE_REQUIRED_HOOK_EVENTS: [&str; 7] = [
+/// Required registrations from the frozen Claude lifecycle mapping.
+/// Core/worker mappings additionally require an admitted trusted supplier;
+/// registration alone cannot establish that supplier or native admission.
+pub const CLAUDE_REQUIRED_HOOK_EVENTS: [&str; 11] = [
     "SessionStart",
     "SessionEnd",
     "PostToolUse",
@@ -165,6 +151,10 @@ pub const CLAUDE_REQUIRED_HOOK_EVENTS: [&str; 7] = [
     "PostCompact",
     "WorktreeCreate",
     "WorktreeRemove",
+    "FileChanged",
+    "SubagentStart",
+    "SubagentStop",
+    "TaskCompleted",
 ];
 
 /// Seven validity families: plugin capability; definition identity; trust;
@@ -270,12 +260,6 @@ impl HostCapabilityObservation {
     }
 }
 
-/// This target's `(O_NONBLOCK | O_NOFOLLOW, ELOOP)`, from the one checked
-/// table; shared by the event spool so no second constant set exists.
-pub(crate) fn no_follow_open_flags() -> Result<(i32, i32), Error> {
-    io::open_flags()
-}
-
 /// Performs only the internally enumerated, read-only Host observations.
 /// Observes through the admitted composition's probe port.
 pub fn observe_host_capabilities(
@@ -291,17 +275,36 @@ pub fn observe_host_capabilities_with_fingerprint(
     port: &dyn HostProbeProcessPort,
 ) -> (HostCapabilityObservation, HostObservationFingerprintV1) {
     let probes = request.host == HostId::ClaudeCode;
-    let executable = probes.then(|| port.executable());
-    let version =
-        probes.then(|| port.run(&io::probe_command(&request.project_root, &["--version"])));
+    let project_safe = crate::private_fs::HostDirectory::open(&request.project_root)
+        .map_err(|_| Error::NotRegularFile);
+    let executable = probes.then(|| {
+        project_safe
+            .as_ref()
+            .map_err(|e| *e)
+            .and_then(|_| port.executable())
+    });
+    let version = probes.then(|| {
+        project_safe
+            .as_ref()
+            .map_err(|e| *e)
+            .and_then(|_| port.run(&io::probe_command(&request.project_root, &["--version"])))
+    });
     let (mut observation, plugins, sources) = observe_material(request, &io::LocalSources(port));
     // Every probe must describe the same admitted executable: re-check after
     // the last probe so a port that reports a different identity (or none)
     // leaves this fingerprint incomplete.
-    let executable = executable.map(|before| match (before, port.executable()) {
-        (Ok(before), Ok(after)) if before == after => Ok(before),
-        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
-        (Ok(_), Ok(_)) => Err(Error::ExecutableChanged),
+    let executable = executable.map(|before| {
+        match (
+            before,
+            project_safe
+                .as_ref()
+                .map_err(|e| *e)
+                .and_then(|_| port.executable()),
+        ) {
+            (Ok(before), Ok(after)) if before == after => Ok(before),
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+            (Ok(_), Ok(_)) => Err(Error::ExecutableChanged),
+        }
     });
     let fingerprint = HostObservationFingerprintV1 {
         host: request.host,
@@ -404,12 +407,7 @@ fn observe_material(
             .and_then(|b| b.as_ref().ok())
             .and_then(|b| decode::claude_receipts_install_path(b));
         let hooks = install_path.as_ref().map(|p| sources.plugin_hooks(p));
-        claude_facts(
-            &mut observation,
-            install_path.as_deref(),
-            hooks.as_ref(),
-            request,
-        );
+        claude_facts(&mut observation, hooks.as_ref());
         if let Some(hooks) = hooks {
             material.push((Source::ClaudePluginHooks, hooks));
         }
@@ -418,25 +416,18 @@ fn observe_material(
 }
 
 /// Claude Code fact derivation; see the module documentation. Files only
-/// refute; positive enablement/admin facts need matching hook execution.
-fn claude_facts(
-    o: &mut HostCapabilityObservation,
-    install_path: Option<&std::path::Path>,
-    hooks: Option<&Result<Vec<u8>, Error>>,
-    request: &HostCapabilityObservationRequest,
-) {
+/// refute; positive enablement/admin facts require admitted effective authority.
+fn claude_facts(o: &mut HostCapabilityObservation, hooks: Option<&Result<Vec<u8>, Error>>) {
     use HostCapabilityHookCoverageClass as Coverage;
     let listed = o.plugins.as_ref().ok();
-    if listed.is_none() {
-        return;
+    if listed.is_some() {
+        o.hooks_supported = Value::Known(true);
+        o.hook_trust_required = Value::Known(false);
     }
-    o.hooks_supported = Value::Known(true);
-    o.hook_trust_required = Value::Known(false);
-    let installed = matches!(o.plugin_installed, Value::Known(true));
-    let events = match (installed, hooks) {
-        (false, _) => Value::Known(Vec::new()),
-        (true, Some(Ok(bytes))) => decode::plugin_hook_events(bytes),
-        (true, Some(Err(Error::Missing))) => Value::Known(Vec::new()),
+    let events = match (&o.plugin_installed, hooks) {
+        (Value::Known(false), _) => Value::Known(Vec::new()),
+        (Value::Known(true), Some(Ok(bytes))) => decode::plugin_hook_events(bytes),
+        (Value::Known(true), Some(Err(Error::Missing))) => Value::Known(Vec::new()),
         _ => Value::Unknown,
     };
     if let Value::Known(list) = &events {
@@ -447,10 +438,12 @@ fn claude_facts(
         o.hooks_configured = Value::Known(!list.is_empty());
         o.required_hook_coverage_satisfied =
             Value::Known(required == CLAUDE_REQUIRED_HOOK_EVENTS.len());
-        o.hook_coverage_class = match required {
-            0 => Coverage::None,
-            n if n == CLAUDE_REQUIRED_HOOK_EVENTS.len() => Coverage::Full,
-            _ => Coverage::Partial,
+        // The recognized set is not an exhaustive, version-bound vendor surface.
+        // Registration can establish partial coverage, never vendor-wide FULL.
+        o.hook_coverage_class = if list.is_empty() {
+            Coverage::None
+        } else {
+            Coverage::Partial
         };
         let mut sorted = list.clone();
         sorted.sort();
@@ -472,37 +465,19 @@ fn claude_facts(
     };
     let disabled_by_file = flag(|r| &r.disable_all_hooks, false);
     let managed_only = flag(|r| &r.allow_managed_hooks_only, true);
-    let unread = |only_managed: bool| {
-        o.configurations.iter().any(|c| {
-            (!only_managed || managed(c.source))
-                && matches!(c.result, Err(e) if e != Error::Missing)
-        })
+    let plugin_disabled = listed.is_some_and(|plugins| plugins.iter().any(|p| p.enabled == Value::Known(false)))
+        || o.configurations.iter().any(|c| c.result.as_ref().is_ok_and(|r| {
+            matches!(&r.receipts_enabled, Value::Known(settings) if settings.iter().any(|p| p.enabled == Value::Known(false)))
+        }));
+    // Observations can refute permission; neither a path match nor a hook claim admits it.
+    o.hooks_enabled = if disabled_by_file || plugin_disabled {
+        Value::Known(false)
+    } else {
+        Value::Unknown
     };
-    let receipts_enabled = match listed.map(Vec::as_slice) {
-        Some([plugin]) => plugin.enabled.clone(),
-        _ => Value::Unknown,
-    };
-    let canonical = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.into());
-    let ran = match (&request.hook_execution, install_path) {
-        (Some(e), Some(p)) => canonical(&e.plugin_root) == canonical(p),
-        _ => false,
-    };
-    // A refutation contradicted by a live hook leaves the fact unknown.
-    o.hooks_enabled = match (
-        disabled_by_file || receipts_enabled == Value::Known(false),
-        ran,
-    ) {
-        (true, true) => Value::Unknown,
-        (true, false) => Value::Known(false),
-        (false, true) if receipts_enabled == Value::Known(true) && !unread(false) => {
-            Value::Known(true)
-        }
-        _ => Value::Unknown,
-    };
-    o.hooks_allowed_by_admin_policy = match (managed_only, ran) {
-        (true, true) => Value::Unknown,
-        (true, false) => Value::Known(false),
-        (false, true) if !unread(true) => Value::Known(true),
-        _ => Value::Unknown,
+    o.hooks_allowed_by_admin_policy = if managed_only {
+        Value::Known(false)
+    } else {
+        Value::Unknown
     };
 }

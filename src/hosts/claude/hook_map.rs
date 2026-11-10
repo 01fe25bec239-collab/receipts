@@ -22,12 +22,9 @@
 //! | PreCompact, PostCompact | CONTEXT_COMPACTED | HOST_HOOK |
 //! | WorktreeCreate | WORKSPACE_CREATED, after the handler created it | CORE_DRIVEN |
 //!
-//! Not registered: `FileChanged`→WORKSPACE_CHANGED (frozen class
-//! WORKER_DISPATCH), `SubagentStart/Stop`→ROLE_EXECUTOR_* and
-//! `WorktreeRemove`→WORKSPACE_REMOVED (CORE_DRIVEN, core not wired until
-//! HI-W4-1), `TaskCompleted` (WORKER_DISPATCH). `WorktreeRemove` is still
-//! handled (see `worktree`), but it emits no event because nothing is
-//! removed.
+//! FileChanged, SubagentStart/Stop and TaskCompleted are requests for trusted
+//! translation. They yield no normalized event from raw hook data; the admitted
+//! composition must independently supply the matching Worker/Core fact.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -57,10 +54,14 @@ pub enum ClaudeHookEvent {
     PostCompact,
     WorktreeCreate,
     WorktreeRemove,
+    FileChanged,
+    SubagentStart,
+    SubagentStop,
+    TaskCompleted,
 }
 
 impl ClaudeHookEvent {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 11] = [
         Self::SessionStart,
         Self::SessionEnd,
         Self::PostToolUse,
@@ -68,6 +69,10 @@ impl ClaudeHookEvent {
         Self::PostCompact,
         Self::WorktreeCreate,
         Self::WorktreeRemove,
+        Self::FileChanged,
+        Self::SubagentStart,
+        Self::SubagentStop,
+        Self::TaskCompleted,
     ];
 
     /// The exact Claude Code hook event name.
@@ -80,6 +85,10 @@ impl ClaudeHookEvent {
             Self::PostCompact => "PostCompact",
             Self::WorktreeCreate => "WorktreeCreate",
             Self::WorktreeRemove => "WorktreeRemove",
+            Self::FileChanged => "FileChanged",
+            Self::SubagentStart => "SubagentStart",
+            Self::SubagentStop => "SubagentStop",
+            Self::TaskCompleted => "TaskCompleted",
         }
     }
 
@@ -126,6 +135,7 @@ pub enum ClaudeHookDetail {
     Compact { trigger: Option<&'static str> },
     WorktreeCreate { name: String },
     WorktreeRemove { worktree_path: PathBuf },
+    RequiresTrustedTranslation,
 }
 
 /// One accepted hook invocation.
@@ -217,6 +227,10 @@ pub fn parse_claude_hook(
             }
             _ => return Err(ClaudeHookError::InvalidField("name")),
         },
+        ClaudeHookEvent::FileChanged
+        | ClaudeHookEvent::SubagentStart
+        | ClaudeHookEvent::SubagentStop
+        | ClaudeHookEvent::TaskCompleted => ClaudeHookDetail::RequiresTrustedTranslation,
         ClaudeHookEvent::WorktreeRemove => ClaudeHookDetail::WorktreeRemove {
             worktree_path: absolute_path(m.get("worktree_path"), "worktree_path")?,
         },
@@ -253,15 +267,10 @@ impl ClaudeHookInvocation {
         &self.detail
     }
 
-    /// Evidence that the host launched this Receipts hook from `plugin_root`
-    /// (the host-set `CLAUDE_PLUGIN_ROOT`). It counts in observation only
-    /// when it matches the installed plugin the probe reports.
-    pub fn execution_evidence(&self, plugin_root: &Path) -> Option<HostHookExecutionEvidenceV1> {
-        plugin_root
-            .is_absolute()
-            .then(|| HostHookExecutionEvidenceV1 {
-                plugin_root: plugin_root.to_path_buf(),
-            })
+    /// Hook input and environment paths cannot establish execution authority.
+    /// Kept for source compatibility; always returns None.
+    pub fn execution_evidence(&self, _plugin_root: &Path) -> Option<HostHookExecutionEvidenceV1> {
+        None
     }
 
     fn build(
@@ -321,7 +330,9 @@ impl ClaudeHookInvocation {
                 entries.extend(some("trigger", *trigger));
                 (T::ContextCompacted, entries)
             }
-            ClaudeHookDetail::WorktreeCreate { .. } | ClaudeHookDetail::WorktreeRemove { .. } => {
+            ClaudeHookDetail::WorktreeCreate { .. }
+            | ClaudeHookDetail::WorktreeRemove { .. }
+            | ClaudeHookDetail::RequiresTrustedTranslation => {
                 return None;
             }
         };
@@ -332,6 +343,47 @@ impl ClaudeHookInvocation {
             NormalizedHostEventConfidence::Observed,
             event_id,
             occurred_at,
+        )
+    }
+
+    /// Validate independently supplied facts at the trusted composition boundary.
+    /// This does not derive Core/worker authority from the hook observation.
+    pub fn admits_translation(
+        &self,
+        class: NormalizedHostEventSourceClass,
+        event: &NormalizedHostEvent,
+    ) -> bool {
+        use NormalizedHostEventType as T;
+        let expected = match self.event {
+            ClaudeHookEvent::FileChanged => T::WorkspaceChanged,
+            ClaudeHookEvent::SubagentStart => T::RoleExecutorStarted,
+            ClaudeHookEvent::SubagentStop => T::RoleExecutorStopped,
+            ClaudeHookEvent::TaskCompleted => T::TaskCompleted,
+            _ => return false,
+        };
+        event.event_type() == expected
+            && event.host().as_str() == "claude-code"
+            && event.host_session_id() == self.session_id
+            && validate_normalized_host_event_source(class, event).is_ok()
+    }
+
+    /// Called only after Workspace's owned removal returned verified success.
+    pub fn workspace_removed_event(
+        &self,
+        path: &Path,
+        id: NormalizedHostEventId,
+        at: OrchestrationDateTimeV1,
+    ) -> Option<NormalizedHostEvent> {
+        if self.event != ClaudeHookEvent::WorktreeRemove {
+            return None;
+        }
+        self.build(
+            NormalizedHostEventType::WorkspaceRemoved,
+            NormalizedHostEventSourceClass::CoreDriven,
+            object(vec![("worktree_path", path.to_str()?.into())]),
+            NormalizedHostEventConfidence::Observed,
+            id,
+            at,
         )
     }
 

@@ -325,10 +325,11 @@ fn execution_evidence_requires_an_absolute_host_plugin_root() {
             .execution_evidence(Path::new("relative"))
             .is_none()
     );
-    let evidence = invocation
-        .execution_evidence(Path::new("/plugins/receipts"))
-        .unwrap();
-    assert_eq!(evidence.plugin_root, PathBuf::from("/plugins/receipts"));
+    assert!(
+        invocation
+            .execution_evidence(Path::new("/plugins/receipts"))
+            .is_none()
+    );
 }
 
 #[test]
@@ -392,4 +393,46 @@ fn claude_adapter_binds_spool_and_never_installs() {
     );
     adapter.shutdown(Some("logout"));
     std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn trusted_translation_requires_matching_type_session_host_and_source() {
+    use crate::{
+        NormalizedHostEvent, NormalizedHostEventInputs, NormalizedHostEventSourceClass as S,
+    };
+    for (hook, event_type, class) in [
+        ("FileChanged", T::WorkspaceChanged, S::WorkerDispatch),
+        ("SubagentStart", T::RoleExecutorStarted, S::CoreDriven),
+        ("SubagentStop", T::RoleExecutorStopped, S::CoreDriven),
+        ("TaskCompleted", T::TaskCompleted, S::WorkerDispatch),
+    ] {
+        let invocation = parse_claude_hook(hook, &input(hook, "")).unwrap();
+        assert!(invocation.observed_event(id(), at()).is_none());
+        let event = |kind, host: &str, session: &str| {
+            NormalizedHostEvent::try_new(NormalizedHostEventInputs {
+                event_id: id(),
+                event_type: kind,
+                host: crate::NormalizedHostEventHost::try_new(host).unwrap(),
+                host_session_id: session.into(),
+                project_id: None,
+                occurred_at: at(),
+                payload: Default::default(),
+                raw_ref: None,
+                confidence: Confidence::Observed,
+            })
+            .unwrap()
+        };
+        assert!(invocation.admits_translation(class, &event(event_type, "claude-code", "abc-123")));
+        assert!(
+            !invocation
+                .admits_translation(S::HostHook, &event(event_type, "claude-code", "abc-123"))
+        );
+        assert!(
+            !invocation.admits_translation(class, &event(event_type, "claude-code", "another"))
+        );
+        assert!(!invocation.admits_translation(class, &event(event_type, "codex", "abc-123")));
+        assert!(
+            !invocation.admits_translation(class, &event(T::HostError, "claude-code", "abc-123"))
+        );
+    }
 }

@@ -16,6 +16,7 @@ hooks to it and handles worktree creation.
   events to the spool yourself.
 - To show the recorded capability report, use `/receipts:capabilities`.
 - Worktrees created through Claude Code are placed under
-  `.claude/worktrees/<name>` on branch `worktree-<name>`. Receipts does not
-  delete them on exit: remove a finished one with `git worktree remove`
-  after checking it holds no work you need.
+  `.claude/worktrees/<name>` on branch `worktree-<name>`. The standalone CLI
+  retains them on exit. Cleanup requires trusted composition with live proof
+  of fresh plain creation and verified repository, identity and cleanliness;
+  hook paths cannot supply that authority. Keep ambiguous or dirty worktrees.

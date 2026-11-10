@@ -75,9 +75,14 @@ pub struct WorktreeCreateResponse {
     head_sha: CommitSha,
     clean: bool,
     handle: Option<WorkspaceHandle>,
+    plain_ownership: Option<crate::OwnedPlainWorktree>,
 }
 
 impl WorktreeCreateResponse {
+    /// Live proof for cleanup, issued only on fresh plain creation. Attach never adopts ownership.
+    pub fn plain_ownership(&self) -> Option<&crate::OwnedPlainWorktree> {
+        self.plain_ownership.as_ref()
+    }
     /// Canonical absolute worktree path for the host.
     pub fn path(&self) -> &Path {
         &self.path
@@ -188,6 +193,7 @@ impl WorktreeCreateRequest {
                 head_sha: handle.base_sha().clone(),
                 clean: true,
                 handle: Some(handle),
+                plain_ownership: None,
             });
         }
         // Ordinary Git semantics: same refusals as provisioning, no handle.
@@ -205,7 +211,16 @@ impl WorktreeCreateRequest {
             ],
         )?
         .require_success("add plain worktree")?;
-        self.observe(target, WorktreeCreateMode::PlainCreated)
+        let mut response = self.observe(target, WorktreeCreateMode::PlainCreated)?;
+        if response.clean {
+            response.plain_ownership = Some(crate::OwnedPlainWorktree::created(
+                root,
+                &response.path,
+                &self.branch,
+                &response.head_sha,
+            )?);
+        }
+        Ok(response)
     }
 
     fn attach(&self, root: &Path, target: &Path) -> Result<WorktreeCreateResponse, WorkspaceError> {
@@ -304,6 +319,7 @@ impl WorktreeCreateRequest {
             head_sha,
             clean: status.raw_stdout().is_empty(),
             handle: None,
+            plain_ownership: None,
         })
     }
 }

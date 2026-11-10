@@ -415,7 +415,7 @@ fn worktree_remove_preserves_the_tree_and_names_it() {
     assert_eq!(
         out.stderr,
         format!(
-            "receipts: worktree kept at {}; remove it with `git worktree remove` when finished\n",
+            "receipts: no admitted plain-worktree ownership; worktree retained; worktree path {}\n",
             path.display()
         )
     );
@@ -488,7 +488,7 @@ fn session_start_records_and_reuses_a_coupled_capability_report() {
         host_capability_report_from_json(&std::fs::read_to_string(&report_path).unwrap()).unwrap()
     };
 
-    // 1. Our hook runs from the installed plugin root: EMBEDDED, COMPLETE.
+    // 1. Matching hook/plugin claims remain observations: SUPERVISED, PARTIAL.
     let out = start(&plugin);
     assert_eq!(
         (out.code, out.stdout.as_str(), out.stderr.as_str()),
@@ -496,11 +496,11 @@ fn session_start_records_and_reuses_a_coupled_capability_report() {
     );
     let first = read();
     let core = first.core();
-    assert_eq!(core.selected_mode(), HostCapabilitySelectedMode::Embedded);
-    assert_eq!(core.probe_status(), HostCapabilityProbeStatus::Complete);
+    assert_eq!(core.selected_mode(), HostCapabilitySelectedMode::Supervised);
+    assert_eq!(core.probe_status(), HostCapabilityProbeStatus::Partial);
     assert_eq!(
         core.inactive_reason(),
-        Some(HostCapabilityInactiveReason::None)
+        Some(HostCapabilityInactiveReason::Unknown)
     );
     assert_eq!(core.host_version(), Some("2.1.319"));
     assert!(core.validity_fingerprint().unwrap().starts_with("sha256:"));
@@ -595,8 +595,7 @@ fn session_start_records_and_reuses_a_coupled_capability_report() {
         honest.core().validity_fingerprint()
     );
 
-    // 7. Relative or missing executable: no probe, explicit note, no write.
-    std::fs::remove_file(&report_path).unwrap();
+    // 7. Missing executable: no probe, explicit note, persisted failed currency.
     std::fs::remove_file(&exe).unwrap();
     let out = start(&plugin);
     assert_eq!(out.code, 0);
@@ -606,7 +605,14 @@ fn session_start_records_and_reuses_a_coupled_capability_report() {
         "{}",
         out.stderr
     );
-    assert!(!report_path.exists());
+    assert_eq!(
+        read().core().probe_status(),
+        HostCapabilityProbeStatus::Failed
+    );
+    assert_eq!(
+        read().core().selected_mode(),
+        HostCapabilitySelectedMode::Supervised
+    );
     // The SessionStart event itself is still spooled every time.
     assert_eq!(
         spool_events(&project)
@@ -722,4 +728,270 @@ fn plugin_manifest_validates_against_packaging_doc_fields() {
     assert!(skill.starts_with("---\nname: receipts\ndescription: "));
     let command = std::fs::read_to_string(root.join("commands/capabilities.md")).unwrap();
     assert!(command.starts_with("---\ndescription: "));
+}
+
+#[test]
+fn project_mismatch_and_symlink_parent_refuse_before_mutation() {
+    let tree = Tree::new("root-binding");
+    let repository = repo(&tree);
+    let outside = tree.join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let out = hook(
+        "WorktreeCreate",
+        &[("CLAUDE_PROJECT_DIR", outside.as_path())],
+        &payload("WorktreeCreate", &repository, r#","name":"mismatch""#),
+    );
+    assert_eq!(out.code, 1);
+    assert!(!repository.join(".claude").exists());
+    std::fs::create_dir(repository.join(".claude")).unwrap();
+    std::os::unix::fs::symlink(&outside, repository.join(".claude/worktrees")).unwrap();
+    let out = hook(
+        "WorktreeCreate",
+        &[("CLAUDE_PROJECT_DIR", repository.as_path())],
+        &payload("WorktreeCreate", &repository, r#","name":"escape""#),
+    );
+    assert_eq!(out.code, 1);
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+}
+
+#[test]
+fn launcher_execution_failure_observers_fail_open_create_refuses() {
+    let tree = Tree::new("launcher-failures");
+    let launcher =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/claude/bin/receipts-hook");
+    let bad = tree.join("bad");
+    std::fs::write(&bad, "#!/missing-interpreter\n").unwrap();
+    std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let nonexec = tree.join("nonexec");
+    std::fs::write(&nonexec, "x").unwrap();
+    for bin in [&tree.join("missing"), &bad, &nonexec] {
+        for (event, code) in [("SessionEnd", 0), ("WorktreeCreate", 1)] {
+            let out = run(
+                Path::new("/bin/sh"),
+                &[launcher.to_str().unwrap(), event],
+                &[("RECEIPTS_BIN", bin)],
+                b"",
+            );
+            assert_eq!(out.code, code, "{}: {}", bin.display(), out.stderr);
+            assert!(out.stdout.is_empty());
+        }
+    }
+}
+
+#[test]
+fn failed_refresh_invalidates_preexisting_embedded_report() {
+    let tree = Tree::new("stale-refresh");
+    let project = tree.join("project");
+    let data = tree.join("data");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::create_dir(&data).unwrap();
+    let path = data.join("host-capability-report.json");
+    let fixture =
+        include_str!("../../../fixtures/host_capability/02_claude_embedded_no_trust_model.json");
+    std::fs::write(&path, fixture).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let out = hook(
+        "SessionStart",
+        &[
+            ("CLAUDE_PROJECT_DIR", &project),
+            ("CLAUDE_PLUGIN_DATA", &data),
+            ("RECEIPTS_CLAUDE_EXECUTABLE", &tree.join("missing")),
+        ],
+        &payload("SessionStart", &project, ""),
+    );
+    assert_eq!(out.code, 0);
+    let current = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| host_capability_report_from_json(&t).ok());
+    assert!(
+        current.is_none_or(|r| r.core().selected_mode() != HostCapabilitySelectedMode::Embedded)
+    );
+}
+
+#[test]
+fn trusted_composition_can_retain_and_remove_only_its_fresh_plain_worktree() {
+    use receipts_cli::hook::{
+        ClaudeHookContext, HostCompositionPort, run_claude_hook_with_composition,
+    };
+    use receipts_workspace_execution::OwnedPlainWorktree;
+    use std::cell::RefCell;
+    struct Owner(RefCell<Option<OwnedPlainWorktree>>);
+    impl HostCompositionPort for Owner {
+        fn plain_created(&self, _: &Path, owned: OwnedPlainWorktree) -> Result<(), &'static str> {
+            *self.0.borrow_mut() = Some(owned);
+            Ok(())
+        }
+        fn plain_removal(
+            &self,
+            _: &Path,
+            _: &Path,
+        ) -> Result<Option<OwnedPlainWorktree>, &'static str> {
+            Ok(self.0.borrow().clone())
+        }
+    }
+    let tree = Tree::new("trusted-cleanup");
+    let project = repo(&tree);
+    let ctx = ClaudeHookContext {
+        project_dir: Some(project.clone()),
+        ..Default::default()
+    };
+    let owner = Owner(RefCell::new(None));
+    let created = run_claude_hook_with_composition(
+        "WorktreeCreate",
+        &payload("WorktreeCreate", &project, r#", "name":"owned""#),
+        &ctx,
+        &owner,
+    );
+    assert_eq!(created.exit_code, 0, "{}", created.stderr);
+    let target = owner.0.borrow().as_ref().unwrap().path().to_path_buf();
+    let remove = payload(
+        "WorktreeRemove",
+        &project,
+        &format!(r#", "worktree_path":"{}""#, target.display()),
+    );
+    std::fs::write(target.join("keep"), "unsaved").unwrap();
+    let refused = run_claude_hook_with_composition("WorktreeRemove", &remove, &ctx, &owner);
+    assert_eq!(refused.exit_code, 0);
+    assert!(target.join("keep").exists());
+    assert!(
+        spool_events(&project)
+            .iter()
+            .all(|e| e.event_type() != NormalizedHostEventType::WorkspaceRemoved)
+    );
+    std::fs::remove_file(target.join("keep")).unwrap();
+    let removed = run_claude_hook_with_composition("WorktreeRemove", &remove, &ctx, &owner);
+    assert_eq!(removed.exit_code, 0, "{}", removed.stderr);
+    assert!(!target.exists());
+    assert_eq!(
+        spool_events(&project)
+            .iter()
+            .filter(|e| e.event_type() == NormalizedHostEventType::WorkspaceRemoved)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn raw_lifecycle_claims_never_emit_core_or_worker_facts() {
+    let tree = Tree::new("untrusted-lifecycle");
+    let project = repo(&tree);
+    for event in [
+        "FileChanged",
+        "SubagentStart",
+        "SubagentStop",
+        "TaskCompleted",
+    ] {
+        let out = hook(
+            event,
+            &[("CLAUDE_PROJECT_DIR", &project)],
+            &payload(
+                event,
+                &project,
+                r#", "task_id":"forged", "source_class":"CORE_DRIVEN""#,
+            ),
+        );
+        assert_eq!(out.code, 0);
+        assert!(out.stdout.is_empty());
+        assert!(
+            out.stderr.contains("supplier unavailable"),
+            "{}",
+            out.stderr
+        );
+    }
+    assert!(spool_events(&project).is_empty());
+}
+
+#[test]
+fn admitted_task_context_uses_workspace_task_path_without_plain_fallback() {
+    use receipts_cli::hook::{
+        ClaudeHookContext, HostCompositionPort, run_claude_hook_with_composition,
+    };
+    use receipts_host_integration::claude::ClaudeHookInvocation;
+    use receipts_workspace_execution::WorktreeCreateTask;
+    struct Task;
+    impl HostCompositionPort for Task {
+        fn task(
+            &self,
+            _: &Path,
+            _: &ClaudeHookInvocation,
+        ) -> Result<Option<WorktreeCreateTask>, &'static str> {
+            Ok(Some(WorktreeCreateTask {
+                workspace_id: "trusted-ws".into(),
+                task_id: "trusted-task".into(),
+            }))
+        }
+    }
+    let tree = Tree::new("trusted-task");
+    let project = repo(&tree);
+    let ctx = ClaudeHookContext {
+        project_dir: Some(project.clone()),
+        ..Default::default()
+    };
+    let input = payload(
+        "WorktreeCreate",
+        &project,
+        r#", "name":"task", "task_id":"untrusted""#,
+    );
+    let out = run_claude_hook_with_composition("WorktreeCreate", &input, &ctx, &Task);
+    assert_eq!(out.exit_code, 0, "{}", out.stderr);
+    let events = spool_events(&project);
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].confidence(),
+        NormalizedHostEventConfidence::Observed
+    );
+    // Repeating with no trusted task context refuses instead of adopting the task as plain.
+    let out = receipts_cli::hook::run_claude_hook("WorktreeCreate", &input, &ctx);
+    assert_eq!(out.exit_code, 1);
+    assert!(out.stdout.is_empty());
+    assert_eq!(spool_events(&project).len(), 1);
+}
+
+#[test]
+fn unsafe_refresh_storage_preserves_target_and_reports_currency_failure() {
+    let tree = Tree::new("refresh-link");
+    let project = tree.join("project");
+    let outside = tree.join("outside");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    let report = outside.join("host-capability-report.json");
+    let old =
+        include_str!("../../../fixtures/host_capability/02_claude_embedded_no_trust_model.json");
+    std::fs::write(&report, old).unwrap();
+    let linked = tree.join("data");
+    std::os::unix::fs::symlink(&outside, &linked).unwrap();
+    let out = hook(
+        "SessionStart",
+        &[
+            ("CLAUDE_PROJECT_DIR", &project),
+            ("CLAUDE_PLUGIN_DATA", &linked),
+        ],
+        &payload("SessionStart", &project, ""),
+    );
+    assert_eq!(out.code, 0);
+    assert!(out.stderr.contains("currency invalidation failed"));
+    assert!(out.stderr.contains("do not treat it as current"));
+    assert_eq!(std::fs::read_to_string(&report).unwrap(), old);
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1);
+}
+
+#[test]
+fn unreadable_nested_repository_identity_cannot_select_the_outer_spool() {
+    let tree = Tree::new("nested-project");
+    let project = repo(&tree);
+    let nested = project.join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    std::fs::write(
+        nested.join(".git"),
+        "gitdir: /missing-receipts-repository\n",
+    )
+    .unwrap();
+    let out = hook(
+        "SessionEnd",
+        &[("CLAUDE_PROJECT_DIR", &project)],
+        &payload("SessionEnd", &nested, ""),
+    );
+    assert_eq!(out.code, 0);
+    assert!(out.stderr.contains("repository identity unavailable"));
+    assert!(!project.join(".receipts").exists());
 }

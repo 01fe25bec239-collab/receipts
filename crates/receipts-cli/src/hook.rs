@@ -10,9 +10,10 @@
 //!   one bounded stderr line;
 //! * `WorktreeCreate` prints exactly `<absolute path>\n` and exits 0, or exits
 //!   1 with a stderr reason, which aborts creation (never exit 2);
-//! * `WorktreeRemove` removes nothing (see [`ClaudeHookDetail::WorktreeRemove`]
-//!   handling below) and exits 0.
+//! * `WorktreeRemove` exits 0; removal requires admitted live ownership and policy.
 
+use receipts_host_integration::private_fs::{HostDirectory, lock};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -75,6 +76,75 @@ fn note(out: &mut HookOutput, message: impl std::fmt::Display) {
 
 /// Runs one Claude hook to completion. Never panics on host input.
 pub fn run_claude_hook(event: &str, stdin: &[u8], ctx: &ClaudeHookContext) -> HookOutput {
+    run_claude_hook_with_composition(event, stdin, ctx, &NoHostComposition)
+}
+
+/// Only the admitted composition may supply task/cleanup authority. Never implemented by a hook decoder.
+pub trait HostCompositionPort {
+    /// Retain a fresh proof in trusted composition if later cleanup is desired.
+    fn plain_created(
+        &self,
+        _project: &Path,
+        _owned: receipts_workspace_execution::OwnedPlainWorktree,
+    ) -> Result<(), &'static str> {
+        Ok(())
+    }
+
+    fn task(
+        &self,
+        _project: &Path,
+        _invocation: &ClaudeHookInvocation,
+    ) -> Result<Option<receipts_workspace_execution::WorktreeCreateTask>, &'static str> {
+        Ok(None)
+    }
+    fn plain_removal(
+        &self,
+        _project: &Path,
+        _path: &Path,
+    ) -> Result<Option<receipts_workspace_execution::OwnedPlainWorktree>, &'static str> {
+        Ok(None)
+    }
+    /// Return independently admitted Core/worker facts, never a reclassified hook payload.
+    fn translated_event(
+        &self,
+        _project: &Path,
+        _invocation: &ClaudeHookInvocation,
+    ) -> Result<Option<(NormalizedHostEventSourceClass, NormalizedHostEvent)>, &'static str> {
+        Ok(None)
+    }
+}
+struct NoHostComposition;
+impl HostCompositionPort for NoHostComposition {}
+
+pub fn run_claude_hook_with_composition(
+    event: &str,
+    stdin: &[u8],
+    ctx: &ClaudeHookContext,
+    composition: &dyn HostCompositionPort,
+) -> HookOutput {
+    // Invalidate currency before parsing/probing; even early failures cannot retain a current report.
+    let refresh =
+        (event == "SessionStart" && ctx.plugin_data.is_some()).then(|| RefreshStorage::begin(ctx));
+    let mut out = run_hook_inner(
+        event,
+        stdin,
+        ctx,
+        composition,
+        refresh.as_ref().and_then(|r| r.as_ref().ok()),
+    );
+    if let Some(Err(error)) = refresh {
+        note(&mut out, error);
+    }
+    out
+}
+
+fn run_hook_inner(
+    event: &str,
+    stdin: &[u8],
+    ctx: &ClaudeHookContext,
+    composition: &dyn HostCompositionPort,
+    refresh: Option<&RefreshStorage>,
+) -> HookOutput {
     let blocking = ClaudeHookEvent::parse(event).is_some_and(ClaudeHookEvent::is_blocking);
     let mut out = HookOutput {
         stdout: String::new(),
@@ -89,34 +159,91 @@ pub fn run_claude_hook(event: &str, stdin: &[u8], ctx: &ClaudeHookContext) -> Ho
             return out;
         }
     };
-    let spool = spool_for(ctx);
+    let project = match verified_project(ctx, invocation.cwd()) {
+        Ok(project) => project,
+        Err(message) => {
+            note(&mut out, message);
+            out.exit_code = i32::from(blocking);
+            return out;
+        }
+    };
+    let spool = HostEventSpool::for_project(&project).ok();
     match invocation.detail() {
         ClaudeHookDetail::WorktreeCreate { name } => {
-            worktree_create(&invocation, name, spool.as_ref(), &mut out);
+            worktree_create(
+                &invocation,
+                name,
+                &project,
+                spool.as_ref(),
+                composition,
+                &mut out,
+            );
         }
         ClaudeHookDetail::WorktreeRemove { worktree_path } => {
-            // Q-02 (2.1.246): with a custom WorktreeCreate, Claude leaves
-            // removal to this hook. Workspace exposes no verified removal for
-            // plain worktrees, so nothing is deleted: the tree and its work
-            // are preserved and named. No WORKSPACE_REMOVED is emitted.
-            note(
-                &mut out,
-                format!(
-                    "worktree kept at {}; remove it with `git worktree remove` when finished",
-                    worktree_path.display()
+            let removed = composition
+                .plain_removal(&project, worktree_path)
+                .and_then(|owned| {
+                    let owned =
+                        owned.ok_or("no admitted plain-worktree ownership; worktree retained")?;
+                    owned
+                        .remove(&project, worktree_path)
+                        .map_err(|_| "plain-worktree cleanup failed or unverified; inspect path and registration")
+                });
+            match removed {
+                Ok(()) => {
+                    if let (Some(spool), Some(event)) = (
+                        &spool,
+                        invocation.workspace_removed_event(
+                            worktree_path,
+                            new_event_id(),
+                            now_utc(),
+                        ),
+                    ) {
+                        emit(
+                            spool,
+                            NormalizedHostEventSourceClass::CoreDriven,
+                            &event,
+                            &mut out,
+                        );
+                    }
+                }
+                Err(message) => note(
+                    &mut out,
+                    format!("{message}; worktree path {}", worktree_path.display()),
                 ),
-            );
+            }
         }
         _ => {
             if invocation.event() == ClaudeHookEvent::SessionStart
-                && let Err(message) = record_capabilities(&invocation, ctx)
+                && let Some(refresh) = refresh
+                && let Err(message) = record_capabilities(ctx, &project, refresh)
             {
                 note(&mut out, message);
             }
             if let Some(spool) = &spool {
                 match invocation.observed_event(new_event_id(), now_utc()) {
-                    Some(event) => emit(spool, &event, &mut out),
-                    None => note(&mut out, "event not representable; not spooled"),
+                    Some(event) => emit(
+                        spool,
+                        NormalizedHostEventSourceClass::HostHook,
+                        &event,
+                        &mut out,
+                    ),
+                    None => match composition.translated_event(&project, &invocation) {
+                        Ok(Some((class, event)))
+                            if invocation.admits_translation(class, &event) =>
+                        {
+                            emit(spool, class, &event, &mut out)
+                        }
+                        Ok(Some(_)) => note(
+                            &mut out,
+                            "trusted event binding/source mismatch; not spooled",
+                        ),
+                        Ok(None) => note(
+                            &mut out,
+                            "trusted Core/worker supplier unavailable; not spooled",
+                        ),
+                        Err(message) => note(&mut out, message),
+                    },
                 }
             } else {
                 note(
@@ -129,23 +256,42 @@ pub fn run_claude_hook(event: &str, stdin: &[u8], ctx: &ClaudeHookContext) -> Ho
     out
 }
 
-fn spool_for(ctx: &ClaudeHookContext) -> Option<HostEventSpool> {
-    let dir = ctx.project_dir.as_ref().filter(|p| p.is_absolute())?;
-    HostEventSpool::for_project(&fs::canonicalize(dir).ok()?).ok()
+fn verified_project(ctx: &ClaudeHookContext, cwd: &Path) -> Result<PathBuf, &'static str> {
+    let project = ctx
+        .project_dir
+        .as_ref()
+        .ok_or("no absolute CLAUDE_PROJECT_DIR; event not spooled")?;
+    let dir =
+        HostDirectory::open(project).map_err(|_| "unsafe CLAUDE_PROJECT_DIR; event not spooled")?;
+    HostDirectory::open(cwd).map_err(|_| "unsafe hook cwd; event not spooled")?;
+    if !cwd.starts_with(project) {
+        return Err("hook cwd/project mismatch; event not spooled");
+    }
+    // A nested repository is a different project, even inside this directory.
+    if cwd
+        .ancestors()
+        .any(|dir| fs::symlink_metadata(dir.join(".git")).is_ok())
+    {
+        let (root, _) = repository_head(cwd)
+            .map_err(|_| "hook repository identity unavailable; event not spooled")?;
+        if root != *project {
+            return Err("hook repository/project mismatch; event not spooled");
+        }
+    }
+    Ok(dir.path().to_path_buf())
 }
 
-fn emit(spool: &HostEventSpool, event: &NormalizedHostEvent, out: &mut HookOutput) {
+fn emit(
+    spool: &HostEventSpool,
+    class: NormalizedHostEventSourceClass,
+    event: &NormalizedHostEvent,
+    out: &mut HookOutput,
+) {
     let adapter = ClaudeHostAdapter::new(
         ClaudeHostEnvironment::default(),
         spool.clone(),
         conservative_report(),
     );
-    let class = match event.event_type() {
-        receipts_host_integration::NormalizedHostEventType::WorkspaceCreated => {
-            NormalizedHostEventSourceClass::CoreDriven
-        }
-        _ => NormalizedHostEventSourceClass::HostHook,
-    };
     match emit_validated_normalized_host_event(&adapter, class, event) {
         Ok(Ok(())) => {}
         Ok(Err(error)) => note(out, error),
@@ -156,7 +302,9 @@ fn emit(spool: &HostEventSpool, event: &NormalizedHostEvent, out: &mut HookOutpu
 fn worktree_create(
     invocation: &ClaudeHookInvocation,
     name: &str,
+    project: &Path,
     spool: Option<&HostEventSpool>,
+    composition: &dyn HostCompositionPort,
     out: &mut HookOutput,
 ) {
     let fail = |out: &mut HookOutput, message: String| {
@@ -168,21 +316,35 @@ fn worktree_create(
         Err(message) => return fail(out, message),
     };
     let (target, branch) = worktree_target(&root, name);
-    if let Some(parent) = target.parent()
-        && let Err(error) = fs::create_dir_all(parent)
-    {
-        return fail(out, format!("cannot create {}: {error}", parent.display()));
+    if root != project {
+        return fail(out, "repository/project mismatch".into());
     }
-    // No core task context exists in W2 (HI-W4-1 supplies it): the no-task
-    // Workspace path is the fallback. Workspace refusals (conflicting path,
-    // other branch, task-bound worktree) are returned as-is, never retried
-    // through another path.
-    let response = WorktreeCreateRequest::new(&root, &target, &branch, &head, None)
+    let parent = HostDirectory::open(project)
+        .and_then(|d| d.child(OsStr::new(".claude"), true))
+        .and_then(|d| d.child(OsStr::new("worktrees"), true));
+    let parent = match parent {
+        Ok(p) => p,
+        Err(_) => return fail(out, "unsafe worktree parent".into()),
+    };
+    let task = match composition.task(project, invocation) {
+        Ok(task) => task,
+        Err(e) => return fail(out, e.into()),
+    };
+    if parent.verify().is_err() {
+        return fail(out, "worktree parent changed".into());
+    }
+    // Workspace refusals are final; never retry a rejected task operation as plain.
+    let response = WorktreeCreateRequest::new(&root, &target, &branch, &head, task)
         .and_then(|request| request.create());
     let response = match response {
         Ok(response) => response,
         Err(error) => return fail(out, error.to_string()),
     };
+    if let Some(owned) = response.plain_ownership()
+        && let Err(message) = composition.plain_created(project, owned.clone())
+    {
+        note(out, message);
+    }
     let Some(stdout) = worktree_create_stdout(response.path()) else {
         return fail(
             out,
@@ -211,7 +373,12 @@ fn worktree_create(
             now_utc(),
         ),
     ) {
-        (Some(spool), Some(event)) => emit(spool, &event, out),
+        (Some(spool), Some(event)) => emit(
+            spool,
+            NormalizedHostEventSourceClass::CoreDriven,
+            &event,
+            out,
+        ),
         _ => note(out, "WORKSPACE_CREATED not spooled"),
     }
 }
@@ -281,15 +448,16 @@ pub fn repository_head(cwd: &Path) -> Result<(PathBuf, String), String> {
 
 /// Bounded read of a small regular non-symlink file.
 fn small_text(path: &Path) -> Result<String, String> {
-    let meta = fs::symlink_metadata(path).map_err(|_| format!("{} unreadable", path.display()))?;
-    if !meta.is_file() || meta.len() > SMALL_FILE_MAX_BYTES {
-        return Err(format!("{} is not a small regular file", path.display()));
-    }
-    let mut text = String::new();
-    fs::File::open(path)
-        .and_then(|f| f.take(SMALL_FILE_MAX_BYTES).read_to_string(&mut text))
-        .map_err(|_| format!("{} unreadable", path.display()))?;
-    Ok(text)
+    let parent = path.parent().ok_or("file has no parent")?;
+    let dir = HostDirectory::open_read(parent).map_err(|_| "unsafe file parent")?;
+    let bytes = dir
+        .read(
+            path.file_name().ok_or("file has no name")?,
+            false,
+            SMALL_FILE_MAX_BYTES,
+        )
+        .map_err(|_| "small file unreadable or unsafe")?;
+    String::from_utf8(bytes).map_err(|_| "small file is not UTF-8".into())
 }
 
 /// The conservative report used before any observation: FAILED probe,
@@ -337,34 +505,74 @@ pub fn conservative_report() -> HostCapabilityReport {
 }
 
 /// SessionStart capability refresh with coupled cache consumption. Writes the
-/// selected report (0600, atomic rename) or removes a report that no longer
-/// holds; never writes host settings.
-fn record_capabilities(
-    invocation: &ClaudeHookInvocation,
-    ctx: &ClaudeHookContext,
-) -> Result<HostCapabilityFreshnessDisposition, String> {
-    let (Some(exe), Some(data), Some(project)) =
-        (&ctx.claude_executable, &ctx.plugin_data, &ctx.project_dir)
-    else {
-        return Err("capability report not recorded (no RECEIPTS_CLAUDE_EXECUTABLE, CLAUDE_PLUGIN_DATA or CLAUDE_PROJECT_DIR)".into());
-    };
-    if !data.is_absolute() {
-        return Err("CLAUDE_PLUGIN_DATA is not absolute".into());
+/// selected report (0600, atomic rename); failed refresh retains explicit
+/// failed currency. Never writes host settings.
+struct RefreshStorage {
+    dir: HostDirectory,
+    _lock: fs::File,
+    cached: Option<HostCapabilityReport>,
+}
+impl RefreshStorage {
+    fn begin(ctx: &ClaudeHookContext) -> Result<Self, String> {
+        let data = ctx
+            .plugin_data
+            .as_deref()
+            .ok_or("capability currency unavailable (no CLAUDE_PLUGIN_DATA)")?;
+        let result = (|| -> Result<Self, String> {
+            let dir =
+                HostDirectory::create_path(data).map_err(|_| "unsafe plugin data directory")?;
+            let file = dir
+                .open_file(OsStr::new(".capability.lock"), true, true)
+                .map_err(|_| "unsafe capability lock")?;
+            lock(&file).map_err(|_| "cannot lock capability cache")?;
+            dir.verify_file(OsStr::new(".capability.lock"), &file, true)
+                .map_err(|_| "capability lock replaced")?;
+            let cached = match dir.read(
+                OsStr::new(CAPABILITY_REPORT_FILE),
+                true,
+                SMALL_FILE_MAX_BYTES,
+            ) {
+                Ok(bytes) => std::str::from_utf8(&bytes)
+                    .ok()
+                    .and_then(|t| host_capability_report_from_json(t).ok()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(_) => return Err("unsafe or unreadable capability report".into()),
+            };
+            dir.replace(
+                OsStr::new(CAPABILITY_REPORT_FILE),
+                host_capability_report_to_json(&conservative_report()).as_bytes(),
+            )
+            .map_err(|_| "cannot persist failed/stale currency")?;
+            Ok(Self {
+                dir,
+                _lock: file,
+                cached,
+            })
+        })();
+        result.map_err(|e| format!("capability currency invalidation failed: {e}; prior report may remain, do not treat it as current"))
     }
+}
+
+fn record_capabilities(
+    ctx: &ClaudeHookContext,
+    project: &Path,
+    storage: &RefreshStorage,
+) -> Result<HostCapabilityFreshnessDisposition, String> {
+    let exe = ctx
+        .claude_executable
+        .as_deref()
+        .ok_or("capability report not refreshed (no RECEIPTS_CLAUDE_EXECUTABLE)")?;
     let env = ChildEnvPolicy::new(ChildEnvProvider::Claude, ChildEnvAuthMode::Subscription)
         .map_err(|_| "probe environment policy unavailable".to_owned())?;
     let runner = WorkspaceHostProbeRunner::new(exe, env)
         .map_err(|e| format!("claude executable not admitted: {e:?}"))?;
-    let project = fs::canonicalize(project).map_err(|_| "CLAUDE_PROJECT_DIR unresolvable")?;
-    let path = data.join(CAPABILITY_REPORT_FILE);
-    let cached = small_text(&path)
-        .ok()
-        .and_then(|text| host_capability_report_from_json(&text).ok());
-    let hook_execution = ctx
-        .plugin_root
-        .as_deref()
-        .and_then(|root| invocation.execution_evidence(root));
-    let spool = HostEventSpool::for_project(&project).map_err(|e| e.to_string())?;
+    HostDirectory::open(project).map_err(|_| "unsafe capability project")?;
+    storage
+        .dir
+        .verify()
+        .map_err(|_| "plugin data directory changed")?;
+    let cached = &storage.cached;
+    let spool = HostEventSpool::for_project(project).map_err(|e| e.to_string())?;
     let adapter = ClaudeHostAdapter::new(
         ClaudeHostEnvironment {
             claudecode: ctx.claudecode,
@@ -380,18 +588,17 @@ fn record_capabilities(
                 codex_detected: false,
             },
             explicit_host_override: Some(adapter.id()),
-            project_root: project,
+            project_root: project.to_path_buf(),
             mode_override: None,
             cached: cached.as_ref().map(HostCapabilityReport::core),
-            hook_execution,
+            hook_execution: None,
         },
         &runner,
     )
     .map_err(|e| e.to_string())?;
     let entry = outcome.capability_refresh.cache_entry.as_ref();
     let Some(entry) = entry else {
-        let _ = fs::remove_file(&path);
-        return Err("capability observation incomplete; cached report removed".into());
+        return Err("capability observation incomplete; failed/stale currency retained".into());
     };
     let now = now_utc();
     let probed_at = match (&cached, outcome.freshness_disposition) {
@@ -401,30 +608,14 @@ fn record_capabilities(
         _ => now.clone(),
     };
     let report = HostCapabilityReport::new(entry.report().clone(), probed_at, now);
-    write_private_atomically(data, &path, &host_capability_report_to_json(&report))?;
+    storage
+        .dir
+        .replace(
+            OsStr::new(CAPABILITY_REPORT_FILE),
+            host_capability_report_to_json(&report).as_bytes(),
+        )
+        .map_err(|_| "cannot install capability report; currency remains failed/stale")?;
     Ok(outcome.freshness_disposition)
-}
-
-fn write_private_atomically(dir: &Path, path: &Path, text: &str) -> Result<(), String> {
-    use std::io::Write;
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .map_err(|_| "cannot create plugin data directory")?;
-    let temp = dir.join(format!(".{CAPABILITY_REPORT_FILE}.{}", std::process::id()));
-    let _ = fs::remove_file(&temp);
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temp)
-        .map_err(|_| "cannot create capability report")?;
-    file.write_all(text.as_bytes())
-        .and_then(|()| file.sync_data())
-        .map_err(|_| "cannot write capability report")?;
-    fs::rename(&temp, path).map_err(|_| "cannot install capability report".into())
 }
 
 /// ULID: 48-bit millisecond time and 80 random bits, Crockford base32.

@@ -204,6 +204,14 @@ struct ConfiguredEvents {
     worktree_create: Field<Vec<Object<HookGroup>>>,
     #[serde(default)]
     worktree_remove: Field<Vec<Object<HookGroup>>>,
+    #[serde(default)]
+    file_changed: Field<Vec<Object<HookGroup>>>,
+    #[serde(default)]
+    subagent_start: Field<Vec<Object<HookGroup>>>,
+    #[serde(default)]
+    subagent_stop: Field<Vec<Object<HookGroup>>>,
+    #[serde(default)]
+    task_completed: Field<Vec<Object<HookGroup>>>,
 }
 impl ConfiguredEvents {
     fn names(self) -> Value<Vec<String>> {
@@ -218,6 +226,10 @@ impl ConfiguredEvents {
             ("PostCompact", self.post_compact),
             ("WorktreeCreate", self.worktree_create),
             ("WorktreeRemove", self.worktree_remove),
+            ("FileChanged", self.file_changed),
+            ("SubagentStart", self.subagent_start),
+            ("SubagentStop", self.subagent_stop),
+            ("TaskCompleted", self.task_completed),
         ];
         // Null is not a known-empty event configuration. Do not partially
         // project this list as complete evidence when one known event is null.

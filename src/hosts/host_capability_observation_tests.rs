@@ -789,9 +789,8 @@ mod fingerprint {
     #[test]
     fn plugin_probe_runs_only_through_the_port_with_fixed_read_only_argv() {
         let port = Recording(RefCell::new(Vec::new()));
-        let bytes = io::LocalSources(&port)
-            .plugins(Path::new("/project"))
-            .unwrap();
+        let directory = Directory::new();
+        let bytes = io::LocalSources(&port).plugins(&directory.0).unwrap();
         assert_eq!(bytes, b"[]");
         assert_eq!(
             io::probe_command(Path::new("/project"), &["--version"]).current_dir,
@@ -893,10 +892,11 @@ mod fingerprint {
 
     #[test]
     fn identity_change_across_probes_leaves_the_fingerprint_incomplete() {
+        let directory = Directory::new();
         let (_, fingerprint) = observe_host_capabilities_with_fingerprint(
             &HostCapabilityObservationRequest {
                 host: HostId::ClaudeCode,
-                project_root: "/nonexistent-receipts-project".into(),
+                project_root: directory.0.clone(),
                 hook_execution: None,
             },
             &Swapping(std::cell::Cell::new(0)),
@@ -947,58 +947,33 @@ fn ran(root: &str) -> HostCapabilityObservationRequest {
 }
 
 #[test]
-fn installed_plugin_manifest_and_matching_hook_execution_make_embedded_reachable() {
+fn installed_manifest_and_forged_execution_claim_preserve_unknown_permission() {
     let value = observe(&ran("/plug/receipts"), &healthy_claude());
     assert_eq!(value.plugin_installed, Value::Known(true));
     assert_eq!(value.hooks_supported, Value::Known(true));
     assert_eq!(value.hooks_configured, Value::Known(true));
     assert_eq!(value.hook_trust_required, Value::Known(false));
     assert_eq!(value.hooks_trusted, Value::Unknown);
-    assert_eq!(value.hooks_enabled, Value::Known(true));
-    assert_eq!(value.hooks_allowed_by_admin_policy, Value::Known(true));
+    assert_eq!(value.hooks_enabled, Value::Unknown);
+    assert_eq!(value.hooks_allowed_by_admin_policy, Value::Unknown);
     assert_eq!(value.required_hook_coverage_satisfied, Value::Known(true));
     assert_eq!(
         value.hook_coverage_class,
-        HostCapabilityHookCoverageClass::Full
+        HostCapabilityHookCoverageClass::Partial
     );
-    let mut events = CLAUDE_REQUIRED_HOOK_EVENTS.map(String::from).to_vec();
-    events.sort();
-    assert_eq!(value.hook_events, Value::Known(events));
-    // Without a complete fingerprint of this observation: PARTIAL, never EMBEDDED.
-    let inputs = value.report_selection_inputs(true, Stale::None, None);
-    assert_eq!(inputs.probe_status, HostCapabilityProbeStatus::Partial);
-    assert_eq!(inputs.host_id, "claude-code");
-    match compose_host_capability_report_selection(&inputs).unwrap() {
-        Outcome::Selected { report } => assert_ne!(report.selected_mode(), Mode::Embedded),
-        Outcome::Indeterminate { .. } => {}
-        other => panic!("{other:?}"),
-    }
-    // With one (as the fingerprint path sets it): COMPLETE selects EMBEDDED.
-    let complete = HostCapabilityObservation {
+    let with_fingerprint = HostCapabilityObservation {
         validity_fingerprint: Some("sha256:f".into()),
         ..value
     };
-    let inputs = complete.report_selection_inputs(true, Stale::None, None);
-    assert_eq!(inputs.probe_status, HostCapabilityProbeStatus::Complete);
+    let inputs = with_fingerprint.report_selection_inputs(true, Stale::None, None);
+    assert_eq!(inputs.probe_status, HostCapabilityProbeStatus::Partial);
     let Outcome::Selected { report } = compose_host_capability_report_selection(&inputs).unwrap()
     else {
         panic!()
     };
-    assert_eq!(report.selected_mode(), Mode::Embedded);
-    assert_eq!(
-        report.inactive_reason(),
-        Some(crate::HostCapabilityInactiveReason::None)
-    );
-    // Unproven validity still re-probes.
-    assert_eq!(
-        compose_host_capability_report_selection(&complete.report_selection_inputs(
-            false,
-            Stale::ValidityFingerprintUnproven,
-            None
-        ))
-        .unwrap(),
-        Outcome::ReprobeRequired
-    );
+    assert_eq!(report.selected_mode(), Mode::Supervised);
+    assert_eq!(report.hooks_enabled(), None);
+    assert_eq!(report.hooks_allowed_by_admin_policy(), None);
 }
 
 #[test]
@@ -1031,7 +1006,7 @@ fn refutations_win_and_contradictions_stay_unknown() {
     // The same file while our hook is demonstrably running: contradiction.
     assert_eq!(
         observe(&ran("/plug/receipts"), &off).hooks_enabled,
-        Value::Unknown
+        Value::Known(false)
     );
     let managed = with((
         Source::ClaudeManagedDropIn,
@@ -1043,7 +1018,7 @@ fn refutations_win_and_contradictions_stay_unknown() {
     );
     assert_eq!(
         observe(&ran("/plug/receipts"), &managed).hooks_allowed_by_admin_policy,
-        Value::Unknown
+        Value::Known(false)
     );
     // allowManagedHooksOnly in user/project files is not admin policy.
     let user = with((
@@ -1052,7 +1027,7 @@ fn refutations_win_and_contradictions_stay_unknown() {
     ));
     assert_eq!(
         observe(&ran("/plug/receipts"), &user).hooks_allowed_by_admin_policy,
-        Value::Known(true)
+        Value::Unknown
     );
     // Host-reported disabled plugin.
     let disabled = Fixture {
@@ -1162,4 +1137,33 @@ fn version_probe_keeps_only_a_plain_version_token() {
         assert_eq!(decode::version(output.as_bytes()), expected, "{output:?}");
     }
     assert_eq!(decode::version(&[b'1'; 65]), Value::Unknown);
+}
+
+#[test]
+fn forged_hook_observation_never_grants_authority_and_coverage_is_independent() {
+    let value = observe(&ran("/plug/receipts"), &healthy_claude());
+    assert_eq!(value.hooks_enabled, Value::Unknown);
+    assert_eq!(value.hooks_allowed_by_admin_policy, Value::Unknown);
+    assert_eq!(value.required_hook_coverage_satisfied, Value::Known(true));
+    assert_eq!(
+        value.hook_coverage_class,
+        HostCapabilityHookCoverageClass::Partial
+    );
+}
+
+#[test]
+fn explicit_plugin_setting_disables_even_with_matching_hook_claim() {
+    let mut f = healthy_claude();
+    f.files.push((
+        Source::ClaudeLocalSettings,
+        Ok(br#"{"enabledPlugins":{"receipts@local":false}}"#.to_vec()),
+    ));
+    assert_eq!(
+        observe(&ran("/plug/receipts"), &f).hooks_enabled,
+        Value::Known(false)
+    );
+    f.plugins = Err(Error::ProbeFailed);
+    let failed = observe(&ran("/plug/receipts"), &f);
+    assert_eq!(failed.hooks_enabled, Value::Known(false));
+    assert_eq!(failed.hooks_configured, Value::Unknown);
 }

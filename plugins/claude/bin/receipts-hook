@@ -14,10 +14,16 @@ case "$bin" in
     esac
     ;;
 esac
-if [ -z "$bin" ]; then
+if [ -z "$bin" ] || [ ! -f "$bin" ] || [ ! -x "$bin" ]; then
   echo "receipts: no absolute receipts binary (set RECEIPTS_BIN or install <plugin>/bin/receipts)" >&2
   # Observers fail open; WorktreeCreate must not pretend a worktree exists.
   [ "$event" = WorktreeCreate ] && exit 1
   exit 0
 fi
-exec "$bin" hook claude "$event"
+# A child keeps shell exec failures inside the observer fail-open boundary.
+"$bin" hook claude "$event"
+result=$?
+[ "$result" -eq 0 ] && exit 0
+echo "receipts: hook execution failed" >&2
+[ "$event" = WorktreeCreate ] && exit 1
+exit 0
