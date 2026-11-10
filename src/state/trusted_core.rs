@@ -231,6 +231,7 @@ impl StateWriteAdmission {
 
 /// The trusted core's exclusive State writer.
 pub struct TrustedCoreStore {
+    // Fields drop in declaration order: SQLite must close before WriterLock unlocks.
     repo: SqliteStateRepository,
     store_id: String,
     /// Process-unique identity of this open writer; never reused, never
@@ -238,7 +239,7 @@ pub struct TrustedCoreStore {
     instance: u64,
     // Held for the store's lifetime: the cooperative exclusive-writer lock,
     // the validated database object and its validated directory.
-    _lock: File,
+    _lock: secure::WriterLock,
     _db: File,
     _dir: File,
 }
@@ -279,8 +280,14 @@ impl TrustedCoreStore {
     }
 
     fn finish(repo: SqliteStateRepository, held: secure::Held) -> Result<Self, StateError> {
-        secure::verify_after_open(&held)?;
-        let store_id = repo.store_identity()?;
+        let store_id = match secure::verify_after_open(&held).and_then(|()| repo.store_identity()) {
+            Ok(id) => id,
+            Err(error) => {
+                // Parameters drop in reverse order; close SQLite before releasing held.
+                drop(repo);
+                return Err(error);
+            }
+        };
         Ok(Self {
             repo,
             store_id,
@@ -1093,9 +1100,26 @@ mod secure {
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::io::{AsRawFd, FromRawFd};
 
+    pub(super) struct WriterLock {
+        file: File,
+        owner: libc::pid_t,
+    }
+
+    impl Drop for WriterLock {
+        fn drop(&mut self) {
+            // A forked copy must neither prolong ownership nor unlock a live parent.
+            // SAFETY: owned, open descriptor; getpid and flock have no pointer arguments.
+            unsafe {
+                if libc::getpid() == self.owner {
+                    libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+                }
+            }
+        }
+    }
+
     pub(super) struct Held {
         pub(super) db_path: PathBuf,
-        pub(super) lock: File,
+        pub(super) lock: WriterLock,
         pub(super) db: File,
         pub(super) dir: File,
     }
@@ -1313,6 +1337,12 @@ mod secure {
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(refused(R::WriterLockHeld));
         }
+        // Only a successfully acquired lock may unlock on drop, including failed opens.
+        let lock = WriterLock {
+            file: lock,
+            // SAFETY: getpid has no preconditions.
+            owner: unsafe { libc::getpid() },
+        };
         // Pre-existing sidecars are validated before SQLite can act on them.
         sidecars(&dir, entry)?;
         let db = open_file(&dir, &name(entry)?, create)?;
@@ -1349,6 +1379,7 @@ mod secure {
 #[cfg(not(unix))]
 mod secure {
     use super::{File, Path, PathBuf, StateError, StateWriteRefusalV1 as R, refused};
+    pub(super) type WriterLock = File;
     pub(super) struct Held {
         pub(super) db_path: PathBuf,
         pub(super) lock: File,
