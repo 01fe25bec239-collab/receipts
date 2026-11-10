@@ -170,7 +170,7 @@ fn latest(conn: &Connection, f: &AvailabilityFactV1) -> Result<u64, StateError> 
     Ok(max.unwrap_or(0) as u64)
 }
 
-fn lifecycle(
+pub(crate) fn lifecycle(
     conn: &Connection,
     project: &str,
     provider: &str,
@@ -215,6 +215,90 @@ fn lifecycle(
     })
 }
 
+/// Checks the D5 ordering rule for `fact` inside the caller's transaction and
+/// returns the latest existing sequence it follows.
+pub(crate) fn check_follows(
+    conn: &Connection,
+    fact: &AvailabilityFactV1,
+) -> Result<u64, StateError> {
+    let current = latest(conn, fact)?;
+    // A non-demotion fact must follow the exact latest sequence:
+    // anything older is stale, anything newer is forged.
+    if fact.follows_sequence.is_some_and(|s| s != current)
+        || (fact.kind != AvailabilityFactKindV1::Demotion && current == 0)
+    {
+        return Err(graph::failure(Phase::Write, Code::ParentConflict, None));
+    }
+    Ok(current)
+}
+
+/// Inserts the fact at `current + 1` (the trusted sample was already accepted
+/// by the caller) and reports the derived lifecycle.
+pub(crate) fn insert_fact(
+    conn: &Connection,
+    fact: &AvailabilityFactV1,
+    current: u64,
+    recorded_at: &str,
+) -> Result<AvailabilityFactReceiptV1, StateError> {
+    let sequence = current + 1;
+    conn.execute(
+        "INSERT INTO availability_fact(project_id,provider_id,runtime_id,model_id,sequence,kind,reason,source_kind,source_ref,follows_sequence,recorded_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        params![
+            fact.project_id,
+            fact.provider_id,
+            fact.runtime_id,
+            fact.model_id,
+            sequence as i64,
+            fact.kind.as_str(),
+            fact.reason,
+            fact.source.as_str(),
+            fact.source_ref,
+            fact.follows_sequence.map(|s| s as i64),
+            recorded_at,
+        ],
+    )
+    .map_err(|e| graph::sqlite_error(Phase::Write, e))?;
+    let status = lifecycle(
+        conn,
+        &fact.project_id,
+        &fact.provider_id,
+        &fact.runtime_id,
+        &fact.model_id,
+    )?
+    .status;
+    Ok(AvailabilityFactReceiptV1 {
+        sequence,
+        recorded_at: recorded_at.to_owned(),
+        status,
+    })
+}
+
+impl AvailabilityFactV1 {
+    pub(crate) fn runtime_id(&self) -> &str {
+        &self.runtime_id
+    }
+    pub(crate) fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+    pub(crate) fn model_id(&self) -> &str {
+        &self.model_id
+    }
+    /// Domain-separated canonical fields for package digests.
+    pub(crate) fn canonical(&self) -> serde_json::Value {
+        serde_json::json!([
+            self.project_id,
+            self.provider_id,
+            self.runtime_id,
+            self.model_id,
+            self.kind.as_str(),
+            self.reason,
+            self.source.as_str(),
+            self.source_ref,
+            self.follows_sequence,
+        ])
+    }
+}
+
 impl SqliteStateRepository {
     pub(crate) fn append_availability_fact(
         &mut self,
@@ -227,46 +311,9 @@ impl SqliteStateRepository {
         let (sample, timestamp) = trusted_time::validate_sample(sample)
             .map_err(|e| graph::legacy_error(Phase::Clock, e))?;
         graph::write_transaction(self.connection(), |conn| {
-            let current = latest(conn, fact)?;
-            // A non-demotion fact must follow the exact latest sequence:
-            // anything older is stale, anything newer is forged.
-            if fact.follows_sequence.is_some_and(|s| s != current)
-                || (fact.kind != AvailabilityFactKindV1::Demotion && current == 0)
-            {
-                return Err(graph::failure(Phase::Write, Code::ParentConflict, None));
-            }
+            let current = check_follows(conn, fact)?;
             graph::accept_graph_sample(conn, &fact.project_id, &sample, &timestamp)?;
-            let sequence = current + 1;
-            conn.execute(
-                "INSERT INTO availability_fact(project_id,provider_id,runtime_id,model_id,sequence,kind,reason,source_kind,source_ref,follows_sequence,recorded_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-                params![
-                    fact.project_id,
-                    fact.provider_id,
-                    fact.runtime_id,
-                    fact.model_id,
-                    sequence as i64,
-                    fact.kind.as_str(),
-                    fact.reason,
-                    fact.source.as_str(),
-                    fact.source_ref,
-                    fact.follows_sequence.map(|s| s as i64),
-                    sample.canonical_utc_timestamp,
-                ],
-            )
-            .map_err(|e| graph::sqlite_error(Phase::Write, e))?;
-            let status = lifecycle(
-                conn,
-                &fact.project_id,
-                &fact.provider_id,
-                &fact.runtime_id,
-                &fact.model_id,
-            )?
-            .status;
-            Ok(AvailabilityFactReceiptV1 {
-                sequence,
-                recorded_at: sample.canonical_utc_timestamp.clone(),
-                status,
-            })
+            insert_fact(conn, fact, current, &sample.canonical_utc_timestamp)
         })
     }
 

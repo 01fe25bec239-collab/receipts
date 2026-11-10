@@ -13,4 +13,5 @@ path = "../../src/routing/lib.rs"
 receipts-state = { path = "../.." }
 receipts-runtime-adapters = { path = "../receipts-runtime-adapters" }
 serde = { version = "=1.0.229", default-features = false, features = ["std", "derive"] }
-serde_json = { version = "=1.0.151", default-features = false, features = ["std"] }
+serde_json = { version = "=1.0.151", default-features = false, features = ["std", "raw_value"] }
+sha2 = "=0.11.0"

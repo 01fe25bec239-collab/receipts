@@ -27,30 +27,53 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use receipts_state::{
     ArtifactMaterializer, AttemptFinish, AttemptStart, AvailabilityFactReceiptV1,
-    AvailabilityFactV1, ChangedSources, CheckpointRecord, ContextEpoch, ContextEpochTrigger,
-    ContextManifest, ContextRehydratedEventSupplier, ContextRehydrationOutcome,
-    ContextRehydrationRequest, DecisionRecordV1, EventPersistReceiptV1, EventProposalV1,
-    ExecutorBinding, ExecutorLeaseExpiryOutcomeV1, ExecutorLeaseExpiryRequestV2,
-    GraphCompilerRefV1, GraphSourceEvidenceRefV1, LogicalRole, LogicalRoleStatus, OutputRef,
-    ProvenanceLinkKind, ReleaseReason, RepositorySnapshotMaterializer, RoleChangeEvidenceV1,
-    SqliteStateRepository, StateEpochValueV1, StateError, StateGraphGenesisV1,
-    StateGraphMutationV1, StateGraphNodeResultV1, StateGraphSnapshotV1, StateWriteAdmission,
-    StateWriteOperationV1 as Op, StateWriteSubjectV1, TrustedClockV1, TrustedCoreStore,
+    AvailabilityFactV1, ChangedSourceSuccessionRequestV1, ChangedSourceSuccessionV1,
+    ChangedSources, CheckpointRecord, ContextEpoch, ContextEpochTrigger, ContextManifest,
+    ContextRehydratedEventSupplier, ContextRehydrationOutcome, ContextRehydrationRequest,
+    DecisionRecordV1, EventPersistReceiptV1, EventProposalV1, ExecutorBinding,
+    ExecutorLeaseExpiryOutcomeV1, ExecutorLeaseExpiryRequestV2,
+    ExecutorReleasedLifecycleAuthorityV1, GraphCompilerRefV1, GraphMutationPublicationV1,
+    GraphPublicationOutcomeV1, GraphResultAttachmentV1, GraphSourceEvidenceRefV1, LogicalRole,
+    LogicalRoleStatus, OutputRef, ProvenanceLinkKind, RehydrationRequiredV1, ReleaseReason,
+    RepositorySnapshotMaterializer, ReviewClaimTicketV1, RoleChangeEvidenceV1, RoleRebindRequestV1,
+    SqliteStateRepository, StartupRecoveryReportV1, StateEpochValueV1, StateError,
+    StateGraphGenesisV1, StateGraphMutationV1, StateGraphNodeResultV1, StateGraphSnapshotV1,
+    StateWriteAdmission, StateWriteOperationV1 as Op, StateWriteSubjectV1, TrustedClockV1,
+    TrustedCoreStore,
 };
 use sha2::{Digest, Sha256};
 
 /// The immutable admission context the trusted composition supplies: the
 /// compiler and policy this core admits and, per admitted project, the
 /// admitted source revision (a typed evidence reference, not a commit SHA).
+///
+/// Two identities are equal only when they are the same admitted object (or a
+/// clone of it): the abandonment grants it mints (see
+/// [`CoreAdmissionIdentity::abandonment_grant`]) are bound to that object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoreAdmissionIdentity {
     compiler_id: GraphCompilerRefV1,
     policy_id: String,
     projects: BTreeMap<String, GraphSourceEvidenceRefV1>,
+    /// Per project, the admitted authority that may abandon a review claim.
+    abandonment: BTreeMap<String, String>,
+    mark: IdentityMark,
 }
+
+/// Identity of one admitted-identity object; clones share it.
+#[derive(Debug, Clone)]
+pub(super) struct IdentityMark(Arc<()>);
+
+impl PartialEq for IdentityMark {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for IdentityMark {}
 
 impl CoreAdmissionIdentity {
     /// `policy_id` must be non-empty and at most 200 characters. No project
@@ -62,6 +85,8 @@ impl CoreAdmissionIdentity {
                 compiler_id,
                 policy_id,
                 projects: BTreeMap::new(),
+                abandonment: BTreeMap::new(),
+                mark: IdentityMark(Arc::new(())),
             })
     }
 
@@ -76,6 +101,60 @@ impl CoreAdmissionIdentity {
         self.projects.insert(project_id.into(), admitted_source);
         self
     }
+
+    /// Admits `authority_ref` (a bounded id such as `operator:<name>` or
+    /// `policy:<name>`) as the authority that may abandon an unfinished review
+    /// claim of `project_id`. Without it no abandonment is possible. The
+    /// reference is recorded on the claim; the name alone never authorizes
+    /// anything (see [`Self::abandonment_grant`]).
+    pub fn with_abandonment_authority(
+        mut self,
+        project_id: impl Into<String>,
+        authority_ref: impl Into<String>,
+    ) -> Self {
+        self.abandonment
+            .insert(project_id.into(), authority_ref.into());
+        self
+    }
+
+    /// Mints the single-use grant to abandon review claim `claim_id` of
+    /// `project_id`, or `None` when the project has no admitted abandonment
+    /// authority. Only code holding this admitted identity (or a clone of
+    /// it, which the trusted composition keeps) can mint one; a writer opened
+    /// with another identity refuses it.
+    pub fn abandonment_grant(
+        &self,
+        project_id: &str,
+        claim_id: &str,
+    ) -> Option<CoreAbandonmentGrantV1> {
+        self.abandonment
+            .get(project_id)
+            .map(|authority_ref| CoreAbandonmentGrantV1 {
+                mark: self.mark.clone(),
+                project_id: project_id.to_owned(),
+                claim_id: claim_id.to_owned(),
+                authority_ref: authority_ref.clone(),
+            })
+    }
+
+    pub(super) fn abandonment_authority(&self, project_id: &str) -> Option<&str> {
+        self.abandonment.get(project_id).map(String::as_str)
+    }
+
+    pub(super) fn owns(&self, mark: &IdentityMark) -> bool {
+        self.mark == *mark
+    }
+}
+
+/// Permission to abandon one review claim, minted by the admitted identity and
+/// consumed by [`CoreStateWriter::abandon_review_claim`]. It is not `Clone`
+/// and carries no caller-supplied authority string.
+#[derive(Debug)]
+pub struct CoreAbandonmentGrantV1 {
+    pub(super) mark: IdentityMark,
+    pub(super) project_id: String,
+    pub(super) claim_id: String,
+    pub(super) authority_ref: String,
 }
 
 /// The trusted composition's read-only access to content referenced by
@@ -105,6 +184,21 @@ pub enum CorePolicyRefusal {
     UnsupportedDigest,
     /// The resolved bytes do not match the supplied digest.
     ContentDigestMismatch,
+    /// This writer holds no live ticket for the review claim (it was claimed
+    /// by an earlier process or by someone else, or it is already finished).
+    NoLiveClaim,
+    /// The review claim has no durable seal to publish from.
+    NotSealed,
+    /// The recovery data does not decode, is of another kind or project, or
+    /// does not rebuild exactly what was sealed.
+    RecoveryDataInvalid,
+    /// The claim may only be completed by publishing its sealed package.
+    CompletionRequiresPublication,
+    /// The grant was not minted by this writer's admitted identity, names
+    /// another claim or project, or the project has no admitted authority.
+    AbandonmentNotAuthorized,
+    /// A package item or key is outside the bounded shape.
+    InvalidShape,
 }
 
 #[derive(Debug)]
@@ -136,13 +230,16 @@ impl std::fmt::Display for CoreStateWriteError {
 
 impl std::error::Error for CoreStateWriteError {}
 
-type Admitted = Result<StateWriteAdmission, CoreStateWriteError>;
+pub(super) type Admitted = Result<StateWriteAdmission, CoreStateWriteError>;
 
 /// The trusted core's State writer.
 #[derive(Debug)]
 pub struct CoreStateWriter {
-    store: TrustedCoreStore,
-    identity: CoreAdmissionIdentity,
+    pub(super) store: TrustedCoreStore,
+    pub(super) identity: CoreAdmissionIdentity,
+    /// Live review-claim tickets by `(project, claim)`: non-`Clone`, never
+    /// persisted, gone after a restart.
+    pub(super) review_tickets: BTreeMap<(String, String), ReviewClaimTicketV1>,
 }
 
 impl CoreStateWriter {
@@ -154,6 +251,7 @@ impl CoreStateWriter {
         Ok(Self {
             store: TrustedCoreStore::open_exclusive(path)?,
             identity,
+            review_tickets: BTreeMap::new(),
         })
     }
 
@@ -166,7 +264,7 @@ impl CoreStateWriter {
         self.store.reader()
     }
 
-    fn admitted_source(
+    pub(super) fn admitted_source(
         &self,
         project_id: &str,
     ) -> Result<&GraphSourceEvidenceRefV1, CorePolicyRefusal> {
@@ -203,7 +301,12 @@ impl CoreStateWriter {
 
     /// Admits a project-scoped write; a named graph must already be stored
     /// in that project.
-    fn admit(&self, operation: Op, project_id: &str, graph_id: Option<&str>) -> Admitted {
+    pub(super) fn admit(
+        &self,
+        operation: Op,
+        project_id: &str,
+        graph_id: Option<&str>,
+    ) -> Admitted {
         self.admitted_source(project_id)?;
         if let Some(graph) = graph_id
             && self
@@ -260,8 +363,10 @@ impl CoreStateWriter {
             .create_initial_graph_v1(admission, clock, genesis)?)
     }
 
-    /// Persists one admitted mutation of a stored graph; the source binding
-    /// is the stored graph's genesis source.
+    /// LEGACY, non-atomic: appends a mutation whose results were attached by
+    /// separate [`Self::append_node_result`] calls. New work uses
+    /// [`Self::publish_graph_mutation`]. Persists one admitted mutation of a
+    /// stored graph; the source binding is the stored graph's genesis source.
     pub fn append_graph_mutation(
         &mut self,
         clock: &dyn TrustedClockV1,
@@ -286,7 +391,8 @@ impl CoreStateWriter {
             .append_graph_mutation_v1(admission, clock, mutation, snapshot)?)
     }
 
-    /// Attaches one node result to a stored graph version.
+    /// LEGACY, non-atomic: attaches one node result to a stored graph version
+    /// in its own transaction. New work uses [`Self::publish_graph_mutation`].
     pub fn append_node_result(
         &mut self,
         project: &str,
@@ -298,6 +404,44 @@ impl CoreStateWriter {
         Ok(self
             .store
             .append_node_result_v1(admission, project, version, reference, result)?)
+    }
+
+    /// Publishes one graph mutation with the node results it attaches, its
+    /// successor snapshot, history, seal, watermark and head move in ONE State
+    /// transaction (the admission binds the stored graph's source and this
+    /// core's compiler and policy exactly as [`Self::append_graph_mutation`]).
+    /// Any failure leaves none of them; an exact retry is `Replayed`.
+    /// `results` are `(graph version, result reference, result)`.
+    pub fn publish_graph_mutation(
+        &mut self,
+        clock: &dyn TrustedClockV1,
+        results: Vec<(String, String, StateGraphNodeResultV1)>,
+        mutation: StateGraphMutationV1,
+        snapshot: StateGraphSnapshotV1,
+    ) -> Result<GraphPublicationOutcomeV1, CoreStateWriteError> {
+        let project = snapshot.content().project_id().to_owned();
+        self.admitted_source(&project)?;
+        let stored = self
+            .reader()
+            .load_current_graph_v1(&project, mutation.graph_id())?
+            .ok_or(CorePolicyRefusal::UnknownSubject)?;
+        let source = stored.genesis_provenance().source_ref().clone();
+        let admission = self.admit_graph_content(
+            Op::GraphMutation,
+            snapshot.content(),
+            mutation.graph_id(),
+            &source,
+        )?;
+        let attachments = results
+            .into_iter()
+            .map(|(version, reference, result)| {
+                GraphResultAttachmentV1::new(&version, &reference, result)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let publication = GraphMutationPublicationV1::new(attachments, mutation, snapshot)?;
+        Ok(self
+            .store
+            .publish_graph_mutation_v1(admission, clock, &publication)?)
     }
 
     // ---- execution records ---------------------------------------------------
@@ -373,27 +517,7 @@ impl CoreStateWriter {
     ) -> Result<EventPersistReceiptV1, CoreStateWriteError> {
         let project = proposal.project_id();
         self.admitted_source(project)?;
-        let payload = proposal.payload();
-        let expected = payload
-            .digest
-            .strip_prefix("sha256:")
-            .filter(|hex| {
-                hex.len() == 64
-                    && hex
-                        .bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            })
-            .ok_or(CorePolicyRefusal::UnsupportedDigest)?;
-        let bytes = content
-            .resolve(project, &payload.reference)
-            .ok_or(CorePolicyRefusal::ContentUnavailable)?;
-        let actual: String = Sha256::digest(&bytes)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        if actual != expected {
-            return Err(CorePolicyRefusal::ContentDigestMismatch.into());
-        }
+        verify_event_content(content, proposal)?;
         let admission = self.admit(Op::EventProposal, project, None)?;
         Ok(self
             .store
@@ -606,6 +730,48 @@ impl CoreStateWriter {
         )?)
     }
 
+    // ---- recovery -------------------------------------------------------------
+
+    /// Startup recovery scan for an admitted project: expired leases are
+    /// released with their events and each role's continuation requirement is
+    /// reported (see State's `recovery`). A project the composition did not
+    /// admit is refused before State.
+    pub fn recover_startup(
+        &mut self,
+        clock: &dyn TrustedClockV1,
+        project_id: &str,
+        authority: &ExecutorReleasedLifecycleAuthorityV1,
+    ) -> Result<StartupRecoveryReportV1, CoreStateWriteError> {
+        let admission = self.admit(Op::ExecutorBinding, project_id, None)?;
+        Ok(self
+            .store
+            .recover_startup(admission, clock, project_id, authority)?)
+    }
+
+    /// Failover rebind of a stored role: the project is the role's own, never
+    /// a caller-supplied one. An unknown role is refused before State.
+    pub fn rebind_role(
+        &mut self,
+        clock: &dyn TrustedClockV1,
+        request: &RoleRebindRequestV1,
+    ) -> Result<RehydrationRequiredV1, CoreStateWriteError> {
+        let admission = self.admit_role(Op::ExecutorBinding, &request.role_id)?;
+        Ok(self.store.rebind_role(admission, clock, request)?)
+    }
+
+    /// Changed-source epoch and manifest succession for a stored role, in the
+    /// role's own project.
+    pub fn succeed_changed_context_sources(
+        &mut self,
+        clock: &dyn TrustedClockV1,
+        request: &ChangedSourceSuccessionRequestV1,
+    ) -> Result<ChangedSourceSuccessionV1, CoreStateWriteError> {
+        let admission = self.admit_role(Op::ContextEpoch, &request.role_id)?;
+        Ok(self
+            .store
+            .succeed_changed_context_sources(admission, clock, request)?)
+    }
+
     // ---- availability (D5) -----------------------------------------------------
 
     /// Records one durable availability fact (D5 ordering/refusal rules).
@@ -619,4 +785,36 @@ impl CoreStateWriter {
             .store
             .append_availability_fact(admission, clock, fact)?)
     }
+}
+
+/// Resolves the content an event proposal references through the
+/// composition's resolver and verifies the actual bytes against the
+/// proposal's `sha256:` digest. Used for every event that reaches State
+/// through the core, alone or inside a package.
+pub(super) fn verify_event_content(
+    content: &dyn CoreContentResolverV1,
+    proposal: &EventProposalV1,
+) -> Result<(), CoreStateWriteError> {
+    let payload = proposal.payload();
+    let expected = payload
+        .digest
+        .strip_prefix("sha256:")
+        .filter(|hex| {
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+        .ok_or(CorePolicyRefusal::UnsupportedDigest)?;
+    let bytes = content
+        .resolve(proposal.project_id(), &payload.reference)
+        .ok_or(CorePolicyRefusal::ContentUnavailable)?;
+    let actual: String = Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    if actual != expected {
+        return Err(CorePolicyRefusal::ContentDigestMismatch.into());
+    }
+    Ok(())
 }

@@ -114,6 +114,28 @@ const TX_PROBE_DDL: &str = "CREATE TABLE tx_probe (
     value TEXT NOT NULL
 );";
 
+#[test]
+fn linked_sqlite_meets_the_bundled_security_floor() {
+    let tmp = TempDir::new("sqlite-version");
+    let repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
+    let (version, source): (String, String) = repo
+        .connection()
+        .query_row("SELECT sqlite_version(), sqlite_source_id()", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    println!(
+        "linked SQLite {version}; source {source}; numeric {}",
+        rusqlite::version_number()
+    );
+    assert_eq!(version, rusqlite::version());
+    // RUSTSEC-2026-0459: mismatched WAL page sizes expose memory before 3.54.0.
+    assert!(
+        rusqlite::version_number() >= 3_054_000,
+        "unpatched SQLite {version}"
+    );
+}
+
 // T1 — a brand-new database bootstraps through the migration mechanism.
 #[test]
 fn t01_new_database_bootstrap() {
@@ -187,7 +209,7 @@ fn t07_current_version_reopen_succeeds() {
     let tmp = TempDir::new("t07");
     drop(SqliteStateRepository::open(tmp.db_path()).expect("bootstrap"));
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("reopen succeeds");
-    assert_eq!(repo.schema_version().expect("version read"), 20);
+    assert_eq!(repo.schema_version().expect("version read"), 23);
 }
 
 // T8 — bootstrap/reopen is idempotent: no duplicate metadata, no reinit.
@@ -198,7 +220,7 @@ fn t08_reopen_idempotent() {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            20,
+            23,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -210,15 +232,15 @@ fn t08_reopen_idempotent() {
 fn t09_lower_unsupported_version_fails() {
     let tmp = TempDir::new("t09");
     // Database initialized one version above the registered chain.
-    let probe_chain = chain_with(&[probe_migration(21, "probe_v20")]);
+    let probe_chain = chain_with(&[probe_migration(24, "probe_v22")]);
     drop(
         SqliteStateRepository::open_with_migrations(tmp.db_path(), &probe_chain)
-            .expect("bootstrap at version 21"),
+            .expect("bootstrap at version 23"),
     );
-    // Opening against a chain supporting version 22 must fail closed.
+    // Opening against a chain supporting version 24 must fail closed.
     let newer_chain = chain_with(&[
-        probe_migration(21, "probe_v20"),
-        probe_migration(22, "probe_v21"),
+        probe_migration(24, "probe_v22"),
+        probe_migration(25, "probe_v23"),
     ]);
     let error = SqliteStateRepository::open_with_migrations(tmp.db_path(), &newer_chain)
         .expect_err("older version must not be silently upgraded");
@@ -226,8 +248,8 @@ fn t09_lower_unsupported_version_fails() {
         matches!(
             error,
             StateError::SchemaVersionMismatch {
-                found: 21,
-                supported: 22
+                found: 24,
+                supported: 25
             }
         ),
         "unexpected error: {error}"
@@ -235,7 +257,7 @@ fn t09_lower_unsupported_version_fails() {
     // The stored version was not altered by the failed open.
     let repo = SqliteStateRepository::open_with_migrations(tmp.db_path(), &probe_chain)
         .expect("database still opens with its original chain");
-    assert_eq!(repo.schema_version().expect("version read"), 21);
+    assert_eq!(repo.schema_version().expect("version read"), 24);
 }
 
 // T10 — an existing database at a higher/unknown version fails to open and
@@ -243,10 +265,10 @@ fn t09_lower_unsupported_version_fails() {
 #[test]
 fn t10_higher_unsupported_version_fails() {
     let tmp = TempDir::new("t10");
-    let probe_chain = chain_with(&[probe_migration(21, "probe_v20")]);
+    let probe_chain = chain_with(&[probe_migration(24, "probe_v22")]);
     drop(
         SqliteStateRepository::open_with_migrations(tmp.db_path(), &probe_chain)
-            .expect("bootstrap at version 21"),
+            .expect("bootstrap at version 23"),
     );
     let error = SqliteStateRepository::open(tmp.db_path())
         .expect_err("newer/unknown version must fail closed");
@@ -254,15 +276,15 @@ fn t10_higher_unsupported_version_fails() {
         matches!(
             error,
             StateError::SchemaVersionMismatch {
-                found: 21,
-                supported: 20
+                found: 24,
+                supported: 23
             }
         ),
         "unexpected error: {error}"
     );
     let repo = SqliteStateRepository::open_with_migrations(tmp.db_path(), &probe_chain)
         .expect("database still opens with its original chain");
-    assert_eq!(repo.schema_version().expect("version read"), 21);
+    assert_eq!(repo.schema_version().expect("version read"), 24);
 }
 
 // T11 — a successful transaction commits all of its mutations.
@@ -368,12 +390,12 @@ fn v12_explicit_migration_preserves_all_families_and_restores_foreign_keys() {
         SqliteStateRepository::open(tmp.db_path()).expect_err("ordinary open refuses v11"),
         StateError::SchemaVersionMismatch {
             found: 11,
-            supported: 20
+            supported: 23
         }
     ));
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).expect("migrate"),
-        20
+        23
     );
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("v14 open");
     assert_eq!(repo.pragma_integer_value("foreign_keys").unwrap(), 1);
@@ -415,7 +437,7 @@ fn v12_explicit_migration_preserves_all_families_and_restores_foreign_keys() {
     );
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).expect("v14 noop"),
-        20
+        23
     );
 }
 

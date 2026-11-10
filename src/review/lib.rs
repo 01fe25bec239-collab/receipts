@@ -142,3 +142,79 @@ pub use a4_review::A4Review;
 
 #[cfg(test)]
 mod a4_review_tests;
+
+pub mod wire;
+
+pub mod claims;
+pub use claims::{ReviewClaimBinding, ReviewClaimScope, ReviewOperation, request_sha256};
+
+pub mod ports;
+pub use ports::{
+    ImplementerIdentity, ReviewClaim, ReviewContentResolver, ReviewRecordProposal,
+    ReviewRecordSink, ReviewerCandidate, ReviewerQualityEvidence, ReviewerRequirements,
+    ReviewerRoutingPort, ReviewerRoutingRefusal, ReviewerRunOutput, ReviewerRuntime,
+    SEALED_REVIEW_KIND, SealedReview, reviewer_output_from_claude, reviewer_output_from_codex,
+    reviewer_tier_rank,
+};
+
+mod records;
+
+pub mod record;
+pub use record::{Recorded, record_proposal};
+
+#[cfg(test)]
+mod dispositions_tests;
+
+pub mod dispositions;
+pub use dispositions::{
+    DispositionRefusal, FindingDisposition, FindingDispositionKind, disposition_claim_binding,
+    disposition_proposal, record_dispositions, undispositioned, validate_dispositions,
+};
+
+pub mod reproduction;
+pub use reproduction::{CheckRun, CheckRunStatus, CheckRunnerConfig, run_check};
+
+pub mod capsule_builder;
+pub use capsule_builder::{CapsuleBuildRefusal, ReviewCapsuleBuildInput, build_review_capsule};
+
+#[cfg(test)]
+mod capsule_builder_tests;
+
+pub mod review_parse;
+pub use review_parse::{ReviewParseError, parse_reviewer_output};
+
+pub mod controller;
+pub use controller::{
+    AttemptFinished, ReplayedReview, ReviewController, ReviewDisposition, ReviewRefusal,
+    ReviewTicket, effective_distinct_provider, effective_reviewer_floor, review_claim_binding,
+};
+
+#[cfg(test)]
+mod controller_tests;
+
+#[cfg(test)]
+mod test_repo;
+
+pub mod acceptance_gate;
+pub use acceptance_gate::{
+    AcceptanceCheckId, AcceptanceCheckResult, AcceptanceGate, AcceptanceInput,
+    DependencySupersession, FailureSeverity, GateOutcome,
+};
+
+#[cfg(test)]
+mod acceptance_gate_tests;
+
+pub mod repair_controller;
+pub use repair_controller::{
+    RepairController, RepairDecision, RepairEscalation, RepairInput, RepairOutcome,
+    RepairPolicyTrigger, RepairRequest, RepairTier, ReviewerExclusions, repair_claim_binding,
+};
+
+#[cfg(test)]
+mod repair_controller_tests;
+
+/// Review's own State and Runtime dependencies, re-exported unchanged so the
+/// Review-owned integration layer (`receipts-e2e`) binds exactly these crate
+/// instances without new manifest edges. Adds no type and no authority.
+pub use receipts_runtime_adapters as runtime;
+pub use receipts_state as state;

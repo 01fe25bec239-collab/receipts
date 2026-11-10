@@ -1,6 +1,7 @@
-//! Strict JSON codecs for the Wave1 graph schemas: `ExecutionGraph`,
-//! `GraphNode`, `GraphMutation`, `GraphSnapshot` and `GraphNodeResult`
-//! (`GraphEdge` reuses [`GraphEdge::from_json`]).
+//! Strict JSON codecs for Orchestration's twelve owned schemas. Graph:
+//! `ExecutionGraph`, `GraphNode`, `GraphMutation`, `GraphSnapshot` and
+//! `GraphNodeResult` (`GraphEdge` reuses [`GraphEdge::from_json`]). The six
+//! capsule/decision codecs live in `contracts` (see its notes).
 //!
 //! Each `*WireV1` value is schema-shaped data: decoding checks the frozen
 //! schema's shape exactly (unknown, duplicate and wrongly typed or null fields
@@ -32,6 +33,8 @@ use crate::{
     GraphSnapshot, GraphSnapshotNodeState, GraphVersionV1, MAX_IDENTIFIER_LENGTH,
 };
 
+#[cfg(test)]
+mod contracts_tests;
 #[cfg(test)]
 mod tests;
 
@@ -145,6 +148,12 @@ wire_type!(
     GraphNodeResultWireV1,
     validate_result
 );
+
+mod contracts;
+pub use contracts::{
+    DispatchAdmissionDecisionWireV1, FeatureAdmissionDecisionWireV1, FeatureCapabilitySetWireV1,
+    GoalEvaluationWireV1, RepairCapsuleWireV1, TaskCapsuleWireV1,
+};
 
 // --- shape primitives -----------------------------------------------------
 
@@ -766,7 +775,7 @@ pub(crate) fn graph_node_result_from_value(value: &V) -> WireResult<GraphNodeRes
     GraphNodeResultWireV1::from_value(value.clone())?.to_graph_node_result()
 }
 
-fn edge_to_value(edge: &GraphEdge) -> V {
+pub(crate) fn edge_to_value(edge: &GraphEdge) -> V {
     V::parse_json(&edge.to_json().expect("edge serialization cannot fail"))
         .expect("edge JSON is valid")
 }

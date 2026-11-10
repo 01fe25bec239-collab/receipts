@@ -1,0 +1,7 @@
+on: {pull_request_target: {types: [opened]}}
+permissions: {contents: read}
+jobs:
+  x:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi

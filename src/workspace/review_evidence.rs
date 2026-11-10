@@ -24,8 +24,9 @@
 //!
 //! Cleanup removes only what this module created. Ownership is not inferred
 //! from path, branch or SHA: the handle retains the canonical repository and
-//! the identity (device, inode) of the task binding record created in the
-//! worktree's administrative directory at provisioning. Immediately before
+//! an open descriptor pinning the task binding record created in the
+//! worktree's administrative directory at provisioning, preventing inode reuse
+//! until the last handle clone is dropped. Immediately before
 //! removal, inside the verified teardown (clean, registered, expected HEAD),
 //! the live binding must still equal this workspace/task/branch/base and be
 //! that same record object. Then the review branch is removed through a
@@ -99,9 +100,23 @@ pub struct ReviewWorkspace {
     reviewed_sha: CommitSha,
     /// Canonical repository this module provisioned in.
     repository_root: PathBuf,
-    /// (device, inode) of the binding record created at provisioning.
-    binding_object: (u64, u64),
+    /// Pins the binding object for this handle and every clone.
+    binding_object: BindingObject,
 }
+
+/// The descriptor keeps the identity from being recycled after unlink.
+#[derive(Debug, Clone)]
+struct BindingObject {
+    identity: (u64, u64),
+    _file: std::sync::Arc<std::fs::File>,
+}
+
+impl PartialEq for BindingObject {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+    }
+}
+impl Eq for BindingObject {}
 
 impl ReviewWorkspace {
     /// The PROVISIONED, task-bound handle (branch = the review branch).
@@ -155,17 +170,32 @@ pub fn provision_review_workspace(
 }
 
 #[cfg(unix)]
-fn binding_object(root: &Path, worktree: &Path) -> Result<(u64, u64), WorkspaceError> {
+fn binding_object(root: &Path, worktree: &Path) -> Result<BindingObject, WorkspaceError> {
     use std::os::unix::fs::MetadataExt;
     let fail = |detail: String| WorkspaceError::WorktreeBindingFailed { detail };
     let dir = worktree_binding::admin_dir(root, worktree).map_err(fail)?;
-    let meta = std::fs::symlink_metadata(dir.join(worktree_binding::BINDING_FILE))
-        .map_err(|e| fail(format!("binding entry: {e}")))?;
-    Ok((meta.dev(), meta.ino()))
+    let path = dir.join(worktree_binding::BINDING_FILE);
+    let listed =
+        std::fs::symlink_metadata(&path).map_err(|e| fail(format!("binding entry: {e}")))?;
+    if !listed.is_file() {
+        return Err(fail("binding entry is not a regular file".into()));
+    }
+    let file = std::fs::File::open(&path).map_err(|e| fail(format!("open binding: {e}")))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| fail(format!("binding metadata: {e}")))?;
+    let identity = (meta.dev(), meta.ino());
+    if identity != (listed.dev(), listed.ino()) {
+        return Err(fail("binding entry changed while being pinned".into()));
+    }
+    Ok(BindingObject {
+        identity,
+        _file: std::sync::Arc::new(file),
+    })
 }
 
 #[cfg(not(unix))]
-fn binding_object(_: &Path, _: &Path) -> Result<(u64, u64), WorkspaceError> {
+fn binding_object(_: &Path, _: &Path) -> Result<BindingObject, WorkspaceError> {
     Err(WorkspaceError::WorktreeBindingFailed {
         detail: "binding identity is unsupported on this platform".into(),
     })
@@ -513,4 +543,43 @@ pub fn provision_temporary_merge(
         merge_sha,
         workspace,
     })
+}
+
+#[cfg(test)]
+mod binding_lifetime_tests {
+    use super::*;
+    use crate::test_support::{TempDir, TestRepo};
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::Arc;
+
+    #[test]
+    fn binding_object_is_pinned_until_the_last_review_handle_drops() {
+        let repo = TestRepo::new("review-pin");
+        let place = TempDir::new("review-pin-wt");
+        let ws = provision_review_workspace(&ReviewWorkspaceRequest {
+            repository_root: repo.path().to_path_buf(),
+            workspace_id: "ws-pin".into(),
+            task_id: "task-pin".into(),
+            reviewed_sha: CommitSha::parse(&repo.head_sha()).unwrap(),
+            worktree_path: place.path().join("pin"),
+        })
+        .unwrap();
+        let pin = Arc::downgrade(&ws.binding_object._file);
+        let cloned = ws.clone();
+        assert_eq!(ws, cloned);
+        assert_eq!(pin.strong_count(), 2, "clones share one descriptor");
+        drop(ws);
+        assert_eq!(pin.strong_count(), 1, "the clone retains ownership");
+        remove_review_workspace(repo.path(), &cloned).unwrap();
+        assert_eq!(
+            cloned.binding_object._file.metadata().unwrap().nlink(),
+            0,
+            "the unlinked object stays alive and cannot be recycled"
+        );
+        drop(cloned);
+        assert!(
+            pin.upgrade().is_none(),
+            "the last handle releases the descriptor"
+        );
+    }
 }

@@ -95,6 +95,11 @@ pub enum ExactShaAcceptanceGateError {
         record: AcceptanceEvidenceRecord,
         check_index: usize,
     },
+    /// The record contradicts itself: a PASS result with a nonzero exit code.
+    EvidenceContradictory {
+        record: AcceptanceEvidenceRecord,
+        check_index: usize,
+    },
     RequiredReproductionMissing,
     ReproductionNotPerformed,
     DependencyEvidenceStale {
@@ -142,7 +147,7 @@ impl ExactShaAcceptanceGate {
     /// reproduction must be performed with nonempty checks. Even optional
     /// supplied reproduction checks are validated; nonempty checks also require
     /// performed=true. No result is inferred from exit_code or an absent/false
-    /// timeout, and exit_code is not judged: expected-exit mapping is held.
+    /// timeout. An explicit PASS with a nonzero exit is contradictory and refused.
     /// Source labels show role consistency only, never execution attestation.
     /// This does not establish criterion coverage or implement assurance profiles.
     pub fn evaluate(
@@ -242,6 +247,7 @@ impl ExactShaAcceptanceGate {
                 check
                     .result()
                     .map(|result| result == A3HandoffCheckResult::Pass),
+                check.exit_code(),
             )?;
         }
         for (index, check) in capsule.checks().unwrap_or_default().iter().enumerate() {
@@ -255,6 +261,7 @@ impl ExactShaAcceptanceGate {
                 check
                     .result()
                     .map(|result| result == ReviewCapsuleCheckResult::Pass),
+                check.exit_code(),
             )?;
         }
         if capsule.reproduction_required() && review.reproduction().is_none() {
@@ -281,6 +288,7 @@ impl ExactShaAcceptanceGate {
                     check
                         .result()
                         .map(|result| result == A4ReviewReproductionCheckResult::Pass),
+                    check.exit_code(),
                 )?;
             }
         }
@@ -295,6 +303,8 @@ impl ExactShaAcceptanceGate {
     }
 }
 
+// The arguments are the observable facts of one check record.
+#[allow(clippy::too_many_arguments)]
 fn validate_check(
     record: AcceptanceEvidenceRecord,
     check_index: usize,
@@ -303,6 +313,7 @@ fn validate_check(
     source: WorkspaceCheckpointCheckSource,
     timed_out: Option<bool>,
     passing: Option<bool>,
+    exit_code: i64,
 ) -> Result<(), ExactShaAcceptanceGateError> {
     use ExactShaAcceptanceGateError::*;
     if code_sha != candidate.as_str() {
@@ -330,6 +341,11 @@ fn validate_check(
         });
     }
     match passing {
+        // Observable result and recorded claim must agree: PASS is exit 0.
+        Some(true) if exit_code != 0 => Err(EvidenceContradictory {
+            record,
+            check_index,
+        }),
         Some(true) => Ok(()),
         Some(false) => Err(EvidenceResultNotPassing {
             record,
