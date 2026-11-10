@@ -1,0 +1,7 @@
+"on": {"push": null}
+"permissions": {"contents": "write"}
+jobs:
+  x:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi

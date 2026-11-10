@@ -463,10 +463,7 @@ fn overlapping_writers_serialize_disjoint_run_parallel_unknown_defers_s10() {
             witness: "docs/readme.md".into()
         }
     );
-    assert_eq!(
-        deferral(&schedule, "d"),
-        DeferralV1::WriteOverlapUndetermined { with: "r".into() }
-    );
+    assert_eq!(deferral(&schedule, "d"), DeferralV1::WriteScopeUnvalidated);
 
     // A matcher resource limit is uncertainty: the second writer waits.
     let big: Vec<String> = (0..10).map(|i| format!("x{i}.rs")).collect();
@@ -480,4 +477,23 @@ fn overlapping_writers_serialize_disjoint_run_parallel_unknown_defers_s10() {
         deferral(&schedule, "b"),
         DeferralV1::WriteOverlapUndetermined { with: "a".into() }
     );
+}
+
+#[test]
+fn unvalidated_first_scope_preserves_all_capacity_for_the_next_writer() {
+    let schedule = run(
+        &flat(),
+        &limits(1),
+        DispatchBudgetV1 {
+            remaining_worker_starts: 1,
+            remaining_cost: Some(1),
+        },
+        &[],
+        &[
+            candidate("a", &["docs/**", "bad?"]),
+            candidate("b", &["src/**"]),
+        ],
+    );
+    assert_eq!(schedule.admitted(), ["b"]);
+    assert_eq!(deferral(&schedule, "a"), DeferralV1::WriteScopeUnvalidated);
 }

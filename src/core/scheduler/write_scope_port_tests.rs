@@ -2,6 +2,10 @@ use super::write_scope_port::*;
 
 struct Fixed(WriteScopeOverlapV1);
 impl WriteScopePort for Fixed {
+    fn validate(&self, _: &[String]) -> bool {
+        panic!("this collision-only test double must not validate candidates")
+    }
+
     fn overlap(&self, _: &[String], _: &[String]) -> WriteScopeOverlapV1 {
         self.0.clone()
     }

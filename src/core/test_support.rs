@@ -130,6 +130,10 @@ pub(crate) struct PrefixPort {
 pub(crate) const PORT: PrefixPort = PrefixPort { limit: 64 };
 
 impl WriteScopePort for PrefixPort {
+    fn validate(&self, paths: &[String]) -> bool {
+        !paths.is_empty() && paths.iter().all(|p| !p.is_empty() && !p.contains('?'))
+    }
+
     fn overlap(&self, left: &[String], right: &[String]) -> WriteScopeOverlapV1 {
         if left.len() * right.len() > self.limit
             || left.iter().chain(right).any(|p| p.contains('?'))
@@ -167,6 +171,13 @@ impl WriteScopePort for PrefixPort {
 pub(crate) struct RealPort;
 
 impl WriteScopePort for RealPort {
+    fn validate(&self, paths: &[String]) -> bool {
+        !paths.is_empty()
+            && paths
+                .iter()
+                .all(|p| receipts_workspace_execution::WritePathPattern::parse(p).is_ok())
+    }
+
     fn overlap(&self, left: &[String], right: &[String]) -> WriteScopeOverlapV1 {
         use receipts_workspace_execution::{WritePathPattern, WritePathSet, intersects};
         let parse = |paths: &[String]| {

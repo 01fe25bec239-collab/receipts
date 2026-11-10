@@ -1191,6 +1191,10 @@ fn every_repair_text_family_is_screened_and_plain_values_still_build() {
 struct LeakyPort;
 
 impl WriteScopePort for LeakyPort {
+    fn validate(&self, _: &[String]) -> bool {
+        panic!("this collision-only test double must not validate candidates")
+    }
+
     fn overlap(&self, _: &[String], _: &[String]) -> WriteScopeOverlapV1 {
         WriteScopeOverlapV1::Overlaps {
             witness: format!("src/core/{TOKEN}"),
