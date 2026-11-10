@@ -596,9 +596,25 @@ fn record_capabilities(
         &runner,
     )
     .map_err(|e| e.to_string())?;
-    let entry = outcome.capability_refresh.cache_entry.as_ref();
-    let Some(entry) = entry else {
-        return Err("capability observation incomplete; failed/stale currency retained".into());
+    let refresh = outcome.capability_refresh;
+    let selection = if refresh
+        .fingerprint
+        .as_ref()
+        .is_some_and(|f| f.is_complete())
+    {
+        refresh.report_selection
+    } else {
+        // Failed probes retain independent facts without minting reusable currency.
+        let mut inputs = refresh.observation.report_selection_inputs(
+            true,
+            HostCapabilityStaleReason::ProbeFailed,
+            None,
+        );
+        inputs.probe_status = HostCapabilityProbeStatus::Failed;
+        compose_host_capability_report_selection(&inputs)
+    };
+    let Ok(HostCapabilityReportSelectionCompositionOutcome::Selected { report }) = selection else {
+        return Err("capability selection unresolved; failed/stale currency retained".into());
     };
     let now = now_utc();
     let probed_at = match (&cached, outcome.freshness_disposition) {
@@ -607,7 +623,7 @@ fn record_capabilities(
         }
         _ => now.clone(),
     };
-    let report = HostCapabilityReport::new(entry.report().clone(), probed_at, now);
+    let report = HostCapabilityReport::new(*report, probed_at, now);
     storage
         .dir
         .replace(

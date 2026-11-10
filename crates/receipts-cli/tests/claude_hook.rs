@@ -995,3 +995,62 @@ fn unreadable_nested_repository_identity_cannot_select_the_outer_spool() {
     assert!(out.stderr.contains("repository identity unavailable"));
     assert!(!project.join(".receipts").exists());
 }
+
+#[test]
+fn failed_plugin_probe_preserves_disabled_settings_without_cache_reuse() {
+    use receipts_host_integration::HostCapabilityStaleReason;
+    for (tag, settings) in [
+        ("all-hooks", r#"{"disableAllHooks":true}"#),
+        ("plugin", r#"{"enabledPlugins":{"receipts@local":false}}"#),
+    ] {
+        let tree = Tree::new(&format!("failed-probe-{tag}"));
+        let project = tree.join("project");
+        let data = tree.join("data");
+        let config = tree.join("config");
+        std::fs::create_dir_all(project.join(".claude")).unwrap();
+        std::fs::create_dir(&config).unwrap();
+        std::fs::write(project.join(".claude/settings.json"), settings).unwrap();
+        let exe = tree.join("claude");
+        std::fs::write(&exe, "#!/bin/sh\nif [ \"$1\" = --version ]; then echo '2.1.319 (fixture)'; else exit 1; fi\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let env = [
+            ("HOME", tree.0.as_path()),
+            ("CLAUDE_CONFIG_DIR", config.as_path()),
+            ("CLAUDE_PROJECT_DIR", project.as_path()),
+            ("CLAUDE_PLUGIN_DATA", data.as_path()),
+            ("RECEIPTS_CLAUDE_EXECUTABLE", exe.as_path()),
+        ];
+        let report_path = data.join("host-capability-report.json");
+        for round in 0..2 {
+            let out = hook("SessionStart", &env, &payload("SessionStart", &project, ""));
+            assert_eq!(out.code, 0, "{}", out.stderr);
+            assert!(out.stdout.is_empty());
+            let text = std::fs::read_to_string(&report_path).unwrap();
+            let report = host_capability_report_from_json(&text).unwrap();
+            let core = report.core();
+            assert_eq!(
+                core.hooks_enabled(),
+                Some(false),
+                "{tag}, round {round}: {out_stderr}",
+                out_stderr = out.stderr
+            );
+            assert_eq!(
+                core.inactive_reason(),
+                Some(HostCapabilityInactiveReason::HooksDisabled)
+            );
+            assert_eq!(core.probe_status(), HostCapabilityProbeStatus::Failed);
+            assert_eq!(core.stale_reason(), HostCapabilityStaleReason::ProbeFailed);
+            assert_eq!(core.selected_mode(), HostCapabilitySelectedMode::Supervised);
+            assert_eq!(core.hooks_allowed_by_admin_policy(), None);
+            assert_eq!(core.validity_fingerprint(), None);
+            assert_eq!(core.host_version(), Some("2.1.319"));
+            assert!(
+                !text.contains("2000-01-01T00:00:00Z"),
+                "incomplete evidence was reused"
+            );
+            // Equal report facts must not make an incomplete observation reusable.
+            let aged = text.replace(report.probed_at().as_str(), "2000-01-01T00:00:00Z");
+            std::fs::write(&report_path, aged).unwrap();
+        }
+    }
+}
