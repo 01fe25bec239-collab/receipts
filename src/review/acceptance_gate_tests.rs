@@ -1516,3 +1516,16 @@ fn a3_repair_incomparable_or_unavailable_supersession_refuses() {
         );
     }
 }
+
+#[test]
+fn a_review_without_nonblocking_findings_needs_no_disposition_content() {
+    let s = scenario_with(
+        AssuranceProfile::Standard,
+        "PASS_WITH_NONBLOCKING_FINDINGS",
+        &[],
+    );
+    assert_eq!(
+        evaluate(&s, &knobs(&s)).outcome,
+        IntegrationDecisionOutcome::Accept
+    );
+}

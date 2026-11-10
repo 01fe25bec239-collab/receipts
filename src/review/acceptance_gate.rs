@@ -581,10 +581,6 @@ fn bind_dispositions(
             "disposition history exceeds the bounded evidence query",
         );
     }
-    let content = i.disposition_content.ok_or((
-        Blocked,
-        "disposition content resolver is unavailable".to_owned(),
-    ))?;
     for expected in &expected.events {
         let found: Vec<_> = events
             .iter()
@@ -596,6 +592,10 @@ fn bind_dispositions(
                 "required finding disposition is not persisted for this review",
             );
         }
+        let content = i.disposition_content.ok_or((
+            Blocked,
+            "disposition content resolver is unavailable".to_owned(),
+        ))?;
         let bytes = content
             .resolve(i.project_id, &expected.payload().reference)
             .map_err(|e| (Blocked, format!("disposition content unreadable: {e}")))?
