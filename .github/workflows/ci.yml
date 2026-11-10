@@ -70,8 +70,13 @@ jobs:
       - name: cargo check
         run: cargo check --workspace --locked
 
+      # The latency contract requires a quiet host: run this test alone,
+      # then run every other test with the suite's normal concurrency.
+      - name: Worktree creation under 500 ms
+        run: cargo test -p receipts-workspace-execution --lib --locked worktree_create::tests::completes_under_500ms_on_small_repo -- --exact --nocapture
+
       - name: cargo test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked -- --skip worktree_create::tests::completes_under_500ms_on_small_repo
 
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
@@ -109,5 +114,10 @@ jobs:
           git --version
           sw_vers
 
+      # The latency contract requires a quiet host: run this test alone,
+      # then run every other test with the suite's normal concurrency.
+      - name: Worktree creation under 500 ms
+        run: cargo test -p receipts-workspace-execution --lib --locked worktree_create::tests::completes_under_500ms_on_small_repo -- --exact --nocapture
+
       - name: cargo test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked -- --skip worktree_create::tests::completes_under_500ms_on_small_repo
