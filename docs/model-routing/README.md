@@ -68,7 +68,9 @@ Interruption or a lost acknowledgement can leave the complete package committed,
 so an error alone cannot prove that nothing was written. An exact retry returns
 the original receipts (`replayed`) without duplicate writes; conflicting content
 under the same logical identity refuses. Routing advances registry/availability
-memory only after a proposal-bound receipt matching State’s stored receipt,
+memory only after proposal-bound event receipts matching State’s stored receipts
+and an exact durable availability fact/receipt match (complete partition, fact
+content, sequence, recorded timestamp and status through that sequence),
 or rebuilds it from State.
 A runtime probe report is one publication. The composition root implements the port over the
 core's `CoreStateWriter`. Every event payload is the exact content its digest
@@ -154,3 +156,8 @@ and unchanged memory on unconfirmed success. `sha256_hex` uses the pinned
 This is the authorized library adapter. Production composition-root wiring,
 deployed authority/isolation, authenticated D5/N6 recovery producers and
 independent cumulative A3/Q06 remain separate boundaries.
+
+Receipt validation refuses faulty-port success before advancing memory. It cannot
+roll back any writes that the faulty port already committed. Historical fact
+receipts remain valid after later facts and reopening; current lifecycle alone
+does not establish a receipt’s identity.

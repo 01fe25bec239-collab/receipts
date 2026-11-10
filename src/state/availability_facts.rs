@@ -300,6 +300,53 @@ impl AvailabilityFactV1 {
 }
 
 impl SqliteStateRepository {
+    /// Checks the exact durable fact and receipt, including lifecycle status
+    /// through its sequence. Later facts do not invalidate a historical receipt.
+    /// This read-only check cannot undo writes made by a faulty publisher.
+    pub fn availability_fact_receipt_matches(
+        &self,
+        fact: &AvailabilityFactV1,
+        receipt: &AvailabilityFactReceiptV1,
+    ) -> Result<bool, StateError> {
+        let Ok(sequence) = i64::try_from(receipt.sequence) else {
+            return Ok(false);
+        };
+        let demoted = match receipt.status {
+            AvailabilityLifecycleStatusV1::Unknown => false,
+            AvailabilityLifecycleStatusV1::Demoted => true,
+        };
+        self.connection()
+            .query_row(
+                "SELECT EXISTS (
+                SELECT 1 FROM availability_fact
+                WHERE project_id=?1 AND provider_id=?2 AND runtime_id=?3 AND model_id=?4
+                  AND sequence=?5 AND kind=?6 AND reason=?7 AND source_kind=?8
+                  AND source_ref=?9 AND follows_sequence IS ?10 AND recorded_at=?11
+                  AND EXISTS (
+                    SELECT 1 FROM availability_fact
+                    WHERE project_id=?1 AND provider_id=?2 AND runtime_id=?3 AND model_id=?4
+                      AND sequence<=?5 AND kind='DEMOTION'
+                  ) = ?12
+            )",
+                params![
+                    fact.project_id,
+                    fact.provider_id,
+                    fact.runtime_id,
+                    fact.model_id,
+                    sequence,
+                    fact.kind.as_str(),
+                    fact.reason,
+                    fact.source.as_str(),
+                    fact.source_ref,
+                    fact.follows_sequence.map(|s| s as i64),
+                    receipt.recorded_at,
+                    demoted
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|e| graph::sqlite_error(Phase::Read, e))
+    }
+
     pub(crate) fn append_availability_fact(
         &mut self,
         clock: &dyn TrustedClockV1,
@@ -333,5 +380,127 @@ impl SqliteStateRepository {
             runtime_id,
             model_id,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::atomic_publication_tests::{T1, T2, open_store, publish, routing_package};
+    use crate::{DecisionPublicationV1, TrustedCoreStore};
+
+    #[test]
+    fn availability_receipt_requires_every_durable_fact_and_receipt_field() {
+        let (dir, mut store) = open_store("availability-receipt");
+        let package = routing_package("first");
+        let receipt = publish(&mut store, &T1, &package).unwrap();
+        // The second fact is a claim following the initial demotion.
+        let fact = AvailabilityFactV1::new(
+            "p".into(),
+            "anthropic".into(),
+            "claude".into(),
+            String::new(),
+            AvailabilityFactKindV1::PromotionUnauthenticated,
+            "PROVIDER_RATE_LIMITED".into(),
+            AvailabilityFactSourceV1::UnauthenticatedClaim,
+            "attempt:1".into(),
+            Some(1),
+        )
+        .unwrap();
+        let original = &receipt.availability[1];
+        assert!(
+            store
+                .reader()
+                .availability_fact_receipt_matches(&fact, original)
+                .unwrap()
+        );
+        for field in 0..9 {
+            let mut changed = fact.clone();
+            match field {
+                0 => changed.project_id = "other".into(),
+                1 => changed.provider_id = "other".into(),
+                2 => changed.runtime_id = "other".into(),
+                3 => changed.model_id = "other".into(),
+                4 => changed.kind = AvailabilityFactKindV1::Demotion,
+                5 => changed.reason = "other".into(),
+                6 => changed.source = AvailabilityFactSourceV1::ProbeReport,
+                7 => changed.source_ref = "other".into(),
+                8 => changed.follows_sequence = Some(2),
+                _ => unreachable!(),
+            }
+            assert!(
+                !store
+                    .reader()
+                    .availability_fact_receipt_matches(&changed, original)
+                    .unwrap(),
+                "fact field {field}"
+            );
+        }
+        for sequence in [0, 1, 3, u64::MAX] {
+            let mut changed = original.clone();
+            changed.sequence = sequence;
+            assert!(
+                !store
+                    .reader()
+                    .availability_fact_receipt_matches(&fact, &changed)
+                    .unwrap()
+            );
+        }
+        let mut changed = original.clone();
+        changed.recorded_at.push(' ');
+        assert!(
+            !store
+                .reader()
+                .availability_fact_receipt_matches(&fact, &changed)
+                .unwrap()
+        );
+        changed = original.clone();
+        changed.status = AvailabilityLifecycleStatusV1::Unknown;
+        assert!(
+            !store
+                .reader()
+                .availability_fact_receipt_matches(&fact, &changed)
+                .unwrap()
+        );
+
+        let later = DecisionPublicationV1::new(
+            "p",
+            "later",
+            vec![],
+            vec![],
+            vec![
+                AvailabilityFactV1::new(
+                    "p".into(),
+                    "anthropic".into(),
+                    "claude".into(),
+                    String::new(),
+                    AvailabilityFactKindV1::Demotion,
+                    "later demotion".into(),
+                    AvailabilityFactSourceV1::RuntimeFailureClass,
+                    "attempt:2".into(),
+                    None,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        publish(&mut store, &T2, &later).unwrap();
+        assert!(
+            store
+                .reader()
+                .availability_fact_receipt_matches(&fact, original)
+                .unwrap()
+        );
+        let replay = publish(&mut store, &T2, &package).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.availability, receipt.availability);
+        drop(store);
+        let store = TrustedCoreStore::open_exclusive(dir.db()).unwrap();
+        assert!(
+            store
+                .reader()
+                .availability_fact_receipt_matches(&fact, original)
+                .unwrap()
+        );
     }
 }

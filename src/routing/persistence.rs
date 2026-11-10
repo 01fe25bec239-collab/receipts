@@ -190,6 +190,13 @@ pub fn publish<P: RoutingStatePort>(
             return Err(RoutingPersistError::ReceiptShape);
         }
     }
+    if let (Some(fact), Some(returned)) = (&publication.fact, &receipt.fact)
+        && !port
+            .reader()
+            .availability_fact_receipt_matches(fact, returned)?
+    {
+        return Err(RoutingPersistError::ReceiptShape);
+    }
     Ok(receipt)
 }
 

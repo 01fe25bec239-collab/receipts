@@ -170,6 +170,12 @@ enum Fault {
     BadOriginReceipt,
     BadStoreReceipt,
     BadEventReceipt,
+    OmittedFact,
+    SubstitutedFact(AvailabilityFactV1),
+    BadFactSequence(u64),
+    BadFactTimestamp,
+    BadFactStatus,
+    NoFactReceipt,
 }
 struct Controlled<'a> {
     port: CoreRoutingState<'a>,
@@ -197,6 +203,8 @@ impl RoutingStatePort for Controlled<'_> {
         let fault = std::mem::take(&mut self.fault);
         let mut sent = p.clone();
         match &fault {
+            Fault::OmittedFact => sent.fact = None,
+            Fault::SubstitutedFact(fact) => sent.fact = Some(fact.clone()),
             Fault::Collision(record) => sent.records.push(record.clone()),
             Fault::StaleFact => {
                 sent.fact = Some(
@@ -219,7 +227,21 @@ impl RoutingStatePort for Controlled<'_> {
         let mut receipt = self.port.publish(&sent).map_err(|e| format!("{e:?}"))?;
         self.receipt = Some(receipt.clone());
         match fault {
+            Fault::OmittedFact => {
+                receipt.fact = Some(receipts_review_integration::state::AvailabilityFactReceiptV1 {
+                    sequence: 999999,
+                    recorded_at: "forged".into(),
+                    status: receipts_review_integration::state::AvailabilityLifecycleStatusV1::Demoted,
+                });
+            }
             Fault::AckLost => return Err("committed; acknowledgement lost".into()),
+            Fault::NoFactReceipt => receipt.fact = None,
+            Fault::BadFactSequence(sequence) => receipt.fact.as_mut().unwrap().sequence = sequence,
+            Fault::BadFactTimestamp => receipt.fact.as_mut().unwrap().recorded_at.push(' '),
+            Fault::BadFactStatus => {
+                receipt.fact.as_mut().unwrap().status =
+                    receipts_review_integration::state::AvailabilityLifecycleStatusV1::Unknown
+            }
             Fault::BadProposalReceipt => receipt.events[0].proposal_sha256 = "0".repeat(64),
             Fault::BadOriginReceipt => {
                 receipt.events[0].origin =
@@ -986,4 +1008,135 @@ fn reloaded_registry_routes_and_persists_then_a_durable_limit_produces_wait() {
         load_decision(port.reader(), PROJECT, "waiting").unwrap(),
         Some(waiting.decision)
     );
+}
+
+#[test]
+fn omitted_fact_with_fabricated_receipt_never_advances_availability_memory() {
+    let dir = Dir::new();
+    let mut writer = dir.open();
+    let requests = Requests::default();
+    let mut port = Controlled::new(&mut writer, &requests);
+    port.fault = Fault::OmittedFact;
+    let mut manager = manager();
+    let effect = manager.assess(&observation()).unwrap();
+    let result = manager.persist_and_commit(&mut port, &scope(), &effect);
+    assert!(
+        matches!(
+            result,
+            Err(receipts_model_routing::persistence::RoutingPersistError::ReceiptShape)
+        ),
+        "{result:?}"
+    );
+    assert!(manager.records().is_empty());
+    // Validation cannot undo the faulty port's already-committed partial package.
+    assert_eq!(counts(port.reader()), (0, 0, 2, 2));
+    assert_eq!(
+        port.reader()
+            .availability_lifecycle(PROJECT, "prov-a", "rt-a", "model-a")
+            .unwrap()
+            .latest_sequence,
+        0
+    );
+}
+
+#[test]
+fn altered_fact_receipts_never_advance_availability_memory() {
+    for fault in [
+        Fault::NoFactReceipt,
+        Fault::BadFactSequence(0),
+        Fault::BadFactSequence(999999),
+        Fault::BadFactSequence(u64::MAX),
+        Fault::BadFactTimestamp,
+        Fault::BadFactStatus,
+    ] {
+        let dir = Dir::new();
+        let mut writer = dir.open();
+        let requests = Requests::default();
+        let mut port = Controlled::new(&mut writer, &requests);
+        port.fault = fault;
+        let mut manager = manager();
+        let effect = manager.assess(&observation()).unwrap();
+        let result = manager.persist_and_commit(&mut port, &scope(), &effect);
+        assert!(
+            matches!(
+                result,
+                Err(receipts_model_routing::persistence::RoutingPersistError::ReceiptShape)
+            ),
+            "{result:?}"
+        );
+        assert!(manager.records().is_empty());
+        assert_eq!(counts(port.reader()), (0, 0, 2, 2));
+    }
+}
+
+#[test]
+fn substituted_durable_fact_never_advances_availability_memory() {
+    for field in 0..6 {
+        let dir = Dir::new();
+        let mut writer = dir.open();
+        let requests = Requests::default();
+        let mut port = Controlled::new(&mut writer, &requests);
+        let fact = AvailabilityFactV1::new(
+            PROJECT.into(),
+            if field == 0 { "other-provider" } else { "prov-a" }.into(),
+            if field == 1 { "other-runtime" } else { "rt-a" }.into(),
+            if field == 2 { "other-model" } else { "model-a" }.into(),
+            AvailabilityFactKindV1::Demotion,
+            if field == 3 { "OTHER_REASON" } else { "RATE_LIMITED" }.into(),
+            if field == 4 { AvailabilityFactSourceV1::ProbeReport } else { AvailabilityFactSourceV1::RuntimeFailureClass },
+            if field == 5 { "other-reference" } else { "state-query:decision_record/AVAILABILITY_OBSERVATION/availability-00000000000000000001" }.into(),
+            None,
+        ).unwrap();
+        port.fault = Fault::SubstitutedFact(fact);
+        let mut manager = manager();
+        let effect = manager.assess(&observation()).unwrap();
+        let result = manager.persist_and_commit(&mut port, &scope(), &effect);
+        assert!(
+            matches!(
+                result,
+                Err(receipts_model_routing::persistence::RoutingPersistError::ReceiptShape)
+            ),
+            "field={field}: {result:?}"
+        );
+        assert!(manager.records().is_empty());
+        assert_eq!(counts(port.reader()), (0, 0, 2, 2));
+    }
+}
+
+#[test]
+fn historical_fact_receipt_replays_after_later_facts_and_reopen() {
+    let dir = Dir::new();
+    let mut writer = dir.open();
+    let requests = Requests::default();
+    let mut port = Controlled::new(&mut writer, &requests);
+    let mut live = manager();
+    let first_effect = live.assess(&observation()).unwrap();
+    let first = live
+        .persist_and_commit(&mut port, &scope(), &first_effect)
+        .unwrap();
+    let second_effect = live.assess(&observation()).unwrap();
+    live.persist_and_commit(&mut port, &scope(), &second_effect)
+        .unwrap();
+    let before = image(port.reader());
+    // Sequence 2 exists in the right partition, but names another exact fact.
+    let mut stale = manager();
+    port.fault = Fault::BadFactSequence(2);
+    assert!(matches!(
+        stale.persist_and_commit(&mut port, &scope(), &first_effect),
+        Err(receipts_model_routing::persistence::RoutingPersistError::ReceiptShape)
+    ));
+    assert!(stale.records().is_empty());
+    assert_eq!(image(port.reader()), before);
+    drop(port);
+    drop(writer);
+    let mut writer = dir.open();
+    let mut port = Controlled::new(&mut writer, &requests);
+    let replay = stale
+        .persist_and_commit(&mut port, &scope(), &first_effect)
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.demotion, first.demotion);
+    assert_eq!(replay.events, first.events);
+    assert!(!stale.records().is_empty());
+    assert_eq!(image(port.reader()), before);
 }
