@@ -168,7 +168,7 @@ pub fn build_review_capsule(
     .map_err(|e| R::Construction(e.to_string()))
 }
 
-/// Stable review identity for one request and exact subject.
+/// Stable identity for the semantic request and exact subject (excluding requested_at).
 pub fn review_id(request: &ReviewRequest) -> String {
     let c = request.core();
     derived_id(
@@ -178,6 +178,7 @@ pub fn review_id(request: &ReviewRequest) -> String {
             c.task_id(),
             c.attempt_id(),
             c.implementation_sha().as_str(),
+            &crate::claims::request_identity_json(request),
         ],
     )
 }

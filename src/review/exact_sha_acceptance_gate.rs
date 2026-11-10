@@ -147,7 +147,7 @@ impl ExactShaAcceptanceGate {
     /// reproduction must be performed with nonempty checks. Even optional
     /// supplied reproduction checks are validated; nonempty checks also require
     /// performed=true. No result is inferred from exit_code or an absent/false
-    /// timeout, and exit_code is not judged: expected-exit mapping is held.
+    /// timeout. An explicit PASS with a nonzero exit is contradictory and refused.
     /// Source labels show role consistency only, never execution attestation.
     /// This does not establish criterion coverage or implement assurance profiles.
     pub fn evaluate(

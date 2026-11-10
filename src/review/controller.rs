@@ -43,7 +43,7 @@
 use crate::capsule_builder::{CapsuleBuildRefusal, ReviewCapsuleBuildInput, build_review_capsule};
 use crate::claims::{
     ReviewClaimBinding, ReviewClaimScope, ReviewOperation, check_identity_json,
-    request_identity_json, request_sha256,
+    request_identity_json, request_sha256, review_dispatch_json,
 };
 use crate::ports::{
     ImplementerIdentity, ReviewClaim, ReviewRecordProposal, ReviewRecordSink, ReviewerCandidate,
@@ -53,9 +53,7 @@ use crate::ports::{
 use crate::records::{ProposalBuilder, derived_id};
 use crate::reproduction::{CheckRunStatus, CheckRunnerConfig, run_check};
 use crate::review_parse::parse_reviewer_output;
-use crate::wire::{
-    decode_a4_review, encode_a4_review, encode_review_capsule, encode_safety_interruption,
-};
+use crate::wire::{decode_a4_review, encode_a4_review, encode_safety_interruption};
 use crate::{
     A4Review, A4ReviewFinding, A4ReviewFindingCategory, A4ReviewFindingConfidence,
     A4ReviewFindingSeverity, A4ReviewFindingSource, A4ReviewNonTemporalCore, A4ReviewReproduction,
@@ -868,7 +866,7 @@ fn records(
     if let Some(capsule) = &ticket.capsule
         && ticket.dispatches > 0
     {
-        let json = encode_review_capsule(capsule);
+        let json = review_dispatch_json(attempt.request, capsule);
         let payload = b.content(
             &format!("review:capsule:{}", capsule.review_id()),
             json.as_bytes(),

@@ -213,7 +213,9 @@ pub fn disposition_proposal(
             FindingDispositionKind::Reject { reason } => serde_json::json!({"reason": reason}),
         };
         let body = serde_json::json!({
+            "project_id": project_id,
             "review_id": review.review_id(),
+            "reviewed_sha": review.reviewed_sha(),
             "task_id": review.task_id(),
             "finding_id": finding.finding_id(),
             "category": finding.category().as_str(),

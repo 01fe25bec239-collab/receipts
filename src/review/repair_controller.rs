@@ -293,17 +293,11 @@ impl RepairController {
                             });
                         }
                     };
-                    let profile_distinct = input
-                        .request
-                        .core()
-                        .assurance_profile()
-                        .requirements()
-                        .distinct_provider;
                     let distinct_provider = if triggers.iter().any(|t| t.distinct_provider_required)
                     {
                         DistinctProviderPolicy::Required
                     } else {
-                        profile_distinct
+                        crate::effective_distinct_provider(input.request)
                     };
                     let floor_by_finding = triggers.iter().any(|t| t.frontier_floor);
                     RepairDecision::Issue(RepairRequest {

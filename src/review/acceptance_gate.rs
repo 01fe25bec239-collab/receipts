@@ -20,16 +20,14 @@
 use crate::capsule_builder::review_id;
 use crate::claims::{
     ReviewClaimBinding, ReviewClaimScope, ReviewOperation, request_identity_json, request_sha256,
+    review_dispatch_json,
 };
-use crate::dispositions::{FindingDisposition, validate_dispositions};
+use crate::dispositions::{FindingDisposition, disposition_proposal, validate_dispositions};
 use crate::ports::ReviewRecordSink;
 use crate::record::{Recorded, record_proposal};
 use crate::records::{ProposalBuilder, derived_id};
 use crate::reproduction::{CheckRunStatus, CheckRunnerConfig, run_check};
-use crate::wire::{
-    decode_a4_review, encode_integration_decision, encode_integration_request,
-    encode_review_capsule,
-};
+use crate::wire::{decode_a4_review, encode_integration_decision, encode_integration_request};
 use crate::{
     A3HandoffCheckResult, A3HandoffNonTemporalCore, A4ReviewFindingCategory,
     A4ReviewNonTemporalCore, A4ReviewReproductionCheckResult, AssuranceProfile,
@@ -378,6 +376,7 @@ fn scratch_path(i: &AcceptanceInput<'_>, name: &str) -> PathBuf {
 /// Check 3: every deterministic criterion re-runs and passes in a fresh
 /// review worktree at the exact SHA; no semantic criterion is reported unmet.
 fn check3(i: &AcceptanceInput<'_>) -> Verdict {
+    bind_origin(i)?;
     let review = current(i.reviews, "A4 review")?;
     if review
         .blocking_findings()
@@ -449,8 +448,8 @@ fn payload_digest(bytes: &[u8]) -> String {
 
 /// Binds the supplied records to the admitted origin: the current A4Review
 /// must equal the A4Review record the trusted core persisted for its id, and
-/// the capsule must be exactly the one named by a persisted REVIEW_DISPATCHED
-/// payload digest for this task. Caller-built records cannot pass.
+/// the capsule and semantic request must equal the pair named by a persisted
+/// REVIEW_DISPATCHED digest for this task. Caller-built digests cannot pass.
 fn bind_origin(i: &AcceptanceInput<'_>) -> Result<(), (FailureSeverity, String)> {
     let state = i.state.ok_or((
         Blocked,
@@ -476,7 +475,7 @@ fn bind_origin(i: &AcceptanceInput<'_>) -> Result<(), (FailureSeverity, String)>
             "the supplied A4Review differs from the persisted record",
         );
     }
-    let want = payload_digest(encode_review_capsule(i.capsule).as_bytes());
+    let want = payload_digest(review_dispatch_json(i.review_request, i.capsule).as_bytes());
     let dispatched = state
         .list_events(&EventQuery {
             project_id: i.project_id.to_owned(),
@@ -488,10 +487,14 @@ fn bind_origin(i: &AcceptanceInput<'_>) -> Result<(), (FailureSeverity, String)>
             limit: 1000,
         })
         .map_err(|e| (Blocked, format!("dispatch events unreadable: {e}")))?;
-    if !dispatched.iter().any(|e| e.payload.digest == want) {
+    if !dispatched.iter().any(|e| {
+        e.payload.digest == want
+            && e.payload.reference == format!("review:capsule:{}", i.capsule.review_id())
+            && e.correlation_id == i.review_request.core().task_id()
+    }) {
         return fail(
             Blocked,
-            "the review capsule is not the one a persisted REVIEW_DISPATCHED names",
+            "the review capsule and semantic request are not the ones a persisted REVIEW_DISPATCHED names",
         );
     }
     Ok(())
@@ -524,6 +527,7 @@ fn check4(i: &AcceptanceInput<'_>) -> Verdict {
                         format!("nonblocking findings are not dispositioned: {e:?}"),
                     )
                 })?;
+                bind_dispositions(i, review)?;
             }
             Ok("verdict passes, origin bound, no blocking finding is open".into())
         }
@@ -540,6 +544,63 @@ fn check4(i: &AcceptanceInput<'_>) -> Verdict {
         Err(e @ E::RepairHistory(_)) => fail(Blocked, format!("{e:?}")),
         Err(e) => fail(Blocked, format!("{e:?}")),
     }
+}
+
+/// Compare exact payload hashes produced by the shared publication path with durable facts.
+fn bind_dispositions(
+    i: &AcceptanceInput<'_>,
+    review: &A4ReviewNonTemporalCore,
+) -> Result<(), (FailureSeverity, String)> {
+    let state = i
+        .state
+        .ok_or((Blocked, "dispositions need a State reader".into()))?;
+    let expected = disposition_proposal(
+        i.project_id,
+        i.review_request,
+        review,
+        i.finding_dispositions,
+        i.generation,
+    )
+    .map_err(|e| (Blocked, format!("disposition package invalid: {e:?}")))?;
+    let events = state
+        .list_events(&EventQuery {
+            project_id: i.project_id.to_owned(),
+            subject: Some(EventSubject {
+                kind: SubjectKind::Review,
+                id: review.review_id().to_owned(),
+            }),
+            event_types: Some(vec![EventType::FindingDispositioned]),
+            limit: 1000,
+        })
+        .map_err(|e| (Blocked, format!("disposition evidence unreadable: {e}")))?;
+    if events.len() == 1000 {
+        return fail(
+            Blocked,
+            "disposition history exceeds the bounded evidence query",
+        );
+    }
+    for expected in &expected.events {
+        let found: Vec<_> = events
+            .iter()
+            .filter(|e| e.payload.reference == expected.payload().reference)
+            .collect();
+        if found.is_empty() {
+            return fail(
+                Blocked,
+                "required finding disposition is not persisted for this review",
+            );
+        }
+        if found.iter().any(|e| {
+            e.correlation_id != i.review_request.core().task_id()
+                || e.payload.digest != expected.payload().digest
+        }) {
+            return fail(
+                Blocked,
+                "persisted finding disposition is conflicting, foreign or altered",
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Check 5: the checks the effective (raised-only) profile requires are
@@ -717,12 +778,14 @@ fn changed_between(
 }
 
 /// Verifies one supersession claim: the superseding task is accepted, its
-/// own range changed the path, it is in the candidate, and the candidate
+/// implementation follows the dependency, its verified range changed the path,
+/// it is in the candidate, and the candidate
 /// carries that task's content for the path (no later change).
 fn verify_supersession(
     i: &AcceptanceInput<'_>,
     state: &StateReader,
     s: &DependencySupersession,
+    dependency: &AcceptedRange,
 ) -> Result<(), (FailureSeverity, String)> {
     let what = format!("{} superseded by {}", s.path, s.superseding_task_id);
     if s.superseding_task_id == s.dependency_task_id || s.superseding_task_id == i.capsule.task_id()
@@ -733,6 +796,29 @@ fn verify_supersession(
         );
     }
     let range = accepted_range(i, state, &s.superseding_task_id)?;
+    let order = review_commit_range(
+        i.repository_root,
+        &dependency.implementation,
+        &range.implementation,
+    )
+    .map_err(|_| {
+        (
+            Blocked,
+            format!("{what}: superseding task does not follow the dependency"),
+        )
+    })?;
+    if order.commits.is_empty() {
+        return fail(
+            Blocked,
+            format!("{what}: superseding task does not follow the dependency"),
+        );
+    }
+    review_commit_range(i.repository_root, &range.start, &range.implementation).map_err(|_| {
+        (
+            Blocked,
+            format!("{what}: superseding task range is not verified"),
+        )
+    })?;
     if !changed_between(i, &range.start, &range.implementation, &what)?.contains(&s.path) {
         return fail(
             Blocked,
@@ -800,7 +886,7 @@ fn check7(i: &AcceptanceInput<'_>) -> Verdict {
                 .iter()
                 .find(|s| s.dependency_task_id == *dep && s.path == *path);
             match claim {
-                Some(s) => verify_supersession(i, state, s)?,
+                Some(s) => verify_supersession(i, state, s, &range)?,
                 None => {
                     return fail(
                         Blocked,

@@ -1042,6 +1042,15 @@ fn pass_with_nonblocking_findings_needs_explicit_dispositions_to_be_accepted() {
         },
         decided_by: "a2".into(),
     }];
+    assert_eq!(
+        evaluate(&s, &k).outcome,
+        IntegrationDecisionOutcome::Blocked
+    );
+    let proposal =
+        crate::disposition_proposal("project", &s.request, &s.review, &k.dispositions, 1).unwrap();
+    let dir = TempDir::new("persisted-dispositions");
+    let persisted = state_with_packages(&dir, &[&s.package, &proposal], |_| {});
+    k.state = Some(&persisted);
     assert_eq!(evaluate(&s, &k).outcome, IntegrationDecisionOutcome::Accept);
     // A disposition naming another finding does not cover this one.
     k.dispositions[0].finding_id = "other".into();
@@ -1338,4 +1347,140 @@ fn sealed_acceptance_refuses_a_consistently_rebound_foreign_subject() {
             .settlement()
             .is_err()
     );
+}
+
+#[test]
+fn a3_repair_older_accepted_task_cannot_supersede_a_newer_dependency() {
+    let mut ranges = Vec::new();
+    let s = scenario_prepared(AssuranceProfile::Standard, "PASS", &[], |repo| {
+        let start = git(&repo.root(), &["rev-parse", "HEAD"]);
+        let old = repo.commit(&[("src/dep.txt", "old\n")], "old accepted task");
+        let dep = repo.commit(&[("src/dep.txt", "new\n")], "new dependency");
+        repo.commit(&[("src/dep.txt", "old\n")], "undo dependency");
+        ranges = vec![start, old, dep];
+    });
+    let dir = TempDir::new("a3-old-sup");
+    let reader = state_with_tasks(
+        &s,
+        &dir,
+        &[
+            ("dep-1", &ranges[1], &ranges[2], true),
+            ("old-1", &ranges[0], &ranges[1], true),
+        ],
+    );
+    assert_eq!(
+        dep_gate(&s, &reader, vec![]).outcome,
+        IntegrationDecisionOutcome::Blocked
+    );
+    let got = dep_gate(&s, &reader, vec![claim("src/dep.txt", "old-1")]);
+    println!(
+        "older accepted task masking undone dependency: {:?}",
+        got.outcome
+    );
+    assert_eq!(
+        got.outcome,
+        IntegrationDecisionOutcome::Blocked,
+        "regression: {:#?}",
+        got.checks
+    );
+}
+#[test]
+fn a3_repair_gate_refuses_old_capsule_after_semantic_request_changes() {
+    let mut s = scenario();
+    let original = crate::wire::encode_review_request(&s.request);
+    let changed = original.replace(
+        r#""check_command":["grep","-q","ok","src/status.txt"]"#,
+        r#""check_command":["false"]"#,
+    );
+    assert_ne!(original, changed);
+    s.request = crate::wire::decode_review_request(&changed).unwrap();
+    let got = evaluate(&s, &knobs(&s));
+    println!("unreviewed changed criterion: {:?}", got.outcome);
+    assert_eq!(
+        got.outcome,
+        IntegrationDecisionOutcome::Blocked,
+        "regression: {:#?}",
+        got.checks
+    );
+}
+#[test]
+fn a3_repair_unpublished_dispositions_do_not_authorize_acceptance() {
+    let s = scenario_json(AssuranceProfile::Standard, |_| {}, nonblocking_style);
+    let mut k = knobs(&s);
+    k.dispositions = vec![FindingDisposition {
+        finding_id: "n0".into(),
+        kind: crate::FindingDispositionKind::Defer {
+            issue_id: "ISSUE-1".into(),
+            revisit_point: "wave3".into(),
+        },
+        decided_by: "a2".into(),
+    }];
+    assert_eq!(
+        evaluate(&s, &k).outcome,
+        IntegrationDecisionOutcome::Blocked
+    );
+}
+
+#[test]
+fn a3_repair_missing_historical_request_binding_refuses() {
+    let s = scenario();
+    let mut spec: serde_json::Value = serde_json::from_slice(&s.package.to_journal()).unwrap();
+    let reference = format!("review:capsule:{}", s.capsule.review_id());
+    let bytes = crate::wire::encode_review_capsule(&s.capsule).into_bytes();
+    for content in spec["content"].as_array_mut().unwrap() {
+        if content["reference"] == reference {
+            content["hex"] = bytes
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+                .into();
+        }
+    }
+    for event in spec["events"].as_array_mut().unwrap() {
+        if event["event_type"] == "REVIEW_DISPATCHED" {
+            event["payload_digest"] =
+                format!("sha256:{}", crate::records::sha256_hex(&bytes)).into();
+        }
+    }
+    let legacy = ReviewRecordProposal::from_journal(spec.to_string().as_bytes()).unwrap();
+    let dir = TempDir::new("legacy-dispatch");
+    let state = state_with_packages(&dir, &[&legacy], |_| {});
+    let mut k = knobs(&s);
+    k.state = Some(&state);
+    let got = evaluate(&s, &k);
+    assert_eq!(got.outcome, IntegrationDecisionOutcome::Blocked);
+    assert!(got.checks[3].detail.contains("semantic request"));
+}
+
+#[test]
+fn a3_repair_incomparable_or_unavailable_supersession_refuses() {
+    let mut ranges = Vec::new();
+    let s = scenario_prepared(AssuranceProfile::Standard, "PASS", &[], |repo| {
+        let start = git(&repo.root(), &["rev-parse", "HEAD"]);
+        let dep = repo.commit(&[("src/dep.txt", "new\n")], "dependency");
+        git(&repo.root(), &["checkout", "-q", "-b", "other", &start]);
+        let unrelated = repo.commit(&[("src/dep.txt", "old\n")], "other branch");
+        git(&repo.root(), &["checkout", "-q", "main"]);
+        let later = repo.commit(&[("src/dep.txt", "old\n")], "later task");
+        ranges = vec![start, dep, unrelated, later];
+    });
+    for (start, end) in [
+        (&ranges[0], &ranges[2]),
+        (&ranges[2], &ranges[3]),
+        (&ranges[1], &"f".repeat(40)),
+    ] {
+        let dir = TempDir::new("unverified-supersession");
+        let state = state_with_tasks(
+            &s,
+            &dir,
+            &[
+                ("dep-1", &ranges[0], &ranges[1], true),
+                ("sup-1", start, end, true),
+            ],
+        );
+        assert_eq!(
+            dep_gate(&s, &state, vec![claim("src/dep.txt", "sup-1")]).outcome,
+            IntegrationDecisionOutcome::Blocked
+        );
+    }
 }

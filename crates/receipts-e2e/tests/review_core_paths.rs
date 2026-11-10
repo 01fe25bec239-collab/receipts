@@ -259,3 +259,50 @@ fn finding_dispositions_publish_through_the_same_sink_and_conflicts_are_refused(
         "the review record is untouched"
     );
 }
+
+#[test]
+fn required_repair_policy_survives_core_publication_and_recovery() {
+    let mut f = fixture("required-repair");
+    let json = receipts_review_integration::wire::encode_review_request(&f.request).replace(
+        "\"review_scope\":\"FULL\"",
+        "\"review_scope\":\"FULL\",\"review_policy\":{\"distinct_provider\":\"REQUIRED\"}",
+    );
+    f.request = receipts_review_integration::wire::decode_review_request(&json).unwrap();
+    let clock = Clock::default();
+    let mut sink = Faulty::open(&f.db, &clock);
+    let review = run_attempt(&f, &mut sink, &Synthetic::rejecting(), 1)
+        .review()
+        .unwrap()
+        .core()
+        .clone();
+    let outcome = RepairController::decide(&RepairInput {
+        project_id: PROJECT,
+        request: &f.request,
+        handoffs: &[handoff(&f)],
+        reviews: &[review],
+        completed_repair_attempts: 0,
+        interruption: None,
+        generation: 1,
+    })
+    .unwrap();
+    let RepairDecision::Issue(repair) = &outcome.decision else {
+        panic!("no repair")
+    };
+    assert_eq!(
+        repair.distinct_provider,
+        receipts_review_integration::DistinctProviderPolicy::Required
+    );
+    sink.fault = Fault::PublishLost;
+    assert!(outcome.record(&mut sink).is_err());
+    drop(sink);
+    let mut sink = open_sink(&f.db, &clock);
+    assert_eq!(outcome.record(&mut sink), Ok(Recorded::Published));
+    let b = outcome.proposal.as_ref().unwrap().binding();
+    let sealed = image(&sink, b, "x").seal.unwrap();
+    let recovered = receipts_review_integration::SealedReview::from_bytes(&sealed.recovery_data)
+        .unwrap()
+        .proposal()
+        .unwrap();
+    let payload = String::from_utf8(recovered.content[0].1.clone()).unwrap();
+    assert!(payload.contains("\"distinct_provider\":\"REQUIRED\""));
+}

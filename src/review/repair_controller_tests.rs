@@ -600,3 +600,64 @@ fn repair_decisions_publish_once_through_the_sink_and_cover_every_input() {
     assert_eq!(none.record(&mut empty), Ok(Recorded::NothingToRecord));
     assert!(empty.claims.is_empty());
 }
+
+#[test]
+fn a3_repair_preserves_effective_independence_in_output_and_publication() {
+    for profile in [
+        AssuranceProfile::Light,
+        AssuranceProfile::Standard,
+        AssuranceProfile::HighAssurance,
+    ] {
+        for raised in [false, true] {
+            for security in [false, true] {
+                let policy = raised.then(|| {
+                    crate::ReviewRequestPolicy::new(
+                        None,
+                        Some(DistinctProviderPolicy::Required),
+                        None,
+                        None,
+                    )
+                });
+                let req = request(BASE, &sha_n(0), profile, policy);
+                let review = reject_with(
+                    0,
+                    if security {
+                        A4ReviewFindingCategory::SecurityBoundaryViolation
+                    } else {
+                        A4ReviewFindingCategory::Correctness
+                    },
+                    Some(finder(0)),
+                );
+                let outcome = RepairController::decide(&RepairInput {
+                    project_id: "project",
+                    request: &req,
+                    handoffs: &[handoff(0)],
+                    reviews: &[review],
+                    completed_repair_attempts: 0,
+                    interruption: None,
+                    generation: 1,
+                })
+                .unwrap();
+                let r = match &outcome.decision {
+                    RepairDecision::Issue(r) => r,
+                    other => panic!("{other:?}"),
+                };
+                let wanted = if security {
+                    DistinctProviderPolicy::Required
+                } else {
+                    crate::effective_distinct_provider(&req)
+                };
+                assert_eq!(
+                    r.distinct_provider, wanted,
+                    "{profile:?} raised={raised} security={security}"
+                );
+                let proposal = outcome.proposal.unwrap();
+                let payload = String::from_utf8(proposal.content[0].1.clone()).unwrap();
+                assert!(
+                    payload.contains(&format!("\"distinct_provider\":\"{}\"", wanted.as_str())),
+                    "{payload}"
+                );
+            }
+        }
+    }
+}

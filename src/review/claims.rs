@@ -244,3 +244,15 @@ pub(crate) fn check_identity_json(check: &ReviewCapsuleCheck) -> String {
 pub(crate) fn interruption_identity_json(interruption: &SafetyInterruption) -> String {
     encode_safety_interruption(interruption)
 }
+
+/// Persist the semantic request with the exact capsule; timestamps do not identify work.
+pub(crate) fn review_dispatch_json(
+    request: &ReviewRequest,
+    capsule: &crate::ReviewCapsuleNonTemporalCore,
+) -> String {
+    serde_json::json!({
+        "request": request_identity_json(request),
+        "capsule": crate::wire::encode_review_capsule(capsule),
+    })
+    .to_string()
+}
