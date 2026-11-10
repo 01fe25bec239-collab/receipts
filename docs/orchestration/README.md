@@ -89,10 +89,12 @@ Control edges never gate readiness. Human-gate nodes, and nodes in any state oth
 
 `GraphEdge` keeps its PR198 codec. Converting to operational types can fail with `Unsupported(field)`, for example for `graph_version: 1.0`, a timestamp that does not parse, or an unknown snapshot state. The wire value is not changed when that happens. Decoding grants no authority.
 
-## Not in Wave1
+## Wave2
 
-- State persistence wiring (OR-W2-5).
-- The remaining six OR-WIRE schemas.
-- The scheduler and admission.
-- A capability-admission verifier.
+Scheduling, collision resolution, capsule builders, the compiler, State persistence and the remaining six codecs are described in [wave2.md](wave2.md). Admission precedence is [ADR-D11](ADR-D11-admission-precedence.md).
+
+## Still not implemented
+
+- A capability-admission verifier (`LOCKED_REQUIRES_PRO → READY` stays unavailable).
 - Any production interface-artifact source or authenticated issuer.
+- The goal loop, resume and ledger rehydration (Wave3).

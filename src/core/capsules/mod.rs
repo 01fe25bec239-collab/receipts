@@ -1,12 +1,20 @@
-//! In-process task and repair capsule physical contract. Construction validates only data
-//! invariants; values authorize no dispatch, execution, or operational effects.
+//! In-process task and repair capsule physical contract, plus the builders
+//! that derive capsules from the graph and trusted context. Values
+//! authorize no dispatch, execution, or operational effects.
 
+mod builder;
+mod containment;
+mod credential_scan;
 mod embedded;
 mod error;
 mod task_capsule;
 mod task_capsule_types;
 mod verification_plan;
 
+pub use builder::{
+    CapsuleBuildError, CapsuleContextV1, RepairCapsuleRequestV1, TaskCapsuleRequestV1,
+    build_repair_capsule_v1, build_task_capsule_v1,
+};
 pub use embedded::{CostPolicy, Criterion, Ref, ReviewPolicy};
 pub use error::CapsuleError;
 pub use task_capsule::TaskCapsule;
@@ -15,6 +23,8 @@ pub use verification_plan::VerificationPlanEntryV1;
 
 use error::validate_identifier;
 
+#[cfg(test)]
+mod builder_tests;
 #[cfg(test)]
 mod task_capsule_tests;
 

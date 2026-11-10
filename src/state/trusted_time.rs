@@ -129,7 +129,7 @@ pub(crate) fn require_current_sample(
     Ok(())
 }
 
-fn read_watermark(
+pub(crate) fn read_watermark(
     conn: &Connection,
     project_id: &str,
 ) -> Result<Option<TrustedTimeWatermarkV1>, StateError> {

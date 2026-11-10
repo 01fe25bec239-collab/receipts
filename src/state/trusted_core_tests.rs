@@ -112,7 +112,7 @@ fn exclusive_open_creates_identified_store_and_holds_the_writer_lock() {
         id.bytes()
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
     );
-    assert_eq!(store.reader().schema_version().unwrap(), 20);
+    assert_eq!(store.reader().schema_version().unwrap(), 23);
     assert_eq!(
         refusal(TrustedCoreStore::open_exclusive(dir.db()).unwrap_err()),
         R::WriterLockHeld
@@ -801,8 +801,8 @@ fn migrate_exclusive_upgrades_a_v19_store_and_a_failed_v20_leaves_exact_v19() {
     drop(conn);
 
     let (store, version) = TrustedCoreStore::migrate_exclusive(dir.db()).unwrap();
-    assert_eq!(version, 20);
-    assert_eq!(store.reader().schema_version().unwrap(), 20);
+    assert_eq!(version, 23);
+    assert_eq!(store.reader().schema_version().unwrap(), 23);
     assert_eq!(store.store_id().len(), 32);
 }
 
@@ -832,4 +832,133 @@ fn store_identity_is_immutable_and_verified() {
         .unwrap();
     drop(conn);
     assert!(TrustedCoreStore::open_exclusive(dir.db()).is_err());
+}
+
+/// Holds the descriptors inherited at fork without running Rust or SQLite in
+/// the child. Only async-signal-safe calls run there; the parent always reaps it.
+struct InheritedDescriptors {
+    pid: libc::pid_t,
+    _sockets: (
+        std::os::unix::net::UnixStream,
+        std::os::unix::net::UnixStream,
+    ),
+}
+impl InheritedDescriptors {
+    fn fork() -> Self {
+        use std::os::fd::AsRawFd;
+        let sockets = std::os::unix::net::UnixStream::pair().unwrap();
+        let fd = sockets.0.as_raw_fd();
+        // SAFETY: the child only polls an inherited fd then calls _exit;
+        // it never touches allocator, Rust destructors or inherited SQLite.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            let mut poll = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: valid pollfd; bounded lifetime even if the parent fails.
+            unsafe {
+                libc::poll(&mut poll, 1, 10_000);
+                libc::_exit(0);
+            }
+        }
+        Self {
+            pid,
+            _sockets: sockets,
+        }
+    }
+
+    fn assert_alive(&mut self) {
+        let mut status = 0;
+        // SAFETY: wait only for this owned child, without blocking.
+        let rc = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
+        if rc == self.pid {
+            self.pid = 0;
+        }
+        assert_eq!(rc, 0, "child must still hold its inherited descriptors");
+    }
+}
+impl Drop for InheritedDescriptors {
+    fn drop(&mut self) {
+        if self.pid == 0 {
+            return;
+        }
+        let mut status = 0;
+        // SAFETY: terminate and reap only the child this helper owns.
+        let reaped = unsafe {
+            libc::kill(self.pid, libc::SIGKILL);
+            libc::waitpid(self.pid, &mut status, 0)
+        };
+        assert_eq!(reaped, self.pid, "owned child was not reaped");
+    }
+}
+
+#[test]
+fn writer_teardown_releases_lock_while_a_forked_child_holds_inherited_descriptors() {
+    let dir = Dir::new("fork-lock");
+    let store = TrustedCoreStore::open_exclusive(dir.db()).unwrap();
+    let id = store.store_id().to_owned();
+    store
+        .reader()
+        .connection()
+        .execute_batch("BEGIN IMMEDIATE; CREATE TABLE lock_teardown_probe(value INTEGER);")
+        .unwrap();
+    let mut child = InheritedDescriptors::fork();
+    assert_eq!(
+        refusal(TrustedCoreStore::open_exclusive(dir.db()).unwrap_err()),
+        R::WriterLockHeld
+    );
+    drop(store);
+    child.assert_alive();
+    let reopened = TrustedCoreStore::open_exclusive(dir.db()).unwrap();
+    assert_eq!(reopened.store_id(), id);
+    let probes: i64 = reopened
+        .reader()
+        .connection()
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name='lock_teardown_probe'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        probes, 0,
+        "SQLite teardown rolled back the open transaction"
+    );
+    assert_eq!(
+        refusal(TrustedCoreStore::open_exclusive(dir.db()).unwrap_err()),
+        R::WriterLockHeld
+    );
+    child.assert_alive();
+}
+
+#[test]
+fn last_writer_reference_controls_lock_lifetime() {
+    let dir = Dir::new("retained-owner");
+    let store = std::rc::Rc::new(TrustedCoreStore::open_exclusive(dir.db()).unwrap());
+    let retained = std::rc::Rc::clone(&store);
+    drop(store);
+    assert_eq!(
+        refusal(TrustedCoreStore::open_exclusive(dir.db()).unwrap_err()),
+        R::WriterLockHeld
+    );
+    drop(retained);
+    drop(TrustedCoreStore::open_exclusive(dir.db()).unwrap());
+}
+
+#[test]
+fn failed_secure_open_and_sqlite_initialization_release_the_writer_lock() {
+    let dir = Dir::new("failed-open-lock");
+    std::fs::write(dir.db(), b"not a sqlite database").unwrap();
+    std::fs::set_permissions(dir.db(), std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(
+        refusal(TrustedCoreStore::open_exclusive(dir.db()).unwrap_err()),
+        R::InsecureMode
+    );
+    std::fs::set_permissions(dir.db(), std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(TrustedCoreStore::open_exclusive(dir.db()).is_err());
+    std::fs::remove_file(dir.db()).unwrap();
+    drop(TrustedCoreStore::open_exclusive(dir.db()).unwrap());
 }

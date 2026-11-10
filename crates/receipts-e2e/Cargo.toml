@@ -10,10 +10,11 @@ license = "Apache-2.0"
 # real merged implementations for library integration tests. Nothing in the
 # product depends on this crate.
 [dependencies]
+receipts-model-routing = { path = "../receipts-model-routing" }
 receipts-orchestration = { path = "../receipts-orchestration" }
+receipts-review-integration = { path = "../receipts-review-integration" }
 receipts-workspace-execution = { path = "../receipts-workspace-execution" }
 
 [dev-dependencies]
 receipts-review-contracts = { path = "../receipts-review-contracts" }
-receipts-review-integration = { path = "../receipts-review-integration" }
 receipts-runtime-bindings = { path = "../receipts-runtime-bindings" }
