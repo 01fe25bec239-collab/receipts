@@ -238,6 +238,7 @@ struct Knobs<'a> {
     repairs: usize,
     supersessions: Vec<DependencySupersession>,
     dispositions: Vec<FindingDisposition>,
+    content: Option<&'a dyn crate::ReviewContentResolver>,
 }
 
 fn knobs<'a>(s: &'a Scenario) -> Knobs<'a> {
@@ -253,6 +254,7 @@ fn knobs<'a>(s: &'a Scenario) -> Knobs<'a> {
         repairs: 0,
         supersessions: vec![],
         dispositions: vec![],
+        content: None,
     }
 }
 
@@ -274,6 +276,7 @@ fn evaluate(s: &Scenario, k: &Knobs<'_>) -> GateOutcome {
         state: k.state,
         supersessions: &k.supersessions,
         finding_dispositions: &k.dispositions,
+        disposition_content: k.content,
         checks: &k.runner,
         component_suite: &k.suite,
         scratch: s.scratch.path(),
@@ -1051,7 +1054,36 @@ fn pass_with_nonblocking_findings_needs_explicit_dispositions_to_be_accepted() {
     let dir = TempDir::new("persisted-dispositions");
     let persisted = state_with_packages(&dir, &[&s.package, &proposal], |_| {});
     k.state = Some(&persisted);
+    assert_eq!(
+        evaluate(&s, &k).outcome,
+        IntegrationDecisionOutcome::Blocked
+    );
+    struct Payloads(Vec<(String, Vec<u8>)>);
+    impl crate::ReviewContentResolver for Payloads {
+        fn resolve(&self, _: &str, reference: &str) -> Result<Option<Vec<u8>>, String> {
+            Ok(self
+                .0
+                .iter()
+                .find(|(r, _)| r == reference)
+                .map(|(_, b)| b.clone()))
+        }
+    }
+    let content = Payloads(proposal.content.clone());
+    k.content = Some(&content);
     assert_eq!(evaluate(&s, &k).outcome, IntegrationDecisionOutcome::Accept);
+    let missing = Payloads(vec![]);
+    k.content = Some(&missing);
+    assert_eq!(
+        evaluate(&s, &k).outcome,
+        IntegrationDecisionOutcome::Blocked
+    );
+    let altered = Payloads(vec![(proposal.content[0].0.clone(), b"altered".to_vec())]);
+    k.content = Some(&altered);
+    assert_eq!(
+        evaluate(&s, &k).outcome,
+        IntegrationDecisionOutcome::Blocked
+    );
+    k.content = Some(&content);
     // A disposition naming another finding does not cover this one.
     k.dispositions[0].finding_id = "other".into();
     assert_eq!(

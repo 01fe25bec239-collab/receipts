@@ -159,6 +159,26 @@ impl CoreReviewSink {
         &self.writer
     }
 
+    /// Resolves existing durable sealed bytes through the same content boundary
+    /// used at publication. The gate separately requires the published event.
+    pub fn content(&self, binding: &ReviewClaimBinding) -> Result<Option<SealedContent>, String> {
+        let Some(stored) = self
+            .writer
+            .sealed_review(&unit_of(binding)?)
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(None);
+        };
+        if stored.seal.recovery_kind != SEALED_REVIEW_KIND {
+            return Err("stored content is not a sealed review".into());
+        }
+        let proposal = SealedReview::from_bytes(&stored.seal.recovery_data)?.proposal()?;
+        if proposal.binding() != binding {
+            return Err("stored content belongs to another claim".into());
+        }
+        Ok(Some(SealedContent::of(&proposal)))
+    }
+
     /// The core's claim id for `binding`: what an admitted identity needs to
     /// mint an abandonment grant for it.
     pub fn claim_id(binding: &ReviewClaimBinding) -> Result<String, String> {
@@ -252,5 +272,11 @@ impl ReviewRecordSink for CoreReviewSink {
             )
             .map(|_| ())
             .map_err(|e| e.to_string())
+    }
+}
+
+impl receipts_review_integration::ReviewContentResolver for SealedContent {
+    fn resolve(&self, project_id: &str, reference: &str) -> Result<Option<Vec<u8>>, String> {
+        Ok(CoreContentResolverV1::resolve(self, project_id, reference))
     }
 }

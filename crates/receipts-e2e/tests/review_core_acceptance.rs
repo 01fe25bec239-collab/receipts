@@ -275,6 +275,17 @@ fn evaluate(
     generation: u32,
     dispositions: &[receipts_review_integration::FindingDisposition],
 ) -> receipts_review_integration::GateOutcome {
+    evaluate_with_content(s, ticket, state, generation, dispositions, None)
+}
+
+fn evaluate_with_content(
+    s: &Scenario,
+    ticket: &receipts_review_integration::ReviewTicket,
+    state: &StateReader,
+    generation: u32,
+    dispositions: &[receipts_review_integration::FindingDisposition],
+    content: Option<&dyn receipts_review_integration::ReviewContentResolver>,
+) -> receipts_review_integration::GateOutcome {
     let review = ticket.review().unwrap().core().clone();
     let ireq = integration_request(s);
     AcceptanceGate::evaluate(&AcceptanceInput {
@@ -294,6 +305,7 @@ fn evaluate(
         state: Some(state),
         supersessions: &[],
         finding_dispositions: dispositions,
+        disposition_content: content,
         checks: &runner(),
         component_suite: &argv(&["grep", "-q", "ok", "src/status.txt"]),
         scratch: &s.dir.0.join("gate-scratch"),
@@ -428,23 +440,37 @@ fn dispositions_must_be_persisted_for_the_exact_review_and_conflicts_block() {
         record_dispositions(&mut sink, &foreign_proposal),
         Ok(Recorded::Published)
     );
+    let foreign_content = sink
+        .inner
+        .content(foreign_proposal.binding())
+        .unwrap()
+        .unwrap();
     s.request = original;
-    assert_eq!(check(&s, &ds).outcome, IntegrationDecisionOutcome::Blocked);
+    let state = StateReader::open_existing(&s.db).unwrap();
+    let foreign = evaluate_with_content(&s, &ticket, &state, 1, &ds, Some(&foreign_content));
+    assert_eq!(foreign.outcome, IntegrationDecisionOutcome::Blocked);
+    assert!(foreign.checks[3].detail.contains("not persisted"));
 
     let p =
         disposition_proposal(PROJECT, &s.request, ticket.review().unwrap().core(), &ds, 1).unwrap();
     sink.fault = Fault::PublishLost;
     assert!(record_dispositions(&mut sink, &p).is_err());
+    let sealed_content = sink.inner.content(p.binding()).unwrap().unwrap();
+    let state = StateReader::open_existing(&s.db).unwrap();
+    let sealed = evaluate_with_content(&s, &ticket, &state, 1, &ds, Some(&sealed_content));
     assert_eq!(
-        check(&s, &ds).outcome,
+        sealed.outcome,
         IntegrationDecisionOutcome::Blocked,
         "a seal is not publication"
     );
+    assert!(sealed.checks[3].detail.contains("not persisted"));
     drop(sink);
     let mut sink = Faulty::open(&s.db, &clock);
     assert_eq!(record_dispositions(&mut sink, &p), Ok(Recorded::Published));
     assert_eq!(record_dispositions(&mut sink, &p), Ok(Recorded::Published));
-    let accepted = check(&s, &ds);
+    let content = sink.inner.content(p.binding()).unwrap().unwrap();
+    let state = StateReader::open_existing(&s.db).unwrap();
+    let accepted = evaluate_with_content(&s, &ticket, &state, 1, &ds, Some(&content));
     assert_eq!(
         accepted.outcome,
         IntegrationDecisionOutcome::Accept,
@@ -452,6 +478,34 @@ fn dispositions_must_be_persisted_for_the_exact_review_and_conflicts_block() {
         accepted.checks
     );
     assert_eq!(accepted.record(&mut sink), Ok(Recorded::Published));
+    struct Unavailable;
+    impl receipts_review_integration::ReviewContentResolver for Unavailable {
+        fn resolve(&self, _: &str, _: &str) -> Result<Option<Vec<u8>>, String> {
+            Ok(None)
+        }
+    }
+    struct Altered;
+    impl receipts_review_integration::ReviewContentResolver for Altered {
+        fn resolve(&self, _: &str, _: &str) -> Result<Option<Vec<u8>>, String> {
+            Ok(Some(b"altered".to_vec()))
+        }
+    }
+    struct Unreadable;
+    impl receipts_review_integration::ReviewContentResolver for Unreadable {
+        fn resolve(&self, _: &str, _: &str) -> Result<Option<Vec<u8>>, String> {
+            Err("storage unavailable".into())
+        }
+    }
+    for resolver in [
+        &Unavailable as &dyn receipts_review_integration::ReviewContentResolver,
+        &Altered,
+        &Unreadable,
+    ] {
+        assert_eq!(
+            evaluate_with_content(&s, &ticket, &state, 1, &ds, Some(resolver)).outcome,
+            IntegrationDecisionOutcome::Blocked
+        );
+    }
     for altered in [
         FindingDisposition {
             decided_by: "someone-else".into(),
@@ -470,7 +524,7 @@ fn dispositions_must_be_persisted_for_the_exact_review_and_conflicts_block() {
         },
     ] {
         assert_eq!(
-            check(&s, &[altered]).outcome,
+            evaluate_with_content(&s, &ticket, &state, 1, &[altered], Some(&content)).outcome,
             IntegrationDecisionOutcome::Blocked
         );
     }
@@ -490,7 +544,7 @@ fn dispositions_must_be_persisted_for_the_exact_review_and_conflicts_block() {
     .unwrap();
     assert_eq!(record_dispositions(&mut sink, &p2), Ok(Recorded::Published));
     assert_eq!(
-        check(&s, &ds).outcome,
+        evaluate_with_content(&s, &ticket, &state, 1, &ds, Some(&content)).outcome,
         IntegrationDecisionOutcome::Blocked,
         "matching evidence does not hide a conflicting decision"
     );
@@ -649,6 +703,7 @@ fn supersession_order_is_verified_against_core_written_task_provenance() {
                 superseding_task_id: "sup-1".into(),
             }],
             finding_dispositions: &[],
+            disposition_content: None,
             checks: &runner(),
             component_suite: &argv(&["true"]),
             scratch: &s.dir.0.join("gate-scratch"),

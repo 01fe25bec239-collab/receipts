@@ -150,10 +150,11 @@ pub use claims::{ReviewClaimBinding, ReviewClaimScope, ReviewOperation, request_
 
 pub mod ports;
 pub use ports::{
-    ImplementerIdentity, ReviewClaim, ReviewRecordProposal, ReviewRecordSink, ReviewerCandidate,
-    ReviewerQualityEvidence, ReviewerRequirements, ReviewerRoutingPort, ReviewerRoutingRefusal,
-    ReviewerRunOutput, ReviewerRuntime, SEALED_REVIEW_KIND, SealedReview,
-    reviewer_output_from_claude, reviewer_output_from_codex, reviewer_tier_rank,
+    ImplementerIdentity, ReviewClaim, ReviewContentResolver, ReviewRecordProposal,
+    ReviewRecordSink, ReviewerCandidate, ReviewerQualityEvidence, ReviewerRequirements,
+    ReviewerRoutingPort, ReviewerRoutingRefusal, ReviewerRunOutput, ReviewerRuntime,
+    SEALED_REVIEW_KIND, SealedReview, reviewer_output_from_claude, reviewer_output_from_codex,
+    reviewer_tier_rank,
 };
 
 mod records;

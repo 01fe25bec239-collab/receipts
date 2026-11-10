@@ -151,6 +151,8 @@ pub struct AcceptanceInput<'a> {
     /// Supersession evidence for dependency paths that changed after the
     /// dependency was accepted (see [`DependencySupersession`]).
     pub supersessions: &'a [DependencySupersession],
+    /// Trusted content boundary for required durable disposition payloads.
+    pub disposition_content: Option<&'a dyn crate::ReviewContentResolver>,
     /// Explicit dispositions for a PASS_WITH_NONBLOCKING_FINDINGS review.
     pub finding_dispositions: &'a [FindingDisposition],
     pub checks: &'a CheckRunnerConfig,
@@ -579,6 +581,10 @@ fn bind_dispositions(
             "disposition history exceeds the bounded evidence query",
         );
     }
+    let content = i.disposition_content.ok_or((
+        Blocked,
+        "disposition content resolver is unavailable".to_owned(),
+    ))?;
     for expected in &expected.events {
         let found: Vec<_> = events
             .iter()
@@ -589,6 +595,13 @@ fn bind_dispositions(
                 Blocked,
                 "required finding disposition is not persisted for this review",
             );
+        }
+        let bytes = content
+            .resolve(i.project_id, &expected.payload().reference)
+            .map_err(|e| (Blocked, format!("disposition content unreadable: {e}")))?
+            .ok_or((Blocked, "disposition payload is unavailable".to_owned()))?;
+        if payload_digest(&bytes) != expected.payload().digest {
+            return fail(Blocked, "disposition payload is altered");
         }
         if found.iter().any(|e| {
             e.correlation_id != i.review_request.core().task_id()

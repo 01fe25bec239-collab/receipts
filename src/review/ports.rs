@@ -411,3 +411,9 @@ pub trait ReviewRecordSink {
         proposal: &ReviewRecordProposal,
     ) -> Result<(), String>;
 }
+
+/// Trusted composition's payload storage. Bytes are evidence only after the gate
+/// hashes them against a persisted event; missing or unreadable content refuses.
+pub trait ReviewContentResolver {
+    fn resolve(&self, project_id: &str, reference: &str) -> Result<Option<Vec<u8>>, String>;
+}
