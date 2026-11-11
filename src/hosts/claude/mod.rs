@@ -89,6 +89,11 @@ pub struct ClaudeHostAdapter {
 }
 
 impl ClaudeHostAdapter {
+    /// Display one verified read-only graph projection, without Host-specific decoration.
+    pub fn present_graph(&self, view: &receipts_orchestration::ReadOnlyGraphViewV1) -> String {
+        crate::render_graph_tree(view)
+    }
+
     pub fn new(
         environment: ClaudeHostEnvironment,
         spool: HostEventSpool,

@@ -3,12 +3,13 @@ use crate::graph_snapshot_renderer::display_text;
 use receipts_orchestration::ReadOnlyGraphViewV1;
 
 pub fn render_graph_tree(view: &ReadOnlyGraphViewV1) -> String {
-    render(view.snapshot(), view.edges())
+    render(view.snapshot(), view.edges(), view.node_workstreams())
 }
 
 fn render(
     snapshot: &receipts_orchestration::GraphSnapshot,
     edges: &[receipts_orchestration::GraphEdge],
+    membership: &std::collections::BTreeMap<String, Option<String>>,
 ) -> String {
     let mut output = format!(
         "graph {} version {} digest {}\n",
@@ -16,27 +17,43 @@ fn render(
         display_text(Some(snapshot.graph_version().as_str())),
         display_text(snapshot.resulting_digest())
     );
-    // Workstream membership is unavailable in the merged projection; do not infer it.
+    let mut groups = std::collections::BTreeMap::new();
     for node in snapshot.node_states() {
+        let workstream = membership.get(node.node_id()).and_then(Option::as_deref);
+        groups.entry(workstream).or_insert_with(Vec::new).push(node);
+    }
+    // None sorts first; assigned workstreams and nodes retain byte order.
+    for (workstream, nodes) in groups {
         output.push_str(&format!(
-            "├─ [{}] {}\n",
-            node.state().as_str(),
-            display_text(Some(node.node_id()))
+            "├─ workstream={}{}\n",
+            display_text(workstream),
+            if workstream.is_none() {
+                " (unassigned)"
+            } else {
+                ""
+            }
         ));
-        for edge in edges.iter().filter(|edge| edge.to_node() == node.node_id()) {
-            let state = snapshot
-                .node_states()
-                .iter()
-                .find(|n| n.node_id() == edge.from_node())
-                .map(|n| n.state().as_str())
-                .unwrap_or("UNKNOWN");
+        for node in nodes {
             output.push_str(&format!(
-                "│  ← {} [{}] {} {}\n",
-                display_text(Some(edge.from_node())),
-                state,
-                edge.class().as_str(),
-                edge.relation().kind_as_str()
+                "│  ├─ [{}] {}\n",
+                node.state().as_str(),
+                display_text(Some(node.node_id()))
             ));
+            for edge in edges.iter().filter(|edge| edge.to_node() == node.node_id()) {
+                let state = snapshot
+                    .node_states()
+                    .iter()
+                    .find(|n| n.node_id() == edge.from_node())
+                    .map(|n| n.state().as_str())
+                    .unwrap_or("UNKNOWN");
+                output.push_str(&format!(
+                    "│  │  ← {} [{}] {} {}\n",
+                    display_text(Some(edge.from_node())),
+                    state,
+                    edge.class().as_str(),
+                    edge.relation().kind_as_str()
+                ));
+            }
         }
     }
     output
@@ -76,11 +93,19 @@ mod tests {
             GraphEdge::precedence("e", "g", "a\u{202e}", "b", PrecedenceKind::RequiresAccepted)
                 .unwrap();
         assert_eq!(
-            render(&snapshot, &[edge]),
+            render(
+                &snapshot,
+                &[edge],
+                &std::collections::BTreeMap::from([
+                    ("a\u{202e}".into(), Some("z\"\u{202e}\n".into())),
+                    ("b".into(), None),
+                ])
+            ),
             concat!(
                 "graph \"g\" version \"2\" digest null\n",
-                "├─ [ACCEPTED] \"a\\u{202e}\"\n├─ [BLOCKED] \"b\"\n",
-                "│  ← \"a\\u{202e}\" [ACCEPTED] PRECEDENCE REQUIRES_ACCEPTED\n"
+                "├─ workstream=null (unassigned)\n│  ├─ [BLOCKED] \"b\"\n",
+                "│  │  ← \"a\\u{202e}\" [ACCEPTED] PRECEDENCE REQUIRES_ACCEPTED\n",
+                "├─ workstream=\"z\\\"\\u{202e}\\n\"\n│  ├─ [ACCEPTED] \"a\\u{202e}\"\n"
             )
         );
     }

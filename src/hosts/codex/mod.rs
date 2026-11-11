@@ -26,6 +26,11 @@ pub struct CodexHostAdapter {
     report: HostCapabilityReport,
 }
 impl CodexHostAdapter {
+    /// Display one verified read-only graph projection, without Host-specific decoration.
+    pub fn present_graph(&self, view: &receipts_orchestration::ReadOnlyGraphViewV1) -> String {
+        crate::render_graph_tree(view)
+    }
+
     /// Accepts a report selected by the existing observation composition.
     /// A report grants no authority; native delivery remains unavailable here.
     pub fn new(

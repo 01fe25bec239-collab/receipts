@@ -11,16 +11,21 @@ Input prompts report unavailable; CI cannot silently supply user approval.
 Claude, Codex and headless share the existing CoreView template. `EconomyRenderer`
 holds only `&GraphSnapshot`, counts exact states, and displays version/digest.
 `render_graph_tree` accepts only the verified `ReadOnlyGraphViewV1` projection
-and displays incoming edge classes, relations and predecessor states. Both
+and groups nodes by the projection's read-only `node_workstreams()` map.
+Every validated node is present in that map, including explicit `None` for
+unassigned nodes. The unassigned group is first, followed by workstream IDs in
+UTF-8 byte order; nodes retain snapshot node-ID order. Dependencies display
+predecessor state even across groups. Workstream text uses the same escaping as
+node IDs. The projection still verifies the original graph digest; no graph
+wire or hash format changes.
+
+All three adapters expose `present_graph(&ReadOnlyGraphViewV1)` and delegate to
+the same deterministic tree renderer. Economy rendering uses that projection's
+`snapshot()` and has no mutable access or State handle. Both
 renderers reuse display escaping, including bidi controls. The old snapshot
 dump remains for compatibility with existing CLI consumers.
 
 ## Open contract dependencies
-
-The setup projection exposes snapshot node states and edges, but omits each
-node's `workstream_id`. Consequently the topology display cannot group by
-workstream. A1 must extend the shared Core projection before that requirement
-can be completed; Host must not recover membership from summaries or State.
 
 `CodexHostAdapter` provides supervised delivery through the same spool and
 CoreView template. Construction refuses foreign-host and native-mode reports;
@@ -55,4 +60,4 @@ hook invocation claims cannot establish those facts.
 Installed-host Q01: PENDING. No installation, registration, trust change,
 provider execution or user settings mutation was performed. Full product
 command composition remains Wave 4. This partial package needs A1 disposition
-of the two contract dependencies before all HI-W3-1–3 obligations can close.
+of native Codex discovery and qualification before all HI-W3-1–3 obligations can close.

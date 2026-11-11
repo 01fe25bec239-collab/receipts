@@ -37,6 +37,11 @@ pub struct HeadlessAdapter {
     report: HostCapabilityReport,
 }
 impl HeadlessAdapter {
+    /// Display one verified read-only graph projection, without Host-specific decoration.
+    pub fn present_graph(&self, view: &receipts_orchestration::ReadOnlyGraphViewV1) -> String {
+        crate::render_graph_tree(view)
+    }
+
     pub fn new(spool: HostEventSpool, report: HostCapabilityReport) -> Self {
         Self { spool, report }
     }
