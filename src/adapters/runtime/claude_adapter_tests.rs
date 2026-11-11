@@ -882,6 +882,17 @@ fn native_turn_cap_and_conformance_refusal_controls() {
     let mut denied = policy(false);
     denied.session_persistence = true;
     denied.read_only = true;
+    for turns in [0, u64::MAX] {
+        let mut invalid = policy(false);
+        invalid.turn_budget = Some(turns);
+        assert!(matches!(
+            fresh
+                .adapter()
+                .start(&fresh.task(), &fresh.workspace, &invalid),
+            Err(FailureClass::PolicyBlocked)
+        ));
+        assert!(!fresh.workspace.worktree_path().join("pid").exists());
+    }
     let task = fresh.task();
     let report = block_on(run_conformance(
         &fresh.adapter(),

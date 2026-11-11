@@ -428,7 +428,10 @@ impl ClaudeAdapter {
         session: Option<&str>,
     ) -> Result<ClaudeAttemptHandle, FailureClass> {
         let text = prompt(task, workspace, policy)?;
-        if policy.turn_budget == Some(0) {
+        if policy
+            .turn_budget
+            .is_some_and(|n| n == 0 || n > 9_007_199_254_740_991)
+        {
             return Err(FailureClass::PolicyBlocked);
         }
         if policy.structured_output_schema.as_ref().is_some_and(|s| {
