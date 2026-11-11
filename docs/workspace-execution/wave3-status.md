@@ -18,7 +18,9 @@ Cancellation acceptance is returned explicitly. Timeout or natural completion
 can win while persistence runs; captured evidence remains, without claiming
 pre-cleanup ordering for that winner. Persistence failure returns an error and
 drops the owned attempt, preserving bounded cleanup. External persistence never
-runs under controller locks. The synchronous caller can block in a slow sink,
+runs under controller locks. The wait loop also observes controller closure,
+so a fault before any terminal claim returns a collection failure instead of
+polling forever. The synchronous caller can block in a slow sink,
 but the process controller still enforces its deadline independently.
 
 `TrustedAttemptEvidenceSinkV1::persist_verified_finalization` compares fresh

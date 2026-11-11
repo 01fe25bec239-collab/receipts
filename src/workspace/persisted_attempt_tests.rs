@@ -424,3 +424,18 @@ fn failed_start_persistence_never_launches_child_and_interval_failure_cleans_up(
     assert!(matches!(result, Err(PersistedAttemptError::Checkpoint(_))));
     assert_eq!(sink.kinds, ["PROGRESS", "PROGRESS"]);
 }
+
+#[test]
+fn controller_fault_before_terminal_claim_returns_instead_of_polling_forever() {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        crate::execution::inject_collection_failure_for_test();
+        let (result, _) = exercise(false, Duration::from_secs(3), None, false);
+        tx.send(matches!(result, Err(PersistedAttemptError::Collection(_))))
+            .unwrap();
+    });
+    assert!(
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("faulted controller must leave the polling loop")
+    );
+}

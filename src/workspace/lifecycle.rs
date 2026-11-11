@@ -185,6 +185,9 @@ impl WorkspaceAttempt {
     pub fn cancel(&self) -> crate::execution::LiveProcessCancelAcceptance {
         self.attempt.cancel()
     }
+    pub fn is_terminating_or_closed(&self) -> bool {
+        self.attempt.is_terminating_or_closed()
+    }
     pub fn terminal_cause(&self) -> Option<crate::execution::LiveProcessTerminalCause> {
         self.attempt.terminal_cause()
     }

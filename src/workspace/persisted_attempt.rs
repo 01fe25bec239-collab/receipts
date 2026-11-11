@@ -155,7 +155,7 @@ pub fn run_persisted_attempt<S: AttemptEvidenceSinkV1>(
     let mut last = Instant::now();
     let mut cancellation = None;
     let mut cancellation_open = true;
-    while attempt.terminal_cause().is_none() {
+    while !attempt.is_terminating_or_closed() {
         if cancellation_open {
             match request.cancellation.try_recv() {
                 Ok(()) => {
@@ -179,7 +179,7 @@ pub fn run_persisted_attempt<S: AttemptEvidenceSinkV1>(
                 Err(TryRecvError::Empty) => {}
             }
         }
-        if last.elapsed() >= request.interval && attempt.terminal_cause().is_none() {
+        if last.elapsed() >= request.interval && !attempt.is_terminating_or_closed() {
             let output = attempt
                 .snapshot_output()
                 .map_err(PersistedAttemptError::Execution)?;
