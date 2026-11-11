@@ -5,6 +5,7 @@ use super::persistence::*;
 use crate::compiler::{
     CompileContextV1, CompileErrorV1, CompiledGraphV1, DecompositionProposalV1, compile_graph_v1,
 };
+use crate::policy::GraphExecutionPolicy;
 use crate::scheduler::WriteScopePort;
 use receipts_state::{SetupRefusalV1, StateError};
 
@@ -30,6 +31,9 @@ pub trait GoalLoopPortV1 {
 }
 
 pub struct PreparedGoalDispatchV1 {
+    pub node_id: String,
+    pub admission_decision_id: String,
+    pub started_at: String,
     pub provider_id: String,
     pub runtime_id: String,
     pub eligible_host_native: bool,
@@ -115,7 +119,18 @@ pub fn tick_goal_v1(
     let mut goal = snapshot_goal_v1(state, project, goal_id)?;
     let round = port.reconcile(&goal)?;
     if round.current_epoch != goal.context_epoch {
-        return Err(refused(SetupRefusalV1::StaleEpoch));
+        if round.dispatch.is_some() {
+            return Err(refused(SetupRefusalV1::StaleEpoch));
+        }
+        state.advance_goal(&GoalProgressV1 {
+            project_id: project.into(),
+            goal_id: goal_id.into(),
+            expected_revision: goal.revision.clone(),
+            expected_epoch: goal.context_epoch.clone(),
+            context_epoch: round.current_epoch.clone(),
+            continuation_ref: goal.continuation_ref.clone(),
+        })?;
+        goal = snapshot_goal_v1(state, project, goal_id)?;
     }
     let mut assessment = round.assessment;
     if let Some(dispatch) = round.dispatch {
@@ -132,7 +147,20 @@ pub fn tick_goal_v1(
         if dispatch.request.project_id != project || dispatch.request.goal_id != goal_id {
             return Err(refused(SetupRefusalV1::ForeignEvidence));
         }
-        match state.reserve_dispatch(&dispatch.request, &dispatch.start) {
+        let reservation =
+            if let Some(existing) = state.load_dispatch(project, &dispatch.request.dispatch_id)? {
+                if existing.request.goal_id != goal_id
+                    || existing.attempt_id != *dispatch.start.attempt_id()
+                {
+                    return Err(refused(SetupRefusalV1::ConflictingReplay));
+                }
+                // A later goal revision does not change the identity or authority
+                // of an already registered external boundary.
+                Ok(SetupWriteOutcomeV1::Replayed)
+            } else {
+                state.reserve_dispatch(&dispatch.request, &dispatch.start)
+            };
+        match reservation {
             Ok(SetupWriteOutcomeV1::Applied) => {
                 let (resolution, evidence) = port.launch(&goal, &dispatch)?;
                 state.resolve_dispatch(
@@ -145,6 +173,11 @@ pub fn tick_goal_v1(
                     state: GoalEvaluationState::Incomplete,
                     gaps: vec!["dispatched work requires completion and verification".into()],
                 };
+                if resolution == LaunchResolutionV1::NotLaunched {
+                    assessment = blocked(
+                        "executor did not launch; reconcile the retained reservation before retry",
+                    );
+                }
                 if resolution == LaunchResolutionV1::Uncertain {
                     assessment =
                         blocked("launch outcome unresolved; reconcile evidence before retry");
@@ -193,7 +226,6 @@ pub fn tick_goal_v1(
     Ok(assessment)
 }
 
-pub use tick_goal_v1 as resume_goal_v1;
 fn refused(reason: SetupRefusalV1) -> StateError {
     StateError::SetupRefused { reason }
 }
@@ -205,7 +237,7 @@ fn blocked(reason: &str) -> GoalAssessmentV1 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::GraphNodeState;
     use crate::store::{compiled_provenance, state_content_v1};
@@ -221,7 +253,7 @@ mod tests {
             policy_id: None,
         }
     }
-    fn seed(limit: &str) -> (Dir, TrustedCoreStore) {
+    pub(crate) fn seed(limit: &str) -> (Dir, TrustedCoreStore) {
         let dir = Dir::new();
         let mut state = TrustedCoreStore::open_exclusive(dir.db()).unwrap();
         let env = envelope(&[("n", "TASK", GraphNodeState::Planned, Some("w"))], &[]);
@@ -263,7 +295,13 @@ mod tests {
                     goal_id: "goal".into(),
                     graph_id: "g".into(),
                     spec_ref: "artifact:verbatim".into(),
-                    spec_sha256: "b".repeat(64),
+                    spec_sha256: {
+                        use sha2::{Digest, Sha256};
+                        Sha256::digest(b"spec")
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect()
+                    },
                     dispatch_limit: limit.into(),
                 },
                 "0",
@@ -288,6 +326,9 @@ mod tests {
                     gaps: vec!["work remains".into()],
                 },
                 dispatch: Some(PreparedGoalDispatchV1 {
+                    node_id: "n".into(),
+                    admission_decision_id: "ad".into(),
+                    started_at: "2026-11-08T10:00:00.000000000Z".into(),
                     provider_id: "host".into(),
                     runtime_id: "runtime".into(),
                     eligible_host_native: true,
@@ -360,7 +401,7 @@ mod tests {
         let mut state = TrustedCoreStore::open_exclusive(dir.db()).unwrap();
         port.replay = true;
         port.crash = false;
-        let outcome = resume_goal_v1(
+        let outcome = tick_goal_v1(
             &crate::policy::FreePolicyV1::new("host".into(), "runtime".into()).unwrap(),
             &mut state,
             &mut port,

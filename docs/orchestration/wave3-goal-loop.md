@@ -1,40 +1,68 @@
-# Goal continuation library
+# Goal continuation
 
-`goal::engine` supplies `start_goal_v1`, `tick_goal_v1`, `resume_goal_v1`
-and `snapshot_goal_v1` over the setup's admitted goal persistence interface.
-Start uses the existing compiler and returns its criterion clarification outcome.
-Trusted composition must persist the compiler's verbatim spec bytes and genesis
-idempotently before the goal definition is created.
+`CoreFacade` exposes host-neutral `start_goal`, `tick`, `resume_goal`,
+`snapshot` and explicit `retry_failed` operations. A tick is one re-entrant
+step; a host drives further steps while the returned state is INCOMPLETE.
+Snapshot includes the durable evaluation state, exact gaps and evaluated graph
+version/SHA. Resuming re-evaluates current evidence, including a previously
+complete goal.
 
-A tick loads durable progress and asks the trusted loop consumer to reconcile
-recovery, rehydration, completions, review and repair. Its prepared dispatch must
-come from the existing scheduler, capsule validation and admitted routing at the
-current epoch. State rechecks project, graph, epoch, revision, membership and
-budget in the reservation transaction. Only Applied calls launch. Replay reads
-existing evidence; unresolved launch produces BLOCKED and never launches again.
-A launch call failing after reservation leaves the durable uncertainty intact.
-A fresh resume has no privileged in-memory ticket.
+Start uses the existing compiler. Missing or unconfirmed measurable criteria
+return its clarification outcome. The trusted compilation sink stores the exact
+spec bytes and genesis idempotently before the goal definition is created.
+Every subsequent snapshot verifies the original spec digest. Adopted criteria,
+FREE runtime selection and resource limits are retained in the immutable
+continuation artifact referenced by admitted State progress.
 
-The continuation supplier stores immutable artifacts before returning a reference
-for revision-CAS publication. It must bind graph/goal/epoch, pending reservation
-and review identities, runtime selection and budget counters. Reservation charging
-and continuation publication are separate transactions: restart must reconcile
-attempts even when the latest continuation predates a reservation.
+The driver recovers/rehydrates through the trusted consumer, loads its current
+State-bound graph and attempt/result ledger, applies completion/review/repair
+proposals through the existing evidence-backed mutation validator, then refreshes
+observations. An admitted epoch change takes a separate no-dispatch step before
+readiness is re-derived. The shared TaskDag and scheduler check dependencies,
+D11 admission, budgets, concurrency and write collisions. Routing must match the
+admitted provider/runtime and pinned FREE runtime. One admitted node is started
+per tick; later ticks may fill allowed same-runtime concurrency.
 
-`goal::evaluate` executes declared deterministic criterion checks only after the
-mechanical prerequisites hold. The runner must bind results to the exact current
-integrated SHA and treat timeout, missing output and execution errors as failure.
-Semantic criteria remain named human-required gaps. No semantic inference exists.
-An empty criterion set cannot complete. Assessment construction is restricted so
-consumers obtain COMPLETE through the evaluator.
+Only a newly Applied State reservation can invoke launch. The driver publishes
+dispatch transitions before the external boundary and records RUNNING only for
+a confirmed launch. Replay reads existing launch evidence and grants no relaunch.
+A failed call after reservation leaves the boundary uncertain. Uncertain and
+not-launched outcomes remain explicit; safe recovery/retry requires evidence.
+An unresolved reservation cannot be replaced, including after a restart whose
+latest continuation predates that reservation.
 
-`policy::FreePolicyV1` checks a selected eligible host-native provider/runtime and
-limits retry eligibility to attached failed/rejected results on rejected nodes.
-The trusted caller must retain the selection across continuation and use the
-shared mutation engine for retries. Accepted history is read without alteration.
+FREE quality gates execute declared task checks at the exact code SHA through
+the check consumer. They do not request cross-provider A4. Completion and review
+consumers may propose results/verdicts, but Core applies the existing attempt,
+code-domain and admitted review evidence checks. An explicit failed-node retry
+can expand only a retained rejected review with attached failure evidence; the
+fresh REPAIR/REVIEW round and accepted history retain their graph identities.
 
-Remaining implementation: concrete goal-owned scheduling/review/repair
-continuation, durable policy selection, multidimensional budget accounting,
-event emission and start/clarification controls. The loop consumer currently
-specifies these obligations; it does not implement them. This is a partial
-library change, not completion of OR-W3-1–3 or Wave 4 product composition.
+Goal completion runs declared criterion checks only after mechanical gates pass.
+An empty ready set cannot complete by itself. Missing checks, findings, epoch,
+security or integration evidence refuse completion. Semantic criteria retain
+explicit HUMAN_REQUIRED gaps. A changed graph/version/epoch/integrated SHA between
+evaluation and recording refuses COMPLETE. Goal/task lifecycle events carry their
+actual graph version; trusted consumers persist events and evaluation records
+idempotently through admitted writes.
+
+Dispatch counts are charged atomically by the setup State port. Wall, cost and
+repair limits are immutable continuation data; exhaustion or unknown capped cost
+blocks new work with a reason. Trusted usage observations must include pending
+reservations and running work. This is not provider monetary accounting. Limits
+are not silently increased on resume; a changed limit requires a separately
+admitted disposition, which this API does not invent.
+
+`GoalConsumerPortV1` is the trusted composition boundary, not worker authority.
+Its snapshot supplier must rebuild attempt classification and review/repair
+ledger facts from admitted State evidence; its compilation, artifact, mutation,
+event and evaluation sinks must be immutable/idempotent and refuse foreign or
+missing evidence. Its routing adapter uses the existing task/repair capsule
+builders. Orchestration imports no Runtime, Routing, Review or Host implementation.
+Loop tests use controlled consumers; real State witnesses cover reservations,
+continuation references, epoch CAS and reopen, including disk-backed artifacts.
+
+Unsafe orphan continuity stays a recovery refusal. Semantic inference, provider
+monetary accounting, production adapters and full product command wiring remain
+later boundaries. Independent A3, applicable Q06 and A1 acceptance are separate
+from these library controls.

@@ -8,18 +8,37 @@ pub struct FreePolicyV1 {
     runtime: String,
 }
 impl FreePolicyV1 {
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+    pub fn runtime(&self) -> &str {
+        &self.runtime
+    }
     pub fn new(provider: String, runtime: String) -> Option<Self> {
         if provider.is_empty() || runtime.is_empty() {
             return None;
         }
         Some(Self { provider, runtime })
     }
+}
+
+pub trait GraphExecutionPolicy {
+    fn permits(&self, provider: &str, runtime: &str, eligible_host_native: bool) -> bool;
+    fn permits_retry(
+        &self,
+        graph: &ExecutionGraphEnvelope,
+        node: &str,
+        result_ref: &str,
+        result: &GraphNodeResult,
+    ) -> bool;
+}
+impl GraphExecutionPolicy for FreePolicyV1 {
     /// Eligibility/native evidence comes from trusted Host/Runtime observation.
     /// Unknown, stale or unavailable observations must pass false.
-    pub fn permits(&self, provider: &str, runtime: &str, eligible_host_native: bool) -> bool {
+    fn permits(&self, provider: &str, runtime: &str, eligible_host_native: bool) -> bool {
         eligible_host_native && self.provider == provider && self.runtime == runtime
     }
-    pub fn permits_retry(
+    fn permits_retry(
         &self,
         graph: &ExecutionGraphEnvelope,
         node: &str,

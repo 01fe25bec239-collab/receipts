@@ -37,3 +37,4 @@ mod facade_tests;
 mod test_support;
 
 pub mod policy;
+pub use goal::CoreFacade;
