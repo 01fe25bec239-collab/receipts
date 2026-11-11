@@ -412,6 +412,9 @@ fn observe_material(
             material.push((Source::ClaudePluginHooks, hooks));
         }
     }
+    if request.host == HostId::Codex {
+        codex_facts(&mut observation);
+    }
     (observation, plugin_bytes, material)
 }
 
@@ -480,4 +483,24 @@ fn claude_facts(o: &mut HostCapabilityObservation, hooks: Option<&Result<Vec<u8>
     } else {
         Value::Unknown
     };
+}
+
+// Codex files can refute permission; missing/failed sources and positive flags
+// never establish effective enablement, trust or managed authority.
+fn codex_facts(o: &mut HostCapabilityObservation) {
+    if o.configurations.iter().any(|c| {
+        c.result
+            .as_ref()
+            .is_ok_and(|r| r.hooks_feature == Value::Known(false))
+    }) {
+        o.hooks_enabled = Value::Known(false);
+    }
+    if o.configurations.iter().any(|c| {
+        c.source == Source::CodexLocalRequirements
+            && c.result
+                .as_ref()
+                .is_ok_and(|r| r.allow_managed_hooks_only == Value::Known(true))
+    }) {
+        o.hooks_allowed_by_admin_policy = Value::Known(false);
+    }
 }

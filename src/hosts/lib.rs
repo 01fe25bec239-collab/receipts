@@ -33,6 +33,7 @@
 
 pub mod adapter;
 pub mod claude;
+pub mod codex;
 pub mod economy_renderer;
 pub mod graph_snapshot_renderer;
 pub mod headless;
@@ -204,3 +205,5 @@ pub use headless::HeadlessAdapter;
 
 pub mod graph_tree_renderer;
 pub use graph_tree_renderer::render_graph_tree;
+
+pub use codex::CodexHostAdapter;
