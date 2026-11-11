@@ -168,6 +168,17 @@ impl fmt::Display for WorkspaceCollectionFailure {
 impl std::error::Error for WorkspaceCollectionFailure {}
 
 impl WorkspaceAttempt {
+    pub fn prepare_cancellation(
+        &self,
+    ) -> Result<Option<crate::execution::LiveProcessCancellationPreparation>, ExecutionError> {
+        self.attempt.prepare_cancellation()
+    }
+    pub fn cancel_prepared(
+        &self,
+        preparation: &crate::execution::LiveProcessCancellationPreparation,
+    ) -> crate::execution::LiveProcessPreparedCancelAcceptance {
+        self.attempt.cancel_prepared(preparation)
+    }
     pub fn snapshot_output(&self) -> Result<crate::execution::LiveProcessOutput, ExecutionError> {
         self.attempt.snapshot_output()
     }

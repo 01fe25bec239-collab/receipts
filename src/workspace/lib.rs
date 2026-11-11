@@ -213,3 +213,11 @@ pub mod output_store;
 pub mod remote_publish;
 #[cfg(test)]
 mod remote_publish_tests;
+
+pub mod persisted_attempt;
+
+#[cfg(test)]
+mod blob_rehydration_tests;
+pub mod orphan_sweep;
+#[cfg(test)]
+mod persisted_attempt_tests;

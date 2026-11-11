@@ -36,6 +36,12 @@ pub enum PublicationOutcome {
 }
 
 pub fn publish(request: &PublicationRequest<'_>) -> PublicationOutcome {
+    publish_locked(request, || {})
+}
+pub(super) fn publish_locked(
+    request: &PublicationRequest<'_>,
+    after_lock: impl FnOnce(),
+) -> PublicationOutcome {
     use ProjectRemoteMode as M;
     use PublicationBranchClass as C;
     use PublicationOutcome as O;
@@ -64,6 +70,10 @@ pub fn publish(request: &PublicationRequest<'_>) -> PublicationOutcome {
         return O::Refused;
     }
     let source = format!("refs/heads/{}", request.branch);
+    let Ok(_guard) = BranchLock::acquire(request.repository, &source) else {
+        return O::Refused;
+    };
+    after_lock();
     let Ok(head) = git::capture(
         request.repository,
         "publish anchor",
@@ -95,5 +105,60 @@ pub fn publish(request: &PublicationRequest<'_>) -> PublicationOutcome {
     ) {
         Ok(result) if result.success => O::Published,
         _ => O::RemoteFailed,
+    }
+}
+
+// Git writers honor this per-ref lock, including when the ref is packed. It
+// closes the anchor-check/push race for cooperating Git writers, not hostile
+// filesystem mutation by a principal with repository write authority.
+struct BranchLock {
+    path: std::path::PathBuf,
+    file: std::fs::File,
+}
+impl BranchLock {
+    fn acquire(repository: &Path, reference: &str) -> Result<Self, ()> {
+        let common = git::capture(
+            repository,
+            "publication common directory",
+            &[
+                OsStr::new("rev-parse"),
+                OsStr::new("--path-format=absolute"),
+                OsStr::new("--git-common-dir"),
+            ],
+        )
+        .map_err(|_| ())?
+        .require_success("publication common directory")
+        .map_err(|_| ())?;
+        #[cfg(unix)]
+        let root = {
+            use std::os::unix::ffi::OsStrExt;
+            let bytes = common.raw_stdout().strip_suffix(b"\n").ok_or(())?;
+            std::fs::canonicalize(OsStr::from_bytes(bytes)).map_err(|_| ())?
+        };
+        #[cfg(not(unix))]
+        let root = std::fs::canonicalize(common.stdout.trim()).map_err(|_| ())?;
+        let path = root.join(format!("{reference}.lock"));
+        std::fs::create_dir_all(path.parent().ok_or(())?).map_err(|_| ())?;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|_| ())?;
+        Ok(Self { path, file })
+    }
+}
+impl Drop for BranchLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let (Ok(owned), Ok(current)) =
+                (self.file.metadata(), std::fs::symlink_metadata(&self.path))
+                && owned.dev() == current.dev()
+                && owned.ino() == current.ino()
+            {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
     }
 }

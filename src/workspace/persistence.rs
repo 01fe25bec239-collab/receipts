@@ -172,3 +172,66 @@ impl TrustedAttemptEvidenceSinkV1<'_> {
             .finish_with_finalization_v1(admission, record, finish)
     }
 }
+
+impl TrustedAttemptEvidenceSinkV1<'_> {
+    /// Bind fresh mechanical finalization to the exact persisted checkpoint,
+    /// then use State's atomic finish/receipt operation. No review is inferred.
+    pub fn persist_verified_finalization(
+        &mut self,
+        evidence: &crate::WorkspaceAttemptFinalizationEvidence,
+        receipt: &CheckpointPersistenceReceiptV1,
+        finish: &receipts_state::AttemptFinish,
+        output_refs: Vec<String>,
+    ) -> Result<receipts_state::SetupWriteOutcomeV1, StateError> {
+        if evidence.workspace_id() != receipt.workspace_id()
+            || evidence.attempt_id() != Some(receipt.attempt_id().as_str())
+            || evidence.checkpoint().checkpoint_id() != receipt.checkpoint_id()
+            || finish.attempt_id() != receipt.attempt_id()
+        {
+            return Err(refused(SetupRefusalV1::ForeignEvidence));
+        }
+        let checkpoint = self
+            .store
+            .reader()
+            .find_checkpoint(receipt.project_id(), receipt.checkpoint_id())?
+            .ok_or_else(|| refused(SetupRefusalV1::MissingEvidence))?;
+        let json = checkpoint.to_json()?;
+        let fields: serde_json::Value =
+            serde_json::from_str(&json).map_err(|_| refused(SetupRefusalV1::InvalidShape))?;
+        let captured_at = fields["captured_at"]
+            .as_str()
+            .ok_or_else(|| refused(SetupRefusalV1::MissingEvidence))?;
+        let temporal = crate::WorkspaceCheckpointTemporalCaptureCore::new(
+            evidence.checkpoint().clone(),
+            crate::WorkspaceDateTimeV1::try_new(captured_at)
+                .map_err(|_| refused(SetupRefusalV1::InvalidShape))?,
+        );
+        let observed = crate::workspace_checkpoint_to_json(&temporal)
+            .map_err(|_| refused(SetupRefusalV1::InvalidShape))?;
+        let observed: serde_json::Value =
+            serde_json::from_str(&observed).map_err(|_| refused(SetupRefusalV1::InvalidShape))?;
+        if observed != fields {
+            return Err(refused(SetupRefusalV1::ConflictingReplay));
+        }
+        let attempt = self
+            .store
+            .reader()
+            .find_attempt(receipt.attempt_id())?
+            .ok_or_else(|| refused(SetupRefusalV1::MissingEvidence))?;
+        let record = receipts_state::FinalizationRecordV1 {
+            project_id: receipt.project_id().into(),
+            graph_id: attempt.graph_id().into(),
+            attempt_id: receipt.attempt_id().as_str().into(),
+            workspace_id: receipt.workspace_id().into(),
+            checkpoint_id: receipt.checkpoint_id().into(),
+            final_sha: evidence.final_sha().as_str().into(),
+            write_scope_verdict: "PASS".into(),
+            check_results: fields["executed_checks"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
+            output_refs,
+        };
+        self.persist_finalization(&record, finish)
+    }
+}
