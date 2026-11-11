@@ -41,6 +41,11 @@ impl RuntimeExecutionPolicy {
     pub fn protected_launch(&self) -> Option<&ProtectedLaunch> {
         self.protected.as_ref()
     }
+    pub(crate) fn fits_time_budget(&self, seconds: i64) -> bool {
+        u64::try_from(seconds).is_ok_and(|seconds| {
+            self.timeout.run_timeout() <= std::time::Duration::from_secs(seconds)
+        })
+    }
     /// True only when no mandatory constraint beyond timeout/read-only is
     /// requested; adapters refuse otherwise instead of prompt-only enforcement.
     pub fn supported(&self) -> bool {
@@ -50,5 +55,29 @@ impl RuntimeExecutionPolicy {
             && !self.session_persistence
             && self.turn_budget.is_none()
             && self.structured_output_schema.is_none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    #[test]
+    fn integer_time_budgets_never_round_up() {
+        let seconds = 9_007_199_254_740_993_i64;
+        let cap = Duration::from_secs(u64::try_from(seconds).unwrap());
+        let policy = RuntimeExecutionPolicy::new(
+            ProcessTimeoutPolicy::new(cap + Duration::from_nanos(1), Duration::from_secs(1))
+                .unwrap(),
+            false,
+        );
+        assert!(!policy.fits_time_budget(seconds));
+        let policy = RuntimeExecutionPolicy::new(
+            ProcessTimeoutPolicy::new(cap, Duration::from_secs(1)).unwrap(),
+            false,
+        );
+        assert!(policy.fits_time_budget(seconds));
+        assert!(!policy.fits_time_budget(0));
+        assert!(!policy.fits_time_budget(-1));
     }
 }

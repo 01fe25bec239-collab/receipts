@@ -24,7 +24,8 @@ a positive policy cap no larger than the capsule budget. Invalid schema JSON,
 missing controls and unsupported network/filesystem/sandbox constraints refuse
 before worker launch. Codex continues refusing turn/schema constraints at the
 adapter boundary; no unsupported enforcement is claimed. Workspace owns process
-timeouts, output capture, cancellation and cleanup for both providers.
+timeouts, output capture, cancellation and cleanup for both providers. Capsule
+time limits use exact Duration comparisons, including very large integer limits.
 
 Session persistence is off by default. With explicit opt-in, an eligible Claude
 task may issue an opaque ticket after successful process and provider collection.

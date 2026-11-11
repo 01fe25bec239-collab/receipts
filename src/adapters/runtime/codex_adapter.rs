@@ -194,7 +194,7 @@ fn prompt(
                 || c.cost_policy().is_some()
                 || !c.required_capabilities().is_empty()
                 || c.time_budget_seconds()
-                    .is_some_and(|s| policy.timeout.run_timeout().as_secs_f64() > s as f64)
+                    .is_some_and(|s| !policy.fits_time_budget(s))
             {
                 return Err(FailureClass::PolicyBlocked);
             }
