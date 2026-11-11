@@ -96,6 +96,48 @@ pub fn project_persisted_current_graph_v1(
     expected_project_id: &str,
     expected_graph_id: &str,
 ) -> Result<GraphSnapshot, GraphSnapshotProjectionErrorV1> {
+    project_graph(persisted, expected_project_id, expected_graph_id).map(|(snapshot, _)| snapshot)
+}
+
+/// Read-only topology and snapshot from the same verified State projection.
+/// No constructor permits a caller to combine independently sourced edges.
+pub struct ReadOnlyGraphViewV1 {
+    project_id: String,
+    snapshot: GraphSnapshot,
+    edges: Vec<GraphEdge>,
+}
+impl ReadOnlyGraphViewV1 {
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+    pub fn snapshot(&self) -> &GraphSnapshot {
+        &self.snapshot
+    }
+    pub fn edges(&self) -> &[GraphEdge] {
+        &self.edges
+    }
+}
+
+pub fn project_persisted_graph_view_v1(
+    persisted: &PersistedCurrentGraphV1,
+    expected_project_id: &str,
+    expected_graph_id: &str,
+) -> Result<ReadOnlyGraphViewV1, GraphSnapshotProjectionErrorV1> {
+    let (snapshot, graph) = project_graph(persisted, expected_project_id, expected_graph_id)?;
+    let mut edges = graph.edges().cloned().collect::<Vec<_>>();
+    edges.sort_by(|a, b| a.edge_id().as_bytes().cmp(b.edge_id().as_bytes()));
+    Ok(ReadOnlyGraphViewV1 {
+        project_id: expected_project_id.into(),
+        snapshot,
+        edges,
+    })
+}
+
+fn project_graph(
+    persisted: &PersistedCurrentGraphV1,
+    expected_project_id: &str,
+    expected_graph_id: &str,
+) -> Result<(GraphSnapshot, ExecutionGraph), GraphSnapshotProjectionErrorV1> {
     if persisted.project_id() != expected_project_id || persisted.graph_id() != expected_graph_id {
         return Err(Error::IdentityMismatch);
     }
@@ -146,6 +188,7 @@ pub fn project_persisted_current_graph_v1(
         Some(digest),
         None,
     )
+    .map(|snapshot| (snapshot, graph))
     .map_err(invalid)
 }
 

@@ -69,7 +69,7 @@ impl SqliteStateRepository {
         Ok(repo)
     }
 
-    /// Explicitly upgrades an exact v11–v22 State database to v23.
+    /// Explicitly upgrades an exact v11–v23 State database to v24.
     pub(crate) fn migrate_existing_to_current(path: impl AsRef<Path>) -> Result<u32, StateError> {
         let mut conn =
             Connection::open_with_flags(path.as_ref(), OpenFlags::SQLITE_OPEN_READ_WRITE)
@@ -104,26 +104,35 @@ impl SqliteStateRepository {
                 migrations::v0021_publication_claims::apply(&conn)?;
                 migrations::v0022_order_and_seal::apply(&conn)?;
                 migrations::v0023_graph_publication_identity::apply(&conn)?;
-                return Ok(23);
+                migrations::v0024_wave3_setup::apply(&conn)?;
+                return Ok(24);
             }
             Some(20) => {
                 migrations::v0021_publication_claims::apply(&conn)?;
                 migrations::v0022_order_and_seal::apply(&conn)?;
                 migrations::v0023_graph_publication_identity::apply(&conn)?;
-                return Ok(23);
+                migrations::v0024_wave3_setup::apply(&conn)?;
+                return Ok(24);
             }
             Some(21) => {
                 migrations::v0022_order_and_seal::apply(&conn)?;
                 migrations::v0023_graph_publication_identity::apply(&conn)?;
-                return Ok(23);
+                migrations::v0024_wave3_setup::apply(&conn)?;
+                return Ok(24);
             }
             Some(22) => {
                 migrations::v0023_graph_publication_identity::apply(&conn)?;
-                return Ok(23);
+                migrations::v0024_wave3_setup::apply(&conn)?;
+                return Ok(24);
             }
             Some(23) => {
+                graph_repository::verify_v23(&conn, GraphPhase::Migration)?;
+                migrations::v0024_wave3_setup::apply(&conn)?;
+                return Ok(24);
+            }
+            Some(24) => {
                 graph_repository::verify_current(&conn, GraphPhase::Migration)?;
-                return Ok(23);
+                return Ok(24);
             }
             // v1–v10 and unknown heads are typed unsupported legacy: no
             // automatic migration and no corruption misclassification.
@@ -162,7 +171,8 @@ impl SqliteStateRepository {
         migrations::v0021_publication_claims::apply(&conn)?;
         migrations::v0022_order_and_seal::apply(&conn)?;
         migrations::v0023_graph_publication_identity::apply(&conn)?;
-        Ok(23)
+        migrations::v0024_wave3_setup::apply(&conn)?;
+        Ok(24)
     }
 
     /// Version-reconciliation core of [`Self::open`], parameterized by the
@@ -617,6 +627,10 @@ fn bootstrap(conn: &mut Connection, chain: &[Migration]) -> Result<(), StateErro
         }
         if migration.version == 23 && migration.name == "graph_publication_identity" {
             migrations::v0023_graph_publication_identity::apply(conn)?;
+            continue;
+        }
+        if migration.version == 24 && migration.name == "wave3_setup" {
+            migrations::v0024_wave3_setup::apply(conn)?;
             continue;
         }
         let tx = conn

@@ -109,6 +109,31 @@ impl LiveProcessOutput {
     }
 }
 
+/// An attempt-bound bounded snapshot taken before requesting explicit cancel.
+/// Holding this value never delays timeout, Drop, completion or fault cleanup.
+/// It proves no durable write and grants no workspace reset authority.
+/// Snapshot each output artifact honestly: running captures have no full digest.
+pub struct LiveProcessCancellationPreparation {
+    lifecycle: Arc<Mutex<Lifecycle>>,
+    output: LiveProcessOutput,
+    deadline: std::time::Instant,
+}
+impl LiveProcessCancellationPreparation {
+    pub fn output(&self) -> &LiveProcessOutput {
+        &self.output
+    }
+    pub fn deadline(&self) -> std::time::Instant {
+        self.deadline
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveProcessPreparedCancelAcceptance {
+    CancelAccepted,
+    AlreadyTerminalOrTerminating,
+    PreparationExpired,
+    ForeignAttempt,
+}
+
 /// Immutable terminal evidence, constructible only after verified reap and reader joins.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveProcessOutcome {
@@ -193,12 +218,61 @@ pub struct LiveProcessAttempt {
     stdout: Retention,
     stderr: Retention,
     controller: Mutex<Option<Controller>>,
+    deadline: std::time::Instant,
 }
 impl LiveProcessAttempt {
     /// Bounded copies (at most the existing per-stream capture limit each).
     /// Valid while running, terminating, terminal, and after collection.
     pub fn snapshot_output(&self) -> Result<LiveProcessOutput, ExecutionError> {
         snapshot(&self.stdout, &self.stderr, false)
+    }
+    /// Opt-in split boundary: capture and persist outside the lifecycle lock,
+    /// then call cancel_prepared. None means terminal/deadline already won.
+    /// External persistence may fail or stall; the controller never waits on it.
+    pub fn prepare_cancellation(
+        &self,
+    ) -> Result<Option<LiveProcessCancellationPreparation>, ExecutionError> {
+        let available = || {
+            let state = lock(&self.lifecycle);
+            !state.closed && state.cause.is_none() && std::time::Instant::now() < self.deadline
+        };
+        if !available() {
+            return Ok(None);
+        }
+        let output = self.snapshot_output()?;
+        if !available() {
+            return Ok(None);
+        }
+        Ok(Some(LiveProcessCancellationPreparation {
+            lifecycle: self.lifecycle.clone(),
+            output,
+            deadline: self.deadline,
+        }))
+    }
+    /// Requests explicit cancellation only for this attempt's unexpired capture.
+    /// A lost race invalidates pre-cleanup ordering; retain the capture as evidence
+    /// and reconcile. The caller reports persistence failure separately and may
+    /// still request cancel; persistence never controls owned-process cleanup.
+    pub fn cancel_prepared(
+        &self,
+        preparation: &LiveProcessCancellationPreparation,
+    ) -> LiveProcessPreparedCancelAcceptance {
+        use LiveProcessPreparedCancelAcceptance as A;
+        if !Arc::ptr_eq(&self.lifecycle, &preparation.lifecycle) {
+            return A::ForeignAttempt;
+        }
+        let mut state = lock(&self.lifecycle);
+        if state.closed || state.cause.is_some() {
+            return A::AlreadyTerminalOrTerminating;
+        }
+        if std::time::Instant::now() >= preparation.deadline {
+            return A::PreparationExpired;
+        }
+        if state.claim(LiveProcessTerminalCause::Cancelled) {
+            A::CancelAccepted
+        } else {
+            A::AlreadyTerminalOrTerminating
+        }
     }
     /// Claim cancellation; cleanup runs exactly once on the owning controller.
     pub fn cancel(&self) -> LiveProcessCancelAcceptance {
@@ -642,6 +716,7 @@ mod platform {
                 stdout,
                 stderr,
                 controller: Mutex::new(Some(controller)),
+                deadline,
             }),
             _ => match controller.join() {
                 Ok(Err(error)) => Err(error.into()),

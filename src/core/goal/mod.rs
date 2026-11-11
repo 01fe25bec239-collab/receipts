@@ -408,3 +408,6 @@ impl DeterministicGoalEvaluationCore {
 
 #[cfg(test)]
 mod tests;
+
+pub mod persistence;
+pub use persistence::GoalPersistencePortV1;

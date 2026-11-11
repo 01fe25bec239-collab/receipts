@@ -1166,3 +1166,115 @@ fn projection_never_mutates_input_projection_schema_or_watermark() {
         "refused watermark changed"
     );
 }
+
+#[test]
+fn read_only_view_binds_topology_snapshot_and_digest_and_core_goal_port_reopens() {
+    use crate::goal::persistence::*;
+    use receipts_state::{
+        ContextEpoch, ContextEpochTrigger, StateEpochValueV1, StateWriteOperationV1,
+        StateWriteSubjectV1, TrustedCoreStore,
+    };
+    let store = Store::new();
+    let fixture = field_base("p");
+    let digest = fixture.reference_digest();
+    let persisted = store.persist(&fixture, &digest);
+    let view = project_persisted_graph_view_v1(&persisted, "p", "g")
+        .unwrap_or_else(|_| panic!("view refused"));
+    assert_eq!(view.project_id(), "p");
+    assert!(view.snapshot() == &fixture.expected(&digest));
+    assert_eq!(view.edges().len(), fixture.edges.len());
+    for (edge, stored) in view.edges().iter().zip(persisted.edges()) {
+        assert_eq!(edge.edge_id(), stored.edge_id());
+        assert_eq!(edge.from_node(), stored.from_node());
+        assert_eq!(edge.to_node(), stored.to_node());
+    }
+    assert!(matches!(
+        project_persisted_graph_view_v1(&persisted, "foreign", "g"),
+        Err(E::IdentityMismatch)
+    ));
+    let tampered = Store::new();
+    let wrong = tampered.persist(&fixture, &"0".repeat(64));
+    assert!(matches!(
+        project_persisted_graph_view_v1(&wrong, "p", "g"),
+        Err(E::DigestMismatch)
+    ));
+    let mut writer = TrustedCoreStore::open_exclusive(&store.0).unwrap();
+    let auth = writer.admit(StateWriteSubjectV1 {
+        operation: StateWriteOperationV1::ContextEpoch,
+        project_id: "p".into(),
+        graph_id: None,
+        source_ref: None,
+        compiler_id: None,
+        policy_id: None,
+    });
+    writer
+        .append_context_epoch(
+            auth,
+            ContextEpoch {
+                project_id: "p".into(),
+                epoch: StateEpochValueV1::try_from("0").unwrap(),
+                advanced_at: "opaque".into(),
+                trigger: ContextEpochTrigger::A1Init,
+            },
+        )
+        .unwrap();
+    let definition = GoalDefinitionV1 {
+        project_id: "p".into(),
+        goal_id: persisted.goal_id().into(),
+        graph_id: "g".into(),
+        spec_ref: "artifact:verbatim".into(),
+        spec_sha256: "b".repeat(64),
+        dispatch_limit: "2".into(),
+    };
+    assert_eq!(
+        GoalPersistencePortV1::create_goal(&mut writer, &definition, "0").unwrap(),
+        SetupWriteOutcomeV1::Applied
+    );
+    let request = GoalDispatchV1 {
+        project_id: "p".into(),
+        goal_id: definition.goal_id.clone(),
+        dispatch_id: "dispatch".into(),
+        expected_revision: "0".into(),
+        context_epoch: "0".into(),
+        graph_version: "1".into(),
+    };
+    let start = AttemptStart::new(
+        receipts_state::AttemptId::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
+        "p",
+        "g",
+        view.snapshot().node_states()[0].node_id(),
+        "1",
+        receipts_state::AttemptRole::RuntimeA3,
+        "runtime",
+        "workspace",
+        &"a".repeat(40),
+        "2026-11-11T00:00:00.000000000Z",
+    )
+    .unwrap();
+    assert_eq!(
+        writer.reserve_dispatch(&request, &start).unwrap(),
+        SetupWriteOutcomeV1::Applied
+    );
+    drop(writer);
+    let mut writer = TrustedCoreStore::open_exclusive(&store.0).unwrap();
+    assert_eq!(
+        writer.reserve_dispatch(&request, &start).unwrap(),
+        SetupWriteOutcomeV1::Replayed
+    );
+    assert_eq!(
+        writer
+            .load_goal("p", &definition.goal_id)
+            .unwrap()
+            .unwrap()
+            .dispatches_used,
+        "1"
+    );
+    assert_eq!(
+        writer
+            .load_dispatch("p", "dispatch")
+            .unwrap()
+            .unwrap()
+            .resolution,
+        None
+    );
+}

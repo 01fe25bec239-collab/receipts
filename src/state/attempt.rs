@@ -139,6 +139,23 @@ impl AttemptStart {
     pub fn graph_id(&self) -> &str {
         &self.graph_id
     }
+    pub(crate) fn canonical(&self) -> serde_json::Value {
+        serde_json::json!([
+            self.attempt_id.as_str(),
+            self.project_id,
+            self.graph_id,
+            self.node_id,
+            self.attempt_number,
+            self.role.as_str(),
+            self.runtime_ref,
+            self.workspace_id,
+            self.start_sha,
+            self.started_at.as_str()
+        ])
+    }
+    pub fn attempt_id(&self) -> &AttemptId {
+        &self.attempt_id
+    }
     /// `attempt_number` is a positive decimal of any length; `start_sha` is a
     /// lowercase 40-hex Git SHA; `started_at` is a canonical UTC timestamp.
     /// `runtime_ref` is opaque and preserved exactly; it grants no admission or authority.
@@ -194,6 +211,18 @@ impl AttemptFinish {
     pub fn attempt_id(&self) -> &AttemptId {
         &self.attempt_id
     }
+    pub(crate) fn canonical(&self) -> serde_json::Value {
+        serde_json::json!([
+            self.attempt_id.as_str(),
+            self.ended_at.as_str(),
+            self.end_sha,
+            self.outcome_ref,
+            self.failure_class
+        ])
+    }
+    pub(crate) fn successful_at(&self, sha: &str) -> bool {
+        self.failure_class.is_none() && self.end_sha.as_deref() == Some(sha)
+    }
     /// Optional strings are opaque and preserved exactly, including empty values.
     /// Callers must supply references/classes rather than raw output or error text.
     pub fn new(
@@ -228,6 +257,13 @@ pub struct AttemptRecord {
     finish: Option<AttemptFinish>,
 }
 impl AttemptRecord {
+    pub(crate) fn start_canonical(&self) -> serde_json::Value {
+        self.start.canonical()
+    }
+    pub(crate) fn finish_canonical(&self) -> Option<serde_json::Value> {
+        self.finish.as_ref().map(AttemptFinish::canonical)
+    }
+
     pub fn attempt_id(&self) -> &AttemptId {
         &self.start.attempt_id
     }
@@ -402,25 +438,7 @@ fn write<T>(
 impl SqliteStateRepository {
     /// Appends the immutable start row of an attempt. A repeated `attempt_id` is refused.
     pub(crate) fn append_attempt_started(&mut self, start: AttemptStart) -> Result<(), StateError> {
-        write(self.connection(), |conn| {
-            let duplicate: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM attempt_started WHERE attempt_id=?1",
-                    [start.attempt_id.as_str()],
-                    |r| r.get(0),
-                )
-                .map_err(sqlite_error)?;
-            if duplicate != 0 {
-                return Err(failure(Code::DuplicateStart, None));
-            }
-            conn.execute(
-                "INSERT INTO attempt_started(attempt_id,project_id,graph_id,node_id,attempt_number,role,runtime_ref,workspace_id,start_sha,started_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-                params![start.attempt_id.as_str(), start.project_id, start.graph_id, start.node_id, start.attempt_number,
-                    start.role.as_str(), start.runtime_ref, start.workspace_id, start.start_sha, start.started_at.as_str()],
-            )
-            .map_err(sqlite_error)?;
-            Ok(())
-        })
+        write(self.connection(), |conn| insert_start_in_tx(conn, &start))
     }
 
     /// Appends the immutable finish row of a started attempt. A finish without
@@ -430,47 +448,7 @@ impl SqliteStateRepository {
         &mut self,
         finish: AttemptFinish,
     ) -> Result<(), StateError> {
-        write(self.connection(), |conn| {
-            let started: Option<String> = conn
-                .query_row(
-                    "SELECT started_at FROM attempt_started WHERE attempt_id=?1",
-                    [finish.attempt_id.as_str()],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(sqlite_error)?;
-            let Some(started) = started else {
-                return Err(failure(Code::UnknownAttempt, Some(Field::AttemptId)));
-            };
-            let same: Option<bool> = conn
-                .query_row(
-                    "SELECT ended_at IS ?2 AND end_sha IS ?3 AND outcome_ref IS ?4 AND failure_class IS ?5 FROM attempt_finished WHERE attempt_id=?1",
-                    params![finish.attempt_id.as_str(), finish.ended_at.as_str(), finish.end_sha, finish.outcome_ref, finish.failure_class],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(sqlite_error)?;
-            if let Some(same) = same {
-                return Err(failure(
-                    if same {
-                        Code::DuplicateFinish
-                    } else {
-                        Code::ConflictingFinish
-                    },
-                    None,
-                ));
-            }
-            let started = CanonicalTimestampV1::parse(&started).map_err(|_| corrupt())?;
-            if finish.ended_at.cmp(&started) == Ordering::Less {
-                return Err(invalid(Field::EndedAt));
-            }
-            conn.execute(
-                "INSERT INTO attempt_finished(attempt_id,ended_at,end_sha,outcome_ref,failure_class) VALUES (?1,?2,?3,?4,?5)",
-                params![finish.attempt_id.as_str(), finish.ended_at.as_str(), finish.end_sha, finish.outcome_ref, finish.failure_class],
-            )
-            .map_err(sqlite_error)?;
-            Ok(())
-        })
+        write(self.connection(), |conn| insert_finish_in_tx(conn, &finish))
     }
 
     /// Reads one attempt by identity, or `None` when it was never started.
@@ -583,4 +561,86 @@ fn read<T>(
             Err(e)
         }
     }
+}
+
+pub(crate) fn insert_start_in_tx(
+    conn: &Connection,
+    start: &AttemptStart,
+) -> Result<(), StateError> {
+    let duplicate: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM attempt_started WHERE attempt_id=?1",
+            [start.attempt_id.as_str()],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    if duplicate != 0 {
+        return Err(failure(Code::DuplicateStart, None));
+    }
+    conn.execute(
+                "INSERT INTO attempt_started(attempt_id,project_id,graph_id,node_id,attempt_number,role,runtime_ref,workspace_id,start_sha,started_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                params![start.attempt_id.as_str(), start.project_id, start.graph_id, start.node_id, start.attempt_number,
+                    start.role.as_str(), start.runtime_ref, start.workspace_id, start.start_sha, start.started_at.as_str()],
+            )
+            .map_err(sqlite_error)?;
+    Ok(())
+}
+
+pub(crate) fn insert_finish_in_tx(
+    conn: &Connection,
+    finish: &AttemptFinish,
+) -> Result<(), StateError> {
+    let started: Option<String> = conn
+        .query_row(
+            "SELECT started_at FROM attempt_started WHERE attempt_id=?1",
+            [finish.attempt_id.as_str()],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some(started) = started else {
+        return Err(failure(Code::UnknownAttempt, Some(Field::AttemptId)));
+    };
+    let same: Option<bool> = conn
+                .query_row(
+                    "SELECT ended_at IS ?2 AND end_sha IS ?3 AND outcome_ref IS ?4 AND failure_class IS ?5 FROM attempt_finished WHERE attempt_id=?1",
+                    params![finish.attempt_id.as_str(), finish.ended_at.as_str(), finish.end_sha, finish.outcome_ref, finish.failure_class],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(sqlite_error)?;
+    if let Some(same) = same {
+        return Err(failure(
+            if same {
+                Code::DuplicateFinish
+            } else {
+                Code::ConflictingFinish
+            },
+            None,
+        ));
+    }
+    let started = CanonicalTimestampV1::parse(&started).map_err(|_| corrupt())?;
+    if finish.ended_at.cmp(&started) == Ordering::Less {
+        return Err(invalid(Field::EndedAt));
+    }
+    conn.execute(
+                "INSERT INTO attempt_finished(attempt_id,ended_at,end_sha,outcome_ref,failure_class) VALUES (?1,?2,?3,?4,?5)",
+                params![finish.attempt_id.as_str(), finish.ended_at.as_str(), finish.end_sha, finish.outcome_ref, finish.failure_class],
+            )
+            .map_err(sqlite_error)?;
+    Ok(())
+}
+
+pub(crate) fn read_attempt_in_tx(
+    conn: &Connection,
+    id: &AttemptId,
+) -> Result<Option<AttemptRecord>, StateError> {
+    conn.query_row(
+        &format!("{SELECT_JOINED} WHERE s.attempt_id=?1"),
+        [id.as_str()],
+        |r| Ok(decode(r)),
+    )
+    .optional()
+    .map_err(sqlite_error)?
+    .transpose()
 }

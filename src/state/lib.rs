@@ -259,3 +259,12 @@ mod output_ref_tests;
 
 #[cfg(test)]
 mod row_identity_tests;
+
+pub mod wave3_setup;
+pub use wave3_setup::{
+    FinalizationRecordV1, GoalDefinitionV1, GoalDispatchRecordV1, GoalDispatchV1, GoalProgressV1,
+    GoalRecordV1, LaunchResolutionV1, SetupRefusalV1, SetupWriteOutcomeV1,
+};
+
+#[cfg(test)]
+mod wave3_setup_tests;

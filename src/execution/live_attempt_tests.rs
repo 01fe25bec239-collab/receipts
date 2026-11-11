@@ -707,3 +707,106 @@ fn live_eof_boundary_wedged_reader_is_typed_through_wait_collect() {
         eof_boundary_case(&[finished], true);
     }
 }
+
+#[test]
+fn prepared_cancel_keeps_capture_and_rejects_foreign_attempt_without_cancelling_it() {
+    let ws = Workspace::new();
+    ws.write("stderr-bytes", b"23");
+    let attempt = ws.start(LIMIT);
+    ws.ready();
+    until(|| attempt.snapshot_output().unwrap().stderr().total_bytes() == 23);
+    let prepared = attempt.prepare_cancellation().unwrap().unwrap();
+    let other_ws = Workspace::new();
+    let other = other_ws.start(LIMIT);
+    other_ws.ready();
+    assert_eq!(
+        other.cancel_prepared(&prepared),
+        LiveProcessPreparedCancelAcceptance::ForeignAttempt
+    );
+    assert_eq!(other.terminal_cause(), None);
+    // A failed persistence operation cannot keep cancellation from cleaning up.
+    use crate::{AttemptEvidenceSinkV1, TrustedAttemptEvidenceSinkV1};
+    use std::os::unix::fs::DirBuilderExt;
+    let state_dir = ws.0.join("state");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&state_dir)
+        .unwrap();
+    let mut store =
+        receipts_state::TrustedCoreStore::open_exclusive(state_dir.join("state.db")).unwrap();
+    let checkpoint=receipts_state::CheckpointRecord::parse_json("p",&serde_json::json!({
+        "checkpoint_id":"pre-cancel","workspace_id":"w","attempt_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "head_sha":"a".repeat(40),"captured_at":"2026-11-11T00:00:00Z","kind":"PRE_TERMINATION"
+    }).to_string()).unwrap();
+    // No admitted attempt exists: the real trusted sink must refuse this write.
+    let persistence =
+        TrustedAttemptEvidenceSinkV1::new(&mut store).persist_checkpoint(&checkpoint, &[]);
+    assert!(matches!(
+        persistence,
+        Err(receipts_state::StateError::SetupRefused {
+            reason: receipts_state::SetupRefusalV1::MissingEvidence
+        })
+    ));
+    assert!(
+        store
+            .reader()
+            .find_checkpoint("p", "pre-cancel")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        attempt.cancel_prepared(&prepared),
+        LiveProcessPreparedCancelAcceptance::CancelAccepted
+    );
+    outcome(&attempt, LiveProcessTerminalCause::Cancelled, false);
+    assert_eq!(prepared.output().stderr().head(), &[b'E'; 23]);
+    assert_eq!(
+        attempt.cancel_prepared(&prepared),
+        LiveProcessPreparedCancelAcceptance::AlreadyTerminalOrTerminating
+    );
+    assert!(attempt.prepare_cancellation().unwrap().is_none());
+    prove_empty(&ws, caller_process_group());
+    drop(other);
+    prove_empty(&other_ws, caller_process_group());
+}
+
+#[test]
+fn persistence_without_ack_never_delays_timeout_or_drop_cleanup() {
+    let ws = Workspace::new();
+    ws.write("ignore", b"1");
+    let attempt = ws.start(Duration::from_millis(300));
+    ws.ready();
+    let prepared = attempt.prepare_cancellation().unwrap().unwrap();
+    let result = outcome(&attempt, LiveProcessTerminalCause::TimedOut, true);
+    assert!(!result.success());
+    assert_eq!(
+        attempt.cancel_prepared(&prepared),
+        LiveProcessPreparedCancelAcceptance::AlreadyTerminalOrTerminating
+    );
+    prove_empty(&ws, caller_process_group());
+    let ws = Workspace::new();
+    let attempt = ws.start(LIMIT);
+    ws.ready();
+    let _prepared = attempt.prepare_cancellation().unwrap().unwrap();
+    drop(attempt);
+    prove_empty(&ws, caller_process_group());
+}
+
+#[test]
+fn prepared_cancel_expiry_cannot_steal_the_timeout_claim() {
+    let ws = Workspace::new();
+    let (arrived, release) = gate(&BEFORE_MONITOR);
+    let attempt = ws.start(Duration::from_millis(200));
+    arrive(&arrived);
+    ws.ready();
+    let prepared = attempt.prepare_cancellation().unwrap().unwrap();
+    until(|| Instant::now() >= prepared.deadline());
+    assert_eq!(
+        attempt.cancel_prepared(&prepared),
+        LiveProcessPreparedCancelAcceptance::PreparationExpired
+    );
+    assert_eq!(attempt.terminal_cause(), None);
+    release.send(()).unwrap();
+    outcome(&attempt, LiveProcessTerminalCause::TimedOut, false);
+    prove_empty(&ws, caller_process_group());
+}

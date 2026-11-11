@@ -546,7 +546,7 @@ fn v16_store_migrates_to_v17_preserving_rows_and_rejects_partial_v17() {
     drop(conn);
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).unwrap(),
-        23
+        24
     );
     let repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
     assert_eq!(repo.count_table_rows("logical_role").unwrap(), 1);
@@ -923,6 +923,7 @@ pub(crate) fn remove_v18(conn: &Connection) {
 }
 
 pub(crate) fn remove_v22(conn: &Connection) {
+    crate::wave3_setup_tests::remove_v24(conn);
     conn.execute_batch("DROP TABLE IF EXISTS graph_publication_identity; DELETE FROM state_schema_version WHERE version=23;").unwrap();
     let head: i64 = conn
         .query_row("SELECT MAX(version) FROM state_schema_version", [], |r| {

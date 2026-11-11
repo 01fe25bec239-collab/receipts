@@ -715,6 +715,7 @@ dependencies = [
 name = "receipts-workspace-execution"
 version = "0.1.0"
 dependencies = [
+ "receipts-state",
  "serde",
  "serde_json",
  "sha2",

@@ -191,20 +191,20 @@ fn t01_fresh_database_bootstraps_to_schema_version_7() {
     let registered = migrations::registered();
     assert_eq!(
         registered.len(),
-        23,
+        24,
         "exactly twenty-one registered migrations may exist"
     );
     assert_eq!(
         registered.last().expect("chain is non-empty").version,
-        23,
-        "the registered chain must end at version 23"
+        24,
+        "the registered chain must end at version 24"
     );
     let tmp = TempDir::new("ce-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 23);
+    assert_eq!(repo.schema_version().expect("version read"), 24);
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        23,
+        24,
         "one metadata row per applied migration"
     );
 }
@@ -215,10 +215,10 @@ fn t02_version_7_database_reopens_idempotently() {
     let tmp = TempDir::new("ce-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 23);
+        assert_eq!(repo.schema_version().expect("version read"), 24);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            23,
+            24,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -241,7 +241,7 @@ fn t03_ordinary_open_of_version_6_fails_closed() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 6,
-                supported: 23
+                supported: 24
             }
         ),
         "unexpected error: {error}"
@@ -361,6 +361,10 @@ fn t04_migration_v7_creates_exactly_the_authorized_schema() {
         "context_rehydration_order",
         "review_claim_seal",
         "graph_publication_identity",
+        "goal_history",
+        "goal_dispatch",
+        "goal_dispatch_resolution",
+        "attempt_finalization",
     ];
     expected.sort_unstable();
     assert_eq!(
@@ -2015,10 +2019,10 @@ fn changed_sources_v10_to_v11_legacy_is_uncaptured_and_four_field_reads_survive(
     drop(repo);
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).expect("v11 -> v13"),
-        23
+        24
     );
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("v13 reopen");
-    assert_eq!(repo.schema_version().expect("version"), 23);
+    assert_eq!(repo.schema_version().expect("version"), 24);
     assert_eq!(
         repo.count_table_rows("context_epoch_changed_source")
             .expect("children"),

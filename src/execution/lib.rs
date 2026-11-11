@@ -106,8 +106,10 @@ mod timeout_tests;
 mod capture_tests;
 
 pub use live_attempt::{
-    LiveProcessAttempt, LiveProcessAttemptError, LiveProcessCancelAcceptance, LiveProcessOutcome,
-    LiveProcessOutput, LiveProcessStartError, LiveProcessTerminalCause, start_live_process_attempt,
+    LiveProcessAttempt, LiveProcessAttemptError, LiveProcessCancelAcceptance,
+    LiveProcessCancellationPreparation, LiveProcessOutcome, LiveProcessOutput,
+    LiveProcessPreparedCancelAcceptance, LiveProcessStartError, LiveProcessTerminalCause,
+    start_live_process_attempt,
 };
 
 #[cfg(any(target_os = "linux", test))]
