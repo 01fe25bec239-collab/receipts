@@ -11,7 +11,9 @@ mod evaluator;
 mod provider_policy_eligibility;
 
 pub use date_time::{ModelRoutingDateTimeV1, ModelRoutingDateTimeV1Error};
-pub use date_time_order::{ModelRoutingDateTimeComparisonError, compare_instants};
+pub use date_time_order::{
+    ModelRoutingDateTimeComparisonError, compare_instants, elapsed_whole_seconds,
+};
 pub use evaluator::PolicyEligibilityEvaluator;
 pub use provider_policy_eligibility::{
     PolicyEvidenceLabel, PolicyStatus, ProviderPolicyEligibility, ProviderPolicyEligibilityError,

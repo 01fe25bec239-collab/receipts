@@ -1,0 +1,15 @@
+{
+  "request_id": "r",
+  "role": "RENDERER",
+  "task_class": "PRESENTATION_ONLY",
+  "quality_floor": "ECONOMY",
+  "required_capabilities": [
+    "render"
+  ],
+  "constraints": {
+    "max_cost": null
+  },
+  "context_size_hint": null,
+  "deadline": null,
+  "preferred_capabilities": []
+}

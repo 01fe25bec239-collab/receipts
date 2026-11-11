@@ -1,0 +1,10 @@
+{
+  "provider_id": "prov-a",
+  "quota_scope": "UNKNOWN",
+  "limit": null,
+  "remaining": null,
+  "resets_at": null,
+  "retry_after_seconds": null,
+  "visibility": "UNKNOWN",
+  "observed_at": "2026-11-08T10:00:00Z"
+}

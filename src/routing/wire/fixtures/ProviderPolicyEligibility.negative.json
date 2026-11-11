@@ -1,0 +1,171 @@
+[
+  {
+    "case": "not_json",
+    "raw": "{",
+    "error": "Json"
+  },
+  {
+    "case": "trailing_input",
+    "raw": "{\"provider_id\": \"p\", \"runtime_id\": \"r\", \"credential_mode\": \"HOST_NATIVE\", \"technical_status\": \"UNKNOWN\", \"policy_status\": \"UNKNOWN\", \"verified_at\": \"2026-11-08T10:00:00Z\", \"evidence_label\": \"UNVERIFIED\"} {}",
+    "error": "Json"
+  },
+  {
+    "case": "not_an_object",
+    "document": [
+      {
+        "provider_id": "p",
+        "runtime_id": "r",
+        "credential_mode": "HOST_NATIVE",
+        "technical_status": "UNKNOWN",
+        "policy_status": "UNKNOWN",
+        "verified_at": "2026-11-08T10:00:00Z",
+        "evidence_label": "UNVERIFIED"
+      }
+    ],
+    "error": "Shape"
+  },
+  {
+    "case": "unknown_field",
+    "document": {
+      "provider_id": "p",
+      "runtime_id": "r",
+      "credential_mode": "HOST_NATIVE",
+      "technical_status": "UNKNOWN",
+      "policy_status": "UNKNOWN",
+      "verified_at": "2026-11-08T10:00:00Z",
+      "evidence_label": "UNVERIFIED",
+      "x_unknown": 1
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "duplicate_key",
+    "raw": "{\"provider_id\": \"p\", \"runtime_id\": \"r\", \"credential_mode\": \"HOST_NATIVE\", \"technical_status\": \"UNKNOWN\", \"policy_status\": \"UNKNOWN\", \"verified_at\": \"2026-11-08T10:00:00Z\", \"evidence_label\": \"UNVERIFIED\", \"provider_id\": \"p\"}",
+    "error": "Shape"
+  },
+  {
+    "case": "missing_evidence_label",
+    "document": {
+      "provider_id": "prov-a",
+      "runtime_id": "rt-a",
+      "credential_mode": "USER_API",
+      "technical_status": "CONNECTED",
+      "policy_status": "VERIFIED_ALLOWED",
+      "allowed_execution_contexts": [
+        "LOCAL_EXTERNAL_WORKER"
+      ],
+      "verified_at": "2026-11-08T10:00:00Z",
+      "evidence_source": "https://example.invalid/terms",
+      "terms_version_or_digest": "v1",
+      "reason": "user API key",
+      "reverification_deadline": "2026-12-01T00:00:00Z",
+      "source_claim_id": "C-10"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "bad_policy_status",
+    "document": {
+      "provider_id": "prov-a",
+      "runtime_id": "rt-a",
+      "credential_mode": "USER_API",
+      "technical_status": "CONNECTED",
+      "policy_status": "ALLOWED",
+      "allowed_execution_contexts": [
+        "LOCAL_EXTERNAL_WORKER"
+      ],
+      "verified_at": "2026-11-08T10:00:00Z",
+      "evidence_source": "https://example.invalid/terms",
+      "evidence_label": "VERIFIED_CURRENT_SELF_FETCHED",
+      "terms_version_or_digest": "v1",
+      "reason": "user API key",
+      "reverification_deadline": "2026-12-01T00:00:00Z",
+      "source_claim_id": "C-10"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "empty_credential_mode",
+    "document": {
+      "provider_id": "prov-a",
+      "runtime_id": "rt-a",
+      "credential_mode": "",
+      "technical_status": "CONNECTED",
+      "policy_status": "VERIFIED_ALLOWED",
+      "allowed_execution_contexts": [
+        "LOCAL_EXTERNAL_WORKER"
+      ],
+      "verified_at": "2026-11-08T10:00:00Z",
+      "evidence_source": "https://example.invalid/terms",
+      "evidence_label": "VERIFIED_CURRENT_SELF_FETCHED",
+      "terms_version_or_digest": "v1",
+      "reason": "user API key",
+      "reverification_deadline": "2026-12-01T00:00:00Z",
+      "source_claim_id": "C-10"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "empty_execution_context",
+    "document": {
+      "provider_id": "prov-a",
+      "runtime_id": "rt-a",
+      "credential_mode": "USER_API",
+      "technical_status": "CONNECTED",
+      "policy_status": "VERIFIED_ALLOWED",
+      "allowed_execution_contexts": [
+        ""
+      ],
+      "verified_at": "2026-11-08T10:00:00Z",
+      "evidence_source": "https://example.invalid/terms",
+      "evidence_label": "VERIFIED_CURRENT_SELF_FETCHED",
+      "terms_version_or_digest": "v1",
+      "reason": "user API key",
+      "reverification_deadline": "2026-12-01T00:00:00Z",
+      "source_claim_id": "C-10"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "null_reason",
+    "document": {
+      "provider_id": "prov-a",
+      "runtime_id": "rt-a",
+      "credential_mode": "USER_API",
+      "technical_status": "CONNECTED",
+      "policy_status": "VERIFIED_ALLOWED",
+      "allowed_execution_contexts": [
+        "LOCAL_EXTERNAL_WORKER"
+      ],
+      "verified_at": "2026-11-08T10:00:00Z",
+      "evidence_source": "https://example.invalid/terms",
+      "evidence_label": "VERIFIED_CURRENT_SELF_FETCHED",
+      "terms_version_or_digest": "v1",
+      "reason": null,
+      "reverification_deadline": "2026-12-01T00:00:00Z",
+      "source_claim_id": "C-10"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "verified_at_not_rfc3339",
+    "document": {
+      "provider_id": "prov-a",
+      "runtime_id": "rt-a",
+      "credential_mode": "USER_API",
+      "technical_status": "CONNECTED",
+      "policy_status": "VERIFIED_ALLOWED",
+      "allowed_execution_contexts": [
+        "LOCAL_EXTERNAL_WORKER"
+      ],
+      "verified_at": "x",
+      "evidence_source": "https://example.invalid/terms",
+      "evidence_label": "VERIFIED_CURRENT_SELF_FETCHED",
+      "terms_version_or_digest": "v1",
+      "reason": "user API key",
+      "reverification_deadline": "2026-12-01T00:00:00Z",
+      "source_claim_id": "C-10"
+    },
+    "error": "Refused"
+  }
+]

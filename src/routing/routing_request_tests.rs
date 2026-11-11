@@ -101,11 +101,11 @@ fn deadline_states_are_distinct_and_preserve_the_complete_core() {
                 Some(vec!["provider".into()]),
                 Some("model".into()),
                 Some("provider".into()),
-                Some(-0.0),
+                Some(Some(-0.0)),
             )
             .unwrap(),
         ),
-        Some(u64::MAX),
+        Some(Some(u64::MAX)),
     )
     .unwrap();
     let timestamp = ModelRoutingDateTimeV1::try_new("2026-09-21T12:34:56Z".into()).unwrap();
@@ -127,6 +127,7 @@ fn deadline_states_are_distinct_and_preserve_the_complete_core() {
                 .constraints()
                 .unwrap()
                 .max_cost()
+                .flatten()
                 .unwrap()
                 .to_bits(),
             (-0.0_f64).to_bits()
@@ -363,7 +364,7 @@ fn constraint_errors_are_only_physical_schema_invariants() {
                 avoid.map(|v| v.into_iter().map(String::from).collect()),
                 model.map(String::from),
                 provider.map(String::from),
-                cost
+                cost.map(Some)
             ),
             Err(error)
         );
@@ -416,16 +417,18 @@ fn opaque_constraints_preserve_unbounded_strings_and_independent_pins() {
 fn max_cost_accepts_every_tested_finite_sign_and_preserves_bits() {
     for cost in [
         None,
-        Some(0.0),
-        Some(-0.0),
-        Some(17.25),
-        Some(-17.25),
-        Some(f64::MAX),
-        Some(f64::MIN),
-        Some(f64::MIN_POSITIVE),
+        Some(None),
+        Some(Some(0.0)),
+        Some(Some(-0.0)),
+        Some(Some(17.25)),
+        Some(Some(-17.25)),
+        Some(Some(f64::MAX)),
+        Some(Some(f64::MIN)),
+        Some(Some(f64::MIN_POSITIVE)),
     ] {
         let core = RoutingRequestConstraints::try_new(None, None, None, None, cost).unwrap();
-        assert_eq!(core.max_cost().map(f64::to_bits), cost.map(f64::to_bits));
+        let bits = |c: Option<Option<f64>>| c.map(|c| c.map(f64::to_bits));
+        assert_eq!(bits(core.max_cost()), bits(cost));
     }
 }
 
@@ -437,7 +440,7 @@ fn all_request_vocabularies_priorities_and_context_hints_are_independent_storage
         Some(vec!["opaque/Ω".into()]),
         Some("future-model/界".into()),
         Some("opaque/Ω".into()),
-        Some(-1.0),
+        Some(Some(-1.0)),
     )
     .unwrap();
     let priorities = [
@@ -452,7 +455,13 @@ fn all_request_vocabularies_priorities_and_context_hints_are_independent_storage
             for floor in RoutingQualityFloor::ALL {
                 for quality in priorities {
                     for cost in priorities {
-                        for context in [None, Some(0), Some(73), Some(u64::MAX)] {
+                        for context in [
+                            None,
+                            Some(None),
+                            Some(Some(0)),
+                            Some(Some(73)),
+                            Some(Some(u64::MAX)),
+                        ] {
                             for constraints in
                                 [None, Some(empty.clone()), Some(conflicting.clone())]
                             {

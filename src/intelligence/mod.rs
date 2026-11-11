@@ -1,5 +1,10 @@
-//! Deterministic lifecycle foundation. No dispatch, clocks, or recovery policy.
+//! Deterministic lifecycle foundation. No dispatch or clocks. Side-state exits
+//! are gated by [`lifecycle_exits`] (N6, D5 producer deferral).
 pub use crate::registry::ModelIntelligenceService;
+
+pub mod lifecycle_exits;
+#[cfg(test)]
+mod lifecycle_exits_tests;
 use crate::registry::{CapabilityId, Observation, RuntimeId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +49,10 @@ impl LifecycleState {
     pub const fn passes_normal_lifecycle_gate(self) -> bool {
         matches!(self, Self::Routable)
     }
+    /// DEPRECATED, DISABLED, UNAVAILABLE and USER_BLOCKED.
+    pub const fn is_side_state(self) -> bool {
+        !self.is_primary()
+    }
     pub(crate) const fn is_primary(self) -> bool {
         matches!(
             self,
@@ -75,6 +84,26 @@ pub enum DemotionReason {
     UserBlock,
 }
 impl DemotionReason {
+    pub const ALL: [Self; 7] = [
+        Self::VendorRetirement,
+        Self::RepeatedRuntimeFailures,
+        Self::SustainedRejectionRate,
+        Self::AuthLoss,
+        Self::TemporarilyUnreachable,
+        Self::RateLimited,
+        Self::UserBlock,
+    ];
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::VendorRetirement => "VENDOR_RETIREMENT",
+            Self::RepeatedRuntimeFailures => "REPEATED_RUNTIME_FAILURES",
+            Self::SustainedRejectionRate => "SUSTAINED_REJECTION_RATE",
+            Self::AuthLoss => "AUTH_LOSS",
+            Self::TemporarilyUnreachable => "TEMPORARILY_UNREACHABLE",
+            Self::RateLimited => "RATE_LIMITED",
+            Self::UserBlock => "USER_BLOCK",
+        }
+    }
     pub const fn target(self) -> LifecycleState {
         match self {
             Self::VendorRetirement => LifecycleState::Deprecated,

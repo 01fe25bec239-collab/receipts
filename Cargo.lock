@@ -615,6 +615,7 @@ dependencies = [
 name = "receipts-e2e"
 version = "0.1.0"
 dependencies = [
+ "receipts-model-routing",
  "receipts-orchestration",
  "receipts-review-contracts",
  "receipts-review-integration",
@@ -626,6 +627,7 @@ dependencies = [
 name = "receipts-host-integration"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "receipts-orchestration",
  "serde",
  "serde_json",
@@ -641,6 +643,7 @@ dependencies = [
  "receipts-state",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

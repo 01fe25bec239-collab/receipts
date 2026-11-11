@@ -66,7 +66,7 @@ fn constraints(
         avoid.map(|value| vec![value.into()]),
         model.map(String::from),
         provider.map(String::from),
-        cost,
+        cost.map(Some),
     )
     .unwrap()
 }

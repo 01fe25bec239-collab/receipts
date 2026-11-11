@@ -1,0 +1,112 @@
+[
+  {
+    "case": "not_json",
+    "raw": "{",
+    "error": "Json"
+  },
+  {
+    "case": "trailing_input",
+    "raw": "{\"provider_id\": \"prov-a\", \"quota_scope\": \"UNKNOWN\", \"observed_at\": \"2026-11-08T10:00:00Z\"} {}",
+    "error": "Json"
+  },
+  {
+    "case": "not_an_object",
+    "document": [
+      {
+        "provider_id": "prov-a",
+        "quota_scope": "UNKNOWN",
+        "observed_at": "2026-11-08T10:00:00Z"
+      }
+    ],
+    "error": "Shape"
+  },
+  {
+    "case": "unknown_field",
+    "document": {
+      "provider_id": "prov-a",
+      "quota_scope": "UNKNOWN",
+      "observed_at": "2026-11-08T10:00:00Z",
+      "x_unknown": 1
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "duplicate_key",
+    "raw": "{\"provider_id\": \"prov-a\", \"quota_scope\": \"UNKNOWN\", \"observed_at\": \"2026-11-08T10:00:00Z\", \"provider_id\": \"prov-a\"}",
+    "error": "Shape"
+  },
+  {
+    "case": "missing_quota_scope",
+    "document": {
+      "provider_id": "prov-a",
+      "model_id": "model-a",
+      "limit": 100.0,
+      "remaining": 12.5,
+      "resets_at": "2026-11-08T11:00:00Z",
+      "retry_after_seconds": 60,
+      "visibility": "HEADERS",
+      "observed_at": "2026-11-08T10:00:00Z"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "bad_visibility",
+    "document": {
+      "provider_id": "prov-a",
+      "model_id": "model-a",
+      "quota_scope": "PROVIDER",
+      "limit": 100.0,
+      "remaining": 12.5,
+      "resets_at": "2026-11-08T11:00:00Z",
+      "retry_after_seconds": 60,
+      "visibility": "EXACT",
+      "observed_at": "2026-11-08T10:00:00Z"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "string_limit",
+    "document": {
+      "provider_id": "prov-a",
+      "model_id": "model-a",
+      "quota_scope": "PROVIDER",
+      "limit": "100",
+      "remaining": 12.5,
+      "resets_at": "2026-11-08T11:00:00Z",
+      "retry_after_seconds": 60,
+      "visibility": "HEADERS",
+      "observed_at": "2026-11-08T10:00:00Z"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "empty_model",
+    "document": {
+      "provider_id": "prov-a",
+      "model_id": "",
+      "quota_scope": "PROVIDER",
+      "limit": 100.0,
+      "remaining": 12.5,
+      "resets_at": "2026-11-08T11:00:00Z",
+      "retry_after_seconds": 60,
+      "visibility": "HEADERS",
+      "observed_at": "2026-11-08T10:00:00Z"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "resets_at_not_rfc3339",
+    "document": {
+      "provider_id": "prov-a",
+      "model_id": "model-a",
+      "quota_scope": "PROVIDER",
+      "limit": 100.0,
+      "remaining": 12.5,
+      "resets_at": "soon",
+      "retry_after_seconds": 60,
+      "visibility": "HEADERS",
+      "observed_at": "2026-11-08T10:00:00Z"
+    },
+    "error": "Refused"
+  }
+]

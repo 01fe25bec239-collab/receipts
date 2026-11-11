@@ -1,0 +1,9 @@
+{
+  "provider_id": "p",
+  "runtime_id": "r",
+  "credential_mode": "HOST_NATIVE",
+  "technical_status": "UNKNOWN",
+  "policy_status": "UNKNOWN",
+  "verified_at": "2026-11-08T10:00:00Z",
+  "evidence_label": "UNVERIFIED"
+}

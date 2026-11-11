@@ -1,0 +1,61 @@
+{
+  "decision_id": "decision-1",
+  "request_id": "request-1",
+  "task_id": "task-1",
+  "occurred_at": "2026-11-08T10:00:00Z",
+  "outcome": "SELECTED",
+  "selected_provider": "prov-a",
+  "selected_model": "model-a",
+  "selected_runtime": "rt-a",
+  "selection_reason": {
+    "quality_floor_applied": "FRONTIER",
+    "hard_filters_passed": [
+      "REGISTRY_CANDIDATE"
+    ],
+    "score_components": {
+      "expected_implementation_cost": 1.5,
+      "expected_rejection_probability": 0.25,
+      "expected_repair_cost": 0.5,
+      "expected_review_cost": 0.75,
+      "latency_estimate_seconds": 12.0
+    },
+    "decisive_factor": "AVAILABILITY"
+  },
+  "capability_evidence": [
+    {
+      "capability": "coding",
+      "value": true,
+      "confidence": "OFFICIAL_VERIFIED",
+      "source_ref": {
+        "ref_type": "ARTIFACT_ID",
+        "target": "synthetic-evidence",
+        "digest": "sha256:00",
+        "section": "s1"
+      },
+      "observed_at": "2026-11-08T10:00:00Z",
+      "sample_size": 3
+    }
+  ],
+  "confidence": "HIGH",
+  "availability_at_decision": "AVAILABLE",
+  "estimated_cost_class": "LOW",
+  "alternative_candidates": [
+    {
+      "provider_id": "prov-b",
+      "model_id": "model-b",
+      "runtime_id": "rt-b",
+      "score": 0.5,
+      "rejection_reason": "RANKED_BELOW_SELECTED:AVAILABILITY"
+    }
+  ],
+  "registry_freshness": {
+    "model_list_age_seconds": 60,
+    "capability_age_seconds": -5,
+    "calibration_sample_size": 0,
+    "stale": false
+  },
+  "mode": "ASK_ON_UNCERTAINTY",
+  "user_involved": false,
+  "user_pin_applied": true,
+  "fallback_from": "decision-0"
+}

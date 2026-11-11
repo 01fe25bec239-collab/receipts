@@ -85,7 +85,7 @@ fn every_state_and_signal_source_is_independent_of_observation_time() {
                 None,
                 None,
                 kind,
-                Some(u64::MAX),
+                Some(Some(u64::MAX)),
                 Some(source),
                 None,
             )
@@ -112,7 +112,13 @@ fn optional_core_fields_and_opaque_identifiers_survive_composition() {
     ] {
         for model in [None, Some(" \t\n"), Some(" Model-β/界/e\u{301} ")] {
             for runtime in [None, Some(" \t\n"), Some(" Runtime-γ/界/é ")] {
-                for retry in [None, Some(0), Some(73), Some(u64::MAX)] {
+                for retry in [
+                    None,
+                    Some(None),
+                    Some(Some(0)),
+                    Some(Some(73)),
+                    Some(Some(u64::MAX)),
+                ] {
                     for source in [None, Some(AvailabilitySignalSource::Unknown)] {
                         for note in [None, Some(""), Some(" \t\n"), Some(" Note-δ/界/e\u{301} ")]
                         {

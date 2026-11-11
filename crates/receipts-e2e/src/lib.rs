@@ -11,6 +11,9 @@
 //! Production composition of these ports remains the later composition-root
 //! task; this crate exists for library integration controls only.
 
+mod routing_state;
+pub use routing_state::CoreRoutingState;
+
 mod review_core_sink;
 pub use review_core_sink::{CoreReviewSink, ReviewSealedCodec, SealedContent, publication_input};
 

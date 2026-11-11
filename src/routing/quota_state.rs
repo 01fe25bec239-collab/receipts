@@ -153,3 +153,110 @@ impl QuotaStateRequiredCore {
         &self.observed_at
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaVisibility {
+    Headers,
+    LocalApprox,
+    None,
+    Unknown,
+}
+
+impl QuotaVisibility {
+    pub const ALL: [Self; 4] = [Self::Headers, Self::LocalApprox, Self::None, Self::Unknown];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Headers => "HEADERS",
+            Self::LocalApprox => "LOCAL_APPROX",
+            Self::None => "NONE",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaStateError {
+    EmptyModelId,
+    NonFiniteLimit,
+    NonFiniteRemaining,
+}
+
+/// The complete in-process QuotaState: the required core plus every optional
+/// schema field, each distinguishing absent (`None`) from explicit null
+/// (`Some(None)`) where the schema allows null. No number is fabricated:
+/// UNKNOWN scope and absent/null limits stay exactly as supplied.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuotaState {
+    core: QuotaStateRequiredCore,
+    model_id: Option<String>,
+    limit: Option<Option<f64>>,
+    remaining: Option<Option<f64>>,
+    resets_at: Option<Option<ModelRoutingDateTimeV1>>,
+    retry_after_seconds: Option<Option<u64>>,
+    visibility: Option<QuotaVisibility>,
+}
+
+impl QuotaState {
+    pub fn try_new(
+        core: QuotaStateRequiredCore,
+        model_id: Option<String>,
+        limit: Option<Option<f64>>,
+        remaining: Option<Option<f64>>,
+        resets_at: Option<Option<ModelRoutingDateTimeV1>>,
+        retry_after_seconds: Option<Option<u64>>,
+        visibility: Option<QuotaVisibility>,
+    ) -> Result<Self, QuotaStateError> {
+        if model_id.as_deref() == Some("") {
+            return Err(QuotaStateError::EmptyModelId);
+        }
+        if limit.flatten().is_some_and(|v| !v.is_finite()) {
+            return Err(QuotaStateError::NonFiniteLimit);
+        }
+        if remaining.flatten().is_some_and(|v| !v.is_finite()) {
+            return Err(QuotaStateError::NonFiniteRemaining);
+        }
+        Ok(Self {
+            core,
+            model_id,
+            limit,
+            remaining,
+            resets_at,
+            retry_after_seconds,
+            visibility,
+        })
+    }
+
+    pub fn core(&self) -> &QuotaStateRequiredCore {
+        &self.core
+    }
+    pub fn model_id(&self) -> Option<&str> {
+        self.model_id.as_deref()
+    }
+    pub fn limit(&self) -> Option<Option<f64>> {
+        self.limit
+    }
+    pub fn remaining(&self) -> Option<Option<f64>> {
+        self.remaining
+    }
+    pub fn resets_at(&self) -> Option<Option<&ModelRoutingDateTimeV1>> {
+        self.resets_at.as_ref().map(Option::as_ref)
+    }
+    pub fn retry_after_seconds(&self) -> Option<Option<u64>> {
+        self.retry_after_seconds
+    }
+    pub fn visibility(&self) -> Option<QuotaVisibility> {
+        self.visibility
+    }
+
+    /// The scope routing may rely on. A scope other than UNKNOWN is accepted
+    /// only when the provider itself reported it (`HEADERS` visibility);
+    /// local approximations, `NONE`/`UNKNOWN` visibility or an absent field
+    /// keep UNKNOWN — scope is never assumed (RATE_LIMIT_AND_AVAILABILITY §53).
+    pub fn verified_scope(&self) -> QuotaScope {
+        match self.visibility {
+            Some(QuotaVisibility::Headers) => self.core.quota_scope(),
+            _ => QuotaScope::Unknown,
+        }
+    }
+}

@@ -1,0 +1,192 @@
+[
+  {
+    "case": "not_json",
+    "raw": "{",
+    "error": "Json"
+  },
+  {
+    "case": "trailing_input",
+    "raw": "{\"observation_id\": \"o\", \"provider_id\": \"p\", \"model_id\": \"m\", \"runtime_id\": \"r\", \"task_class\": \"\", \"outcome\": \"TIMEOUT\", \"observed_at\": \"2026-11-08T10:00:00Z\"} {}",
+    "error": "Json"
+  },
+  {
+    "case": "not_an_object",
+    "document": [
+      {
+        "observation_id": "o",
+        "provider_id": "p",
+        "model_id": "m",
+        "runtime_id": "r",
+        "task_class": "",
+        "outcome": "TIMEOUT",
+        "observed_at": "2026-11-08T10:00:00Z"
+      }
+    ],
+    "error": "Shape"
+  },
+  {
+    "case": "unknown_field",
+    "document": {
+      "observation_id": "o",
+      "provider_id": "p",
+      "model_id": "m",
+      "runtime_id": "r",
+      "task_class": "",
+      "outcome": "TIMEOUT",
+      "observed_at": "2026-11-08T10:00:00Z",
+      "x_unknown": 1
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "duplicate_key",
+    "raw": "{\"observation_id\": \"o\", \"provider_id\": \"p\", \"model_id\": \"m\", \"runtime_id\": \"r\", \"task_class\": \"\", \"outcome\": \"TIMEOUT\", \"observed_at\": \"2026-11-08T10:00:00Z\", \"observation_id\": \"o\"}",
+    "error": "Shape"
+  },
+  {
+    "case": "missing_outcome",
+    "document": {
+      "observation_id": "obs-1",
+      "provider_id": "prov-a",
+      "model_id": "model-a",
+      "runtime_id": "rt-a",
+      "task_id": "task-1",
+      "task_class": "FRONTIER_IMPLEMENTATION",
+      "repair_count": 2,
+      "cost": 0.42,
+      "tokens": 1200,
+      "latency_seconds": 33.5,
+      "cost_to_accepted_result": 0.84,
+      "difficulty_hint": "HIGH",
+      "excluded_from_calibration": false,
+      "observed_at": "2026-11-08T10:00:00Z"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "bad_outcome",
+    "document": {
+      "observation_id": "obs-1",
+      "provider_id": "prov-a",
+      "model_id": "model-a",
+      "runtime_id": "rt-a",
+      "task_id": "task-1",
+      "task_class": "FRONTIER_IMPLEMENTATION",
+      "outcome": "ACCEPTED",
+      "repair_count": 2,
+      "cost": 0.42,
+      "tokens": 1200,
+      "latency_seconds": 33.5,
+      "cost_to_accepted_result": 0.84,
+      "difficulty_hint": "HIGH",
+      "excluded_from_calibration": false,
+      "observed_at": "2026-11-08T10:00:00Z"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "negative_repair_count",
+    "document": {
+      "observation_id": "obs-1",
+      "provider_id": "prov-a",
+      "model_id": "model-a",
+      "runtime_id": "rt-a",
+      "task_id": "task-1",
+      "task_class": "FRONTIER_IMPLEMENTATION",
+      "outcome": "ACCEPTED_AFTER_REPAIR",
+      "repair_count": -1,
+      "cost": 0.42,
+      "tokens": 1200,
+      "latency_seconds": 33.5,
+      "cost_to_accepted_result": 0.84,
+      "difficulty_hint": "HIGH",
+      "excluded_from_calibration": false,
+      "observed_at": "2026-11-08T10:00:00Z"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "null_repair_count",
+    "document": {
+      "observation_id": "obs-1",
+      "provider_id": "prov-a",
+      "model_id": "model-a",
+      "runtime_id": "rt-a",
+      "task_id": "task-1",
+      "task_class": "FRONTIER_IMPLEMENTATION",
+      "outcome": "ACCEPTED_AFTER_REPAIR",
+      "repair_count": null,
+      "cost": 0.42,
+      "tokens": 1200,
+      "latency_seconds": 33.5,
+      "cost_to_accepted_result": 0.84,
+      "difficulty_hint": "HIGH",
+      "excluded_from_calibration": false,
+      "observed_at": "2026-11-08T10:00:00Z"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "fractional_tokens",
+    "document": {
+      "observation_id": "obs-1",
+      "provider_id": "prov-a",
+      "model_id": "model-a",
+      "runtime_id": "rt-a",
+      "task_id": "task-1",
+      "task_class": "FRONTIER_IMPLEMENTATION",
+      "outcome": "ACCEPTED_AFTER_REPAIR",
+      "repair_count": 2,
+      "cost": 0.42,
+      "tokens": 1.5,
+      "latency_seconds": 33.5,
+      "cost_to_accepted_result": 0.84,
+      "difficulty_hint": "HIGH",
+      "excluded_from_calibration": false,
+      "observed_at": "2026-11-08T10:00:00Z"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "observation_id_too_long",
+    "document": {
+      "observation_id": "ooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo",
+      "provider_id": "prov-a",
+      "model_id": "model-a",
+      "runtime_id": "rt-a",
+      "task_id": "task-1",
+      "task_class": "FRONTIER_IMPLEMENTATION",
+      "outcome": "ACCEPTED_AFTER_REPAIR",
+      "repair_count": 2,
+      "cost": 0.42,
+      "tokens": 1200,
+      "latency_seconds": 33.5,
+      "cost_to_accepted_result": 0.84,
+      "difficulty_hint": "HIGH",
+      "excluded_from_calibration": false,
+      "observed_at": "2026-11-08T10:00:00Z"
+    },
+    "error": "Shape"
+  },
+  {
+    "case": "observed_at_not_rfc3339",
+    "document": {
+      "observation_id": "obs-1",
+      "provider_id": "prov-a",
+      "model_id": "model-a",
+      "runtime_id": "rt-a",
+      "task_id": "task-1",
+      "task_class": "FRONTIER_IMPLEMENTATION",
+      "outcome": "ACCEPTED_AFTER_REPAIR",
+      "repair_count": 2,
+      "cost": 0.42,
+      "tokens": 1200,
+      "latency_seconds": 33.5,
+      "cost_to_accepted_result": 0.84,
+      "difficulty_hint": "HIGH",
+      "excluded_from_calibration": false,
+      "observed_at": "x"
+    },
+    "error": "Refused"
+  }
+]

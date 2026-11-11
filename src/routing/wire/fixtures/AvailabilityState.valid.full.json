@@ -1,0 +1,10 @@
+{
+  "provider_id": "prov-a",
+  "model_id": "model-a",
+  "runtime_id": "rt-a",
+  "state": "RATE_LIMITED",
+  "retry_after_seconds": 30,
+  "signal_source": "RATE_LIMIT_HEADER",
+  "observed_at": "2026-11-08T10:00:00Z",
+  "note": "failure_class=RATE_LIMITED"
+}

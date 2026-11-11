@@ -12,7 +12,14 @@ mod quota_state;
 #[cfg(test)]
 mod quota_state_tests;
 
-pub use quota_state::{QuotaScope, QuotaStateRequiredCore};
+pub use quota_state::{
+    QuotaScope, QuotaState, QuotaStateError, QuotaStateRequiredCore, QuotaVisibility,
+};
+
+mod model_observation;
+pub use model_observation::{
+    DifficultyHint, ModelObservation, ModelObservationError, ModelObservationOutcome,
+};
 
 #[cfg(test)]
 mod candidate_eligibility_tests;
@@ -80,6 +87,18 @@ pub use routing_request::{
 };
 
 pub mod policy_eligibility;
+
+pub mod persistence;
+pub mod router;
+#[cfg(test)]
+mod router_tests;
+#[cfg(test)]
+mod test_state;
+pub mod wire;
+pub use router::{RouteContext, RouteError, RoutedDecision, route};
+
+#[path = "../availability/mod.rs"]
+pub mod availability;
 
 #[path = "../intelligence/mod.rs"]
 pub mod intelligence;

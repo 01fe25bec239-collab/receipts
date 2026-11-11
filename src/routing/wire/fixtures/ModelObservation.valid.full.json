@@ -1,0 +1,17 @@
+{
+  "observation_id": "obs-1",
+  "provider_id": "prov-a",
+  "model_id": "model-a",
+  "runtime_id": "rt-a",
+  "task_id": "task-1",
+  "task_class": "FRONTIER_IMPLEMENTATION",
+  "outcome": "ACCEPTED_AFTER_REPAIR",
+  "repair_count": 2,
+  "cost": 0.42,
+  "tokens": 1200,
+  "latency_seconds": 33.5,
+  "cost_to_accepted_result": 0.84,
+  "difficulty_hint": "HIGH",
+  "excluded_from_calibration": false,
+  "observed_at": "2026-11-08T10:00:00Z"
+}

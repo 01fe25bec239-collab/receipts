@@ -83,7 +83,13 @@ fn all_states_sources_retry_values_and_notes_are_independent_storage() {
     ];
     for state in states {
         for source in sources {
-            for retry in [None, Some(0), Some(73), Some(u64::MAX)] {
+            for retry in [
+                None,
+                Some(None),
+                Some(Some(0)),
+                Some(Some(73)),
+                Some(Some(u64::MAX)),
+            ] {
                 for note in [None, Some(""), Some(" \t\n"), Some(" note-δ/界/e\u{301} ")] {
                     let core = AvailabilityStateNonTemporalCore::try_new(
                         "provider-α".into(),

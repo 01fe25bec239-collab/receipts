@@ -1,0 +1,51 @@
+{
+  "decision_id": "d",
+  "request_id": "r",
+  "occurred_at": "2026-11-08T10:00:00Z",
+  "outcome": "BLOCKED",
+  "selection_reason": {
+    "score_components": {
+      "expected_implementation_cost": null,
+      "expected_rejection_probability": null,
+      "expected_repair_cost": null,
+      "expected_review_cost": null,
+      "latency_estimate_seconds": null
+    }
+  },
+  "capability_evidence": [
+    {
+      "capability": "coding",
+      "value": null,
+      "confidence": "UNVERIFIED",
+      "observed_at": "2026-11-08T10:00:00Z",
+      "sample_size": null
+    },
+    {
+      "capability": "tier",
+      "value": {
+        "nested": [
+          1,
+          "x"
+        ]
+      },
+      "confidence": "LOCAL_EMPIRICAL",
+      "observed_at": "2026-11-08T10:00:00Z"
+    }
+  ],
+  "alternative_candidates": [
+    {
+      "provider_id": "p",
+      "model_id": "m",
+      "runtime_id": "r",
+      "score": null,
+      "rejection_reason": ""
+    }
+  ],
+  "registry_freshness": {
+    "model_list_age_seconds": null,
+    "capability_age_seconds": null,
+    "calibration_sample_size": null,
+    "stale": false
+  },
+  "mode": "USER_CONTROLLED"
+}
