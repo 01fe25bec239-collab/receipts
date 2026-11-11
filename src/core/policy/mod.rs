@@ -23,6 +23,8 @@ impl FreePolicyV1 {
 }
 
 pub trait GraphExecutionPolicy {
+    fn provider(&self) -> &str;
+    fn runtime(&self) -> &str;
     fn permits(&self, provider: &str, runtime: &str, eligible_host_native: bool) -> bool;
     fn permits_retry(
         &self,
@@ -33,6 +35,12 @@ pub trait GraphExecutionPolicy {
     ) -> bool;
 }
 impl GraphExecutionPolicy for FreePolicyV1 {
+    fn provider(&self) -> &str {
+        &self.provider
+    }
+    fn runtime(&self) -> &str {
+        &self.runtime
+    }
     /// Eligibility/native evidence comes from trusted Host/Runtime observation.
     /// Unknown, stale or unavailable observations must pass false.
     fn permits(&self, provider: &str, runtime: &str, eligible_host_native: bool) -> bool {

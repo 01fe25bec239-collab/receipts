@@ -9,7 +9,6 @@ use super::{GoalEvaluationState, engine::*, evaluate::*, persistence::*};
 use crate::capsules::{Criterion, CriterionKind};
 use crate::compiler::CompiledGraphV1;
 use crate::dag::{InterfaceEvidenceVerifier, TaskDag};
-use crate::policy::FreePolicyV1;
 use crate::scheduler::*;
 use crate::{
     ApplyEvidenceV1, ExecutionGraphEnvelope, GraphMutation, GraphMutationOutcomeV1,
@@ -213,7 +212,7 @@ pub trait GoalConsumerPortV1: CriterionCheckPortV1 + WriteScopePort {
 /// reservation engine. Evidence verifiers are independent trusted read sources.
 pub struct GoalDriverV1<'a, P> {
     pub consumers: &'a mut P,
-    pub policy: &'a FreePolicyV1,
+    pub policy: &'a dyn GraphExecutionPolicy,
     pub evidence: ApplyEvidenceV1<'a>,
     pub retry_failed: &'a BTreeSet<String>,
     pub(super) evaluation_binding: Option<(String, Option<String>, String)>,
@@ -814,7 +813,7 @@ impl<P: GoalConsumerPortV1> GoalLoopPortV1 for GoalDriverV1<'_, P> {
 pub fn initialize_goal_continuation_v1(
     state: &mut impl GoalPersistencePortV1,
     consumers: &mut impl GoalConsumerPortV1,
-    policy: &FreePolicyV1,
+    policy: &dyn GraphExecutionPolicy,
     project: &str,
     goal_id: &str,
 ) -> Result<GoalRecordV1, StateError> {

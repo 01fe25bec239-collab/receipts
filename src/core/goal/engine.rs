@@ -110,7 +110,7 @@ pub fn snapshot_goal_v1(
 /// Resume is a fresh tick from durable inputs, with no in-memory launch ticket.
 /// A failed launch call leaves its reservation unresolved and never relaunches it.
 pub fn tick_goal_v1(
-    policy: &crate::policy::FreePolicyV1,
+    policy: &dyn GraphExecutionPolicy,
     state: &mut impl GoalPersistencePortV1,
     port: &mut impl GoalLoopPortV1,
     project: &str,

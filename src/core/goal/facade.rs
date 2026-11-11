@@ -2,7 +2,7 @@
 use super::{driver::*, engine::*, evaluate::GoalAssessmentV1, persistence::*};
 use crate::ApplyEvidenceV1;
 use crate::compiler::{CompileContextV1, DecompositionProposalV1};
-use crate::policy::FreePolicyV1;
+use crate::policy::GraphExecutionPolicy;
 use crate::scheduler::WriteScopePort;
 use receipts_state::StateError;
 use std::collections::BTreeSet;
@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 pub struct CoreFacade<'a, S, P> {
     pub state: &'a mut S,
     pub consumers: &'a mut P,
-    pub policy: &'a FreePolicyV1,
+    pub policy: &'a dyn GraphExecutionPolicy,
     pub evidence: ApplyEvidenceV1<'a>,
 }
 impl<S: GoalPersistencePortV1, P: GoalConsumerPortV1> CoreFacade<'_, S, P> {

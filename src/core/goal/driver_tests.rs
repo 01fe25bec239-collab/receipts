@@ -1013,3 +1013,62 @@ fn a_passing_review_proposal_cannot_override_a_failed_free_check() {
         assert_eq!(port.checked_shas, vec!["b".repeat(40)]);
     }
 }
+
+#[test]
+fn policy_swap_keeps_goal_graph_and_accepted_history_without_recompilation() {
+    use crate::policy::GraphExecutionPolicy;
+    // Policy-contract fixture only; production PRO loading/admission is W4.
+    struct BroaderPolicy;
+    impl GraphExecutionPolicy for BroaderPolicy {
+        fn provider(&self) -> &str {
+            "host"
+        }
+        fn runtime(&self) -> &str {
+            "runtime"
+        }
+        fn permits(&self, _: &str, _: &str, eligible: bool) -> bool {
+            eligible
+        }
+        fn permits_retry(
+            &self,
+            _: &ExecutionGraphEnvelope,
+            _: &str,
+            _: &str,
+            _: &GraphNodeResult,
+        ) -> bool {
+            false
+        }
+    }
+    let (_dir, mut state) = seed("2");
+    let mut port = Controlled::new(GraphNodeState::Integrated);
+    let free = policy();
+    CoreFacade {
+        state: &mut state,
+        consumers: &mut port,
+        policy: &free,
+        evidence: ApplyEvidenceV1::default(),
+    }
+    .tick("p", "goal")
+    .unwrap();
+    let before = port.graph.clone();
+    let outcome = CoreFacade {
+        state: &mut state,
+        consumers: &mut port,
+        policy: &BroaderPolicy,
+        evidence: ApplyEvidenceV1::default(),
+    }
+    .resume_goal("p", "goal")
+    .unwrap();
+    assert_eq!(outcome.state(), super::GoalEvaluationState::Complete);
+    assert_eq!(port.graph, before);
+    assert_eq!(port.launches, 0);
+    assert!(port.compiled_specs.is_empty());
+    let goal = state.load_goal("p", "goal").unwrap().unwrap();
+    assert_eq!(
+        (
+            goal.definition.goal_id.as_str(),
+            goal.definition.graph_id.as_str()
+        ),
+        ("goal", "g")
+    );
+}
