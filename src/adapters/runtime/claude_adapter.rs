@@ -412,6 +412,7 @@ impl ClaudeAdapter {
                 .turns
                 .is_some_and(|cap| policy.turn_budget.is_none_or(|budget| budget > cap))
             || policy.structured_output_schema != binding.schema
+            || prompt(task, workspace, policy).map_or(true, |p| p != binding.capsule_prompt)
         {
             return Err(FailureClass::PolicyBlocked);
         }
@@ -461,6 +462,22 @@ impl ClaudeAdapter {
             ClaudePermissionMode::Plan
         } else {
             ClaudePermissionMode::AcceptEdits
+        };
+        let resume_binding = if policy.session_persistence {
+            match task {
+                RuntimeCapsuleFamily::Task(c) => Some(ResumeBinding {
+                    issuer: self.issuer.clone(),
+                    capsule_prompt: text.clone(),
+                    workspace: workspace.clone(),
+                    task_id: c.task_id().into(),
+                    timeout: policy.timeout.run_timeout(),
+                    turns: policy.turn_budget,
+                    schema: policy.structured_output_schema.clone(),
+                }),
+                _ => None,
+            }
+        } else {
+            None
         };
         let mut request = ClaudeTaskExecutionRequest::new(
             &self.executable,
@@ -516,21 +533,7 @@ impl ClaudeAdapter {
             collector: Mutex::new(Some(worker)),
             cancel: Mutex::new(None),
             turn_budget: policy.turn_budget,
-            resume_binding: if policy.session_persistence {
-                match task {
-                    RuntimeCapsuleFamily::Task(c) => Some(ResumeBinding {
-                        issuer: self.issuer.clone(),
-                        workspace: workspace.clone(),
-                        task_id: c.task_id().into(),
-                        timeout: policy.timeout.run_timeout(),
-                        turns: policy.turn_budget,
-                        schema: policy.structured_output_schema.clone(),
-                    }),
-                    _ => None,
-                }
-            } else {
-                None
-            },
+            resume_binding,
         })
     }
 }
@@ -540,6 +543,7 @@ struct ResumeBinding {
     issuer: Arc<()>,
     workspace: WorkspaceHandle,
     task_id: String,
+    capsule_prompt: String,
     timeout: std::time::Duration,
     turns: Option<u64>,
     schema: Option<String>,
