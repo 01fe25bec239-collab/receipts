@@ -33,7 +33,9 @@
 
 pub mod adapter;
 pub mod claude;
+pub mod economy_renderer;
 pub mod graph_snapshot_renderer;
+pub mod headless;
 pub mod host_capability_consistency;
 pub mod host_capability_freshness_policy;
 pub mod host_capability_freshness_vocabulary;
@@ -196,3 +198,9 @@ pub use host_session_activation::{
     HostSessionActivationError, HostSessionActivationOutcome, HostSessionActivationRequest,
     prepare_host_session,
 };
+
+pub use economy_renderer::EconomyRenderer;
+pub use headless::HeadlessAdapter;
+
+pub mod graph_tree_renderer;
+pub use graph_tree_renderer::render_graph_tree;

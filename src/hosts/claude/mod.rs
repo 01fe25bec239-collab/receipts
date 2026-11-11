@@ -162,11 +162,7 @@ impl HostAdapter for ClaudeHostAdapter {
     }
 
     fn present(&self, view: &ClaudeCoreView) -> String {
-        format!(
-            "receipts {}: {}",
-            view.view_type.as_str(),
-            OrchestrationJsonValueV1::Object(view.content.clone()).to_json()
-        )
+        render_core_view(view)
     }
 
     fn request_user_input(&mut self, _prompt: String) -> Ready<ClaudeUserResponse> {
@@ -187,5 +183,14 @@ pub fn worktree_target(repository_root: &Path, name: &str) -> (PathBuf, String) 
     (
         repository_root.join(".claude/worktrees").join(name),
         format!("worktree-{name}"),
+    )
+}
+
+/// Shared deterministic view formatting for terminal and embedded hosts.
+pub fn render_core_view(view: &ClaudeCoreView) -> String {
+    format!(
+        "receipts {}: {}",
+        view.view_type.as_str(),
+        OrchestrationJsonValueV1::Object(view.content.clone()).to_json()
     )
 }

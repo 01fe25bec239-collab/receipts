@@ -41,7 +41,7 @@ pub fn render_graph_snapshot(snapshot: &GraphSnapshot) -> String {
 }
 
 // Lowercase hexadecimal escapes are display syntax, not JSON serialization.
-fn display_text(value: Option<&str>) -> String {
+pub(crate) fn display_text(value: Option<&str>) -> String {
     let Some(value) = value else {
         return "null".to_owned();
     };
