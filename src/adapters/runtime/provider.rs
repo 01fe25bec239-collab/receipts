@@ -52,10 +52,10 @@ impl ProbeCache {
         probe: impl FnOnce() -> RuntimeCapabilities,
     ) -> (RuntimeCapabilities, SystemTime) {
         let mut entry = self.entry.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((at, wall, report)) = &*entry {
-            if at.elapsed() < self.ttl {
-                return (report.clone(), *wall);
-            }
+        if let Some((at, wall, report)) = &*entry
+            && at.elapsed() < self.ttl
+        {
+            return (report.clone(), *wall);
         }
         let report = probe();
         let wall = SystemTime::now();
