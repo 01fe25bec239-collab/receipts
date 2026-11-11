@@ -198,10 +198,13 @@ fn bounds_line_and_total_size() {
 fn concurrent_appends_keep_whole_lines() {
     let root = Root::new("concurrent");
     let spool = HostEventSpool::for_project(&root.0).unwrap();
+    let start = std::sync::Barrier::new(8);
     std::thread::scope(|s| {
         for n in 0..8 {
             let spool = &spool;
+            let start = &start;
             s.spawn(move || {
+                start.wait();
                 for _ in 0..25 {
                     spool.append(&event(1000 + n)).unwrap();
                 }

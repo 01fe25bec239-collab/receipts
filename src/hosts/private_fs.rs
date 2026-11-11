@@ -143,19 +143,28 @@ impl HostDirectory {
         }
         let n = name(part)?;
         let flags = if append {
-            libc::O_RDWR | libc::O_APPEND | libc::O_CREAT
+            libc::O_RDWR | libc::O_APPEND | libc::O_CREAT | libc::O_EXCL
         } else {
             libc::O_RDONLY
         };
-        // SAFETY: openat uses a live directory and a single terminated component.
-        let file = fd_file(unsafe {
-            libc::openat(
-                self.file.as_raw_fd(),
-                n.as_ptr(),
-                flags | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-                0o600,
-            )
-        })?;
+        let open = |flags| {
+            // SAFETY: live directory descriptor and single terminated component.
+            fd_file(unsafe {
+                libc::openat(
+                    self.file.as_raw_fd(),
+                    n.as_ptr(),
+                    flags | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                    0o600,
+                )
+            })
+        };
+        // Exclusive creation avoids macOS O_CREAT races; existing entries still undergo all checks.
+        let file = match open(flags) {
+            Err(e) if append && e.kind() == io::ErrorKind::AlreadyExists => {
+                open(flags & !(libc::O_CREAT | libc::O_EXCL))?
+            }
+            result => result?,
+        };
         self.verify_file(part, &file, private)?;
         Ok(file)
     }
