@@ -272,3 +272,19 @@ fn codex_result(stderr: &str) -> crate::CodexTaskExecutionResult {
     })
     .unwrap()
 }
+
+#[test]
+fn typed_cancellation_reasons_do_not_become_rate_limits() {
+    let outcome = run("sleep 10", 2000, true);
+    for (reason, expected) in [
+        (CancelReason::Timeout, FailureClass::Timeout),
+        (CancelReason::SafetyInterruption, FailureClass::Unknown),
+        (CancelReason::Superseded, FailureClass::Unknown),
+        (CancelReason::BudgetExhausted, FailureClass::Unknown),
+    ] {
+        assert_eq!(
+            classify_live_outcome(&outcome, Some(reason)),
+            Some(expected)
+        );
+    }
+}

@@ -1,3 +1,5 @@
+mod provider;
+pub use provider::{InstallState, Provider};
 mod attempt_types;
 mod claude_adapter;
 mod policy;

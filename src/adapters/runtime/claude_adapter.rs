@@ -26,19 +26,55 @@ pub enum RuntimeObservation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelReason {
     UserRequested,
+    Timeout,
+    Superseded,
+    SafetyInterruption,
+    BudgetExhausted,
 }
 
 /// No default executable, inherited environment, capability or authentication claim.
 pub struct ClaudeAdapter {
     executable: PathBuf,
     env: Option<ChildEnvPolicy>,
+    probe: crate::provider::ProbeCache,
 }
 impl ClaudeAdapter {
     pub fn new(executable: impl Into<PathBuf>) -> Self {
         Self {
             executable: executable.into(),
             env: None,
+            probe: crate::provider::ProbeCache::new(std::time::Duration::from_secs(300)),
         }
+    }
+    /// CLI probes do not establish account usage or remaining quota.
+    pub fn usage(&self) -> RuntimeObservation {
+        RuntimeObservation::Unknown
+    }
+    pub fn quota(&self) -> RuntimeObservation {
+        RuntimeObservation::Unknown
+    }
+    /// TTL bounds installation evidence; expiry never keeps stale capabilities.
+    pub fn with_probe_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.probe = crate::provider::ProbeCache::new(ttl);
+        self
+    }
+    /// Runs only bounded version/help probes, never a model invocation.
+    pub fn provider(
+        &self,
+        workspace: &WorkspaceHandle,
+        timeout: &receipts_workspace_execution::execution::ProcessTimeoutPolicy,
+    ) -> Provider {
+        let (report, at) = self.probe.observe(|| {
+            execute_claude_capability_probe(
+                &self.executable,
+                workspace.worktree_path(),
+                workspace.worktree_path(),
+                timeout,
+            )
+            .map(RuntimeCapabilities::Claude)
+            .unwrap_or(RuntimeCapabilities::Unknown)
+        });
+        crate::provider::provider("anthropic", "Anthropic", report, at)
     }
     pub fn with_env_policy(mut self, env: ChildEnvPolicy) -> Self {
         self.env = Some(env);
@@ -248,7 +284,7 @@ impl RuntimeAdapter for ClaudeAdapter {
         RuntimeAuthStatus::Unknown
     }
     fn capabilities(&self) -> RuntimeCapabilities {
-        RuntimeCapabilities::Unknown
+        self.probe.capabilities()
     }
     fn start(
         &self,
@@ -336,7 +372,13 @@ impl RuntimeAdapter for ClaudeAdapter {
             outcome: result.map_err(|e| e.classify_failure())?,
             reduced_isolation: true,
             protected: handle.protected(),
-            cancel: *handle.cancel.lock().unwrap_or_else(|e| e.into_inner()),
+            cancel: if handle.attempt.terminal_cause()
+                == Some(receipts_workspace_execution::execution::LiveProcessTerminalCause::TimedOut)
+            {
+                Some(CancelReason::Timeout)
+            } else {
+                *handle.cancel.lock().unwrap_or_else(|e| e.into_inner())
+            },
         })
     }
     fn cancel(&self, handle: &ClaudeAttemptHandle, reason: &CancelReason) {

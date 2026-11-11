@@ -350,6 +350,14 @@ fn cancellation_timeout_drop_and_policy_refusal() {
                 LiveProcessTerminalCause::Cancelled
             }
         );
+        assert_eq!(
+            result.cancel_reason(),
+            Some(if timeout {
+                CancelReason::Timeout
+            } else {
+                CancelReason::UserRequested
+            })
+        );
         assert!(adapter.collect_result(&handle).is_err());
     }
     let f = Fixture::new("", "");
