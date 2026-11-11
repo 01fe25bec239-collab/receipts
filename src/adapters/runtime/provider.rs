@@ -81,7 +81,8 @@ pub(crate) fn provider(
         install_state: match &report {
             RuntimeCapabilities::Unknown => InstallState::Unavailable,
             RuntimeCapabilities::Codex(p)
-                if p.json != crate::CodexCapabilityEvidence::Supported =>
+                if p.json != crate::CodexCapabilityEvidence::Supported
+                    || p.sandbox != crate::CodexCapabilityEvidence::Supported =>
             {
                 InstallState::VersionUnsupported
             }
@@ -110,6 +111,23 @@ pub(crate) fn provider(
 mod tests {
     use super::*;
     use std::cell::Cell;
+    #[test]
+    fn missing_base_sandbox_control_is_version_unsupported() {
+        let p = provider(
+            "openai",
+            "OpenAI",
+            RuntimeCapabilities::Codex(crate::CodexCapabilityProbeReport {
+                version: "synthetic".into(),
+                json: crate::CodexCapabilityEvidence::Supported,
+                output_schema: crate::CodexCapabilityEvidence::Unknown,
+                sandbox: crate::CodexCapabilityEvidence::Unknown,
+            }),
+            SystemTime::now(),
+        );
+        assert_eq!(p.install_state, InstallState::VersionUnsupported);
+        assert_eq!(p.models, RuntimeObservation::Unknown);
+        assert_eq!(p.health, RuntimeObservation::Unknown);
+    }
     #[test]
     fn stale_success_is_unknown_and_failure_replaces_it() {
         let cache = ProbeCache::new(Duration::from_secs(60));

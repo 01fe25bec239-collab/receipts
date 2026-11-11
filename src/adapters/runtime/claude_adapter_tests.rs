@@ -958,3 +958,22 @@ fn conformance_reports_isolation_failure_and_cancellation() {
     ));
     assert!(report.passed(), "{report:?}");
 }
+
+#[test]
+fn missing_binaries_report_unavailable_without_inventing_provider_facts() {
+    let f = Fixture::new("", "");
+    let timeout = policy(false).timeout;
+    let missing = f.root.join("missing-cli");
+    for observation in [
+        ClaudeAdapter::new(&missing).provider(&f.workspace, &timeout),
+        CodexAdapter::new(&missing).provider(&f.workspace, &timeout),
+    ] {
+        assert_eq!(observation.install_state, InstallState::Unavailable);
+        assert_eq!(observation.models, RuntimeObservation::Unknown);
+        assert_eq!(observation.health, RuntimeObservation::Unknown);
+        assert_eq!(observation.usage, RuntimeObservation::Unknown);
+        assert_eq!(observation.quota, RuntimeObservation::Unknown);
+        assert_eq!(observation.capabilities, RuntimeCapabilities::Unknown);
+    }
+    assert!(!f.workspace.worktree_path().join("pid").exists());
+}
