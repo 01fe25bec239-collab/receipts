@@ -71,7 +71,7 @@ impl Fixture {
         fs::write(workspace.worktree_path().join("prefix"), prefix).unwrap();
         fs::write(workspace.worktree_path().join("suffix"), suffix).unwrap();
         let executable = root.join("worker");
-        fs::write(&executable, "#!/bin/sh\nprintf '%s' \"$$\" > pid\n/bin/ps -o pgid= -p \"$$\" > pgid\nprintf '%s\\n' \"$@\" > argv\n/bin/cat > received\n/bin/cat prefix\n: > ready\nwhile [ ! -f release ]; do /bin/sleep 0.01; done\n/bin/cat suffix\nwhile [ -f hold ] && [ ! -f finish ]; do /bin/sleep 0.01; done\nif [ -f fail ]; then exit 9; fi\n").unwrap();
+        fs::write(&executable, "#!/bin/sh\nif [ \"$1\" = --help ]; then printf 'Usage: claude\\nOptions:\\n'; exit 0; fi\nprintf '%s' \"$$\" > pid\n/bin/ps -o pgid= -p \"$$\" > pgid\nprintf '%s\\n' \"$@\" > argv\n/bin/cat > received\n/bin/cat prefix\n: > ready\nwhile [ ! -f release ]; do /bin/sleep 0.01; done\n/bin/cat suffix\nwhile [ -f hold ] && [ ! -f finish ]; do /bin/sleep 0.01; done\nif [ -f fail ]; then exit 9; fi\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         Self {
@@ -732,4 +732,218 @@ fn cancel_and_uncollected_drop_remove_owned_process_and_group() {
             "owned leader or group remains observable after cleanup"
         );
     }
+}
+
+fn policy_worker(f: &Fixture) {
+    fs::write(&f.executable, r#"#!/bin/sh
+if [ "$1" = --help ]; then
+  printf 'Usage: claude\nOptions:\n  --max-turns <n>  Maximum turns\n  --resume <session>  Resume a session\n  --json-schema <schema>  Structured output\n'
+  exit 0
+fi
+printf '%s\n' "$@" > argv
+/bin/cat > received
+/bin/cat prefix
+"#).unwrap();
+}
+
+#[test]
+fn policy_controls_resume_tickets_and_reviewer_refusal() {
+    let f = Fixture::new(
+        "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\",\"session_id\":\"12345678-1234-1234-1234-123456789abc\"}\n",
+        "",
+    );
+    policy_worker(&f);
+    let adapter = f.adapter();
+    let mut p = policy(false);
+    p.turn_budget = Some(2);
+    p.session_persistence = true;
+    p.structured_output_schema = Some("{\"type\":\"object\"}".into());
+    let task = f.task_with_budgets(None, Some(2));
+    let handle = adapter
+        .start(&task, &f.workspace, &p)
+        .unwrap_or_else(|_| panic!("start"));
+    let result = adapter
+        .collect_result(&handle)
+        .unwrap_or_else(|_| panic!("collect"));
+    let ticket = result.resume_ticket().expect("eligible collected session");
+    let argv = fs::read_to_string(f.workspace.worktree_path().join("argv")).unwrap();
+    assert!(argv.contains("--max-turns\n2\n"));
+    assert!(argv.contains("--json-schema\n{\"type\":\"object\"}\n"));
+    assert!(!argv.contains("--no-session-persistence"));
+    let mut denied = p.clone();
+    denied.read_only = true;
+    assert!(matches!(
+        adapter.resume_with_policy(&task, &f.workspace, &denied, ticket),
+        Err(FailureClass::PolicyBlocked)
+    ));
+    denied = p.clone();
+    denied.session_persistence = false;
+    assert!(matches!(
+        adapter.resume_with_policy(&task, &f.workspace, &denied, ticket),
+        Err(FailureClass::PolicyBlocked)
+    ));
+    denied = p.clone();
+    denied.turn_budget = Some(3);
+    assert!(matches!(
+        adapter.resume_with_policy(&task, &f.workspace, &denied, ticket),
+        Err(FailureClass::PolicyBlocked)
+    ));
+    assert!(matches!(
+        f.adapter()
+            .resume_with_policy(&task, &f.workspace, &p, ticket),
+        Err(FailureClass::PolicyBlocked)
+    ));
+    let other = Fixture::new(RESULT, "");
+    assert!(matches!(
+        adapter.resume_with_policy(&task, &other.workspace, &p, ticket),
+        Err(FailureClass::PolicyBlocked)
+    ));
+    drop(handle);
+    let resumed = adapter
+        .resume_with_policy(&task, &f.workspace, &p, ticket)
+        .unwrap_or_else(|_| panic!("resume"));
+    let result = adapter
+        .collect_result(&resumed)
+        .unwrap_or_else(|_| panic!("resume collect"));
+    assert!(result.failure().is_none());
+    let argv = fs::read_to_string(f.workspace.worktree_path().join("argv")).unwrap();
+    assert!(argv.contains("--resume\n12345678-1234-1234-1234-123456789abc\n"));
+    assert!(matches!(
+        adapter.resume_with_policy(&task, &f.workspace, &p, ticket),
+        Err(FailureClass::PolicyBlocked)
+    ));
+    // Frozen ID-only optional resume grants no current policy authority.
+    assert!(
+        adapter
+            .resume(&AttemptId::new("arbitrary").unwrap())
+            .is_none()
+    );
+}
+
+#[test]
+fn reusable_lifecycle_controls_run_on_synthetic_cli() {
+    use crate::conformance::{ConformanceCase, run_conformance};
+    let f = Fixture::new(RESULT, "");
+    f.release();
+    let adapter = f.adapter();
+    let task = f.task();
+    let p = policy(false);
+    let report = block_on(run_conformance(
+        &adapter,
+        ConformanceCase {
+            task: &task,
+            workspace: &f.workspace,
+            policy: &p,
+            cancel: None,
+            expected_failure: None,
+            refused_start: false,
+            classification: None,
+        },
+        || {
+            // This fake only writes its declared diagnostics; its captured prompt
+            // remains data and no worker remains after handle cleanup.
+            let pid: i32 = fs::read_to_string(f.workspace.worktree_path().join("pid"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            unsafe { kill(pid, 0) != 0 }
+        },
+    ));
+    assert!(report.passed(), "{report:?}");
+}
+
+#[test]
+fn native_turn_cap_and_conformance_refusal_controls() {
+    use crate::conformance::{ConformanceCase, run_conformance};
+    let f = Fixture::new(
+        "{\"type\":\"result\",\"subtype\":\"error_max_turns\",\"is_error\":true,\"errors\":[]}\n",
+        "",
+    );
+    policy_worker(&f);
+    let adapter = f.adapter();
+    let mut p = policy(false);
+    p.turn_budget = Some(1);
+    let handle = adapter
+        .start(&f.task_with_budgets(None, Some(1)), &f.workspace, &p)
+        .unwrap_or_else(|_| panic!("capped start"));
+    let result = adapter
+        .collect_result(&handle)
+        .unwrap_or_else(|_| panic!("capped collect"));
+    assert_eq!(result.cancel_reason(), Some(CancelReason::BudgetExhausted));
+    assert_eq!(result.failure(), Some(FailureClass::Unknown));
+    assert!(result.resume_ticket().is_none());
+    assert!(
+        fs::read_to_string(f.workspace.worktree_path().join("argv"))
+            .unwrap()
+            .contains("--max-turns\n1\n")
+    );
+    drop(handle);
+    let fresh = Fixture::new(RESULT, "");
+    let mut denied = policy(false);
+    denied.session_persistence = true;
+    denied.read_only = true;
+    let task = fresh.task();
+    let report = block_on(run_conformance(
+        &fresh.adapter(),
+        ConformanceCase {
+            task: &task,
+            workspace: &fresh.workspace,
+            policy: &denied,
+            cancel: None,
+            expected_failure: Some(FailureClass::PolicyBlocked),
+            refused_start: true,
+            classification: None,
+        },
+        || !fresh.workspace.worktree_path().join("pid").exists(),
+    ));
+    assert!(report.passed(), "{report:?}");
+}
+
+#[test]
+fn conformance_reports_isolation_failure_and_cancellation() {
+    use crate::conformance::{ConformanceCase, run_conformance};
+    let f = Fixture::new(RESULT, "");
+    f.release();
+    policy_worker(&f);
+    let task = f.task();
+    let mut p = policy(true);
+    p.structured_output_schema = Some("{\"type\":\"object\"}".into());
+    let adapter = f.adapter();
+    let report = block_on(run_conformance(
+        &adapter,
+        ConformanceCase {
+            task: &task,
+            workspace: &f.workspace,
+            policy: &p,
+            cancel: None,
+            expected_failure: None,
+            refused_start: false,
+            classification: None,
+        },
+        || false,
+    ));
+    assert!(!report.passed());
+    assert!(!report.isolation_and_cleanup);
+    assert!(report.stream && report.collection);
+    let argv = fs::read_to_string(f.workspace.worktree_path().join("argv")).unwrap();
+    assert!(argv.contains("--permission-mode\nplan\n"));
+    assert!(argv.contains("--no-session-persistence"));
+    let f = Fixture::new("", "");
+    let task = f.task();
+    let p = policy(false);
+    let adapter = f.adapter();
+    let report = block_on(run_conformance(
+        &adapter,
+        ConformanceCase {
+            task: &task,
+            workspace: &f.workspace,
+            policy: &p,
+            cancel: Some(CancelReason::Superseded),
+            expected_failure: Some(FailureClass::Unknown),
+            refused_start: false,
+            classification: None,
+        },
+        || true,
+    ));
+    assert!(report.passed(), "{report:?}");
 }

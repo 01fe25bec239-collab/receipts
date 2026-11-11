@@ -1,3 +1,5 @@
+mod claude_policy_probe;
+pub mod conformance;
 mod provider;
 pub use provider::{InstallState, Provider};
 mod attempt_types;
@@ -5,7 +7,8 @@ mod claude_adapter;
 mod policy;
 pub use attempt_types::{ClaudeAttemptEvent, ClaudeEventError, ClaudeEventStream};
 pub use claude_adapter::{
-    CancelReason, ClaudeAdapter, ClaudeAttemptHandle, ClaudeAttemptResult, RuntimeObservation,
+    CancelReason, ClaudeAdapter, ClaudeAttemptHandle, ClaudeAttemptResult, ClaudeResumeTicket,
+    RuntimeObservation,
 };
 pub use policy::RuntimeExecutionPolicy;
 #[cfg(all(test, unix))]

@@ -5,6 +5,7 @@ use crate::ProtectedLaunch;
 
 /// `None` means no mandatory constraint on that axis. Unsupported mandatory
 /// requirements are refused, never translated into prompt-only enforcement.
+#[derive(Clone)]
 pub struct RuntimeExecutionPolicy {
     pub timeout: ProcessTimeoutPolicy,
     pub read_only: bool,
@@ -13,6 +14,8 @@ pub struct RuntimeExecutionPolicy {
     pub filesystem_scope: Option<Vec<String>>,
     pub turn_budget: Option<u64>,
     pub structured_output_schema: Option<String>,
+    /// Opt-in only for eligible task sessions; reviewers always refuse.
+    pub session_persistence: bool,
     protected: Option<ProtectedLaunch>,
 }
 impl RuntimeExecutionPolicy {
@@ -25,6 +28,7 @@ impl RuntimeExecutionPolicy {
             filesystem_scope: None,
             turn_budget: None,
             structured_output_schema: None,
+            session_persistence: false,
             protected: None,
         }
     }
@@ -43,6 +47,7 @@ impl RuntimeExecutionPolicy {
         self.sandbox_mode.is_none()
             && self.network_access.is_none()
             && self.filesystem_scope.is_none()
+            && !self.session_persistence
             && self.turn_budget.is_none()
             && self.structured_output_schema.is_none()
     }

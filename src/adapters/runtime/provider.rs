@@ -111,6 +111,24 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     #[test]
+    fn stale_success_is_unknown_and_failure_replaces_it() {
+        let cache = ProbeCache::new(Duration::from_secs(60));
+        let known = RuntimeCapabilities::Codex(crate::CodexCapabilityProbeReport {
+            version: "synthetic".into(),
+            json: crate::CodexCapabilityEvidence::Supported,
+            output_schema: crate::CodexCapabilityEvidence::Unknown,
+            sandbox: crate::CodexCapabilityEvidence::Supported,
+        });
+        cache.observe(|| known.clone());
+        assert_eq!(cache.capabilities(), known);
+        cache.entry.lock().unwrap().as_mut().unwrap().0 = Instant::now() - Duration::from_secs(61);
+        assert_eq!(cache.capabilities(), RuntimeCapabilities::Unknown);
+        let (report, at) = cache.observe(|| RuntimeCapabilities::Unknown);
+        let provider = provider("openai", "OpenAI", report, at);
+        assert_eq!(provider.install_state, InstallState::Unavailable);
+        assert_eq!(cache.capabilities(), RuntimeCapabilities::Unknown);
+    }
+    #[test]
     fn expiry_reprobes_and_failed_probe_replaces_old_evidence() {
         let cache = ProbeCache::new(Duration::ZERO);
         let calls = Cell::new(0);
