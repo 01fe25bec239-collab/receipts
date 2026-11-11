@@ -203,3 +203,13 @@ pub use persistence::{
 
 #[cfg(test)]
 mod persistence_tests;
+
+pub mod blob_materializer;
+pub use blob_materializer::GitBlobMaterializer;
+#[cfg(test)]
+mod blob_materializer_tests;
+pub mod checkpoint_writer;
+pub mod output_store;
+pub mod remote_publish;
+#[cfg(test)]
+mod remote_publish_tests;

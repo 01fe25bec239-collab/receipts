@@ -156,3 +156,19 @@ impl AttemptEvidenceSinkV1 for TrustedAttemptEvidenceSinkV1<'_> {
         })
     }
 }
+
+impl TrustedAttemptEvidenceSinkV1<'_> {
+    /// Atomically commits successful finish and its State-validated mechanical
+    /// receipt. This is not review acceptance.
+    pub fn persist_finalization(
+        &mut self,
+        record: &receipts_state::FinalizationRecordV1,
+        finish: &receipts_state::AttemptFinish,
+    ) -> Result<receipts_state::SetupWriteOutcomeV1, StateError> {
+        let mut binding = subject(Op::Finalization, &record.project_id);
+        binding.graph_id = Some(record.graph_id.clone());
+        let admission = self.store.admit(binding);
+        self.store
+            .finish_with_finalization_v1(admission, record, finish)
+    }
+}
