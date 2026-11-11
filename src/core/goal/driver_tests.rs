@@ -17,6 +17,9 @@ struct Controlled {
     drift_after_check: bool,
     route_provider: String,
     compiled_specs: Vec<Vec<u8>>,
+    gate_pass: bool,
+    checked_shas: Vec<String>,
+    review_gates: Vec<super::GoalEvaluationState>,
     artifact_root: Option<std::path::PathBuf>,
     crash_launch: bool,
     graph: ExecutionGraphEnvelope,
@@ -50,6 +53,9 @@ impl Controlled {
             drift_after_check: false,
             route_provider: "host".into(),
             compiled_specs: vec![],
+            gate_pass: true,
+            checked_shas: vec![],
+            review_gates: vec![],
             artifact_root: None,
             crash_launch: false,
             graph: envelope(&[("n", "TASK", state, Some("w"))], &[]),
@@ -81,9 +87,10 @@ impl Controlled {
     }
 }
 impl CriterionCheckPortV1 for Controlled {
-    fn check(&mut self, _: &crate::capsules::Criterion, _: &str) -> bool {
+    fn check(&mut self, _: &crate::capsules::Criterion, sha: &str) -> bool {
         self.checks += 1;
-        true
+        self.checked_shas.push(sha.into());
+        self.gate_pass
     }
 }
 impl WriteScopePort for Controlled {
@@ -202,8 +209,9 @@ impl GoalConsumerPortV1 for Controlled {
         &mut self,
         _: &GoalRecordV1,
         node: &str,
-        _: &GoalAssessmentV1,
+        gate: &GoalAssessmentV1,
     ) -> Result<(), StateError> {
+        self.review_gates.push(gate.state());
         self.reviews.insert(node.into());
         Ok(())
     }
@@ -852,4 +860,156 @@ fn start_facade_compiles_verbatim_spec_and_emits_creation_events() {
     assert_eq!(port.compiled_specs, vec![b"spec".to_vec()]);
     assert!(port.events.contains(&GoalLifecycleEventV1::GoalCreated));
     assert!(port.events.contains(&GoalLifecycleEventV1::GoalDecomposed));
+}
+
+fn submitted_code(port: &mut Controlled) {
+    use serde_json::json;
+    let set = |from: &str, to: &str, cause: serde_json::Value| json!({"op":"SET_NODE_STATE","node_id":"n","detail":{"from":from,"to":to,"cause":cause}});
+    apply_control(
+        port,
+        json!([
+            set("PLANNED", "READY", json!({"kind":"DEPENDENCIES_SATISFIED"})),
+            set(
+                "READY",
+                "ADMITTED",
+                json!({"kind":"ADMISSION","admission_decision_id":"ad"})
+            ),
+            set(
+                "ADMITTED",
+                "DISPATCHED",
+                json!({"kind":"DISPATCH","attempt_id":"at1"})
+            ),
+            set(
+                "DISPATCHED",
+                "RUNNING",
+                json!({"kind":"START","attempt_id":"at1"})
+            ),
+            set(
+                "RUNNING",
+                "AWAITING_REVIEW",
+                json!({"kind":"SUBMIT","attempt_id":"at1"})
+            )
+        ]),
+    );
+    port.results = port
+        .results
+        .admit_attempt_code_sha("p", "g", "n", "at1", &"b".repeat(40))
+        .unwrap();
+}
+#[test]
+fn free_quality_gate_checks_admitted_final_sha_and_retains_failed_result() {
+    for pass in [false, true] {
+        let (_dir, mut state) = seed("2");
+        let mut port = Controlled::new(GraphNodeState::Planned);
+        let policy = policy();
+        submitted_code(&mut port);
+        port.gate_pass = pass;
+        let outcome = CoreFacade {
+            state: &mut state,
+            consumers: &mut port,
+            policy: &policy,
+            evidence: ApplyEvidenceV1::default(),
+        }
+        .tick("p", "goal")
+        .unwrap();
+        assert_eq!(port.checked_shas, vec!["b".repeat(40)]);
+        assert_eq!(
+            port.review_gates,
+            vec![if pass {
+                super::GoalEvaluationState::Complete
+            } else {
+                super::GoalEvaluationState::Incomplete
+            }]
+        );
+        assert_ne!(outcome.state(), super::GoalEvaluationState::Complete);
+        assert_eq!(
+            port.graph.graph().node_state("n"),
+            Some(GraphNodeState::AwaitingReview)
+        );
+        assert_eq!(port.launches, 0);
+    }
+}
+
+struct GateReview;
+impl ReviewEvidenceSource for GateReview {
+    fn review_record(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Result<Option<ReviewEvidenceRecord>, ReviewSourceUnavailable> {
+        use sha2::{Digest, Sha256};
+        Ok(Some(ReviewEvidenceRecord {
+            project_id: "p".into(),
+            graph_id: "g".into(),
+            review_id: "gate".into(),
+            subject_node_id: "n".into(),
+            subject_attempt_id: "at1".into(),
+            code_sha: Some("b".repeat(40)),
+            round: None,
+            outcome: ReviewOutcome::Pass,
+            content_sha256: Sha256::digest(b"gate evidence")
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
+            provenance: ReviewProvenance::Admitted {
+                admission_id: "admitted-gate".into(),
+            },
+        }))
+    }
+    fn review_content(&self, _: &str) -> Result<Option<Vec<u8>>, ReviewSourceUnavailable> {
+        Ok(Some(b"gate evidence".to_vec()))
+    }
+}
+#[test]
+fn a_passing_review_proposal_cannot_override_a_failed_free_check() {
+    use serde_json::json;
+    for pass in [false, true] {
+        let (_dir, mut state) = seed("2");
+        let mut port = Controlled::new(GraphNodeState::Planned);
+        let policy = policy();
+        submitted_code(&mut port);
+        port.gate_pass = pass;
+        let proposal = change(
+            &port,
+            json!([
+                {"op":"ATTACH_RESULT","node_id":"n","detail":{"result_ref":"result","result":{"node_id":"n","graph_id":"g","outcome":"PASS","attempt_id":"at1","review_id":"gate","code_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","produced_at":"2026-11-08T00:00:00Z"}}},
+                {"op":"SET_NODE_STATE","node_id":"n","detail":{"from":"AWAITING_REVIEW","to":"PASSED","cause":{"kind":"REVIEW_VERDICT","result_node_id":"n","review_id":"gate"}}}
+            ]),
+        );
+        let evidence = ApplyEvidenceV1 {
+            interface: None,
+            review: Some(ReviewEvidenceVerifier::new(&GateReview)),
+        };
+        // Establish that the ordinary admitted review path allows the proposal.
+        assert!(
+            apply_graph_mutation_with_evidence_v1(
+                &port.graph,
+                &port.results,
+                &proposal.mutation,
+                &proposal.scope,
+                evidence
+            )
+            .is_ok()
+        );
+        port.changes.push(proposal);
+        let outcome = CoreFacade {
+            state: &mut state,
+            consumers: &mut port,
+            policy: &policy,
+            evidence,
+        }
+        .tick("p", "goal")
+        .unwrap();
+        assert_eq!(
+            port.graph.graph().node_state("n"),
+            Some(if pass {
+                GraphNodeState::Passed
+            } else {
+                GraphNodeState::AwaitingReview
+            })
+        );
+        assert_ne!(outcome.state(), super::GoalEvaluationState::Complete);
+        assert_eq!(port.checked_shas, vec!["b".repeat(40)]);
+    }
 }

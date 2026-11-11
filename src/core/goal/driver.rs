@@ -241,13 +241,11 @@ impl<P: GoalConsumerPortV1> GoalDriverV1<'_, P> {
         operations: Vec<serde_json::Value>,
         phase: &str,
     ) -> Result<(), StateError> {
-        let next =
-            receipts_state::StateEpochValueV1::try_from(snapshot.graph.graph_version().as_str())?
-                .successor()?
-                .to_string();
+        let next = snapshot.graph.graph_version().successor();
         let parent_number: serde_json::Value =
             serde_json::from_str(snapshot.graph.graph_version().as_str()).map_err(|_| refused())?;
-        let next_number: serde_json::Value = serde_json::from_str(&next).map_err(|_| refused())?;
+        let next_number: serde_json::Value =
+            serde_json::from_str(next.as_str()).map_err(|_| refused())?;
         let json = serde_json::json!({"mutation_id":format!("{}-{phase}",dispatch.request.dispatch_id),"graph_id":snapshot.graph.graph_id(),"parent_version":parent_number,"resulting_version":next_number,"actor":{"role":"RUNTIME_A1"},"reason":phase,"created_at":dispatch.started_at,"operations":operations});
         let mutation = crate::wire::GraphMutationWireV1::from_json(&json.to_string())
             .and_then(|w| w.to_mutation())
@@ -427,6 +425,22 @@ impl<P: GoalConsumerPortV1> GoalLoopPortV1 for GoalDriverV1<'_, P> {
                 self.evidence,
             )
             .map_err(|_| refused())?;
+            for node in outcome.envelope.graph().nodes().filter(|n| {
+                needs_task_gate(n)
+                    && matches!(n.state(), GraphNodeState::Passed | GraphNodeState::Accepted)
+                    && snapshot.graph.graph().node_state(n.node_id()) != Some(n.state())
+            }) {
+                let criteria = self.consumers.task_criteria(goal, node.node_id())?;
+                let facts = task_gate_facts(&outcome.envelope, &outcome.results, node);
+                let gate = evaluate_required_criteria_v1(&criteria, &facts, self.consumers);
+                if gate.state() != GoalEvaluationState::Complete {
+                    return Ok(GoalRoundV1 {
+                        current_epoch: snapshot.current_epoch.clone(),
+                        dispatch: None,
+                        assessment: gate,
+                    });
+                }
+            }
             self.consumers
                 .publish_change(&snapshot.graph, &change, &outcome)?;
             self.emit_changes(goal, &snapshot.graph, &outcome)?;
@@ -464,37 +478,14 @@ impl<P: GoalConsumerPortV1> GoalLoopPortV1 for GoalDriverV1<'_, P> {
                 None,
             ));
         }
-        for node in snapshot.graph.graph().nodes().filter(|n| {
-            n.state() == GraphNodeState::AwaitingReview
-                && ![
-                    crate::GraphNodeKind::REVIEW,
-                    crate::GraphNodeKind::DETERMINISTIC_CHECK,
-                    crate::GraphNodeKind::GOAL,
-                    crate::GraphNodeKind::WORKSTREAM,
-                    crate::GraphNodeKind::GOAL_EVALUATION,
-                    crate::GraphNodeKind::ROUTING,
-                    crate::GraphNodeKind::INTEGRATION,
-                    crate::GraphNodeKind::HUMAN_GATE,
-                ]
-                .contains(n.kind())
-        }) {
+        for node in snapshot
+            .graph
+            .graph()
+            .nodes()
+            .filter(|n| n.state() == GraphNodeState::AwaitingReview && needs_task_gate(n))
+        {
             let criteria = self.consumers.task_criteria(goal, node.node_id())?;
-            let facts = GoalCompletionFactsV1 {
-                required_work_integrated: true,
-                no_blocking_tasks_or_findings: true,
-                security_review_complete: true,
-                dependencies_resolved: true,
-                epoch_reconciled: true,
-                integrated_sha: snapshot
-                    .results
-                    .attempt_code_sha(
-                        snapshot.graph.project_id(),
-                        snapshot.graph.graph_id(),
-                        node.node_id(),
-                    )
-                    .or_else(|| node.code_sha())
-                    .map(str::to_owned),
-            };
+            let facts = task_gate_facts(&snapshot.graph, &snapshot.results, node);
             let gate = evaluate_required_criteria_v1(&criteria, &facts, self.consumers);
             self.consumers.request_review(goal, node.node_id(), &gate)?;
         }
@@ -684,8 +675,9 @@ impl<P: GoalConsumerPortV1> GoalLoopPortV1 for GoalDriverV1<'_, P> {
             snapshot.graph.graph().nodes().all(|n| {
                 matches!(
                     n.state(),
-                    GraphNodeState::Accepted | GraphNodeState::Integrated | GraphNodeState::Passed
-                ) || historical_rejection(n)
+                    GraphNodeState::Accepted | GraphNodeState::Integrated
+                ) || (n.state() == GraphNodeState::Passed && !needs_task_gate(n))
+                    || historical_rejection(n)
             });
         snapshot.completion.required_work_integrated &=
             snapshot.graph.graph().nodes().next().is_some();
@@ -882,5 +874,36 @@ fn blocked(reason: &str) -> GoalAssessmentV1 {
     GoalAssessmentV1 {
         state: GoalEvaluationState::Blocked,
         gaps: vec![reason.into()],
+    }
+}
+
+fn needs_task_gate(node: &crate::GraphNode) -> bool {
+    ![
+        crate::GraphNodeKind::REVIEW,
+        crate::GraphNodeKind::DETERMINISTIC_CHECK,
+        crate::GraphNodeKind::GOAL,
+        crate::GraphNodeKind::WORKSTREAM,
+        crate::GraphNodeKind::GOAL_EVALUATION,
+        crate::GraphNodeKind::ROUTING,
+        crate::GraphNodeKind::INTEGRATION,
+        crate::GraphNodeKind::HUMAN_GATE,
+    ]
+    .contains(node.kind())
+}
+fn task_gate_facts(
+    graph: &ExecutionGraphEnvelope,
+    results: &GraphResultLedgerV1,
+    node: &crate::GraphNode,
+) -> GoalCompletionFactsV1 {
+    GoalCompletionFactsV1 {
+        required_work_integrated: true,
+        no_blocking_tasks_or_findings: true,
+        security_review_complete: true,
+        dependencies_resolved: true,
+        epoch_reconciled: true,
+        integrated_sha: results
+            .attempt_code_sha(graph.project_id(), graph.graph_id(), node.node_id())
+            .or_else(|| node.code_sha())
+            .map(str::to_owned),
     }
 }

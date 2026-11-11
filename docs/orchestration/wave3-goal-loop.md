@@ -34,9 +34,14 @@ latest continuation predates that reservation.
 FREE quality gates execute declared task checks at the exact code SHA through
 the check consumer. They do not request cross-provider A4. Completion and review
 consumers may propose results/verdicts, but Core applies the existing attempt,
-code-domain and admitted review evidence checks. An explicit failed-node retry
+code-domain and admitted review evidence checks. Publishing a work node as
+PASSED or ACCEPTED also requires its declared task checks to pass at the admitted
+final code SHA; a passing review cannot override a failed FREE check. An explicit failed-node retry
 can expand only a retained rejected review with attached failure evidence; the
 fresh REPAIR/REVIEW round and accepted history retain their graph identities.
+Expanded rejected reviews remain history; active descendants still gate completion.
+Repair accounting includes durable repair nodes and every expansion in the batch,
+while an already admitted repair can finish at the configured round limit.
 
 Goal completion runs declared criterion checks only after mechanical gates pass.
 An empty ready set cannot complete by itself. Missing checks, findings, epoch,
