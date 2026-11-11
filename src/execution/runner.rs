@@ -666,7 +666,8 @@ pub fn run_with_timeout_and_capture(
             )?;
             return Ok(CapturedProcessRun::new(outcome, stdout, stderr));
         }
-        std::thread::sleep(POLL_INTERVAL.min(remaining));
+        // Short local Git commands should not pay a full child-state poll per call.
+        std::thread::sleep(Duration::from_millis(1).min(remaining));
     }
 
     // EOF alone is not child completion: a child may close both streams and
