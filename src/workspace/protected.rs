@@ -1000,6 +1000,19 @@ impl ProtectedAttemptView<'_> {
     pub fn snapshot_output(&self) -> Result<LiveProcessOutput, ExecutionError> {
         self.attempt.snapshot_output()
     }
+    /// See [`LiveProcessAttempt::prepare_cancellation`]. Custody is unchanged.
+    pub fn prepare_cancellation(
+        &self,
+    ) -> Result<Option<crate::execution::LiveProcessCancellationPreparation>, ExecutionError> {
+        self.attempt.prepare_cancellation()
+    }
+    /// See [`LiveProcessAttempt::cancel_prepared`]. This never releases custody.
+    pub fn cancel_prepared(
+        &self,
+        preparation: &crate::execution::LiveProcessCancellationPreparation,
+    ) -> crate::execution::LiveProcessPreparedCancelAcceptance {
+        self.attempt.cancel_prepared(preparation)
+    }
     /// See [`LiveProcessAttempt::cancel`].
     pub fn cancel(&self) -> LiveProcessCancelAcceptance {
         self.attempt.cancel()

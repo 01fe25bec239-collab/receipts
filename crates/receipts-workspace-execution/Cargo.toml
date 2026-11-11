@@ -10,6 +10,7 @@ license = "Apache-2.0"
 path = "../../src/workspace/lib.rs"
 
 [dependencies]
+receipts-state = { path = "../.." }
 sha2 = "=0.11.0"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = { version = "=1.0.151", features = ["raw_value"] }

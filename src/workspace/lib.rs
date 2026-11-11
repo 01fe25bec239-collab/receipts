@@ -195,3 +195,11 @@ pub use write_path_pattern::{
 pub use write_scope_case::{
     CaseAliasCollision, FilesystemCaseSensitivity, WriteScopeCaseAliasCheck, probe_case_sensitivity,
 };
+
+pub mod persistence;
+pub use persistence::{
+    AttemptEvidenceSinkV1, CheckpointPersistenceReceiptV1, TrustedAttemptEvidenceSinkV1,
+};
+
+#[cfg(test)]
+mod persistence_tests;

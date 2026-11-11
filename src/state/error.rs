@@ -700,6 +700,10 @@ pub enum StateError {
         code: PublicationFailureCode,
         kind: &'static str,
     },
+    /// An internal goal/reservation/finalization operation refused.
+    SetupRefused {
+        reason: crate::wave3_setup::SetupRefusalV1,
+    },
     /// A State wire document was not admitted by its schema codec.
     WireDecode { schema: &'static str },
     /// An admitted wire value has no representation in the operational domain.
@@ -1124,6 +1128,7 @@ impl fmt::Display for StateError {
             StateError::Publication { code, kind } => {
                 write!(f, "publication {kind} {}", code.label())
             }
+            StateError::SetupRefused { reason } => write!(f, "shared setup refused: {reason:?}"),
             StateError::WireDecode { schema } => write!(f, "{schema} wire document refused"),
             StateError::WireConversionUnsupported { schema, field } => write!(
                 f,

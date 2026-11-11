@@ -25,14 +25,21 @@ pub(crate) fn apply(conn: &Connection) -> Result<(), StateError> {
         graph::verify_v22(conn, GraphPhase::Migration)?;
         conn.execute_batch(SQL)
             .map_err(|e| graph::sqlite_error(GraphPhase::Migration, e))?;
-        graph::verify_current(conn, GraphPhase::Migration)
+        graph::verify_v23(conn, GraphPhase::Migration)
     })
 }
 /// Exact v23 objects: every CREATE statement stored byte-for-byte, no extra
 /// trigger or index on the new tables, every new table `WITHOUT ROWID`.
 pub(crate) fn objects_match(conn: &Connection) -> Result<bool, rusqlite::Error> {
+    objects_match_definition(conn, SQL, &TABLES)
+}
+pub(crate) fn objects_match_definition(
+    conn: &Connection,
+    sql: &str,
+    tables: &[&str],
+) -> Result<bool, rusqlite::Error> {
     let (mut expected_triggers, mut expected_indexes) = (0, 0);
-    for statement in SQL.split(";\n") {
+    for statement in sql.split(";\n") {
         let statement = statement.trim();
         let mut words = statement.split_whitespace();
         let (Some("CREATE"), Some(mut kind)) = (words.next(), words.next()) else {
@@ -59,7 +66,7 @@ pub(crate) fn objects_match(conn: &Connection) -> Result<bool, rusqlite::Error> 
         }
     }
     let (mut triggers, mut indexes) = (0i64, 0i64);
-    for table in TABLES {
+    for table in tables {
         triggers += conn.query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND tbl_name=?1",
             [table],

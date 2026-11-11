@@ -112,6 +112,9 @@ use crate::trusted_time::TrustedClockV1;
 /// Closed operation families a single admission can authorize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateWriteOperationV1 {
+    Goal,
+    GoalDispatch,
+    Finalization,
     GraphGenesis,
     GraphMutation,
     GraphNodeResult,
@@ -446,6 +449,88 @@ impl TrustedCoreStore {
         )?;
         self.repo
             .append_node_result_v1(project, version, reference, result)
+    }
+
+    // ---- goal/reservation/finalization setup ---------------------------------
+
+    pub fn create_goal_v1(
+        &mut self,
+        admission: StateWriteAdmission,
+        definition: &crate::GoalDefinitionV1,
+        context_epoch: &str,
+    ) -> Result<crate::SetupWriteOutcomeV1, StateError> {
+        self.check(
+            admission,
+            StateWriteOperationV1::Goal,
+            Bound::graph(&definition.project_id, &definition.graph_id),
+        )?;
+        self.repo.create_goal_v1(definition, context_epoch)
+    }
+    pub fn advance_goal_v1(
+        &mut self,
+        admission: StateWriteAdmission,
+        progress: &crate::GoalProgressV1,
+    ) -> Result<crate::SetupWriteOutcomeV1, StateError> {
+        let goal = self
+            .repo
+            .find_goal_v1(&progress.project_id, &progress.goal_id)?
+            .ok_or_else(|| refused(StateWriteRefusalV1::UnknownSubject))?;
+        self.check(
+            admission,
+            StateWriteOperationV1::Goal,
+            Bound::graph(&progress.project_id, &goal.definition.graph_id),
+        )?;
+        self.repo.advance_goal_v1(progress)
+    }
+    pub fn reserve_goal_dispatch_v1(
+        &mut self,
+        admission: StateWriteAdmission,
+        request: &crate::GoalDispatchV1,
+        start: &AttemptStart,
+    ) -> Result<crate::SetupWriteOutcomeV1, StateError> {
+        self.check(
+            admission,
+            StateWriteOperationV1::GoalDispatch,
+            Bound::graph(&request.project_id, start.graph_id()),
+        )?;
+        self.repo.reserve_goal_dispatch_v1(request, start)
+    }
+    pub fn resolve_goal_dispatch_v1(
+        &mut self,
+        admission: StateWriteAdmission,
+        project: &str,
+        dispatch: &str,
+        resolution: crate::LaunchResolutionV1,
+        evidence_ref: &str,
+    ) -> Result<crate::SetupWriteOutcomeV1, StateError> {
+        let record = self
+            .repo
+            .find_goal_dispatch_v1(project, dispatch)?
+            .ok_or_else(|| refused(StateWriteRefusalV1::UnknownSubject))?;
+        let attempt = self
+            .repo
+            .find_attempt(&record.attempt_id)?
+            .ok_or_else(|| refused(StateWriteRefusalV1::UnknownSubject))?;
+        self.check(
+            admission,
+            StateWriteOperationV1::GoalDispatch,
+            Bound::graph(project, attempt.graph_id()),
+        )?;
+        self.repo
+            .resolve_goal_dispatch_v1(project, dispatch, resolution, evidence_ref)
+    }
+    pub fn finish_with_finalization_v1(
+        &mut self,
+        admission: StateWriteAdmission,
+        record: &crate::FinalizationRecordV1,
+        finish: &AttemptFinish,
+    ) -> Result<crate::SetupWriteOutcomeV1, StateError> {
+        self.check(
+            admission,
+            StateWriteOperationV1::Finalization,
+            Bound::graph(&record.project_id, &record.graph_id),
+        )?;
+        self.repo.finish_with_finalization_v1(record, finish)
     }
 
     // ---- execution records ---------------------------------------------------

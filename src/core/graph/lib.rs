@@ -171,7 +171,8 @@ pub use passed_acceptance_transition::{
     validate_passed_acceptance_transition,
 };
 pub use persisted_snapshot_projection::{
-    GraphSnapshotProjectionErrorV1, project_persisted_current_graph_v1,
+    GraphSnapshotProjectionErrorV1, ReadOnlyGraphViewV1, project_persisted_current_graph_v1,
+    project_persisted_graph_view_v1,
 };
 pub use rejected_repair_transition::{
     AUTHORIZED_REJECTED_REPAIR_TRANSITIONS, RejectedRepairTransitionError,
