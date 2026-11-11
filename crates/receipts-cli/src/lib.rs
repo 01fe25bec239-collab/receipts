@@ -17,6 +17,8 @@
 //! detected; binding execution to the hashed object would need an
 //! execute-by-descriptor primitive the Workspace runner does not provide.
 
+pub mod hook;
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 

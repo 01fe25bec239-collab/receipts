@@ -72,6 +72,50 @@ fn is_receipts(id: &str) -> bool {
             .is_some_and(|source| !source.is_empty())
 }
 
+/// The single Receipts entry's absolute `installPath`; `None` when absent,
+/// ambiguous, relative or malformed. The path is never formatted or stored.
+pub(super) fn claude_receipts_install_path(bytes: &[u8]) -> Option<PathBuf> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Row {
+        id: String,
+        #[serde(default)]
+        install_path: Option<String>,
+    }
+    let rows: Vec<Object<Row>> = serde_json::from_str(text(bytes).ok()?).ok()?;
+    let mut receipts = rows.into_iter().map(|r| r.0).filter(|r| is_receipts(&r.id));
+    let only = receipts.next()?;
+    if receipts.next().is_some() {
+        return None;
+    }
+    let path = PathBuf::from(only.install_path?);
+    path.is_absolute().then_some(path)
+}
+
+/// First whitespace token of `--version` output, bounded to a plain version
+/// alphabet; anything else stays unknown rather than echoing host text.
+pub(super) fn version(bytes: &[u8]) -> Value<String> {
+    let token = text(bytes)
+        .ok()
+        .and_then(|t| t.split_whitespace().next())
+        .filter(|v| {
+            (1..=64).contains(&v.len())
+                && v.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b))
+        });
+    token.map_or(Value::Unknown, |v| Value::Known(v.to_owned()))
+}
+
+/// Configured recognized events of a plugin `hooks/hooks.json` document.
+pub(super) fn plugin_hook_events(bytes: &[u8]) -> Value<Vec<String>> {
+    match text(bytes)
+        .and_then(|t| serde_json::from_str::<Object<CodexHooks>>(t).map_err(|_| Error::InvalidJson))
+    {
+        Ok(Object(hooks)) => hooks.hooks.0.names(),
+        Err(_) => Value::Unknown,
+    }
+}
+
 pub(super) fn claude_plugins(bytes: &[u8]) -> Result<Vec<HostObservedPlugin>, Error> {
     // Actual installed C1 shape verified before implementation: array of objects;
     // id is required. version/enabled are optional facts, not default values.
@@ -152,6 +196,22 @@ struct ConfiguredEvents {
     post_tool_use: Field<Vec<Object<HookGroup>>>,
     #[serde(default)]
     stop: Field<Vec<Object<HookGroup>>>,
+    #[serde(default)]
+    pre_compact: Field<Vec<Object<HookGroup>>>,
+    #[serde(default)]
+    post_compact: Field<Vec<Object<HookGroup>>>,
+    #[serde(default)]
+    worktree_create: Field<Vec<Object<HookGroup>>>,
+    #[serde(default)]
+    worktree_remove: Field<Vec<Object<HookGroup>>>,
+    #[serde(default)]
+    file_changed: Field<Vec<Object<HookGroup>>>,
+    #[serde(default)]
+    subagent_start: Field<Vec<Object<HookGroup>>>,
+    #[serde(default)]
+    subagent_stop: Field<Vec<Object<HookGroup>>>,
+    #[serde(default)]
+    task_completed: Field<Vec<Object<HookGroup>>>,
 }
 impl ConfiguredEvents {
     fn names(self) -> Value<Vec<String>> {
@@ -162,6 +222,14 @@ impl ConfiguredEvents {
             ("PreToolUse", self.pre_tool_use),
             ("PostToolUse", self.post_tool_use),
             ("Stop", self.stop),
+            ("PreCompact", self.pre_compact),
+            ("PostCompact", self.post_compact),
+            ("WorktreeCreate", self.worktree_create),
+            ("WorktreeRemove", self.worktree_remove),
+            ("FileChanged", self.file_changed),
+            ("SubagentStart", self.subagent_start),
+            ("SubagentStop", self.subagent_stop),
+            ("TaskCompleted", self.task_completed),
         ];
         // Null is not a known-empty event configuration. Do not partially
         // project this list as complete evidence when one known event is null.
@@ -283,6 +351,6 @@ pub(super) fn configuration(
                 ..Default::default()
             })
         }
-        Source::ClaudePluginList => Err(Error::Unsupported),
+        Source::ClaudePluginList | Source::ClaudePluginHooks => Err(Error::Unsupported),
     }
 }

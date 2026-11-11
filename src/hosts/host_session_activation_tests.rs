@@ -65,18 +65,24 @@ fn request() -> HostSessionActivationRequest<'static> {
         project_root: "/unused-session-context".into(),
         mode_override: None,
         cached: None,
+        hook_execution: None,
     }
 }
 
 fn unknown(host: HostId) -> HostCapabilityObservation {
     // Existing Headless observation has no physical I/O. Replace only identity
     // for synthetic tests; this does not claim any interactive-host evidence.
+    // No physical fingerprint is claimed for synthetic facts.
     HostCapabilityObservation {
         host,
+        validity_fingerprint: None,
+        hook_definition_digest: None,
+        relevant_config_digest: None,
         ..crate::host_capability_observation::observe_host_capabilities(
             &HostCapabilityObservationRequest {
                 host: HostId::Headless,
                 project_root: request().project_root,
+                hook_execution: None,
             },
             &NoPort,
         )
@@ -105,22 +111,12 @@ fn headless_refresh(
             observation: HostCapabilityObservationRequest {
                 host: HostId::Headless,
                 project_root: project_root.into(),
+                hook_execution: None,
             },
             mode_override,
         },
         &NoPort,
     )
-}
-
-/// A genuinely minted entry whose report is replaced (crate-private
-/// construction only; no public path can do this).
-fn entry(report: HostCapabilityReportNonTemporalCore) -> HostCapabilityCacheEntryV1 {
-    HostCapabilityCacheEntryV1 {
-        report,
-        ..headless_refresh("/unused-session-context", None)
-            .cache_entry
-            .unwrap()
-    }
 }
 
 fn report(outcome: &HostCapabilityReportRefreshOutcome) -> &HostCapabilityReportNonTemporalCore {
@@ -259,9 +255,8 @@ fn identity_errors_are_typed_and_have_bounded_diagnostics() {
 }
 
 fn requires_refresh(candidate: Option<&HostCapabilityReportNonTemporalCore>) {
-    let candidate = candidate.cloned().map(entry);
     let request = HostSessionActivationRequest {
-        cached: candidate.as_ref(),
+        cached: candidate,
         ..request()
     };
     let calls = Cell::new(0);
@@ -309,7 +304,6 @@ fn nonempty_uncomparable_fingerprint_refreshes() {
 fn stale_embedded_never_survives_real_session_start_or_resume() {
     let candidate = cached(Stale::ValidityFingerprintChanged, Some("looks-valid"));
     assert_eq!(candidate.selected_mode(), Mode::Embedded);
-    let candidate = entry(candidate);
     let request = HostSessionActivationRequest {
         cached: Some(&candidate),
         ..request()
@@ -321,6 +315,7 @@ fn stale_embedded_never_survives_real_session_start_or_resume() {
                 observation: HostCapabilityObservationRequest {
                     host: HostId::Headless,
                     project_root: request.project_root.clone(),
+                    hook_execution: None,
                 },
                 mode_override: None,
             },
@@ -335,10 +330,10 @@ fn stale_embedded_never_survives_real_session_start_or_resume() {
             report(&result.capability_refresh).selected_mode(),
             Mode::Supervised
         );
-        assert_eq!(
-            report(&result.capability_refresh).validity_fingerprint(),
-            None
-        );
+        // The fresh complete observation carries its own token, never the
+        // candidate's.
+        let token = report(&result.capability_refresh).validity_fingerprint();
+        assert!(token.is_some_and(|t| t.starts_with("sha256:") && t != "looks-valid"));
     }
 }
 
@@ -347,7 +342,7 @@ fn only_an_identical_minted_entry_is_reused() {
     let genuine = headless_refresh("/unused-session-context", None)
         .cache_entry
         .expect("complete headless observation mints an entry");
-    let reuse = |cached: &HostCapabilityCacheEntryV1,
+    let reuse = |cached: &crate::HostCapabilityCacheEntryV1,
                  mode_override: Option<HostCapabilityModeOverride>,
                  project_root: &str| {
         prepare_host_session(
@@ -355,7 +350,7 @@ fn only_an_identical_minted_entry_is_reused() {
             &HostSessionActivationRequest {
                 project_root: project_root.into(),
                 mode_override,
-                cached: Some(cached),
+                cached: Some(cached.report()),
                 ..request()
             },
             &NoPort,
@@ -393,23 +388,23 @@ fn only_an_identical_minted_entry_is_reused() {
         reuse(&genuine, None, "/other-project"),
         HostCapabilityFreshnessDisposition::ReprobeThenSelect
     );
-    // A substituted report under a genuine fingerprint is refused.
-    let substituted = entry(cached(Stale::None, Some("old")));
+    // A substituted report (any other content or token) is refused.
+    let mut substituted = genuine.clone();
+    substituted.report = cached(Stale::None, Some("old"));
     assert_eq!(substituted.fingerprint(), genuine.fingerprint());
     assert_eq!(
         reuse(&substituted, None, "/unused-session-context"),
         HostCapabilityFreshnessDisposition::ReprobeThenSelect
     );
-    // A substituted fingerprint under the genuine report is refused.
-    let mut foreign_fingerprint = genuine.clone();
-    foreign_fingerprint.fingerprint = headless_refresh("/other-project", None)
+    // The token binds the fingerprint: another project's report differs.
+    let foreign = headless_refresh("/other-project", None)
         .cache_entry
-        .unwrap()
-        .fingerprint;
-    assert_eq!(
-        reuse(&foreign_fingerprint, None, "/unused-session-context"),
-        HostCapabilityFreshnessDisposition::ReprobeThenSelect
+        .unwrap();
+    assert_ne!(
+        foreign.report().validity_fingerprint(),
+        genuine.report().validity_fingerprint()
     );
+    assert!(!genuine.permits_reuse_of(foreign.report()));
 }
 
 #[test]
@@ -438,7 +433,7 @@ fn changed_plugin_install_and_other_failures_use_existing_policy() {
     ];
     let report_candidate = cached(Stale::None, Some("old"));
     assert_eq!(report_candidate.plugin_installed(), Some(true));
-    let candidate = entry(report_candidate);
+    let candidate = report_candidate;
     for host in [HostId::ClaudeCode, HostId::Codex, HostId::Headless] {
         for (change, reason) in cases {
             let request = HostSessionActivationRequest {

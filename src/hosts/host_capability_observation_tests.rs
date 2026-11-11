@@ -287,8 +287,13 @@ fn json_recursion_protection_is_active() {
 struct Fixture {
     plugins: Result<Vec<u8>, Error>,
     files: Vec<(Source, Result<Vec<u8>, Error>)>,
+    hooks: Result<Vec<u8>, Error>,
 }
 impl Sources for Fixture {
+    fn plugin_hooks(&self, path: &Path) -> Result<Vec<u8>, Error> {
+        assert_eq!(path, Path::new("/plug/receipts"));
+        self.hooks.clone()
+    }
     fn plugins(&self, _: &Path) -> Result<Vec<u8>, Error> {
         self.plugins.clone()
     }
@@ -303,22 +308,26 @@ fn fixture() -> Fixture {
     Fixture {
         plugins: Ok(b"[]".to_vec()),
         files: vec![],
+        hooks: Err(Error::Unavailable),
     }
 }
 fn request(host: HostId) -> HostCapabilityObservationRequest {
     HostCapabilityObservationRequest {
         host,
         project_root: "/synthetic-project".into(),
+        hook_execution: None,
     }
 }
 
 #[test]
 fn real_source_semantics_distinguish_present_absent_and_failed_plugins() {
-    for (bytes, expected) in [
-        (b"[]".to_vec(), Value::Known(false)),
+    // A plugin the host itself reports disabled refutes hook enablement.
+    for (bytes, expected, enabled) in [
+        (b"[]".to_vec(), Value::Known(false), Value::Unknown),
         (
             br#"[{"id":"receipts@market","enabled":false}]"#.to_vec(),
             Value::Known(true),
+            Value::Known(false),
         ),
     ] {
         let observation = observe(
@@ -330,7 +339,7 @@ fn real_source_semantics_distinguish_present_absent_and_failed_plugins() {
         );
         assert_eq!(observation.plugin_supported, Value::Known(true));
         assert_eq!(observation.plugin_installed, expected);
-        assert_eq!(observation.hooks_enabled, Value::Unknown);
+        assert_eq!(observation.hooks_enabled, enabled);
     }
     for error in [
         Error::ProbeFailed,
@@ -404,12 +413,13 @@ fn partial_source_failure_preserves_independent_facts() {
     assert_eq!(value.configurations[1].result, Err(Error::PermissionDenied));
     assert_eq!(value.configurations[2].result, Err(Error::InvalidJson));
     assert_eq!(value.configurations[3].result, Err(Error::Missing));
-    assert_eq!(value.hooks_enabled, Value::Unknown);
+    // A readable disableAllHooks refutes enablement despite other failures.
+    assert_eq!(value.hooks_enabled, Value::Known(false));
     assert_eq!(value, observe(&request(HostId::ClaudeCode), &state));
 }
 
 #[test]
-fn file_policy_and_project_config_never_prove_effective_authority() {
+fn file_policy_refutes_but_never_proves_effective_authority() {
     for flag in [true, false] {
         for (host, source, input) in [
             (
@@ -435,10 +445,22 @@ fn file_policy_and_project_config_never_prove_effective_authority() {
                     ..fixture()
                 },
             );
-            assert_eq!(value.hooks_allowed_by_admin_policy, Value::Unknown);
+            // Only a Claude managed `true` refutes; nothing here proves.
+            let refuted = if flag && host == HostId::ClaudeCode {
+                Value::Known(false)
+            } else {
+                Value::Unknown
+            };
+            assert_eq!(value.hooks_allowed_by_admin_policy, refuted);
+            assert_eq!(value.hooks_enabled, refuted);
             assert_eq!(value.hooks_trusted, Value::Unknown);
-            assert_eq!(value.hooks_enabled, Value::Unknown);
-            assert_eq!(value.hooks_supported, Value::Unknown);
+            // Plugin-list success shows the probed Claude version has hooks.
+            let supported = if host == HostId::ClaudeCode {
+                Value::Known(true)
+            } else {
+                Value::Unknown
+            };
+            assert_eq!(value.hooks_supported, supported);
         }
     }
 }
@@ -767,9 +789,8 @@ mod fingerprint {
     #[test]
     fn plugin_probe_runs_only_through_the_port_with_fixed_read_only_argv() {
         let port = Recording(RefCell::new(Vec::new()));
-        let bytes = io::LocalSources(&port)
-            .plugins(Path::new("/project"))
-            .unwrap();
+        let directory = Directory::new();
+        let bytes = io::LocalSources(&port).plugins(&directory.0).unwrap();
         assert_eq!(bytes, b"[]");
         assert_eq!(
             io::probe_command(Path::new("/project"), &["--version"]).current_dir,
@@ -871,10 +892,12 @@ mod fingerprint {
 
     #[test]
     fn identity_change_across_probes_leaves_the_fingerprint_incomplete() {
+        let directory = Directory::new();
         let (_, fingerprint) = observe_host_capabilities_with_fingerprint(
             &HostCapabilityObservationRequest {
                 host: HostId::ClaudeCode,
-                project_root: "/nonexistent-receipts-project".into(),
+                project_root: directory.0.clone(),
+                hook_execution: None,
             },
             &Swapping(std::cell::Cell::new(0)),
         );
@@ -892,4 +915,255 @@ mod fingerprint {
         assert!(!rendered.contains(marker), "{rendered}");
         assert!(rendered.contains(":sha256:"));
     }
+}
+
+const PLUGIN_HOOKS: &str = include_str!("../../plugins/claude/hooks/hooks.json");
+const INSTALLED: &[u8] =
+    br#"[{"id":"receipts@local","enabled":true,"installPath":"/plug/receipts","version":"0.1.0"}]"#;
+
+fn healthy_claude() -> Fixture {
+    Fixture {
+        plugins: Ok(INSTALLED.to_vec()),
+        hooks: Ok(PLUGIN_HOOKS.as_bytes().to_vec()),
+        files: vec![
+            (Source::ClaudeUserSettings, Err(Error::Missing)),
+            (
+                Source::ClaudeProjectSettings,
+                Ok(br#"{"disableAllHooks":false}"#.to_vec()),
+            ),
+            (Source::ClaudeManagedSettings, Err(Error::Missing)),
+            (Source::ClaudeManagedDropIn, Err(Error::Missing)),
+        ],
+    }
+}
+
+fn ran(root: &str) -> HostCapabilityObservationRequest {
+    HostCapabilityObservationRequest {
+        hook_execution: Some(HostHookExecutionEvidenceV1 {
+            plugin_root: root.into(),
+        }),
+        ..request(HostId::ClaudeCode)
+    }
+}
+
+#[test]
+fn installed_manifest_and_forged_execution_claim_preserve_unknown_permission() {
+    let value = observe(&ran("/plug/receipts"), &healthy_claude());
+    assert_eq!(value.plugin_installed, Value::Known(true));
+    assert_eq!(value.hooks_supported, Value::Known(true));
+    assert_eq!(value.hooks_configured, Value::Known(true));
+    assert_eq!(value.hook_trust_required, Value::Known(false));
+    assert_eq!(value.hooks_trusted, Value::Unknown);
+    assert_eq!(value.hooks_enabled, Value::Unknown);
+    assert_eq!(value.hooks_allowed_by_admin_policy, Value::Unknown);
+    assert_eq!(value.required_hook_coverage_satisfied, Value::Known(true));
+    assert_eq!(
+        value.hook_coverage_class,
+        HostCapabilityHookCoverageClass::Partial
+    );
+    let with_fingerprint = HostCapabilityObservation {
+        validity_fingerprint: Some("sha256:f".into()),
+        ..value
+    };
+    let inputs = with_fingerprint.report_selection_inputs(true, Stale::None, None);
+    assert_eq!(inputs.probe_status, HostCapabilityProbeStatus::Partial);
+    let Outcome::Selected { report } = compose_host_capability_report_selection(&inputs).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(report.selected_mode(), Mode::Supervised);
+    assert_eq!(report.hooks_enabled(), None);
+    assert_eq!(report.hooks_allowed_by_admin_policy(), None);
+}
+
+#[test]
+fn hook_execution_counts_only_for_the_installed_plugin_root() {
+    for request in [
+        request(HostId::ClaudeCode),
+        ran("/elsewhere/receipts"),
+        ran("relative"),
+    ] {
+        let value = observe(&request, &healthy_claude());
+        assert_eq!(value.hooks_enabled, Value::Unknown);
+        assert_eq!(value.hooks_allowed_by_admin_policy, Value::Unknown);
+        assert_eq!(value.hooks_configured, Value::Known(true));
+    }
+}
+
+#[test]
+fn refutations_win_and_contradictions_stay_unknown() {
+    let with = |file: (Source, &str)| {
+        let mut f = healthy_claude();
+        f.files.push((file.0, Ok(file.1.as_bytes().to_vec())));
+        f
+    };
+    // Readable refutations without a live hook: known false.
+    let off = with((Source::ClaudeLocalSettings, r#"{"disableAllHooks":true}"#));
+    assert_eq!(
+        observe(&request(HostId::ClaudeCode), &off).hooks_enabled,
+        Value::Known(false)
+    );
+    // The same file while our hook is demonstrably running: contradiction.
+    assert_eq!(
+        observe(&ran("/plug/receipts"), &off).hooks_enabled,
+        Value::Known(false)
+    );
+    let managed = with((
+        Source::ClaudeManagedDropIn,
+        r#"{"allowManagedHooksOnly":true}"#,
+    ));
+    assert_eq!(
+        observe(&request(HostId::ClaudeCode), &managed).hooks_allowed_by_admin_policy,
+        Value::Known(false)
+    );
+    assert_eq!(
+        observe(&ran("/plug/receipts"), &managed).hooks_allowed_by_admin_policy,
+        Value::Known(false)
+    );
+    // allowManagedHooksOnly in user/project files is not admin policy.
+    let user = with((
+        Source::ClaudeUserSettings,
+        r#"{"allowManagedHooksOnly":true}"#,
+    ));
+    assert_eq!(
+        observe(&ran("/plug/receipts"), &user).hooks_allowed_by_admin_policy,
+        Value::Unknown
+    );
+    // Host-reported disabled plugin.
+    let disabled = Fixture {
+        plugins: Ok(
+            br#"[{"id":"receipts@local","enabled":false,"installPath":"/plug/receipts"}]"#.to_vec(),
+        ),
+        ..healthy_claude()
+    };
+    assert_eq!(
+        observe(&request(HostId::ClaudeCode), &disabled).hooks_enabled,
+        Value::Known(false)
+    );
+    // An unreadable settings source blocks the positive facts.
+    let mut unread = healthy_claude();
+    unread
+        .files
+        .push((Source::ClaudeManagedSettings, Err(Error::PermissionDenied)));
+    let value = observe(&ran("/plug/receipts"), &unread);
+    assert_eq!(value.hooks_enabled, Value::Unknown);
+    assert_eq!(value.hooks_allowed_by_admin_policy, Value::Unknown);
+}
+
+#[test]
+#[allow(clippy::type_complexity)]
+fn plugin_manifest_shapes_drive_configuration_and_coverage() {
+    let cases: [(
+        Result<Vec<u8>, Error>,
+        Value<bool>,
+        Value<bool>,
+        HostCapabilityHookCoverageClass,
+    ); 5] = [
+        (
+            Err(Error::Missing),
+            Value::Known(false),
+            Value::Known(false),
+            HostCapabilityHookCoverageClass::None,
+        ),
+        (
+            Ok(br#"{"hooks":{}}"#.to_vec()),
+            Value::Known(false),
+            Value::Known(false),
+            HostCapabilityHookCoverageClass::None,
+        ),
+        (
+            Ok(
+                br#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"x"}]}]}}"#
+                    .to_vec(),
+            ),
+            Value::Known(true),
+            Value::Known(false),
+            HostCapabilityHookCoverageClass::Partial,
+        ),
+        (
+            Ok(b"{not json".to_vec()),
+            Value::Unknown,
+            Value::Unknown,
+            HostCapabilityHookCoverageClass::Unknown,
+        ),
+        (
+            Err(Error::NotRegularFile),
+            Value::Unknown,
+            Value::Unknown,
+            HostCapabilityHookCoverageClass::Unknown,
+        ),
+    ];
+    for (hooks, configured, required, coverage) in cases {
+        let value = observe(
+            &ran("/plug/receipts"),
+            &Fixture {
+                hooks,
+                ..healthy_claude()
+            },
+        );
+        assert_eq!(value.hooks_configured, configured);
+        assert_eq!(value.required_hook_coverage_satisfied, required);
+        assert_eq!(value.hook_coverage_class, coverage);
+    }
+    // No unambiguous absolute install path: the manifest is never read.
+    for plugins in [
+        br#"[{"id":"receipts@a","installPath":"/plug/receipts"},{"id":"receipts@b","installPath":"/plug/receipts"}]"#.to_vec(),
+        br#"[{"id":"receipts@a","installPath":"plug/receipts"}]"#.to_vec(),
+        br#"[{"id":"receipts@a"}]"#.to_vec(),
+    ] {
+        let fixture = Fixture {
+            plugins: Ok(plugins),
+            hooks: Err(Error::Unavailable),
+            ..healthy_claude()
+        };
+        let value = observe(&ran("/plug/receipts"), &fixture);
+        assert_eq!(value.hooks_configured, Value::Unknown);
+        assert_eq!(value.hooks_enabled, Value::Unknown);
+    }
+}
+
+#[test]
+fn version_probe_keeps_only_a_plain_version_token() {
+    for (output, expected) in [
+        (
+            "2.1.319 (Claude Code)\n",
+            Value::Known("2.1.319".to_owned()),
+        ),
+        ("  1.0.0-beta+7\n", Value::Known("1.0.0-beta+7".to_owned())),
+        ("", Value::Unknown),
+        ("SECRET=\"x\" 1.0", Value::Unknown),
+        ("\u{1b}[31m1.0", Value::Unknown),
+    ] {
+        assert_eq!(decode::version(output.as_bytes()), expected, "{output:?}");
+    }
+    assert_eq!(decode::version(&[b'1'; 65]), Value::Unknown);
+}
+
+#[test]
+fn forged_hook_observation_never_grants_authority_and_coverage_is_independent() {
+    let value = observe(&ran("/plug/receipts"), &healthy_claude());
+    assert_eq!(value.hooks_enabled, Value::Unknown);
+    assert_eq!(value.hooks_allowed_by_admin_policy, Value::Unknown);
+    assert_eq!(value.required_hook_coverage_satisfied, Value::Known(true));
+    assert_eq!(
+        value.hook_coverage_class,
+        HostCapabilityHookCoverageClass::Partial
+    );
+}
+
+#[test]
+fn explicit_plugin_setting_disables_even_with_matching_hook_claim() {
+    let mut f = healthy_claude();
+    f.files.push((
+        Source::ClaudeLocalSettings,
+        Ok(br#"{"enabledPlugins":{"receipts@local":false}}"#.to_vec()),
+    ));
+    assert_eq!(
+        observe(&ran("/plug/receipts"), &f).hooks_enabled,
+        Value::Known(false)
+    );
+    f.plugins = Err(Error::ProbeFailed);
+    let failed = observe(&ran("/plug/receipts"), &f);
+    assert_eq!(failed.hooks_enabled, Value::Known(false));
+    assert_eq!(failed.hooks_configured, Value::Unknown);
 }

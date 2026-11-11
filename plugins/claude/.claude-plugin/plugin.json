@@ -1,3 +1,6 @@
 {
-  "name": "receipts"
+  "name": "receipts",
+  "version": "0.1.0",
+  "description": "Receipts host bridge: forwards Claude Code lifecycle hooks to the local Receipts core and handles worktree creation.",
+  "license": "Apache-2.0"
 }

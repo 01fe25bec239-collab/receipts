@@ -2,7 +2,7 @@
 use super::*;
 use crate::host_probe_port::{HostProbeCommandV1, HostProbeProcessPort};
 use std::{
-    fs::{self, OpenOptions},
+    fs::{self},
     io::Read,
     path::{Path, PathBuf},
 };
@@ -24,8 +24,13 @@ pub(super) fn probe_command(project_root: &Path, args: &[&str]) -> HostProbeComm
 
 impl Sources for LocalSources<'_> {
     fn plugins(&self, project_root: &Path) -> Result<Vec<u8>, Error> {
+        crate::private_fs::HostDirectory::open(project_root).map_err(|_| Error::NotRegularFile)?;
         self.0
             .run(&probe_command(project_root, &["plugin", "list", "--json"]))
+    }
+
+    fn plugin_hooks(&self, install_path: &Path) -> Result<Vec<u8>, Error> {
+        read_document(&install_path.join("hooks/hooks.json"))
     }
 
     fn configurations(
@@ -201,23 +206,30 @@ pub(super) fn open_document(_: &Path, _: (i32, i32)) -> Result<Vec<u8>, Error> {
 /// turn this into a blocking FIFO open or follow a replacement symlink.
 #[cfg(unix)]
 pub(super) fn open_document(path: &Path, (flags, eloop): (i32, i32)) -> Result<Vec<u8>, Error> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut options = OpenOptions::new();
-    options.read(true).custom_flags(flags);
-    let file = options
-        .open(path)
-        .map_err(|error| match error.raw_os_error() {
-            // O_NOFOLLOW refused a symlink now at the final component.
-            Some(code) if code == eloop => Error::NotRegularFile,
-            _ => io_error(error),
-        })?;
-    if !file.metadata().map_err(io_error)?.is_file() {
-        return Err(Error::NotRegularFile);
-    }
+    let _ = (flags, eloop); // Checked target table remains the supported-platform gate.
+    let parent = path.parent().ok_or(Error::NotRegularFile)?;
+    let dir = crate::private_fs::HostDirectory::open_read(parent).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            Error::Missing
+        } else {
+            Error::NotRegularFile
+        }
+    })?;
+    let name = path.file_name().ok_or(Error::NotRegularFile)?;
+    let file = dir.open_file(name, false, false).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            Error::Missing
+        } else {
+            Error::NotRegularFile
+        }
+    })?;
     let mut bytes = Vec::new();
-    file.take((HOST_STRUCTURED_OBSERVATION_MAX_BYTES + 1) as u64)
+    (&file)
+        .take((HOST_STRUCTURED_OBSERVATION_MAX_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(io_error)?;
+    dir.verify_file(name, &file, false)
+        .map_err(|_| Error::NotRegularFile)?;
     if bytes.len() > HOST_STRUCTURED_OBSERVATION_MAX_BYTES {
         return Err(Error::StructuredObservationTooLarge);
     }
@@ -226,20 +238,7 @@ pub(super) fn open_document(path: &Path, (flags, eloop): (i32, i32)) -> Result<V
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(super) fn drop_ins(path: &Path) -> Result<Vec<PathBuf>, Error> {
-    // Reject redirects for directories too. Bound all entries examined, including
-    // irrelevant names; do not scan a large directory searching for 32 matches.
-    for ancestor in path.ancestors() {
-        if ancestor.as_os_str().is_empty() {
-            continue;
-        }
-        if fs::symlink_metadata(ancestor)
-            .map_err(io_error)?
-            .file_type()
-            .is_symlink()
-        {
-            return Err(Error::NotRegularFile);
-        }
-    }
+    let dir = crate::private_fs::HostDirectory::open_read(path).map_err(io_error)?;
     let mut paths = Vec::new();
     for (index, entry) in fs::read_dir(path).map_err(io_error)?.enumerate() {
         if index == HOST_MANAGED_DROP_IN_MAX_FILES {
@@ -250,6 +249,7 @@ pub(super) fn drop_ins(path: &Path) -> Result<Vec<PathBuf>, Error> {
             paths.push(entry.path());
         }
     }
+    dir.verify().map_err(|_| Error::NotRegularFile)?;
     paths.sort();
     Ok(paths)
 }

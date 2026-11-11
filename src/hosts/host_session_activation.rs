@@ -8,10 +8,11 @@ use std::path::PathBuf;
 
 use crate::{
     HostAdapter, HostCapabilityFreshnessDisposition, HostCapabilityModeOverride,
-    HostCapabilityReportRefreshOutcome, HostCapabilityReportRefreshRequest, HostDetectionError,
-    HostDetectionSignals, HostId, freshness_disposition,
-    host_capability_observation::HostCapabilityObservationRequest,
-    host_probe_port::{HostCapabilityCacheEntryV1, HostProbeProcessPort},
+    HostCapabilityReportNonTemporalCore, HostCapabilityReportRefreshOutcome,
+    HostCapabilityReportRefreshRequest, HostDetectionError, HostDetectionSignals, HostId,
+    freshness_disposition,
+    host_capability_observation::{HostCapabilityObservationRequest, HostHookExecutionEvidenceV1},
+    host_probe_port::HostProbeProcessPort,
     refresh_host_capability_report, resolve_host,
 };
 
@@ -90,8 +91,12 @@ pub struct HostSessionActivationRequest<'a> {
     pub explicit_host_override: Option<HostId>,
     pub project_root: PathBuf,
     pub mode_override: Option<HostCapabilityModeOverride>,
-    /// A previously minted coupled entry; never current evidence by itself.
-    pub cached: Option<&'a HostCapabilityCacheEntryV1>,
+    /// A previously persisted report (decoded through `wire`); never current
+    /// evidence by itself. Reused only when it equals the report this fresh,
+    /// completely fingerprinted observation selects.
+    pub cached: Option<&'a HostCapabilityReportNonTemporalCore>,
+    /// Present only inside a host-launched Receipts hook process.
+    pub hook_execution: Option<HostHookExecutionEvidenceV1>,
 }
 
 /// Identity reconciled and capability refresh attempted, not unconditional readiness.
@@ -142,8 +147,9 @@ impl std::error::Error for HostSessionActivationError {
 
 /// Prepare a session start or resume; not a per-command probe.
 ///
-/// Positive cache reuse is currently unavailable: no integrated physical
-/// fingerprint proof exists. Every reconciled entry delegates to A3-021.
+/// Always observes fresh; the cached report is reused (`ReuseReport`) only
+/// when it equals the report selected from this completely fingerprinted
+/// observation. Drift, incompleteness or a different selection re-probes.
 /// `HostAdapter::id` is the only adapter operation consumed.
 ///
 /// The private refresh seam cannot be used by production callers.
@@ -183,11 +189,12 @@ fn prepare_with_refresh<A: HostAdapter>(
         observation: HostCapabilityObservationRequest {
             host: resolved_host,
             project_root: request.project_root.clone(),
+            hook_execution: request.hook_execution.clone(),
         },
         mode_override: request.mode_override.clone(),
     });
     let reusable = match (&capability_refresh.cache_entry, request.cached) {
-        (Some(current), Some(cached)) => cached.permits_reuse_by(current),
+        (Some(current), Some(cached)) => current.permits_reuse_of(cached),
         _ => false,
     };
     let freshness_disposition = freshness_disposition(reusable);

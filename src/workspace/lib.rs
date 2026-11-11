@@ -65,11 +65,13 @@ pub mod git;
 pub mod handle;
 pub mod handle_wire;
 pub mod lifecycle;
+pub mod plain_worktree;
 pub mod protected;
 mod protected_custody;
 #[cfg(target_os = "linux")]
 mod protected_linux;
 pub mod provision;
+pub use plain_worktree::OwnedPlainWorktree;
 pub mod recovery_preparation;
 pub mod remote_publish_policy;
 pub mod review_evidence;

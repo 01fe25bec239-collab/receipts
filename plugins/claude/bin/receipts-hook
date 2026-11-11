@@ -1,0 +1,29 @@
+#!/bin/sh
+# Receipts Claude hook launcher. Hook JSON stays on stdin; the only argument
+# is the fixed event name from hooks.json. No PATH lookup, no eval, no
+# interpolation of host input: exec an absolute receipts binary or stop.
+set -u
+event=${1:-}
+bin=${RECEIPTS_BIN:-}
+case "$bin" in
+  /*) ;;
+  *)
+    bin=
+    case "${CLAUDE_PLUGIN_ROOT:-}" in
+      /*) [ -x "$CLAUDE_PLUGIN_ROOT/bin/receipts" ] && bin=$CLAUDE_PLUGIN_ROOT/bin/receipts ;;
+    esac
+    ;;
+esac
+if [ -z "$bin" ] || [ ! -f "$bin" ] || [ ! -x "$bin" ]; then
+  echo "receipts: no absolute receipts binary (set RECEIPTS_BIN or install <plugin>/bin/receipts)" >&2
+  # Observers fail open; WorktreeCreate must not pretend a worktree exists.
+  [ "$event" = WorktreeCreate ] && exit 1
+  exit 0
+fi
+# A child keeps shell exec failures inside the observer fail-open boundary.
+"$bin" hook claude "$event"
+result=$?
+[ "$result" -eq 0 ] && exit 0
+echo "receipts: hook execution failed" >&2
+[ "$event" = WorktreeCreate ] && exit 1
+exit 0
