@@ -445,14 +445,32 @@ fn file_policy_refutes_but_never_proves_effective_authority() {
                     ..fixture()
                 },
             );
-            // Only a Claude managed `true` refutes; nothing here proves.
-            let refuted = if flag && host == HostId::ClaudeCode {
-                Value::Known(false)
-            } else {
-                Value::Unknown
+            let admin_refuted = flag
+                && matches!(
+                    source,
+                    Source::ClaudeManagedSettings | Source::CodexLocalRequirements
+                );
+            let disabled = match host {
+                HostId::ClaudeCode => flag,
+                HostId::Codex => !flag,
+                HostId::Headless => false,
             };
-            assert_eq!(value.hooks_allowed_by_admin_policy, refuted);
-            assert_eq!(value.hooks_enabled, refuted);
+            assert_eq!(
+                value.hooks_allowed_by_admin_policy,
+                if admin_refuted {
+                    Value::Known(false)
+                } else {
+                    Value::Unknown
+                }
+            );
+            assert_eq!(
+                value.hooks_enabled,
+                if disabled {
+                    Value::Known(false)
+                } else {
+                    Value::Unknown
+                }
+            );
             assert_eq!(value.hooks_trusted, Value::Unknown);
             // Plugin-list success shows the probed Claude version has hooks.
             let supported = if host == HostId::ClaudeCode {
@@ -1166,4 +1184,73 @@ fn explicit_plugin_setting_disables_even_with_matching_hook_claim() {
     let failed = observe(&ran("/plug/receipts"), &f);
     assert_eq!(failed.hooks_enabled, Value::Known(false));
     assert_eq!(failed.hooks_configured, Value::Unknown);
+}
+
+#[test]
+fn codex_files_only_refute_native_permission_and_failed_sources_remain_unknown() {
+    for (files, enabled, admin) in [
+        (
+            vec![(
+                Source::CodexUserConfig,
+                Ok(b"[features]\nhooks=false".to_vec()),
+            )],
+            Value::Known(false),
+            Value::Unknown,
+        ),
+        (
+            vec![(
+                Source::CodexLocalRequirements,
+                Ok(b"allow_managed_hooks_only=true".to_vec()),
+            )],
+            Value::Unknown,
+            Value::Known(false),
+        ),
+        (
+            vec![(
+                Source::CodexUserConfig,
+                Ok(b"allow_managed_hooks_only=true\n[features]\nhooks=true".to_vec()),
+            )],
+            Value::Unknown,
+            Value::Unknown,
+        ),
+        (
+            vec![
+                (Source::CodexUserConfig, Err(Error::PermissionDenied)),
+                (
+                    Source::CodexProjectConfig,
+                    Ok(b"[features]\nhooks='bad'".to_vec()),
+                ),
+            ],
+            Value::Unknown,
+            Value::Unknown,
+        ),
+        (
+            vec![
+                (
+                    Source::CodexUserConfig,
+                    Ok(b"[features]\nhooks=false".to_vec()),
+                ),
+                (Source::CodexProjectConfig, Err(Error::Unavailable)),
+            ],
+            Value::Known(false),
+            Value::Unknown,
+        ),
+    ] {
+        let o = observe(&request(HostId::Codex), &Fixture { files, ..fixture() });
+        assert_eq!(o.hooks_enabled, enabled);
+        assert_eq!(o.hooks_allowed_by_admin_policy, admin);
+        assert_eq!(o.plugin_installed, Value::Unknown);
+        assert_eq!(o.hooks_trusted, Value::Unknown);
+        assert_eq!(o.required_hook_coverage_satisfied, Value::Unknown);
+        let selection = compose_host_capability_report_selection(&o.report_selection_inputs(
+            true,
+            Stale::None,
+            None,
+        ))
+        .unwrap();
+        let Outcome::Selected { report } = selection else {
+            panic!("conservative selection required")
+        };
+        assert_eq!(report.selected_mode(), Mode::Supervised);
+    }
 }

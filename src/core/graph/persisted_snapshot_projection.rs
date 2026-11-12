@@ -31,6 +31,8 @@
 //! Failures are closed categories that never carry or format supplied
 //! values; nested errors are discarded unformatted.
 
+use std::collections::BTreeMap;
+
 use receipts_state::{
     PersistedCurrentGraphV1, StateGraphEdgeRelationV1, StateGraphEdgeV1, StateGraphNodeV1,
 };
@@ -99,12 +101,13 @@ pub fn project_persisted_current_graph_v1(
     project_graph(persisted, expected_project_id, expected_graph_id).map(|(snapshot, _)| snapshot)
 }
 
-/// Read-only topology and snapshot from the same verified State projection.
+/// Read-only topology, node membership and snapshot from one verified State projection.
 /// No constructor permits a caller to combine independently sourced edges.
 pub struct ReadOnlyGraphViewV1 {
     project_id: String,
     snapshot: GraphSnapshot,
     edges: Vec<GraphEdge>,
+    node_workstreams: BTreeMap<String, Option<String>>,
 }
 impl ReadOnlyGraphViewV1 {
     pub fn project_id(&self) -> &str {
@@ -115,6 +118,17 @@ impl ReadOnlyGraphViewV1 {
     }
     pub fn edges(&self) -> &[GraphEdge] {
         &self.edges
+    }
+    /// Every validated node in node-ID byte order; `None` explicitly denotes
+    /// an unassigned node. Values preserve the hashed workstream bytes exactly.
+    /// ```compile_fail
+    /// use receipts_orchestration::ReadOnlyGraphViewV1;
+    /// fn mutate(view: &ReadOnlyGraphViewV1) {
+    ///     view.node_workstreams().clear();
+    /// }
+    /// ```
+    pub fn node_workstreams(&self) -> &BTreeMap<String, Option<String>> {
+        &self.node_workstreams
     }
 }
 
@@ -130,6 +144,15 @@ pub fn project_persisted_graph_view_v1(
         project_id: expected_project_id.into(),
         snapshot,
         edges,
+        node_workstreams: graph
+            .nodes()
+            .map(|node| {
+                (
+                    node.node_id().to_owned(),
+                    node.workstream_id().map(str::to_owned),
+                )
+            })
+            .collect(),
     })
 }
 

@@ -1278,3 +1278,43 @@ fn read_only_view_binds_topology_snapshot_and_digest_and_core_goal_port_reopens(
         None
     );
 }
+
+#[test]
+fn read_only_membership_preserves_assigned_and_unassigned_nodes_and_digest() {
+    let store = Store::new();
+    let mut fixture = field_base("p");
+    fixture.nodes[0].workstream = Some("ws\"\u{202e}\n".into());
+    fixture.nodes[1].workstream = Some("other".into());
+    let digest = fixture.reference_digest();
+    let persisted = store.persist(&fixture, &digest);
+    let before = store.read("p", "g");
+    let view = project_persisted_graph_view_v1(&persisted, "p", "g")
+        .unwrap_or_else(|_| panic!("view refused"));
+    assert_eq!(
+        view.node_workstreams(),
+        &std::collections::BTreeMap::from([
+            ("w".to_owned(), Some("other".to_owned())),
+            ("x-ñ\u{0}".to_owned(), Some("ws\"\u{202e}\n".to_owned())),
+            ("y".to_owned(), None),
+        ])
+    );
+    assert_eq!(
+        view.node_workstreams()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["w", "x-ñ\u{0}", "y"]
+    );
+    assert_eq!(view.snapshot().resulting_digest(), Some(digest.as_str()));
+    assert!(view.snapshot() == &fixture.expected(&digest));
+    assert!(store.read("p", "g") == before, "projection mutated State");
+    let mut changed = fixture.clone().in_project("changed");
+    changed.nodes[0].workstream = None;
+    assert_ne!(changed.reference_digest(), digest);
+    // Old digest with changed membership must refuse the whole view.
+    let stale = store.persist(&changed, &digest);
+    assert!(matches!(
+        project_persisted_graph_view_v1(&stale, "changed", "g"),
+        Err(E::DigestMismatch)
+    ));
+}

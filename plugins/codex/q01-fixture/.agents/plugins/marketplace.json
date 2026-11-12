@@ -1,0 +1,9 @@
+{
+  "name": "receipts-q01-fixture",
+  "plugins": [{
+    "name": "q01-observer",
+    "source": {"source": "local", "path": "./plugins/q01-observer"},
+    "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
+    "category": "Productivity"
+  }]
+}
