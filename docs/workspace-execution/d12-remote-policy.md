@@ -77,7 +77,10 @@ Exact readback requests symbolic-ref metadata and refuses aliases, preventing
 deleted aliases from deleting their protected targets. Deletion compares the remote SHA, then uses a deletion-only exact lease at the
 receive side to refuse movement after readback. Publication never uses force or
 lease flags. Deletion affects the remote ref only; local branches and evidence
-are retained. Lost responses stay Uncertain until readback. Reopening permits
+are retained. Lost responses stay Uncertain until readback. Local policy,
+configuration or ref-lock refusals during reconciliation record their reason
+and preserve a started deletion's Uncertain outcome, keeping competing
+publication and deletion blocked until remote evidence resolves it. Reopening permits
 readback only and never repeats the destructive command; another deletion
 attempt requires new user direction. An absent ref proves deletion only after
 a durable delete-started marker. D4 restart authority and automatic cleanup

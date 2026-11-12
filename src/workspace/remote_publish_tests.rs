@@ -1095,3 +1095,179 @@ fn deletion_lost_transport_response_and_receive_side_movement() {
         );
     }
 }
+
+#[test]
+fn uncertain_deletion_configuration_refusal_keeps_competitors_blocked() {
+    uncertain_deletion_local_refusal("config");
+}
+
+#[test]
+fn uncertain_deletion_branch_lock_keeps_competitors_blocked() {
+    uncertain_deletion_local_refusal("lock");
+}
+
+fn uncertain_deletion_local_refusal(obstacle: &str) {
+    use receipts_state::RemotePublicationOutcomeV1 as O;
+    let source = TestRepo::new(&format!("uncertain-delete-{obstacle}"));
+    let remote = TestRepo::new(&format!("uncertain-delete-remote-{obstacle}"));
+    git(source.path(), &["branch", "task/transport"]);
+    let sha = source.head_sha();
+    let endpoint = remote.path().to_str().unwrap();
+    let (db, mut store) = transport_store(&source);
+    let request = PublicationRequest {
+        repository: source.path(),
+        remote: endpoint,
+        branch: "task/transport",
+        commit: &sha,
+        wire: W::PushOnAccept,
+        mode: ProjectRemoteMode::PushAcceptedA3,
+        class: PublicationBranchClass::Task,
+        accepted_commit: Some(&sha),
+    };
+    let publication = transport_intent(&source, endpoint, &sha, "original-publication");
+    let a = publication_admission(&store);
+    assert_eq!(
+        publish_durable(&mut store, a, &publication, &request, &PublicationClock).unwrap(),
+        O::Published
+    );
+    let mut deletion = publication.clone();
+    deletion.operation_id = "lost-deletion".into();
+    deletion.deletion_authorization = Some(deletion.operation_id.clone());
+    let a = publication_admission(&store);
+    let authorization = store.authorize_remote_deletion_v1(a, &deletion).unwrap();
+    let a = publication_admission(&store);
+    store
+        .append_remote_publication_result_v1(
+            a,
+            "p",
+            "lost-deletion",
+            1,
+            O::Uncertain,
+            None,
+            "d12:delete-started",
+            &PublicationClock,
+        )
+        .unwrap();
+    // Simulate remote success followed by a lost response and process restart.
+    git(
+        remote.path(),
+        &["update-ref", "-d", "refs/heads/task/transport"],
+    );
+    drop(authorization);
+    drop(store);
+    let mut store = receipts_state::TrustedCoreStore::open_exclusive(&db).unwrap();
+    let lock = source.path().join(".git/refs/heads/task/transport.lock");
+    if obstacle == "config" {
+        git(source.path(), &["config", "core.sshCommand", "false"]);
+    } else {
+        std::fs::write(&lock, "fixture-owned lock").unwrap();
+    }
+    assert_eq!(
+        reconcile_remote_deletion(
+            &mut store,
+            "p",
+            "lost-deletion",
+            &request,
+            &PublicationClock,
+            None
+        )
+        .unwrap(),
+        O::Uncertain
+    );
+    drop(store);
+    let mut store = receipts_state::TrustedCoreStore::open_exclusive(&db).unwrap();
+    let history = store
+        .reader()
+        .read_remote_publication_v1("p", "lost-deletion")
+        .unwrap()
+        .unwrap();
+    assert_eq!(history.outcome(), O::Uncertain);
+    assert_eq!(history.results.len(), 2);
+    assert_eq!(history.results[1].observed_commit, None);
+    assert_eq!(
+        history.results[1].evidence_ref,
+        if obstacle == "config" {
+            "d12:deletion-configuration-refused"
+        } else {
+            "d12:deletion-ref-locked"
+        }
+    );
+    let mut competing_publication = publication.clone();
+    competing_publication.operation_id = "competing-publication".into();
+    let a = publication_admission(&store);
+    assert!(matches!(
+        publish_durable(
+            &mut store,
+            a,
+            &competing_publication,
+            &request,
+            &PublicationClock
+        ),
+        Err(receipts_state::StateError::SetupRefused {
+            reason: receipts_state::SetupRefusalV1::ConflictingReplay
+        })
+    ));
+    let mut competing_deletion = deletion.clone();
+    competing_deletion.operation_id = "competing-deletion".into();
+    competing_deletion.deletion_authorization = Some(competing_deletion.operation_id.clone());
+    let a = publication_admission(&store);
+    assert!(matches!(
+        store.authorize_remote_deletion_v1(a, &competing_deletion),
+        Err(receipts_state::StateError::SetupRefused {
+            reason: receipts_state::SetupRefusalV1::ConflictingReplay
+        })
+    ));
+    for operation in ["competing-publication", "competing-deletion"] {
+        assert!(
+            store
+                .reader()
+                .read_remote_publication_v1("p", operation)
+                .unwrap()
+                .is_none()
+        );
+    }
+    if obstacle == "config" {
+        git(source.path(), &["config", "--unset", "core.sshCommand"]);
+    } else {
+        assert_eq!(
+            std::fs::read_to_string(&lock).unwrap(),
+            "fixture-owned lock"
+        );
+        std::fs::remove_file(&lock).unwrap();
+    }
+    assert_eq!(
+        reconcile_remote_deletion(
+            &mut store,
+            "p",
+            "lost-deletion",
+            &request,
+            &PublicationClock,
+            None
+        )
+        .unwrap(),
+        O::Deleted
+    );
+    let history = store
+        .reader()
+        .read_remote_publication_v1("p", "lost-deletion")
+        .unwrap()
+        .unwrap();
+    assert_eq!(history.results.len(), 3);
+    assert_eq!(
+        history.results[2].evidence_ref,
+        "d12:deletion-readback-absent"
+    );
+    assert_eq!(history.outcome(), O::Deleted);
+    assert!(!crate::test_support::branch_exists(
+        &remote,
+        "task/transport"
+    ));
+    // A terminal remote observation releases the ref for future publication.
+    let a = publication_admission(&store);
+    assert_eq!(
+        store
+            .reserve_remote_publication_v1(a, &competing_publication)
+            .unwrap(),
+        receipts_state::SetupWriteOutcomeV1::Applied
+    );
+}

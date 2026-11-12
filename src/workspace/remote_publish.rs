@@ -561,6 +561,16 @@ fn deletion_run(
     if !execute && record.outcome() != O::Uncertain {
         return Ok(record.outcome());
     }
+    let started = record
+        .results
+        .iter()
+        .any(|r| r.evidence_ref == "d12:delete-started");
+    // Local obstacles cannot establish the outcome of a started remote deletion.
+    let local_refusal = if started && record.outcome() == O::Uncertain {
+        O::Uncertain
+    } else {
+        O::Refused
+    };
     let mut sequence = record.results.len() as u64;
     let mut append = |outcome, observed: Option<&str>, evidence| {
         sequence += 1;
@@ -587,18 +597,17 @@ fn deletion_run(
     if matches!(request.branch, "main" | "master")
         || protected_refs.contains(&reference.as_str())
         || validate_branch_name(request.branch).is_err()
-        || !transport_allowed(request, settings)
+    {
+        return append(local_refusal, None, "d12:deletion-policy-refused");
+    }
+    if !transport_allowed(request, settings)
         || git::refuse_untrusted_repository_config(request.repository, "delete branch").is_err()
         || !publication_config_allowed(request.repository)
     {
-        return append(O::Refused, None, "d12:deletion-refused");
+        return append(local_refusal, None, "d12:deletion-configuration-refused");
     }
-    let started = record
-        .results
-        .iter()
-        .any(|r| r.evidence_ref == "d12:delete-started");
     let Ok(_guard) = BranchLock::acquire(request.repository, &reference) else {
-        return append(O::Refused, None, "d12:deletion-ref-locked");
+        return append(local_refusal, None, "d12:deletion-ref-locked");
     };
     match exact_remote_ref(request, &reference, settings) {
         Err(()) => return append(O::Uncertain, None, "d12:deletion-readback-unavailable"),
