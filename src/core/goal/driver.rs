@@ -426,7 +426,12 @@ impl<P: GoalConsumerPortV1> GoalLoopPortV1 for GoalDriverV1<'_, P> {
             .map_err(|_| refused())?;
             for node in outcome.envelope.graph().nodes().filter(|n| {
                 needs_task_gate(n)
-                    && matches!(n.state(), GraphNodeState::Passed | GraphNodeState::Accepted)
+                    && matches!(
+                        n.state(),
+                        GraphNodeState::Passed
+                            | GraphNodeState::Accepted
+                            | GraphNodeState::Integrated
+                    )
                     && snapshot.graph.graph().node_state(n.node_id()) != Some(n.state())
             }) {
                 let criteria = self.consumers.task_criteria(goal, node.node_id())?;

@@ -30,6 +30,7 @@ struct Controlled {
     routes: usize,
     launches: usize,
     checks: usize,
+    publications: usize,
     reviews: BTreeSet<String>,
     events: Vec<GoalLifecycleEventV1>,
     changes: Vec<GoalGraphChangeV1>,
@@ -75,6 +76,7 @@ impl Controlled {
             routes: 0,
             launches: 0,
             checks: 0,
+            publications: 0,
             reviews: BTreeSet::new(),
             events: vec![],
             changes: vec![],
@@ -201,6 +203,7 @@ impl GoalConsumerPortV1 for Controlled {
         _: &GoalGraphChangeV1,
         outcome: &GraphMutationOutcomeV1,
     ) -> Result<(), StateError> {
+        self.publications += 1;
         self.graph = outcome.envelope.clone();
         self.results = outcome.results.clone();
         Ok(())
@@ -1071,4 +1074,84 @@ fn policy_swap_keeps_goal_graph_and_accepted_history_without_recompilation() {
         ),
         ("goal", "g")
     );
+}
+
+#[test]
+fn combined_completion_batch_requires_task_checks_at_result_sha() {
+    use serde_json::json;
+    for target in [
+        GraphNodeState::Passed,
+        GraphNodeState::Accepted,
+        GraphNodeState::Integrated,
+    ] {
+        for pass in [false, true] {
+            let (_dir, mut state) = seed("2");
+            let mut port = Controlled::new(GraphNodeState::Planned);
+            let policy = policy();
+            submitted_code(&mut port);
+            port.gate_pass = pass;
+            let mut operations = vec![
+                json!({"op":"ATTACH_RESULT","node_id":"n","detail":{"result_ref":"result","result":{"node_id":"n","graph_id":"g","outcome":"PASS","attempt_id":"at1","review_id":"gate","code_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","produced_at":"2026-11-08T00:00:00Z"}}}),
+                json!({"op":"SET_NODE_STATE","node_id":"n","detail":{"from":"AWAITING_REVIEW","to":"PASSED","cause":{"kind":"REVIEW_VERDICT","result_node_id":"n","review_id":"gate"}}}),
+            ];
+            if target != GraphNodeState::Passed {
+                operations.push(json!({"op":"SET_NODE_STATE","node_id":"n","detail":{"from":"PASSED","to":"ACCEPTED","cause":{"kind":"ACCEPTANCE","decision_id":"accept"}}}));
+            }
+            if target == GraphNodeState::Integrated {
+                operations.push(json!({"op":"SET_NODE_STATE","node_id":"n","detail":{"from":"ACCEPTED","to":"INTEGRATED","cause":{"kind":"INTEGRATION","decision_id":"integrate"}}}));
+            }
+            let proposal = change(&port, json!(operations));
+            let evidence = ApplyEvidenceV1 {
+                interface: None,
+                review: Some(ReviewEvidenceVerifier::new(&GateReview)),
+            };
+            assert!(
+                apply_graph_mutation_with_evidence_v1(
+                    &port.graph,
+                    &port.results,
+                    &proposal.mutation,
+                    &proposal.scope,
+                    evidence
+                )
+                .is_ok()
+            );
+            let before = (port.graph.clone(), port.results.clone());
+            port.changes.push(proposal);
+            let outcome = CoreFacade {
+                state: &mut state,
+                consumers: &mut port,
+                policy: &policy,
+                evidence,
+            }
+            .tick("p", "goal")
+            .unwrap();
+            assert_eq!(
+                port.publications,
+                usize::from(pass),
+                "{target:?}, task check pass={pass}"
+            );
+            assert_eq!(
+                port.graph.graph().node_state("n"),
+                Some(if pass {
+                    target
+                } else {
+                    GraphNodeState::AwaitingReview
+                })
+            );
+            // The task result is b; the fixture's integrated repository SHA is a.
+            assert_eq!(port.checked_shas.first(), Some(&"b".repeat(40)));
+            assert_eq!(
+                port.checked_shas
+                    .iter()
+                    .filter(|sha| **sha == "b".repeat(40))
+                    .count(),
+                1
+            );
+            if !pass {
+                assert_eq!((port.graph.clone(), port.results.clone()), before);
+                assert_eq!(outcome.state(), super::GoalEvaluationState::Incomplete);
+                assert_eq!(port.checked_shas, vec!["b".repeat(40)]);
+            }
+        }
+    }
 }
