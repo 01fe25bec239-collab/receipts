@@ -60,7 +60,7 @@ pub(crate) fn apply(conn: &Connection) -> Result<(), StateError> {
         graph::verify_v23(conn, GraphPhase::Migration)?;
         conn.execute_batch(SQL)
             .map_err(|e| graph::sqlite_error(GraphPhase::Migration, e))?;
-        graph::verify_current(conn, GraphPhase::Migration)
+        graph::verify_v24(conn, GraphPhase::Migration)
     })
 }
 pub(crate) fn objects_match(conn: &Connection) -> Result<bool, rusqlite::Error> {

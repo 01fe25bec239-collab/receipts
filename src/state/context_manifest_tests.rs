@@ -134,7 +134,7 @@ fn t01_fresh_database_bootstraps_to_schema_version_7() {
     );
     let tmp = TempDir::new("cm-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 24);
+    assert_eq!(repo.schema_version().expect("version read"), 25);
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
         24,
@@ -148,7 +148,7 @@ fn t02_version_7_database_reopens_idempotently() {
     let tmp = TempDir::new("cm-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 24);
+        assert_eq!(repo.schema_version().expect("version read"), 25);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
             24,

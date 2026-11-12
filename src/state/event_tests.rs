@@ -174,7 +174,7 @@ fn check_values(sql: &str, column: &str) -> Vec<String> {
 fn t01_fresh_database_bootstraps_to_schema_version_7() {
     let tmp = TempDir::new("ev-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 24);
+    assert_eq!(repo.schema_version().expect("version read"), 25);
     assert!(
         repo.table_exists("event").expect("table check"),
         "event must exist after migration 4"
@@ -182,7 +182,7 @@ fn t01_fresh_database_bootstraps_to_schema_version_7() {
     // Exactly one metadata row per applied migration.
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        24
+        25
     );
 }
 
@@ -192,7 +192,7 @@ fn t02_version_7_database_reopens() {
     let tmp = TempDir::new("ev-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 24);
+        assert_eq!(repo.schema_version().expect("version read"), 25);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
             24,

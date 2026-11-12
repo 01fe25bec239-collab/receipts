@@ -1549,12 +1549,25 @@ pub(crate) fn verify_v18(conn: &Connection, phase: Phase) -> Result<(), StateErr
     Ok(())
 }
 /// The supported current State schema head.
-pub(crate) const CURRENT_SCHEMA_HEAD: i64 = 24;
+pub(crate) const CURRENT_SCHEMA_HEAD: i64 = 25;
 
-/// Verifies the exact current ledger and all objects through v24.
+/// Verifies the exact current ledger and all objects through v25.
 pub(crate) fn verify_current(conn: &Connection, phase: Phase) -> Result<(), StateError> {
+    verify_v24_objects(conn, phase)?;
+    verify_ledger(conn, 25, phase)?;
+    if !migrations::v0025_remote_publication::objects_match(conn)
+        .map_err(|e| schema_error(phase, e))?
+    {
+        return Err(failure(phase, Code::CorruptStore, None));
+    }
+    Ok(())
+}
+pub(crate) fn verify_v24(conn: &Connection, phase: Phase) -> Result<(), StateError> {
+    verify_v24_objects(conn, phase)?;
+    verify_ledger(conn, 24, phase)
+}
+fn verify_v24_objects(conn: &Connection, phase: Phase) -> Result<(), StateError> {
     verify_v23_objects(conn, phase)?;
-    verify_ledger(conn, 24, phase)?;
     if !migrations::v0024_wave3_setup::objects_match(conn).map_err(|e| schema_error(phase, e))? {
         return Err(failure(phase, Code::CorruptStore, None));
     }

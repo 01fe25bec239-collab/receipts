@@ -268,3 +268,9 @@ pub use wave3_setup::{
 
 #[cfg(test)]
 mod wave3_setup_tests;
+
+pub mod remote_publication;
+pub use remote_publication::{
+    RemotePublicationIntentV1, RemotePublicationOutcomeV1, RemotePublicationRecordV1,
+    RemotePublicationResultV1,
+};

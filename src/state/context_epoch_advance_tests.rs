@@ -210,7 +210,7 @@ fn direct_exec(repo: &mut SqliteStateRepository, sql: &str, params: &[&dyn ToSql
 #[test]
 fn t01_schema_remains_version_8() {
     let (tmp, mut repo) = opened_repo("cea-t01");
-    assert_eq!(repo.schema_version().expect("version read"), 24);
+    assert_eq!(repo.schema_version().expect("version read"), 25);
     advance(&mut repo, "project-1", ContextEpochTrigger::A1Init).expect("advance");
     assert_eq!(
         repo.schema_version().expect("version read"),
@@ -219,7 +219,7 @@ fn t01_schema_remains_version_8() {
     );
     drop(repo);
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("reopen");
-    assert_eq!(repo.schema_version().expect("version read"), 24);
+    assert_eq!(repo.schema_version().expect("version read"), 25);
 }
 
 // T02 — migration v11 is the exact registered chain head.

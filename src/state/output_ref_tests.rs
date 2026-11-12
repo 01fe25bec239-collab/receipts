@@ -134,7 +134,7 @@ fn reference_injected_insert_failure_rolls_back_everything() {
     ));
     assert_eq!(repo.count_table_rows("workspace_checkpoints").unwrap(), 0);
     assert_eq!(repo.count_table_rows("output_refs").unwrap(), 0);
-    assert_eq!(repo.count_table_rows("state_schema_version").unwrap(), 24);
+    assert_eq!(repo.count_table_rows("state_schema_version").unwrap(), 25);
     assert_eq!(repo.count_table_rows("trusted_time_watermark").unwrap(), 0);
 }
 #[test]

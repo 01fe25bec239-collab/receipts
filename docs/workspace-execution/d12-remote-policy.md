@@ -24,3 +24,19 @@ undoing local progress. Review does not depend on successful publication.
 
 This ADR fixes shared interpretation. Publication, retry and pruning execution
 belong to the Workspace publication feature.
+
+D12 durable publication uses `publish_durable` at the trusted composition
+boundary and State v25. Its immutable operation identity binds project,
+canonical repository and owned file remote, full equal source/destination
+refs, commit, both policy vocabularies, branch class and applicable acceptance
+artifact reference. Composition must verify acceptance before supplying it.
+The lower-level `publish` remains a transport helper and provides no durability.
+
+Intent without an outcome derives `Uncertain`. Before pushing, durable
+publication appends `Uncertain`; every retry reads the exact destination ref.
+Only an exact matching observation records `Published`. Failed readback stays
+`Uncertain`; a successful differing/absent observation can record `RemoteFailed`.
+Outcomes retain ordered history, trusted timestamps and bounded evidence refs;
+no transport output or credentials are persisted. Reads confer no acceptance.
+File remotes are the supported transport; production transports, pruning,
+D4 restart authority and automatic cleanup acknowledgement remain open.

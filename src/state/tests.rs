@@ -209,7 +209,7 @@ fn t07_current_version_reopen_succeeds() {
     let tmp = TempDir::new("t07");
     drop(SqliteStateRepository::open(tmp.db_path()).expect("bootstrap"));
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("reopen succeeds");
-    assert_eq!(repo.schema_version().expect("version read"), 24);
+    assert_eq!(repo.schema_version().expect("version read"), 25);
 }
 
 // T8 — bootstrap/reopen is idempotent: no duplicate metadata, no reinit.
@@ -395,7 +395,7 @@ fn v12_explicit_migration_preserves_all_families_and_restores_foreign_keys() {
     ));
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).expect("migrate"),
-        24
+        25
     );
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("v14 open");
     assert_eq!(repo.pragma_integer_value("foreign_keys").unwrap(), 1);
@@ -437,7 +437,7 @@ fn v12_explicit_migration_preserves_all_families_and_restores_foreign_keys() {
     );
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).expect("v14 noop"),
-        24
+        25
     );
 }
 

@@ -315,3 +315,230 @@ fn publication_overrides_are_refused_without_reaching_push() {
     );
     assert_eq!(publish(&request), PublicationOutcome::Published);
 }
+
+struct PublicationClock;
+impl receipts_state::TrustedClockV1 for PublicationClock {
+    fn sample(&self) -> Result<receipts_state::TrustedTimeSampleV1, receipts_state::StateError> {
+        Ok(receipts_state::TrustedTimeSampleV1 {
+            canonical_utc_timestamp: "2026-11-12T00:00:00.000000000Z".into(),
+            clock_source_id: "test".into(),
+            clock_contract_version: "1".into(),
+        })
+    }
+}
+fn publication_admission(
+    store: &receipts_state::TrustedCoreStore,
+) -> receipts_state::StateWriteAdmission {
+    store.admit(receipts_state::StateWriteSubjectV1 {
+        operation: receipts_state::StateWriteOperationV1::RemotePublication,
+        project_id: "p".into(),
+        graph_id: None,
+        source_ref: None,
+        compiler_id: None,
+        policy_id: None,
+    })
+}
+#[test]
+fn durable_publication_reopens_reconciles_lost_response_and_retries_nonforce() {
+    use receipts_state::{
+        RemotePublicationIntentV1, RemotePublicationOutcomeV1 as O, TrustedCoreStore,
+    };
+    let source = TestRepo::new("d12-source");
+    let remote = TestRepo::new("d12-remote");
+    let state_dir = source.path().join("state");
+    std::fs::create_dir(&state_dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let db = state_dir.join("publication.sqlite");
+    git(source.path(), &["branch", "checkpoint/d12"]);
+    let sha = source.head_sha();
+    let endpoint = remote.path().to_str().unwrap();
+    let request = PublicationRequest {
+        repository: source.path(),
+        remote: endpoint,
+        branch: "checkpoint/d12",
+        commit: &sha,
+        wire: W::PushAlways,
+        mode: ProjectRemoteMode::PushAllCheckpoints,
+        class: PublicationBranchClass::Checkpoint,
+        accepted_commit: None,
+    };
+    let intent = RemotePublicationIntentV1 {
+        project_id: "p".into(),
+        operation_id: "operation".into(),
+        repository: std::fs::canonicalize(source.path())
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .into(),
+        remote: std::fs::canonicalize(remote.path())
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .into(),
+        source_ref: "refs/heads/checkpoint/d12".into(),
+        destination_ref: "refs/heads/checkpoint/d12".into(),
+        commit: sha.clone(),
+        wire: "PUSH_ALWAYS".into(),
+        mode: "PUSH_ALL_CHECKPOINTS".into(),
+        branch_class: "CHECKPOINT".into(),
+        acceptance_ref: None,
+    };
+    let mut store = TrustedCoreStore::open_exclusive(&db).unwrap();
+    let a = publication_admission(&store);
+    store.reserve_remote_publication_v1(a, &intent).unwrap();
+    // Simulate process interruption after durable intent, before any response.
+    drop(store);
+    let mut store = TrustedCoreStore::open_exclusive(&db).unwrap();
+    assert_eq!(
+        store
+            .reader()
+            .read_remote_publication_v1("p", "operation")
+            .unwrap()
+            .unwrap()
+            .outcome(),
+        O::Uncertain
+    );
+    let a = publication_admission(&store);
+    assert_eq!(
+        publish_durable(&mut store, a, &intent, &request, &PublicationClock).unwrap(),
+        O::Published
+    );
+    // The remote accepted the push, but its response/outcome append was lost.
+    let mut lost = intent.clone();
+    lost.operation_id = "lost-response".into();
+    let a = publication_admission(&store);
+    store.reserve_remote_publication_v1(a, &lost).unwrap();
+    drop(store);
+    let mut store = TrustedCoreStore::open_exclusive(&db).unwrap();
+    let a = publication_admission(&store);
+    assert_eq!(
+        publish_durable(&mut store, a, &lost, &request, &PublicationClock).unwrap(),
+        O::Published
+    );
+    let history = store
+        .reader()
+        .read_remote_publication_v1("p", "lost-response")
+        .unwrap()
+        .unwrap();
+    assert_eq!(history.results.len(), 1);
+    assert_eq!(history.results[0].evidence_ref, "d12:exact-remote-readback");
+    let mut protected = intent.clone();
+    protected.operation_id = "protected".into();
+    protected.source_ref = "refs/heads/main".into();
+    protected.destination_ref = protected.source_ref.clone();
+    let protected_request = PublicationRequest {
+        branch: "main",
+        ..request
+    };
+    let a = publication_admission(&store);
+    assert_eq!(
+        publish_durable(
+            &mut store,
+            a,
+            &protected,
+            &protected_request,
+            &PublicationClock
+        )
+        .unwrap(),
+        O::Refused
+    );
+    let mut accepted = intent.clone();
+    accepted.operation_id = "acceptance".into();
+    accepted.wire = "PUSH_ON_ACCEPT".into();
+    accepted.mode = "PUSH_ACCEPTED_A3".into();
+    accepted.branch_class = "TASK".into();
+    accepted.acceptance_ref = Some("acceptance:exact-sha".into());
+    let mut accepted_request = PublicationRequest {
+        wire: W::PushOnAccept,
+        mode: ProjectRemoteMode::PushAcceptedA3,
+        class: PublicationBranchClass::Task,
+        ..request
+    };
+    let a = publication_admission(&store);
+    assert_eq!(
+        publish_durable(
+            &mut store,
+            a,
+            &accepted,
+            &accepted_request,
+            &PublicationClock
+        )
+        .unwrap(),
+        O::Refused
+    );
+    accepted_request.accepted_commit = Some(&sha);
+    let a = publication_admission(&store);
+    assert_eq!(
+        publish_durable(
+            &mut store,
+            a,
+            &accepted,
+            &accepted_request,
+            &PublicationClock
+        )
+        .unwrap(),
+        O::Published
+    );
+    // Divergent existing destination cannot be overwritten by retry.
+    git(
+        remote.path(),
+        &["update-ref", "refs/heads/checkpoint/d12", "HEAD"],
+    );
+    git(remote.path(), &["checkout", "-b", "diverge"]);
+    std::fs::write(remote.path().join("divergent"), "remote").unwrap();
+    git(remote.path(), &["add", "divergent"]);
+    git(remote.path(), &["commit", "-m", "divergent"]);
+    let divergent = remote.head_sha();
+    git(
+        remote.path(),
+        &["update-ref", "refs/heads/checkpoint/d12", &divergent],
+    );
+    let a = publication_admission(&store);
+    assert_eq!(
+        publish_durable(&mut store, a, &intent, &request, &PublicationClock).unwrap(),
+        O::RemoteFailed
+    );
+    assert_eq!(
+        crate::test_support::stdout_trimmed(&git(
+            remote.path(),
+            &["rev-parse", "refs/heads/checkpoint/d12"]
+        )),
+        divergent
+    );
+    // A read failure remains uncertain after reopen, even after a prior result.
+    git(source.path(), &["config", "remote.fake.url", "/unused"]);
+    let moved = remote.path().with_extension("unavailable");
+    std::fs::rename(remote.path(), &moved).unwrap();
+    std::fs::create_dir(remote.path()).unwrap();
+    let a = publication_admission(&store);
+    assert_eq!(
+        publish_durable(&mut store, a, &intent, &request, &PublicationClock).unwrap(),
+        O::Uncertain
+    );
+    std::fs::remove_dir(remote.path()).unwrap();
+    std::fs::rename(&moved, remote.path()).unwrap();
+    git(
+        source.path(),
+        &["config", "remote.fake.receivepack", "blocked"],
+    );
+    let a = publication_admission(&store);
+    assert_eq!(
+        publish_durable(&mut store, a, &intent, &request, &PublicationClock).unwrap(),
+        O::Uncertain
+    );
+    drop(store);
+    let store = TrustedCoreStore::open_exclusive(&db).unwrap();
+    assert_eq!(
+        store
+            .reader()
+            .read_remote_publication_v1("p", "operation")
+            .unwrap()
+            .unwrap()
+            .outcome(),
+        O::Uncertain
+    );
+}

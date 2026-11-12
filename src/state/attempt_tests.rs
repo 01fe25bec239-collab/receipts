@@ -123,7 +123,7 @@ fn attempt_row_image(repo: &SqliteStateRepository) -> Vec<Vec<rusqlite::types::V
 fn start_finish_find_list_survive_reopen() {
     let db = TempDb::new();
     let mut repo = SqliteStateRepository::open(&db.0).unwrap();
-    assert_eq!(repo.schema_version().unwrap(), 24);
+    assert_eq!(repo.schema_version().unwrap(), 25);
     let huge = format!("1{}", "0".repeat(10000));
     // Appended out of numeric order; listing is numeric, not lexical.
     for (id, number) in [(ID_C, huge.as_str()), (ID_B, "10"), (ID_A, "9")] {
@@ -447,7 +447,7 @@ fn ordinary_open_refuses_missing_or_altered_attempt_immutability_triggers() {
                 )
                 .unwrap();
                 assert_eq!(rows(&repo), (1, 1));
-                assert_eq!(repo.schema_version().unwrap(), 24);
+                assert_eq!(repo.schema_version().unwrap(), 25);
                 repo.connection()
                     .execute_batch(&format!("DROP TRIGGER IF EXISTS {trigger}"))
                     .unwrap();
@@ -834,11 +834,11 @@ fn v13_store_migrates_to_v14_preserving_graph_genesis() {
     ));
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
-        24
+        25
     );
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(&db.0).unwrap(),
-        24
+        25
     );
     assert_eq!(graph_image(&db.0), before);
 

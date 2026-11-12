@@ -43,27 +43,11 @@ pub(super) fn publish_locked(
     after_lock: impl FnOnce(),
 ) -> PublicationOutcome {
     use ProjectRemoteMode as M;
-    use PublicationBranchClass as C;
     use PublicationOutcome as O;
     if request.wire == Wire::LocalOnly && request.mode == M::LocalOnly {
         return O::LocalOnly;
     }
-    let eligible = match (request.wire, request.mode, request.class) {
-        (Wire::PushOnAccept, M::PushA2Branches, C::Workstream)
-        | (Wire::PushOnAccept, M::PushAcceptedA3, C::Workstream | C::Task) => {
-            request.accepted_commit == Some(request.commit)
-        }
-        (Wire::PushAlways, M::PushAllCheckpoints, C::Checkpoint) => true,
-        _ => false,
-    };
-    if !eligible
-        || request.branch == "main"
-        || request.branch == "master"
-        || validate_branch_name(request.branch).is_err()
-        || CommitSha::parse(request.commit).is_err()
-        || request.remote.is_empty()
-        || request.remote.starts_with('-')
-    {
+    if !policy_allowed(request) {
         return O::Refused;
     }
     if git::refuse_untrusted_repository_config(request.repository, "publish").is_err()
@@ -199,4 +183,177 @@ impl Drop for BranchLock {
             }
         }
     }
+}
+
+/// Trusted composition only. File remotes are the admitted D12 transport.
+/// The acceptance reference must name the exact evidence checked by the caller;
+/// neither this entry point nor State turns that reference into acceptance.
+pub fn publish_durable(
+    store: &mut receipts_state::TrustedCoreStore,
+    admission: receipts_state::StateWriteAdmission,
+    intent: &receipts_state::RemotePublicationIntentV1,
+    request: &PublicationRequest<'_>,
+    clock: &dyn receipts_state::TrustedClockV1,
+) -> Result<receipts_state::RemotePublicationOutcomeV1, receipts_state::StateError> {
+    use receipts_state::{RemotePublicationOutcomeV1 as O, SetupRefusalV1, StateError};
+    let refused = || StateError::SetupRefused {
+        reason: SetupRefusalV1::InvalidShape,
+    };
+    let repository = std::fs::canonicalize(request.repository).map_err(|_| refused())?;
+    let remote = std::fs::canonicalize(request.remote).map_err(|_| refused())?;
+    let wire = match request.wire {
+        Wire::LocalOnly => "LOCAL_ONLY",
+        Wire::PushOnAccept => "PUSH_ON_ACCEPT",
+        Wire::PushAlways => "PUSH_ALWAYS",
+    };
+    let mode = match request.mode {
+        ProjectRemoteMode::LocalOnly => "LOCAL_ONLY",
+        ProjectRemoteMode::PushA2Branches => "PUSH_A2_BRANCHES",
+        ProjectRemoteMode::PushAcceptedA3 => "PUSH_ACCEPTED_A3",
+        ProjectRemoteMode::PushAllCheckpoints => "PUSH_ALL_CHECKPOINTS",
+    };
+    let class = match request.class {
+        PublicationBranchClass::Workstream => "WORKSTREAM",
+        PublicationBranchClass::Task => "TASK",
+        PublicationBranchClass::Checkpoint => "CHECKPOINT",
+    };
+    if repository.to_str() != Some(&intent.repository)
+        || remote.to_str() != Some(&intent.remote)
+        || !Path::new(request.remote).is_absolute()
+        || intent.source_ref != format!("refs/heads/{}", request.branch)
+        || intent.destination_ref != intent.source_ref
+        || intent.commit != request.commit
+        || intent.wire != wire
+        || intent.mode != mode
+        || intent.branch_class != class
+    {
+        return Err(refused());
+    }
+    let reservation = store.reserve_remote_publication_v1(admission, intent)?;
+    let history = store
+        .reader()
+        .read_remote_publication_v1(&intent.project_id, &intent.operation_id)?
+        .ok_or_else(refused)?;
+    let blocked = if reservation == receipts_state::SetupWriteOutcomeV1::Replayed
+        && history.outcome() == O::Uncertain
+    {
+        O::Uncertain
+    } else {
+        O::Refused
+    };
+    let mut sequence = history.results.len() as u64;
+    let mut record = |outcome, observed: Option<&str>, evidence| {
+        sequence += 1;
+        let admission = store.admit(receipts_state::StateWriteSubjectV1 {
+            operation: receipts_state::StateWriteOperationV1::RemotePublication,
+            project_id: intent.project_id.clone(),
+            graph_id: None,
+            source_ref: None,
+            compiler_id: None,
+            policy_id: None,
+        });
+        store.append_remote_publication_result_v1(
+            admission,
+            &intent.project_id,
+            &intent.operation_id,
+            sequence,
+            outcome,
+            observed,
+            evidence,
+            clock,
+        )?;
+        Ok::<_, receipts_state::StateError>(outcome)
+    };
+    if request.wire == Wire::LocalOnly && request.mode == ProjectRemoteMode::LocalOnly {
+        return record(blocked, None, "d12:local-only");
+    }
+    if !policy_allowed(request) {
+        return record(blocked, None, "d12:policy-refused");
+    }
+    // Readback also runs before a retry: an interrupted/lost push response is
+    // never evidence of remote failure. An unavailable read leaves uncertainty.
+    if git::refuse_untrusted_repository_config(request.repository, "reconcile publication").is_err()
+        || !publication_config_allowed(request.repository)
+    {
+        return record(blocked, None, "d12:configuration-refused");
+    }
+    match exact_remote_ref(request, &intent.destination_ref) {
+        Ok(Some(observed)) if observed == request.commit => {
+            return record(O::Published, Some(&observed), "d12:exact-remote-readback");
+        }
+        Err(()) => return record(O::Uncertain, None, "d12:remote-readback-unavailable"),
+        _ => {}
+    }
+    record(O::Uncertain, None, "d12:push-started")?;
+    let outcome = publish(request);
+    if outcome == PublicationOutcome::Refused {
+        return record(O::Refused, None, "d12:policy-refused");
+    }
+    match exact_remote_ref(request, &intent.destination_ref) {
+        Ok(Some(observed)) if observed == request.commit => {
+            record(O::Published, Some(&observed), "d12:exact-remote-readback")
+        }
+        Ok(observed) => record(
+            O::RemoteFailed,
+            observed.as_deref(),
+            "d12:exact-remote-mismatch",
+        ),
+        Err(()) => record(O::Uncertain, None, "d12:remote-readback-unavailable"),
+    }
+}
+fn exact_remote_ref(
+    request: &PublicationRequest<'_>,
+    reference: &str,
+) -> Result<Option<String>, ()> {
+    let output = git::capture(
+        request.repository,
+        "reconcile publication",
+        &[
+            OsStr::new("-c"),
+            OsStr::new("protocol.file.allow=always"),
+            OsStr::new("ls-remote"),
+            OsStr::new("--refs"),
+            OsStr::new("--"),
+            OsStr::new(request.remote),
+            OsStr::new(reference),
+        ],
+    )
+    .map_err(|_| ())?;
+    if !output.success {
+        return Err(());
+    }
+    if output.stdout.is_empty() {
+        return Ok(None);
+    }
+    let mut lines = output.stdout.lines();
+    let line = lines.next().ok_or(())?;
+    let (commit, actual) = line.split_once('\t').ok_or(())?;
+    if actual != reference || CommitSha::parse(commit).is_err() || lines.next().is_some() {
+        return Err(());
+    }
+    Ok(Some(commit.into()))
+}
+
+fn policy_allowed(request: &PublicationRequest<'_>) -> bool {
+    use ProjectRemoteMode as M;
+    use PublicationBranchClass as C;
+    let eligible = match (request.wire, request.mode, request.class) {
+        (Wire::PushOnAccept, M::PushA2Branches, C::Workstream)
+        | (Wire::PushOnAccept, M::PushAcceptedA3, C::Workstream | C::Task) => {
+            request.accepted_commit == Some(request.commit)
+        }
+        (Wire::PushAlways, M::PushAllCheckpoints, C::Checkpoint) => true,
+        _ => false,
+    };
+    if !eligible
+        || request.branch == "main"
+        || request.branch == "master"
+        || validate_branch_name(request.branch).is_err()
+        || CommitSha::parse(request.commit).is_err()
+        || request.remote.is_empty()
+        || request.remote.starts_with('-')
+    {
+        return false;
+    }
+    true
 }

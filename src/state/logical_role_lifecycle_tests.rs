@@ -725,11 +725,11 @@ fn migration18_rolls_back_and_restores_pragmas_then_preserves_exact17() {
     ));
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).unwrap(),
-        24
+        25
     );
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).unwrap(),
-        24
+        25
     );
     let repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
     assert_eq!(repo.find_context_manifest("old").unwrap(), Some(snapshot));
@@ -791,11 +791,11 @@ fn every_supported_legacy_head_explicitly_upgrades_to18() {
         assert!(SqliteStateRepository::open(tmp.db_path()).is_err());
         assert_eq!(
             SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).unwrap(),
-            24
+            25
         );
         let repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
         assert_eq!(repo.find_context_manifest("old").unwrap(), Some(snapshot));
-        assert_eq!(repo.count_table_rows("state_schema_version").unwrap(), 24);
+        assert_eq!(repo.count_table_rows("state_schema_version").unwrap(), 25);
     }
 }
 

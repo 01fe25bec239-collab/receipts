@@ -193,7 +193,7 @@ fn t01_schema_version_remains_11() {
     );
     drop(repo);
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("reopen");
-    assert_eq!(repo.schema_version().expect("version read"), 24);
+    assert_eq!(repo.schema_version().expect("version read"), 25);
 }
 
 // T02 — lease renewal itself introduces no migration beyond the authorized

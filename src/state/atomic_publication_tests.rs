@@ -1051,12 +1051,12 @@ fn v20_store_migrates_to_v21_and_a_failed_step_leaves_exact_v20() {
     conn.execute_batch("DROP TRIGGER fail21").unwrap();
     drop(conn);
     let (store, version) = TrustedCoreStore::migrate_exclusive(dir.db()).unwrap();
-    assert_eq!(version, 24);
-    assert_eq!(store.reader().schema_version().unwrap(), 24);
+    assert_eq!(version, 25);
+    assert_eq!(store.reader().schema_version().unwrap(), 25);
     drop(store);
     // Idempotent on a current store.
     let (store, version) = TrustedCoreStore::migrate_exclusive(dir.db()).unwrap();
-    assert_eq!(version, 24);
+    assert_eq!(version, 25);
     drop(store);
     // A removed v21 guard is detected as corruption on open.
     let conn = Connection::open(dir.db()).unwrap();
@@ -1138,7 +1138,7 @@ fn repair_v22_upgrade_keeps_legacy_membership_unknown_and_guards_identity() {
     conn.execute_batch("DROP TRIGGER fail23").unwrap();
     drop(conn);
     let (mut store, version) = TrustedCoreStore::migrate_exclusive(dir.db()).unwrap();
-    assert_eq!(version, 24);
+    assert_eq!(version, 25);
     let before = fingerprint(&store);
     assert_eq!(
         publication_code(
