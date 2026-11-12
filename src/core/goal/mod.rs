@@ -1,17 +1,10 @@
-//! Deterministic projection of `GoalEvaluation.schema.json`.
+//! Goal entrypoints and deterministic evaluation.
 //!
-//! `GLOBAL_GOAL_EVALUATOR.md` requires deterministic gates before semantic
-//! evaluation. This module validates supplied layer results and state; it does
-//! not derive a state from prose or collect evidence. Callers must report missing
-//! required evidence and blocking facts as deterministic failures.
-//!
-//! This is not the complete physical GoalEvaluation or completion authority:
-//! `evaluated_at` is physically carried as caller-supplied data only.
-//! Semantic evaluation, gaps, and convergence remain deferred.
-//! In particular, accepting a caller-supplied COMPLETE state only establishes
-//! deterministic consistency, not that human-language criteria are satisfied.
-//! A full evaluator must still establish semantic satisfaction before completion.
-//! No model, routing, clock, persistence, or external operations are involved.
+//! [`CoreFacade`] drives admitted persistence and goal-owned consumer ports.
+//! Runtime, routing and review implementations remain behind trusted adapters.
+//! The deterministic projection types below retain their original validation
+//! semantics; use `evaluate` for executed checks and explicit semantic gaps.
+//! Semantic inference and full product composition remain later work.
 
 use crate::orchestration::OrchestrationDateTimeV1;
 
@@ -411,3 +404,18 @@ mod tests;
 
 pub mod persistence;
 pub use persistence::GoalPersistencePortV1;
+
+pub(crate) mod engine;
+pub mod evaluate;
+
+pub(crate) mod driver;
+pub mod facade;
+pub use facade::CoreFacade;
+#[cfg(test)]
+mod driver_tests;
+
+pub use driver::{
+    GoalBudgetLimitsV1, GoalBudgetUsageV1, GoalConsumerPortV1, GoalGraphChangeV1,
+    GoalLifecycleEventV1, GoalRouteV1, GoalRuntimeSnapshotV1, GoalSnapshotV1,
+};
+pub use engine::{PreparedGoalDispatchV1, StartGoalOutcomeV1};
