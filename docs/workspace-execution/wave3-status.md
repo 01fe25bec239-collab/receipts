@@ -56,6 +56,14 @@ write authority. A stale lock after a process crash refuses publication and
 requires operator reconciliation; it is never blindly removed. Trusted composition supplies configuration, branch class and
 exact acceptance; this module does not authenticate those issuers.
 
+Publication preflight also refuses repository/worktree command, signing,
+proxy, recursive-push and transport-policy configuration overrides. In the
+publication-related configuration families, only named-remote URL/fetch mappings
+are admitted. The hardened builder's fixed command-scope settings remain trusted.
+Configuration keys are inspected through the bounded Git runner without reading
+or logging their values. PUSH_ALWAYS with PUSH_ALL_CHECKPOINTS admits Checkpoint
+branches only; Task and Workstream still require an eligible acceptance-gated mode.
+
 Local-only returns before Git or remote access. Remote failure leaves local
 progress intact. Tests use owned local remotes and verify rejected checkpoint
 retention, non-fast-forward refusal and exact destination/commit publication.

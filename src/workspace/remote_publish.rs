@@ -53,7 +53,7 @@ pub(super) fn publish_locked(
         | (Wire::PushOnAccept, M::PushAcceptedA3, C::Workstream | C::Task) => {
             request.accepted_commit == Some(request.commit)
         }
-        (Wire::PushAlways, M::PushAllCheckpoints, _) => true,
+        (Wire::PushAlways, M::PushAllCheckpoints, C::Checkpoint) => true,
         _ => false,
     };
     if !eligible
@@ -66,7 +66,9 @@ pub(super) fn publish_locked(
     {
         return O::Refused;
     }
-    if git::refuse_untrusted_repository_config(request.repository, "publish").is_err() {
+    if git::refuse_untrusted_repository_config(request.repository, "publish").is_err()
+        || !publication_config_allowed(request.repository)
+    {
         return O::Refused;
     }
     let source = format!("refs/heads/{}", request.branch);
@@ -106,6 +108,42 @@ pub(super) fn publish_locked(
         Ok(result) if result.success => O::Published,
         _ => O::RemoteFailed,
     }
+}
+
+// Publication permits repository remote URLs/fetch mappings, but no command,
+// signing, proxy, recursive-push or transport-policy overrides. Fixed command
+// scope entries come from the hardened builder, never repository configuration.
+fn publication_config_allowed(repository: &Path) -> bool {
+    let Ok(listing) = git::capture(
+        repository,
+        "inspect publication configuration",
+        &[
+            OsStr::new("config"),
+            OsStr::new("--null"),
+            OsStr::new("--show-scope"),
+            OsStr::new("--name-only"),
+            OsStr::new("--get-regexp"),
+            OsStr::new(
+                r"^(remote|url|protocol|push|credential|http|gpg|ssh|submodule)\.|^core\.(sshcommand|gitproxy|alternaterefscommand|askpass)$",
+            ),
+        ],
+    ) else {
+        return false;
+    };
+    if !listing.success {
+        return listing.exit_status == "exit status: 1" && listing.raw_stdout().is_empty();
+    }
+    let Some(fields) = listing.raw_stdout().strip_suffix(&[0]) else {
+        return false;
+    };
+    let fields: Vec<_> = fields.split(|byte| *byte == 0).collect();
+    fields.len().is_multiple_of(2)
+        && fields.chunks_exact(2).all(|entry| {
+            entry[0] == b"command"
+                || (matches!(entry[0], b"local" | b"worktree")
+                    && entry[1].starts_with(b"remote.")
+                    && (entry[1].ends_with(b".url") || entry[1].ends_with(b".fetch")))
+        })
 }
 
 // Git writers honor this per-ref lock, including when the ref is packed. It
