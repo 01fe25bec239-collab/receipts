@@ -414,7 +414,7 @@ fn goal_definition_is_immutable_and_budget_domain_is_not_a_machine_integer() {
 
 /// Historical migration fixtures remove successors before testing old heads.
 pub(crate) fn remove_v24(conn: &rusqlite::Connection) {
-    conn.execute_batch("DROP TABLE IF EXISTS attempt_finalization; DROP TABLE IF EXISTS goal_dispatch_resolution; DROP TABLE IF EXISTS goal_dispatch; DROP TABLE IF EXISTS goal_history; DELETE FROM state_schema_version WHERE version=24;").unwrap();
+    conn.execute_batch("DROP TABLE IF EXISTS remote_publication_result; DROP TABLE IF EXISTS remote_publication_intent; DELETE FROM state_schema_version WHERE version=25; DROP TABLE IF EXISTS attempt_finalization; DROP TABLE IF EXISTS goal_dispatch_resolution; DROP TABLE IF EXISTS goal_dispatch; DROP TABLE IF EXISTS goal_history; DELETE FROM state_schema_version WHERE version=24;").unwrap();
 }
 
 #[test]
@@ -437,7 +437,7 @@ fn v24_upgrade_is_forward_only_atomic_and_exactly_guarded() {
     conn.execute_batch("DROP TRIGGER fail24").unwrap();
     drop(conn);
     let (store, version) = TrustedCoreStore::migrate_exclusive(dir.db()).unwrap();
-    assert_eq!(version, 24);
+    assert_eq!(version, 25);
     assert!(
         store
             .reader()
@@ -447,7 +447,7 @@ fn v24_upgrade_is_forward_only_atomic_and_exactly_guarded() {
     );
     drop(store);
     let (mut store, version) = TrustedCoreStore::migrate_exclusive(dir.db()).unwrap();
-    assert_eq!(version, 24);
+    assert_eq!(version, 25);
     let conn = rusqlite::Connection::open(dir.db()).unwrap();
     for table in [
         "goal_history",

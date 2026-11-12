@@ -112,6 +112,7 @@ use crate::trusted_time::TrustedClockV1;
 /// Closed operation families a single admission can authorize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateWriteOperationV1 {
+    RemotePublication,
     Goal,
     GoalDispatch,
     Finalization,
@@ -385,6 +386,46 @@ impl TrustedCoreStore {
             .find_executor_binding(binding_id)?
             .ok_or_else(|| refused(StateWriteRefusalV1::UnknownSubject))?;
         self.role_project(&binding.role_id)
+    }
+
+    pub fn reserve_remote_publication_v1(
+        &mut self,
+        admission: StateWriteAdmission,
+        intent: &crate::RemotePublicationIntentV1,
+    ) -> Result<crate::SetupWriteOutcomeV1, StateError> {
+        self.check(
+            admission,
+            StateWriteOperationV1::RemotePublication,
+            Bound::project(&intent.project_id),
+        )?;
+        self.repo.reserve_remote_publication_v1(intent)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_remote_publication_result_v1(
+        &mut self,
+        admission: StateWriteAdmission,
+        project: &str,
+        operation: &str,
+        sequence: u64,
+        outcome: crate::RemotePublicationOutcomeV1,
+        observed_commit: Option<&str>,
+        evidence_ref: &str,
+        clock: &dyn TrustedClockV1,
+    ) -> Result<crate::SetupWriteOutcomeV1, StateError> {
+        self.check(
+            admission,
+            StateWriteOperationV1::RemotePublication,
+            Bound::project(project),
+        )?;
+        self.repo.append_remote_publication_result_v1(
+            project,
+            operation,
+            sequence,
+            outcome,
+            observed_commit,
+            evidence_ref,
+            clock,
+        )
     }
 
     // ---- graph -------------------------------------------------------------
