@@ -191,20 +191,20 @@ fn t01_fresh_database_bootstraps_to_schema_version_7() {
     let registered = migrations::registered();
     assert_eq!(
         registered.len(),
-        24,
-        "exactly twenty-one registered migrations may exist"
+        25,
+        "exactly twenty-five registered migrations may exist"
     );
     assert_eq!(
         registered.last().expect("chain is non-empty").version,
-        24,
-        "the registered chain must end at version 24"
+        25,
+        "the registered chain must end at version 25"
     );
     let tmp = TempDir::new("ce-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
     assert_eq!(repo.schema_version().expect("version read"), 25);
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        24,
+        25,
         "one metadata row per applied migration"
     );
 }
@@ -218,7 +218,7 @@ fn t02_version_7_database_reopens_idempotently() {
         assert_eq!(repo.schema_version().expect("version read"), 25);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            24,
+            25,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -241,7 +241,7 @@ fn t03_ordinary_open_of_version_6_fails_closed() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 6,
-                supported: 24
+                supported: 25
             }
         ),
         "unexpected error: {error}"
@@ -361,6 +361,8 @@ fn t04_migration_v7_creates_exactly_the_authorized_schema() {
         "context_rehydration_order",
         "review_claim_seal",
         "graph_publication_identity",
+        "remote_publication_intent",
+        "remote_publication_result",
         "goal_history",
         "goal_dispatch",
         "goal_dispatch_resolution",

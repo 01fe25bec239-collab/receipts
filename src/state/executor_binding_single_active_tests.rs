@@ -145,7 +145,7 @@ fn t01_fresh_database_bootstraps_through_schema_7() {
     assert_eq!(repo.schema_version().expect("version read"), 25);
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        24,
+        25,
         "one metadata row per applied migration"
     );
     // The guard index is part of the fresh bootstrap.
@@ -168,7 +168,7 @@ fn t02_schema_version_7_reopens() {
         assert_eq!(repo.schema_version().expect("version read"), 25);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            24,
+            25,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -187,7 +187,7 @@ fn t03_ordinary_open_of_version_4_fails_closed() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 4,
-                supported: 24
+                supported: 25
             }
         ),
         "unexpected error: {error}"

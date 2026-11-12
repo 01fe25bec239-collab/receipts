@@ -214,7 +214,7 @@ fn t01_schema_remains_version_8() {
     advance(&mut repo, "project-1", ContextEpochTrigger::A1Init).expect("advance");
     assert_eq!(
         repo.schema_version().expect("version read"),
-        24,
+        25,
         "advancement must not change the schema version"
     );
     drop(repo);
@@ -228,14 +228,15 @@ fn t02_migration_v8_registered() {
     let registered = migrations::registered();
     assert_eq!(
         registered.len(),
-        24,
-        "exactly twenty-two registered migrations may exist"
+        25,
+        "exactly twenty-five registered migrations may exist"
     );
     let versions: Vec<u32> = registered.iter().map(|m| m.version).collect();
     assert_eq!(
         versions,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25
         ]
     );
 }
@@ -1282,6 +1283,8 @@ fn t64_no_new_schema_object() {
         "context_rehydration_order",
         "review_claim_seal",
         "graph_publication_identity",
+        "remote_publication_intent",
+        "remote_publication_result",
         "goal_history",
         "goal_dispatch",
         "goal_dispatch_resolution",

@@ -89,7 +89,7 @@ fn v8_bootstrap_reopen_and_v7_open_fail_closed() {
         SqliteStateRepository::open(old.db_path()).expect_err("ordinary open refuses upgrade"),
         StateError::SchemaVersionMismatch {
             found: 7,
-            supported: 24
+            supported: 25
         }
     ));
 }

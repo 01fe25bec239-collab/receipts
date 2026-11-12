@@ -720,7 +720,7 @@ fn migration18_rolls_back_and_restores_pragmas_then_preserves_exact17() {
         SqliteStateRepository::open(tmp.db_path()),
         Err(StateError::SchemaVersionMismatch {
             found: 17,
-            supported: 24
+            supported: 25
         })
     ));
     assert_eq!(

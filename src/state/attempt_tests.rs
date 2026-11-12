@@ -610,7 +610,7 @@ fn tampered_store_fails_closed_without_writing() {
             Code::CorruptStore,
         ),
         (
-            "INSERT INTO state_schema_version(version,migration_name) VALUES (25,'future')",
+            "INSERT INTO state_schema_version(version,migration_name) VALUES (26,'future')",
             Code::UnsupportedSchema,
         ),
     ] {
@@ -829,7 +829,7 @@ fn v13_store_migrates_to_v14_preserving_graph_genesis() {
         SqliteStateRepository::open(&db.0).unwrap_err(),
         StateError::SchemaVersionMismatch {
             found: 13,
-            supported: 24
+            supported: 25
         }
     ));
     assert_eq!(
@@ -922,7 +922,7 @@ fn v14_migration_failures_and_corrupt_ledgers_fail_closed() {
     rusqlite::Connection::open(&db.0)
         .unwrap()
         .execute_batch(
-            "INSERT INTO state_schema_version(version,migration_name) VALUES (25,'future')",
+            "INSERT INTO state_schema_version(version,migration_name) VALUES (26,'future')",
         )
         .unwrap();
     assert!(SqliteStateRepository::open(&db.0).is_err());

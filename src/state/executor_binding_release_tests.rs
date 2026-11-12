@@ -730,7 +730,7 @@ fn t29_schema_version_remains_exactly_7() {
             .last()
             .expect("registered chain is non-empty")
             .version,
-        24,
+        25,
         "the registered chain itself must end at version 17"
     );
     assert_eq!(repo.schema_version().expect("version read"), 25);
@@ -742,12 +742,12 @@ fn t29_schema_version_remains_exactly_7() {
         .expect("release");
     assert_eq!(
         repo.schema_version().expect("version read"),
-        24,
+        25,
         "a release must not change the schema version"
     );
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        24,
+        25,
         "no extra migration metadata row may appear"
     );
     drop(repo);

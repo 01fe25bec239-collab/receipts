@@ -74,7 +74,7 @@ fn t02_version_7_reopen_idempotent() {
         assert_eq!(repo.schema_version().expect("version read"), 25);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            24,
+            25,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -97,7 +97,7 @@ fn t03_ordinary_open_of_version_1_database_fails() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 1,
-                supported: 24
+                supported: 25
             }
         ),
         "unexpected error: {error}"

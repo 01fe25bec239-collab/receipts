@@ -589,7 +589,7 @@ fn v21_store_migrates_to_v22_and_a_failed_step_leaves_exact_v21() {
     );
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).unwrap(),
-        24,
+        25,
         "idempotent on a current store"
     );
     let conn = rusqlite::Connection::open(tmp.db_path()).unwrap();
