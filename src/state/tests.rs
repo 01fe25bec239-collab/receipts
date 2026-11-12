@@ -277,7 +277,7 @@ fn t10_higher_unsupported_version_fails() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 26,
-                supported: 26
+                supported: 25
             }
         ),
         "unexpected error: {error}"
