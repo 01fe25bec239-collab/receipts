@@ -723,6 +723,31 @@ fn network_selection_durable_replay_refusal_and_user_deletion() {
         );
         assert_eq!(calls.borrow().len(), count);
         git(source.path(), &["config", "--unset", "core.sshCommand"]);
+        let shadow = format!("remote.{endpoint}.url");
+        git(
+            source.path(),
+            &["config", &shadow, "https://other.invalid/repo.git"],
+        );
+        let count = calls.borrow().len();
+        let a = publication_admission(&store);
+        assert_eq!(
+            publish_durable_with_transport(
+                &mut store,
+                a,
+                &intent,
+                &request,
+                &PublicationClock,
+                Some(&settings)
+            )
+            .unwrap(),
+            O::Refused
+        );
+        assert_eq!(
+            calls.borrow().len(),
+            count,
+            "endpoint-name shadowing must refuse before remote access"
+        );
+        git(source.path(), &["config", "--unset", &shadow]);
         // Reconcile publication after the refusal; authorization checks complete history.
         let a = publication_admission(&store);
         assert_eq!(

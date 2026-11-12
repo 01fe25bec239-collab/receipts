@@ -66,23 +66,31 @@ fn transport_allowed(
     if !request.remote.starts_with('/') && settings.is_none() {
         return false;
     }
-    if let Some(settings) = settings {
-        // Endpoint rewriting would detach durable identity from execution.
-        let Ok(listing) = git::publication_capture(
-            request.repository,
-            &[
-                OsStr::new("config"),
-                OsStr::new("--name-only"),
-                OsStr::new("--get-regexp"),
-                OsStr::new(r"^url\."),
-            ],
-            settings,
-        ) else {
-            return false;
-        };
-        return !listing.success && listing.exit_status == "exit status: 1";
+    // Git also treats a full URL as a remote name. Refuse both rewriting and
+    // remote subsections that shadow the immutable execution endpoint.
+    let Ok(listing) = transport_capture(
+        request.repository,
+        &[
+            OsStr::new("config"),
+            OsStr::new("--null"),
+            OsStr::new("--name-only"),
+            OsStr::new("--get-regexp"),
+            OsStr::new(r"^(url|remote)\."),
+        ],
+        settings,
+    ) else {
+        return false;
+    };
+    if !listing.success {
+        return listing.exit_status == "exit status: 1" && listing.raw_stdout().is_empty();
     }
-    true
+    let prefix = format!("remote.{}.", request.remote);
+    let Some(fields) = listing.raw_stdout().strip_suffix(&[0]) else {
+        return false;
+    };
+    fields
+        .split(|byte| *byte == 0)
+        .all(|key| !key.starts_with(b"url.") && !key.starts_with(prefix.as_bytes()))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

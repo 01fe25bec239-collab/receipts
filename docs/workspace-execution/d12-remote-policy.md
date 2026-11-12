@@ -48,7 +48,8 @@ TLS settings, HOME and agent socket paths come from trusted composition outside
 State; no ambient configuration or environment is inherited. Configuration and
 credential stores must remain outside worker write authority. Trusted config
 must use existing credential mechanisms, never embed credentials in helper
-arguments. Repository transport overrides and all URL rewriting refuse.
+arguments. Repository transport overrides, remote subsections shadowing endpoint URLs,
+and all URL rewriting refuse.
 Transport diagnostics are discarded and never persisted. Tests use controlled
 transport fixtures; live credentials, TLS and SSH interoperability require
 separate qualification.
