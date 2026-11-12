@@ -87,7 +87,7 @@ fn native_worker() -> &'static Path {
     })
 }
 
-fn launcher() -> ProtectedLauncher {
+pub(crate) fn launcher() -> ProtectedLauncher {
     let cgroup = std::env::var_os("RECEIPTS_RA_HOSTED_CGROUP").expect("hosted diagnostic only");
     let config = ProtectedLaunchConfig::new(
         CONTROLLER_ID,
@@ -101,13 +101,19 @@ fn launcher() -> ProtectedLauncher {
 }
 
 pub(crate) struct Fixture {
-    root: PathBuf,
-    repo: PathBuf,
+    pub(crate) root: PathBuf,
+    pub(crate) repo: PathBuf,
     pub(crate) workspace: WorkspaceHandle,
     executable: PathBuf,
 }
 impl Fixture {
     pub(crate) fn new(task: Option<&str>) -> Self {
+        Self::build(task, true)
+    }
+    pub(crate) fn without_worker(task: Option<&str>) -> Self {
+        Self::build(task, false)
+    }
+    fn build(task: Option<&str>, worker: bool) -> Self {
         static N: AtomicU64 = AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
             "ra-w1-native-{}-{}",
@@ -148,8 +154,10 @@ impl Fixture {
         .provision()
         .unwrap();
         let executable = root.join("worker");
-        fs::copy(native_worker(), &executable).unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        if worker {
+            fs::copy(native_worker(), &executable).unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        }
         Self {
             root,
             repo,

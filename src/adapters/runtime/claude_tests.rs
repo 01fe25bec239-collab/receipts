@@ -1419,6 +1419,14 @@ fn typed_result_in_live_snapshot_does_not_establish_process_completion() {
     let attempt = start_claude_live_attempt(&request).unwrap();
     ws.ready(start, &attempt, false);
     live(&attempt, || {
+        // The ready file precedes the capture reader; wait for observable bytes.
+        until(|| {
+            attempt
+                .snapshot_output()
+                .unwrap()
+                .protocol()
+                .is_ok_and(|p| p.result().is_ok())
+        });
         let snapshot = attempt.snapshot_output().unwrap();
         assert_eq!(
             snapshot

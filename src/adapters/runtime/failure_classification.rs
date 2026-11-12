@@ -18,7 +18,13 @@ pub fn classify_live_outcome(
         LiveProcessTerminalCause::TimedOut => Some(FailureClass::Timeout),
         LiveProcessTerminalCause::Cancelled => Some(match accepted_cancel {
             Some(CancelReason::UserRequested) => FailureClass::UserCancelled,
-            None => FailureClass::Unknown,
+            Some(CancelReason::Timeout) => FailureClass::Timeout,
+            Some(
+                CancelReason::Superseded
+                | CancelReason::BudgetExhausted
+                | CancelReason::SafetyInterruption,
+            )
+            | None => FailureClass::Unknown,
         }),
         LiveProcessTerminalCause::Completed => {
             (!outcome.success()).then_some(FailureClass::Unknown)
