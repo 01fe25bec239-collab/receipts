@@ -21,10 +21,11 @@ use std::{
 const SCHEMA: &str = r#"{"type":"object","properties":{"answer":{"type":"string","enum":["OK"]}},"required":["answer"],"additionalProperties":false}"#;
 const WRITE: &str = "printf qualification-marker > ";
 
-fn live(flag: &str, exe: &str) -> Option<(PathBuf, PathBuf)> {
-    if std::env::var(flag).ok().as_deref() != Some("1") {
-        return None;
-    }
+fn live(flag: &str, exe: &str) -> (PathBuf, PathBuf) {
+    assert!(
+        std::env::var(flag).ok().as_deref() == Some("1"),
+        "{flag} must be set to 1 for an explicitly selected qualification test"
+    );
     let executable = PathBuf::from(std::env::var_os(exe).expect("explicit executable"));
     let evidence =
         PathBuf::from(std::env::var_os("RECEIPTS_LIVE_EVIDENCE_DIR").expect("evidence directory"));
@@ -40,7 +41,7 @@ fn live(flag: &str, exe: &str) -> Option<(PathBuf, PathBuf)> {
         0,
         "private evidence directory required"
     );
-    Some((executable, evidence))
+    (executable, evidence)
 }
 fn policy(read_only: bool) -> RuntimeExecutionPolicy {
     RuntimeExecutionPolicy::new(
@@ -288,21 +289,19 @@ fn codex_case(exe: &Path, evidence: &Path) -> bool {
 #[test]
 #[ignore = "live provider; A1 context disposition required"]
 fn live_claude_qualification() {
-    if let Some((exe, evidence)) = live("RECEIPTS_QUALIFY_CLAUDE", "RECEIPTS_LIVE_CLAUDE_EXE") {
-        assert!(claude_cases(
-            &exe,
-            &evidence,
-            Some(env(ChildEnvProvider::Claude))
-        ));
-    }
+    let (exe, evidence) = live("RECEIPTS_QUALIFY_CLAUDE", "RECEIPTS_LIVE_CLAUDE_EXE");
+    assert!(claude_cases(
+        &exe,
+        &evidence,
+        Some(env(ChildEnvProvider::Claude))
+    ));
 }
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "live provider; disposable admitted Linux host and A1 disposition required"]
 fn live_codex_protected_reviewer() {
-    if let Some((exe, evidence)) = live("RECEIPTS_QUALIFY_CODEX", "RECEIPTS_LIVE_CODEX_EXE") {
-        assert!(codex_case(&exe, &evidence));
-    }
+    let (exe, evidence) = live("RECEIPTS_QUALIFY_CODEX", "RECEIPTS_LIVE_CODEX_EXE");
+    assert!(codex_case(&exe, &evidence));
 }
 #[test]
 fn refusal_requires_a_real_failed_target_command() {
@@ -411,4 +410,62 @@ fn review_fixture_is_bound_and_ordinary_launch_is_refused() {
     drop(ws);
     drop(f);
     assert!(!root.exists());
+}
+
+#[test]
+fn explicit_qualification_requires_opt_in_before_provider_setup() {
+    let root = std::env::temp_dir().join(format!("ra-qualification-optin-{}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    let exe = root.join("provider");
+    fs::write(&exe, "#!/bin/sh\n/usr/bin/touch provider-started\n").unwrap();
+    fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut cases = vec![(
+        "qualification_tests::live_claude_qualification",
+        "RECEIPTS_QUALIFY_CLAUDE",
+        "RECEIPTS_LIVE_CLAUDE_EXE",
+    )];
+    if cfg!(target_os = "linux") {
+        cases.push((
+            "qualification_tests::live_codex_protected_reviewer",
+            "RECEIPTS_QUALIFY_CODEX",
+            "RECEIPTS_LIVE_CODEX_EXE",
+        ));
+    }
+    for (test, flag, exe_var) in cases {
+        for value in [None, Some("0"), Some("")] {
+            for prepared in [false, true] {
+                let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+                cmd.env_clear().current_dir(&root).args([
+                    test,
+                    "--ignored",
+                    "--exact",
+                    "--nocapture",
+                ]);
+                if prepared {
+                    cmd.env(exe_var, &exe)
+                        .env("RECEIPTS_LIVE_EVIDENCE_DIR", &root);
+                }
+                if let Some(value) = value {
+                    cmd.env(flag, value);
+                }
+                let out = cmd.output().unwrap();
+                assert!(!out.status.success(), "{test}: {value:?} passed");
+                let text = String::from_utf8_lossy(&out.stderr);
+                assert!(
+                    text.contains(&format!("{flag} must be set to 1")),
+                    "unexpected refusal: {text}"
+                );
+                assert!(!root.join("provider-started").exists());
+            }
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .env_clear()
+            .args([test, "--exact"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains("1 ignored"), "not skipped: {text}");
+    }
+    assert!(clean(&root));
 }
