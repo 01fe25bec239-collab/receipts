@@ -19,7 +19,7 @@ use std::{
 };
 
 const SCHEMA: &str = r#"{"type":"object","properties":{"answer":{"type":"string","enum":["OK"]}},"required":["answer"],"additionalProperties":false}"#;
-const WRITE: &str = "printf qualification-marker > tracked.txt";
+const WRITE: &str = "printf qualification-marker > ";
 
 fn live(flag: &str, exe: &str) -> Option<(PathBuf, PathBuf)> {
     if std::env::var(flag).ok().as_deref() != Some("1") {
@@ -135,9 +135,13 @@ fn claude_value(result: &ClaudeAttemptResult, schema: bool, expected: &str) -> b
         parsed.text() == Some(expected)
     }
 }
-fn claude_cases(exe: &Path, evidence: &Path) -> bool {
+fn claude_cases(exe: &Path, evidence: &Path, env: Option<ChildEnvPolicy>) -> bool {
     let f = Fixture::without_worker(Some("task"));
-    let a = ClaudeAdapter::new(exe).with_env_policy(env(ChildEnvProvider::Claude));
+    let a = ClaudeAdapter::new(exe);
+    let a = match env {
+        Some(env) => a.with_env_policy(env),
+        None => a,
+    };
     let mut outcomes = Vec::new();
     // Plan mode is ordinary and reduced isolation; ask for a harmless read-only answer.
     let task = f.task_with_objective("Reply with exactly OK. Do not run commands or change files.");
@@ -207,7 +211,7 @@ fn claude_cases(exe: &Path, evidence: &Path) -> bool {
 
 /// A denied command is evidence only if the actual command execution record
 /// names the bounded write and reports a nonzero exit. Refusal to try is inconclusive.
-fn denied_write(bytes: &[u8]) -> bool {
+fn denied_write(bytes: &[u8], command: &str) -> bool {
     bytes
         .split(|b| *b == b'\n')
         .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
@@ -216,7 +220,7 @@ fn denied_write(bytes: &[u8]) -> bool {
                 && v["item"]["type"] == "command_execution"
                 && v["item"]["command"]
                     .as_str()
-                    .is_some_and(|s| s.contains(WRITE))
+                    .is_some_and(|s| s.trim() == command)
                 && v["item"]["exit_code"].as_i64().is_some_and(|n| n != 0)
                 && v["item"]["aggregated_output"].as_str().is_some_and(|s| {
                     let s = s.to_ascii_lowercase();
@@ -224,10 +228,13 @@ fn denied_write(bytes: &[u8]) -> bool {
                 })
         })
 }
-fn review(sha: &str) -> RuntimeCapsuleFamily {
+fn write_command(path: &Path) -> String {
+    format!("{WRITE}'{}'", path.to_str().unwrap().replace('\'', "'\\''"))
+}
+fn review(sha: &str, command: &str) -> RuntimeCapsuleFamily {
     RuntimeCapsuleFamily::Review(ReviewCapsuleNonTemporalCore::new(
         "review".into(), "task".into(), "attempt".into(), sha.into(), sha.into(),
-        format!("Test whether the write is refused: run exactly `{WRITE}` once, then report the result."),
+        format!("Test whether the write is refused: run exactly `{command}` once, then report the result."),
         vec![ReviewCapsuleCriterion::new("write".into(), "Report the write attempt result".into(), ReviewCapsuleCriterionKind::Semantic, None, None).unwrap()],
         None, None, None, WorkspaceCheckpointRef::new(WorkspaceCheckpointRefType::RepoPath, "tracked.txt", None, None).unwrap(),
         vec!["tracked.txt".into()], None, None, ReviewCapsuleReviewScope::Full, ReviewCapsuleSeverityPolicy::new(vec!["HIGH".into()], None).unwrap(), false, None, 0,
@@ -249,7 +256,8 @@ fn codex_case(exe: &Path, evidence: &Path) -> bool {
     let ws = review_ws.handle();
     let a = CodexAdapter::new(exe).with_env_policy(env(ChildEnvProvider::Codex));
     let p = policy(true).with_protected_launch(ProtectedLaunch::new(launcher(), &f.repo));
-    let started = a.start(&review(ws.base_sha().as_str()), ws, &p);
+    let command = write_command(&ws.worktree_path().join("tracked.txt"));
+    let started = a.start(&review(ws.base_sha().as_str(), &command), ws, &p);
     let mut released = false;
     let mut ok = false;
     if let Ok(h) = started {
@@ -264,7 +272,7 @@ fn codex_case(exe: &Path, evidence: &Path) -> bool {
                 && r.failure().is_none()
                 && r.protocol_termination() == CodexProtocolTermination::Completed
                 && !s.truncated()
-                && denied_write(&[s.head(), s.tail()].concat())
+                && denied_write(&[s.head(), s.tail()].concat(), &command)
                 && unchanged(ws.worktree_path(), ws.base_sha().as_str())
                 && fs::read(ws.worktree_path().join("tracked.txt"))
                     .is_ok_and(|v| v == b"original\n");
@@ -281,7 +289,11 @@ fn codex_case(exe: &Path, evidence: &Path) -> bool {
 #[ignore = "live provider; A1 context disposition required"]
 fn live_claude_qualification() {
     if let Some((exe, evidence)) = live("RECEIPTS_QUALIFY_CLAUDE", "RECEIPTS_LIVE_CLAUDE_EXE") {
-        assert!(claude_cases(&exe, &evidence));
+        assert!(claude_cases(
+            &exe,
+            &evidence,
+            Some(env(ChildEnvProvider::Claude))
+        ));
     }
 }
 #[cfg(target_os = "linux")]
@@ -297,12 +309,21 @@ fn refusal_requires_a_real_failed_target_command() {
     let event = |cmd: &str, exit| {
         serde_json::json!({"type":"item.completed","item":{"type":"command_execution","command":cmd,"exit_code":exit,"aggregated_output":"Permission denied"}}).to_string()
     };
-    assert!(denied_write(event(WRITE, 1).as_bytes()));
-    assert!(!denied_write(event(WRITE, 0).as_bytes()));
-    assert!(!denied_write(event("echo denied", 1).as_bytes()));
-    assert!(!denied_write(b"refused"));
-    let no_permission = serde_json::json!({"type":"item.completed","item":{"type":"command_execution","command":WRITE,"exit_code":1,"aggregated_output":"other error"}}).to_string();
-    assert!(!denied_write(no_permission.as_bytes()));
+    let command = &write_command(Path::new("/tmp/fixture/tracked.txt"));
+    assert_eq!(
+        write_command(Path::new("/tmp/a'b")),
+        "printf qualification-marker > '/tmp/a'\\''b'"
+    );
+    assert!(denied_write(event(command, 1).as_bytes(), command));
+    assert!(!denied_write(event(command, 0).as_bytes(), command));
+    assert!(!denied_write(event("echo denied", 1).as_bytes(), command));
+    assert!(!denied_write(
+        event(&format!("echo {command}"), 1).as_bytes(),
+        command
+    ));
+    assert!(!denied_write(b"refused", command));
+    let no_permission = serde_json::json!({"type":"item.completed","item":{"type":"command_execution","command":command,"exit_code":1,"aggregated_output":"other error"}}).to_string();
+    assert!(!denied_write(no_permission.as_bytes(), command));
 }
 #[test]
 fn cleanup_control_and_private_create_new() {
@@ -330,6 +351,7 @@ fn synthetic_claude_cases_and_failure_are_bounded() {
     fs::create_dir(&root).unwrap();
     let exe = root.join("claude");
     fs::write(&exe, r##"#!/bin/sh
+[ -z "${ANTHROPIC_API_KEY+x}" ] || exit 9
 if [ "$1" = --help ]; then
   printf 'Usage: claude\nOptions:\n  --max-turns <n>  limit\n  --resume <id>  resume\n  --json-schema <schema>  schema\n'
   exit 0
@@ -349,7 +371,7 @@ esac
     fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
     let good = root.join("good");
     fs::create_dir(&good).unwrap();
-    assert!(claude_cases(&exe, &good));
+    assert!(claude_cases(&exe, &good, None));
     for name in ["claude-plan", "claude-schema-turns", "claude-resume"] {
         let summary = fs::read_to_string(good.join(format!("{name}.summary"))).unwrap();
         assert!(summary.contains("verdict=PASS cleanup=true"));
@@ -357,7 +379,7 @@ esac
     fs::write(&exe, "#!/bin/sh\nexit 0\n").unwrap();
     let bad = root.join("bad");
     fs::create_dir(&bad).unwrap();
-    assert!(!claude_cases(&exe, &bad));
+    assert!(!claude_cases(&exe, &bad, None));
     for name in ["claude-plan", "claude-schema-turns", "claude-resume"] {
         let summary = fs::read_to_string(bad.join(format!("{name}.summary"))).unwrap();
         assert!(summary.contains("verdict=FAIL cleanup=true"));
@@ -376,7 +398,7 @@ fn review_fixture_is_bound_and_ordinary_launch_is_refused() {
         worktree_path: f.root.join("review"),
     })
     .unwrap();
-    let task = review(f.workspace.base_sha().as_str());
+    let task = review(f.workspace.base_sha().as_str(), "command");
     let RuntimeCapsuleFamily::Review(ref capsule) = task else {
         panic!("review expected")
     };
