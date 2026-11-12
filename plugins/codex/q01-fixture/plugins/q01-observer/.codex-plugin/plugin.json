@@ -1,0 +1,7 @@
+{
+  "name": "q01-observer",
+  "version": "0.0.1",
+  "description": "Disposable Q01 observation fixture",
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json"
+}
