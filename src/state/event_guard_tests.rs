@@ -253,7 +253,7 @@ fn v16_store_with_events_migrates_to_guarded_v17_preserving_rows() {
     assert!(SqliteStateRepository::open(tmp.db_path()).is_err());
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).unwrap(),
-        25
+        26
     );
     let repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
     assert_eq!(image(repo.connection()), before);
@@ -272,7 +272,7 @@ fn v16_store_with_events_migrates_to_guarded_v17_preserving_rows() {
     drop(repo);
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).unwrap(),
-        25
+        26
     );
 }
 
@@ -288,7 +288,7 @@ fn v11_store_with_events_reaches_guarded_v17() {
     drop(repo);
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).unwrap(),
-        25
+        26
     );
     let repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
     let rows = image(repo.connection());

@@ -2,6 +2,89 @@
 use crate::{CommitSha, WorkspaceRemotePublishPolicy as Wire, git, validate_branch_name};
 use std::{ffi::OsStr, path::Path};
 
+/// Paths are admitted by trusted composition, outside the worker repository.
+/// Git configuration supplies existing credential helpers, TLS and SSH settings;
+/// HOME and the agent socket are explicit, never inherited from the environment.
+/// No credential value belongs in this structure or in the endpoint URL.
+pub struct TrustedTransportSettings<'a> {
+    pub git_config: &'a Path,
+    pub home: Option<&'a Path>,
+    pub ssh_auth_sock: Option<&'a Path>,
+}
+
+fn transport_capture(
+    repository: &Path,
+    args: &[&OsStr],
+    settings: Option<&TrustedTransportSettings<'_>>,
+) -> Result<git::GitCapture, ()> {
+    match settings {
+        Some(settings) => git::publication_capture(repository, args, settings),
+        None => git::capture(repository, "publication", args).map_err(|_| ()),
+    }
+}
+fn protocol(remote: &str) -> &'static str {
+    if remote.starts_with("https://") {
+        "protocol.https.allow=always"
+    } else if remote.starts_with("ssh://") {
+        "protocol.ssh.allow=always"
+    } else {
+        "protocol.file.allow=always"
+    }
+}
+fn transport_allowed(
+    request: &PublicationRequest<'_>,
+    settings: Option<&TrustedTransportSettings<'_>>,
+) -> bool {
+    if !receipts_state::remote_endpoint_allowed(request.remote) {
+        // Preserve named owned-file remotes for the legacy transport helper.
+        // Network endpoints must come directly from trusted composition.
+        if settings.is_some()
+            || request.remote.is_empty()
+            || !request
+                .remote
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        {
+            return false;
+        }
+        let key = format!("remote.{}.url", request.remote);
+        let Ok(url) = git::capture(
+            request.repository,
+            "file remote",
+            &[
+                OsStr::new("config"),
+                OsStr::new("--get-all"),
+                OsStr::new(&key),
+            ],
+        ) else {
+            return false;
+        };
+        return url.success
+            && url.stdout.lines().count() == 1
+            && Path::new(url.stdout.trim()).is_absolute();
+    }
+    if !request.remote.starts_with('/') && settings.is_none() {
+        return false;
+    }
+    if let Some(settings) = settings {
+        // Endpoint rewriting would detach durable identity from execution.
+        let Ok(listing) = git::publication_capture(
+            request.repository,
+            &[
+                OsStr::new("config"),
+                OsStr::new("--name-only"),
+                OsStr::new("--get-regexp"),
+                OsStr::new(r"^url\."),
+            ],
+            settings,
+        ) else {
+            return false;
+        };
+        return !listing.success && listing.exit_status == "exit status: 1";
+    }
+    true
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProjectRemoteMode {
     LocalOnly,
@@ -42,12 +125,19 @@ pub(super) fn publish_locked(
     request: &PublicationRequest<'_>,
     after_lock: impl FnOnce(),
 ) -> PublicationOutcome {
+    publish_transport(request, None, after_lock)
+}
+fn publish_transport(
+    request: &PublicationRequest<'_>,
+    settings: Option<&TrustedTransportSettings<'_>>,
+    after_lock: impl FnOnce(),
+) -> PublicationOutcome {
     use ProjectRemoteMode as M;
     use PublicationOutcome as O;
     if request.wire == Wire::LocalOnly && request.mode == M::LocalOnly {
         return O::LocalOnly;
     }
-    if !policy_allowed(request) {
+    if !policy_allowed(request) || !transport_allowed(request, settings) {
         return O::Refused;
     }
     if git::refuse_untrusted_repository_config(request.repository, "publish").is_err()
@@ -76,18 +166,18 @@ pub(super) fn publish_locked(
     }
     let refspec = format!("{source}:{source}");
     // The fixed argv has no force mode. Git's receive side enforces fast-forward.
-    match git::capture(
+    match transport_capture(
         request.repository,
-        "publish",
         &[
             OsStr::new("-c"),
-            OsStr::new("protocol.file.allow=always"),
+            OsStr::new(protocol(request.remote)),
             OsStr::new("push"),
             OsStr::new("--porcelain"),
             OsStr::new("--"),
             OsStr::new(request.remote),
             OsStr::new(&refspec),
         ],
+        settings,
     ) {
         Ok(result) if result.success => O::Published,
         _ => O::RemoteFailed,
@@ -185,7 +275,7 @@ impl Drop for BranchLock {
     }
 }
 
-/// Trusted composition only. File remotes are the admitted D12 transport.
+/// Trusted composition only. File remotes use this compatibility entry point.
 /// The acceptance reference must name the exact evidence checked by the caller;
 /// neither this entry point nor State turns that reference into acceptance.
 pub fn publish_durable(
@@ -195,12 +285,31 @@ pub fn publish_durable(
     request: &PublicationRequest<'_>,
     clock: &dyn receipts_state::TrustedClockV1,
 ) -> Result<receipts_state::RemotePublicationOutcomeV1, receipts_state::StateError> {
+    publish_durable_with_transport(store, admission, intent, request, clock, None)
+}
+/// Durable publication with explicitly trusted network execution settings.
+pub fn publish_durable_with_transport(
+    store: &mut receipts_state::TrustedCoreStore,
+    admission: receipts_state::StateWriteAdmission,
+    intent: &receipts_state::RemotePublicationIntentV1,
+    request: &PublicationRequest<'_>,
+    clock: &dyn receipts_state::TrustedClockV1,
+    settings: Option<&TrustedTransportSettings<'_>>,
+) -> Result<receipts_state::RemotePublicationOutcomeV1, receipts_state::StateError> {
     use receipts_state::{RemotePublicationOutcomeV1 as O, SetupRefusalV1, StateError};
     let refused = || StateError::SetupRefused {
         reason: SetupRefusalV1::InvalidShape,
     };
     let repository = std::fs::canonicalize(request.repository).map_err(|_| refused())?;
-    let remote = std::fs::canonicalize(request.remote).map_err(|_| refused())?;
+    let remote = if request.remote.starts_with('/') {
+        std::fs::canonicalize(request.remote)
+            .map_err(|_| refused())?
+            .to_str()
+            .ok_or_else(refused)?
+            .to_owned()
+    } else {
+        request.remote.to_owned()
+    };
     let wire = match request.wire {
         Wire::LocalOnly => "LOCAL_ONLY",
         Wire::PushOnAccept => "PUSH_ON_ACCEPT",
@@ -218,8 +327,8 @@ pub fn publish_durable(
         PublicationBranchClass::Checkpoint => "CHECKPOINT",
     };
     if repository.to_str() != Some(&intent.repository)
-        || remote.to_str() != Some(&intent.remote)
-        || !Path::new(request.remote).is_absolute()
+        || remote != intent.remote
+        || intent.deletion_authorization.is_some()
         || intent.source_ref != format!("refs/heads/{}", request.branch)
         || intent.destination_ref != intent.source_ref
         || intent.commit != request.commit
@@ -267,7 +376,7 @@ pub fn publish_durable(
     if request.wire == Wire::LocalOnly && request.mode == ProjectRemoteMode::LocalOnly {
         return record(blocked, None, "d12:local-only");
     }
-    if !policy_allowed(request) {
+    if !policy_allowed(request) || !transport_allowed(request, settings) {
         return record(blocked, None, "d12:policy-refused");
     }
     // Readback also runs before a retry: an interrupted/lost push response is
@@ -277,7 +386,7 @@ pub fn publish_durable(
     {
         return record(blocked, None, "d12:configuration-refused");
     }
-    match exact_remote_ref(request, &intent.destination_ref) {
+    match exact_remote_ref(request, &intent.destination_ref, settings) {
         Ok(Some(observed)) if observed == request.commit => {
             return record(O::Published, Some(&observed), "d12:exact-remote-readback");
         }
@@ -285,11 +394,11 @@ pub fn publish_durable(
         _ => {}
     }
     record(O::Uncertain, None, "d12:push-started")?;
-    let outcome = publish(request);
+    let outcome = publish_transport(request, settings, || {});
     if outcome == PublicationOutcome::Refused {
         return record(O::Refused, None, "d12:policy-refused");
     }
-    match exact_remote_ref(request, &intent.destination_ref) {
+    match exact_remote_ref(request, &intent.destination_ref, settings) {
         Ok(Some(observed)) if observed == request.commit => {
             record(O::Published, Some(&observed), "d12:exact-remote-readback")
         }
@@ -304,19 +413,22 @@ pub fn publish_durable(
 fn exact_remote_ref(
     request: &PublicationRequest<'_>,
     reference: &str,
+    settings: Option<&TrustedTransportSettings<'_>>,
 ) -> Result<Option<String>, ()> {
-    let output = git::capture(
+    let output = transport_capture(
         request.repository,
-        "reconcile publication",
         &[
             OsStr::new("-c"),
-            OsStr::new("protocol.file.allow=always"),
+            OsStr::new(protocol(request.remote)),
             OsStr::new("ls-remote"),
+            // A symbolic alias must never authorize mutation of its target.
+            OsStr::new("--symref"),
             OsStr::new("--refs"),
             OsStr::new("--"),
             OsStr::new(request.remote),
             OsStr::new(reference),
         ],
+        settings,
     )
     .map_err(|_| ())?;
     if !output.success {
@@ -356,4 +468,169 @@ fn policy_allowed(request: &PublicationRequest<'_>) -> bool {
         return false;
     }
     true
+}
+
+/// Consumes explicit user direction. Only trusted composition may issue the State
+/// capability; no worker input may call that issuer. Local branches are retained.
+pub fn delete_remote_branch(
+    store: &mut receipts_state::TrustedCoreStore,
+    authorization: receipts_state::RemoteDeletionAuthorizationV1,
+    request: &PublicationRequest<'_>,
+    protected_refs: &[&str],
+    clock: &dyn receipts_state::TrustedClockV1,
+    settings: Option<&TrustedTransportSettings<'_>>,
+) -> Result<receipts_state::RemotePublicationOutcomeV1, receipts_state::StateError> {
+    deletion_run(
+        store,
+        authorization.intent(),
+        request,
+        protected_refs,
+        clock,
+        settings,
+        true,
+    )
+}
+
+/// Reopening an operation permits readback only; it never reuses authorization
+/// for another destructive command, even when the remote still has the old SHA.
+pub fn reconcile_remote_deletion(
+    store: &mut receipts_state::TrustedCoreStore,
+    project: &str,
+    operation: &str,
+    request: &PublicationRequest<'_>,
+    clock: &dyn receipts_state::TrustedClockV1,
+    settings: Option<&TrustedTransportSettings<'_>>,
+) -> Result<receipts_state::RemotePublicationOutcomeV1, receipts_state::StateError> {
+    let record = store
+        .reader()
+        .read_remote_publication_v1(project, operation)?
+        .ok_or(receipts_state::StateError::SetupRefused {
+            reason: receipts_state::SetupRefusalV1::InvalidShape,
+        })?;
+    deletion_run(store, &record.intent, request, &[], clock, settings, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deletion_run(
+    store: &mut receipts_state::TrustedCoreStore,
+    intent: &receipts_state::RemotePublicationIntentV1,
+    request: &PublicationRequest<'_>,
+    protected_refs: &[&str],
+    clock: &dyn receipts_state::TrustedClockV1,
+    settings: Option<&TrustedTransportSettings<'_>>,
+    execute: bool,
+) -> Result<receipts_state::RemotePublicationOutcomeV1, receipts_state::StateError> {
+    use receipts_state::{RemotePublicationOutcomeV1 as O, SetupRefusalV1, StateError};
+    let invalid = || StateError::SetupRefused {
+        reason: SetupRefusalV1::InvalidShape,
+    };
+    let reference = format!("refs/heads/{}", request.branch);
+    let repository = std::fs::canonicalize(request.repository).map_err(|_| invalid())?;
+    let remote = if request.remote.starts_with('/') {
+        std::fs::canonicalize(request.remote)
+            .map_err(|_| invalid())?
+            .to_str()
+            .ok_or_else(invalid)?
+            .to_owned()
+    } else {
+        request.remote.to_owned()
+    };
+    if intent.deletion_authorization.is_none()
+        || repository.to_str() != Some(&intent.repository)
+        || remote != intent.remote
+        || reference != intent.destination_ref
+        || intent.commit != request.commit
+    {
+        return Err(invalid());
+    }
+    let record = store
+        .reader()
+        .read_remote_publication_v1(&intent.project_id, &intent.operation_id)?
+        .ok_or_else(invalid)?;
+    if record.intent != *intent {
+        return Err(invalid());
+    }
+    if !execute && record.outcome() != O::Uncertain {
+        return Ok(record.outcome());
+    }
+    let mut sequence = record.results.len() as u64;
+    let mut append = |outcome, observed: Option<&str>, evidence| {
+        sequence += 1;
+        let admission = store.admit(receipts_state::StateWriteSubjectV1 {
+            operation: receipts_state::StateWriteOperationV1::RemotePublication,
+            project_id: intent.project_id.clone(),
+            graph_id: None,
+            source_ref: None,
+            compiler_id: None,
+            policy_id: None,
+        });
+        store.append_remote_publication_result_v1(
+            admission,
+            &intent.project_id,
+            &intent.operation_id,
+            sequence,
+            outcome,
+            observed,
+            evidence,
+            clock,
+        )?;
+        Ok::<_, StateError>(outcome)
+    };
+    if matches!(request.branch, "main" | "master")
+        || protected_refs.contains(&reference.as_str())
+        || validate_branch_name(request.branch).is_err()
+        || !transport_allowed(request, settings)
+        || git::refuse_untrusted_repository_config(request.repository, "delete branch").is_err()
+        || !publication_config_allowed(request.repository)
+    {
+        return append(O::Refused, None, "d12:deletion-refused");
+    }
+    let started = record
+        .results
+        .iter()
+        .any(|r| r.evidence_ref == "d12:delete-started");
+    let Ok(_guard) = BranchLock::acquire(request.repository, &reference) else {
+        return append(O::Refused, None, "d12:deletion-ref-locked");
+    };
+    match exact_remote_ref(request, &reference, settings) {
+        Err(()) => return append(O::Uncertain, None, "d12:deletion-readback-unavailable"),
+        Ok(None) if started => return append(O::Deleted, None, "d12:deletion-readback-absent"),
+        Ok(Some(observed))
+            if observed == request.commit && execute && record.results.is_empty() => {}
+        Ok(observed) => {
+            return append(
+                O::Refused,
+                observed.as_deref(),
+                "d12:deletion-moved-or-unused",
+            );
+        }
+    }
+    append(O::Uncertain, None, "d12:delete-started")?;
+    // Conditional deletion closes the readback/delete race at the receive side.
+    // This lease is deletion-only; publication still never uses a force option.
+    let lease = format!("--force-with-lease={reference}:{}", request.commit);
+    let refspec = format!(":{reference}");
+    let _ = transport_capture(
+        request.repository,
+        &[
+            OsStr::new("-c"),
+            OsStr::new(protocol(request.remote)),
+            OsStr::new("push"),
+            OsStr::new("--porcelain"),
+            OsStr::new(&lease),
+            OsStr::new("--"),
+            OsStr::new(request.remote),
+            OsStr::new(&refspec),
+        ],
+        settings,
+    );
+    match exact_remote_ref(request, &reference, settings) {
+        Ok(None) => append(O::Deleted, None, "d12:deletion-readback-absent"),
+        Ok(observed) => append(
+            O::RemoteFailed,
+            observed.as_deref(),
+            "d12:deletion-still-present",
+        ),
+        Err(()) => append(O::Uncertain, None, "d12:deletion-readback-unavailable"),
+    }
 }

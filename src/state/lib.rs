@@ -271,6 +271,6 @@ mod wave3_setup_tests;
 
 pub mod remote_publication;
 pub use remote_publication::{
-    RemotePublicationIntentV1, RemotePublicationOutcomeV1, RemotePublicationRecordV1,
-    RemotePublicationResultV1,
+    RemoteDeletionAuthorizationV1, RemotePublicationIntentV1, RemotePublicationOutcomeV1,
+    RemotePublicationRecordV1, RemotePublicationResultV1, remote_endpoint_allowed,
 };

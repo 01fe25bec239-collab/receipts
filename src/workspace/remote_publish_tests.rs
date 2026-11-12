@@ -386,6 +386,7 @@ fn durable_publication_reopens_reconciles_lost_response_and_retries_nonforce() {
         mode: "PUSH_ALL_CHECKPOINTS".into(),
         branch_class: "CHECKPOINT".into(),
         acceptance_ref: None,
+        deletion_authorization: None,
     };
     let mut store = TrustedCoreStore::open_exclusive(&db).unwrap();
     let a = publication_admission(&store);
@@ -541,4 +542,531 @@ fn durable_publication_reopens_reconciles_lost_response_and_retries_nonforce() {
             .outcome(),
         O::Uncertain
     );
+}
+
+fn transport_intent(
+    source: &TestRepo,
+    endpoint: &str,
+    sha: &str,
+    operation: &str,
+) -> receipts_state::RemotePublicationIntentV1 {
+    receipts_state::RemotePublicationIntentV1 {
+        project_id: "p".into(),
+        operation_id: operation.into(),
+        repository: std::fs::canonicalize(source.path())
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .into(),
+        remote: if endpoint.starts_with('/') {
+            std::fs::canonicalize(endpoint)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .into()
+        } else {
+            endpoint.into()
+        },
+        source_ref: "refs/heads/task/transport".into(),
+        destination_ref: "refs/heads/task/transport".into(),
+        commit: sha.into(),
+        wire: "PUSH_ON_ACCEPT".into(),
+        mode: "PUSH_ACCEPTED_A3".into(),
+        branch_class: "TASK".into(),
+        acceptance_ref: Some("acceptance:exact".into()),
+        deletion_authorization: None,
+    }
+}
+fn transport_store(source: &TestRepo) -> (std::path::PathBuf, receipts_state::TrustedCoreStore) {
+    let dir = source.path().join("private-state");
+    std::fs::create_dir(&dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let db = dir.join("state.sqlite");
+    let store = receipts_state::TrustedCoreStore::open_exclusive(&db).unwrap();
+    (db, store)
+}
+
+#[test]
+fn network_selection_durable_replay_refusal_and_user_deletion() {
+    use receipts_state::RemotePublicationOutcomeV1 as O;
+    use std::{cell::RefCell, rc::Rc};
+    for endpoint in [
+        "https://fixture.invalid/repo.git",
+        "ssh://git@fixture.invalid/repo.git",
+    ] {
+        let source = TestRepo::new("network-publication");
+        git(source.path(), &["branch", "task/transport"]);
+        let sha = source.head_sha();
+        let (db, mut store) = transport_store(&source);
+        let config = source.path().join("trusted-config");
+        std::fs::write(&config, "").unwrap();
+        let settings = TrustedTransportSettings {
+            git_config: &config,
+            home: None,
+            ssh_auth_sock: None,
+        };
+        let request = PublicationRequest {
+            repository: source.path(),
+            remote: endpoint,
+            branch: "task/transport",
+            commit: &sha,
+            wire: W::PushOnAccept,
+            mode: ProjectRemoteMode::PushAcceptedA3,
+            class: PublicationBranchClass::Task,
+            accepted_commit: Some(&sha),
+        };
+        let intent = transport_intent(&source, endpoint, &sha, "publish");
+        let remote = Rc::new(RefCell::new(None::<String>));
+        let calls = Rc::new(RefCell::new(Vec::<Vec<String>>::new()));
+        let fixture_remote = remote.clone();
+        let fixture_calls = calls.clone();
+        let fixture_sha = sha.clone();
+        let _fixture = crate::git::publication_fixture(Box::new(move |request| {
+            let args: Vec<_> = request
+                .arguments()
+                .iter()
+                .map(|v| v.to_str().unwrap().to_owned())
+                .collect();
+            if !args.iter().any(|v| v == "push" || v == "ls-remote") {
+                return None;
+            }
+            assert!(
+                request
+                    .fixed_env()
+                    .iter()
+                    .any(|(key, _)| *key == "GIT_CONFIG_GLOBAL")
+            );
+            assert!(
+                !request
+                    .fixed_env()
+                    .iter()
+                    .any(|(key, _)| *key == "GIT_SSH_COMMAND")
+            );
+            fixture_calls.borrow_mut().push(args.clone());
+            if args.iter().any(|v| v == "ls-remote") {
+                let output = fixture_remote
+                    .borrow()
+                    .as_ref()
+                    .map(|sha| format!("{sha}\trefs/heads/task/transport\n"))
+                    .unwrap_or_default();
+                return Some(Ok(crate::git::fixture_capture(true, output)));
+            }
+            if args.last().unwrap() == ":refs/heads/task/transport" {
+                assert!(args.contains(&format!(
+                    "--force-with-lease=refs/heads/task/transport:{fixture_sha}"
+                )));
+                *fixture_remote.borrow_mut() = None;
+            } else {
+                assert!(
+                    !args
+                        .iter()
+                        .any(|v| v.starts_with("--force") || v.starts_with('+'))
+                );
+                *fixture_remote.borrow_mut() = Some(fixture_sha.clone());
+            }
+            Some(Ok(crate::git::fixture_capture(true, String::new())))
+        }));
+        // Network transports require explicit trusted settings.
+        let a = publication_admission(&store);
+        assert_eq!(
+            publish_durable(&mut store, a, &intent, &request, &PublicationClock).unwrap(),
+            O::Refused
+        );
+        let a = publication_admission(&store);
+        assert_eq!(
+            publish_durable_with_transport(
+                &mut store,
+                a,
+                &intent,
+                &request,
+                &PublicationClock,
+                Some(&settings)
+            )
+            .unwrap(),
+            O::Published
+        );
+        let expected_protocol = if endpoint.starts_with("https") {
+            "protocol.https.allow=always"
+        } else {
+            "protocol.ssh.allow=always"
+        };
+        assert!(
+            calls
+                .borrow()
+                .iter()
+                .all(|args| args.iter().any(|v| v == expected_protocol))
+        );
+        // Endpoint changes cannot replay an existing operation ID.
+        let mut changed = intent.clone();
+        changed.remote.push_str("/other");
+        let a = publication_admission(&store);
+        assert!(store.reserve_remote_publication_v1(a, &changed).is_err());
+        // Repository overrides refuse before remote execution.
+        let count = calls.borrow().len();
+        git(source.path(), &["config", "core.sshCommand", "false"]);
+        let a = publication_admission(&store);
+        assert_eq!(
+            publish_durable_with_transport(
+                &mut store,
+                a,
+                &intent,
+                &request,
+                &PublicationClock,
+                Some(&settings)
+            )
+            .unwrap(),
+            O::Refused
+        );
+        assert_eq!(calls.borrow().len(), count);
+        git(source.path(), &["config", "--unset", "core.sshCommand"]);
+        // Reconcile publication after the refusal; authorization checks complete history.
+        let a = publication_admission(&store);
+        assert_eq!(
+            publish_durable_with_transport(
+                &mut store,
+                a,
+                &intent,
+                &request,
+                &PublicationClock,
+                Some(&settings)
+            )
+            .unwrap(),
+            O::Published
+        );
+        let mut deletion = intent.clone();
+        deletion.operation_id = "user-delete".into();
+        deletion.deletion_authorization = Some("user-delete".into());
+        let a = publication_admission(&store);
+        let authorization = store.authorize_remote_deletion_v1(a, &deletion).unwrap();
+        // A pending deletion excludes even replay of a prior publication.
+        let a = publication_admission(&store);
+        assert!(
+            publish_durable_with_transport(
+                &mut store,
+                a,
+                &intent,
+                &request,
+                &PublicationClock,
+                Some(&settings)
+            )
+            .is_err()
+        );
+        assert_eq!(
+            delete_remote_branch(
+                &mut store,
+                authorization,
+                &request,
+                &[],
+                &PublicationClock,
+                Some(&settings)
+            )
+            .unwrap(),
+            O::Deleted
+        );
+        let count = calls.borrow().len();
+        drop(store);
+        let mut store = receipts_state::TrustedCoreStore::open_exclusive(&db).unwrap();
+        let a = publication_admission(&store);
+        assert!(store.authorize_remote_deletion_v1(a, &deletion).is_err());
+        assert_eq!(
+            reconcile_remote_deletion(
+                &mut store,
+                "p",
+                "user-delete",
+                &request,
+                &PublicationClock,
+                Some(&settings)
+            )
+            .unwrap(),
+            O::Deleted
+        );
+        assert_eq!(calls.borrow().len(), count);
+        assert_eq!(source.head_sha(), sha);
+    }
+}
+
+#[test]
+fn deletion_retains_evidence_refuses_movement_and_reconciles_lost_response() {
+    use receipts_state::RemotePublicationOutcomeV1 as O;
+    for case in [
+        "delete",
+        "moved",
+        "pending",
+        "rejected",
+        "protected",
+        "lost",
+        "unused",
+        "lock",
+        "symbolic",
+    ] {
+        let source = TestRepo::new(&format!("delete-{case}"));
+        let remote = TestRepo::new(&format!("delete-remote-{case}"));
+        git(source.path(), &["branch", "task/transport"]);
+        let sha = source.head_sha();
+        let endpoint = remote.path().to_str().unwrap();
+        let (db, mut store) = transport_store(&source);
+        let request = PublicationRequest {
+            repository: source.path(),
+            remote: endpoint,
+            branch: "task/transport",
+            commit: &sha,
+            wire: W::PushOnAccept,
+            mode: ProjectRemoteMode::PushAcceptedA3,
+            class: PublicationBranchClass::Task,
+            accepted_commit: Some(&sha),
+        };
+        let intent = transport_intent(&source, endpoint, &sha, "original");
+        let a = publication_admission(&store);
+        assert_eq!(
+            publish_durable(&mut store, a, &intent, &request, &PublicationClock).unwrap(),
+            O::Published
+        );
+        if matches!(case, "pending" | "rejected") {
+            let mut extra = intent.clone();
+            extra.operation_id = "older-evidence".into();
+            if case == "rejected" {
+                extra.wire = "PUSH_ALWAYS".into();
+                extra.mode = "PUSH_ALL_CHECKPOINTS".into();
+                extra.branch_class = "CHECKPOINT".into();
+                extra.acceptance_ref = None;
+            }
+            let a = publication_admission(&store);
+            store.reserve_remote_publication_v1(a, &extra).unwrap();
+            if case == "rejected" {
+                let a = publication_admission(&store);
+                store
+                    .append_remote_publication_result_v1(
+                        a,
+                        "p",
+                        "older-evidence",
+                        1,
+                        O::Published,
+                        Some(&sha),
+                        "d12:rejected-checkpoint",
+                        &PublicationClock,
+                    )
+                    .unwrap();
+            }
+        }
+        let mut deletion = intent.clone();
+        deletion.operation_id = "direction".into();
+        deletion.deletion_authorization = Some("direction".into());
+        let a = publication_admission(&store);
+        let authorization = store.authorize_remote_deletion_v1(a, &deletion);
+        if matches!(case, "pending" | "rejected") {
+            assert!(authorization.is_err(), "{case}");
+            continue;
+        }
+        let authorization = authorization.unwrap();
+        // State's exclusive writer remains held while the remote is reconciled.
+        assert!(receipts_state::TrustedCoreStore::open_exclusive(&db).is_err());
+        if case == "symbolic" {
+            git(remote.path(), &["update-ref", "refs/heads/main", &sha]);
+            git(
+                remote.path(),
+                &[
+                    "symbolic-ref",
+                    "refs/heads/task/transport",
+                    "refs/heads/main",
+                ],
+            );
+        }
+        if case == "moved" {
+            let changed = remote.commit_file("moved", "new remote commit");
+            git(
+                remote.path(),
+                &["update-ref", "refs/heads/task/transport", &changed],
+            );
+        }
+        if case == "lock" {
+            std::fs::write(
+                source.path().join(".git/refs/heads/task/transport.lock"),
+                "held",
+            )
+            .unwrap();
+        }
+        if matches!(case, "lost" | "unused") {
+            if case == "lost" {
+                let a = publication_admission(&store);
+                store
+                    .append_remote_publication_result_v1(
+                        a,
+                        "p",
+                        "direction",
+                        1,
+                        O::Uncertain,
+                        None,
+                        "d12:delete-started",
+                        &PublicationClock,
+                    )
+                    .unwrap();
+            }
+            git(
+                remote.path(),
+                &["update-ref", "-d", "refs/heads/task/transport"],
+            );
+            drop(authorization);
+            drop(store);
+            let mut store = receipts_state::TrustedCoreStore::open_exclusive(&db).unwrap();
+            assert_eq!(
+                reconcile_remote_deletion(
+                    &mut store,
+                    "p",
+                    "direction",
+                    &request,
+                    &PublicationClock,
+                    None
+                )
+                .unwrap(),
+                if case == "lost" {
+                    O::Deleted
+                } else {
+                    O::Refused
+                }
+            );
+            continue;
+        }
+        let protected = if case == "protected" {
+            vec!["refs/heads/task/transport"]
+        } else {
+            vec![]
+        };
+        assert_eq!(
+            delete_remote_branch(
+                &mut store,
+                authorization,
+                &request,
+                &protected,
+                &PublicationClock,
+                None
+            )
+            .unwrap(),
+            if case == "delete" {
+                O::Deleted
+            } else if case == "symbolic" {
+                O::Uncertain
+            } else {
+                O::Refused
+            },
+            "{case}"
+        );
+        assert_eq!(
+            crate::test_support::branch_exists(&remote, "task/transport"),
+            case != "delete"
+        );
+        assert!(crate::test_support::branch_exists(
+            &source,
+            "task/transport"
+        ));
+        if case == "symbolic" {
+            assert!(crate::test_support::branch_exists(&remote, "main"));
+        }
+    }
+}
+
+#[test]
+fn deletion_lost_transport_response_and_receive_side_movement() {
+    use receipts_state::RemotePublicationOutcomeV1 as O;
+    use std::{cell::RefCell, rc::Rc};
+    for race in [false, true] {
+        let source = TestRepo::new("delete-network-loss");
+        let sha = source.head_sha();
+        let endpoint = "ssh://git@fixture.invalid/repo.git";
+        let (db, mut store) = transport_store(&source);
+        let config = source.path().join("trusted-config");
+        std::fs::write(&config, "").unwrap();
+        let settings = TrustedTransportSettings {
+            git_config: &config,
+            home: None,
+            ssh_auth_sock: None,
+        };
+        let request = PublicationRequest {
+            repository: source.path(),
+            remote: endpoint,
+            branch: "task/transport",
+            commit: &sha,
+            wire: W::PushOnAccept,
+            mode: ProjectRemoteMode::PushAcceptedA3,
+            class: PublicationBranchClass::Task,
+            accepted_commit: Some(&sha),
+        };
+        let mut deletion = transport_intent(&source, endpoint, &sha, "delete-loss");
+        deletion.deletion_authorization = Some("delete-loss".into());
+        let a = publication_admission(&store);
+        let authorization = store.authorize_remote_deletion_v1(a, &deletion).unwrap();
+        // (remote SHA, fail next read, number of destructive commands)
+        let state = Rc::new(RefCell::new((Some(sha.clone()), false, 0)));
+        let fixture_state = state.clone();
+        let fixture_sha = sha.clone();
+        let _fixture = crate::git::publication_fixture(Box::new(move |request| {
+            let args: Vec<_> = request
+                .arguments()
+                .iter()
+                .map(|a| a.to_str().unwrap())
+                .collect();
+            if args.contains(&"push") {
+                let mut state = fixture_state.borrow_mut();
+                state.2 += 1;
+                assert!(args.contains(
+                    &format!("--force-with-lease=refs/heads/task/transport:{fixture_sha}").as_str()
+                ));
+                // A moved ref rejects the lease; a lost response may hide success.
+                state.0 = if race { Some("b".repeat(40)) } else { None };
+                state.1 = !race;
+                return Some(Err(()));
+            }
+            if args.contains(&"ls-remote") {
+                let mut state = fixture_state.borrow_mut();
+                if state.1 {
+                    state.1 = false;
+                    return Some(Err(()));
+                }
+                return Some(Ok(crate::git::fixture_capture(
+                    true,
+                    state
+                        .0
+                        .as_ref()
+                        .map(|s| format!("{s}\trefs/heads/task/transport\n"))
+                        .unwrap_or_default(),
+                )));
+            }
+            None
+        }));
+        assert_eq!(
+            delete_remote_branch(
+                &mut store,
+                authorization,
+                &request,
+                &[],
+                &PublicationClock,
+                Some(&settings)
+            )
+            .unwrap(),
+            if race { O::RemoteFailed } else { O::Uncertain }
+        );
+        assert_eq!(state.borrow().2, 1);
+        drop(store);
+        let mut store = receipts_state::TrustedCoreStore::open_exclusive(&db).unwrap();
+        assert_eq!(
+            reconcile_remote_deletion(
+                &mut store,
+                "p",
+                "delete-loss",
+                &request,
+                &PublicationClock,
+                Some(&settings)
+            )
+            .unwrap(),
+            if race { O::RemoteFailed } else { O::Deleted }
+        );
+        assert_eq!(
+            state.borrow().2,
+            1,
+            "reconciliation must never repeat deletion"
+        );
+    }
 }

@@ -277,7 +277,7 @@ fn v15_to_v16_failure_rolls_back_and_v15_postcondition_is_enforced() {
     conn.execute_batch("DROP TRIGGER fail_v16").unwrap();
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).unwrap(),
-        25
+        26
     );
     let repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
     assert!(repo.find_attempt(&aid).unwrap().is_some());
@@ -306,7 +306,7 @@ fn v11_through_v15_maintenance_preserves_rows_and_v15_intermediate_postcondition
         assert!(ReadOnlyGraphReader::open_existing(tmp.db_path()).is_err());
         assert_eq!(
             SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).unwrap(),
-            25
+            26
         );
         let repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
         assert_eq!(repo.count_table_rows("logical_role").unwrap(), 1);
@@ -320,7 +320,7 @@ fn v11_through_v15_maintenance_preserves_rows_and_v15_intermediate_postcondition
                 .unwrap(),
             "0"
         );
-        assert_eq!(repo.schema_version().unwrap(), 25);
+        assert_eq!(repo.schema_version().unwrap(), 26);
         ReadOnlyGraphReader::open_existing(tmp.db_path()).unwrap();
     }
 }

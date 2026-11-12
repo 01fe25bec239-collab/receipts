@@ -488,6 +488,72 @@ pub(crate) fn capture(
     })
 }
 
+/// Network publication uses only explicitly supplied trusted configuration.
+pub(super) fn publication_capture(
+    directory: &Path,
+    args: &[&OsStr],
+    settings: &super::remote_publish::TrustedTransportSettings<'_>,
+) -> Result<GitCapture, ()> {
+    let cwd = subprocess_cwd(directory, "publication").map_err(|_| ())?;
+    let config = std::fs::canonicalize(settings.git_config).map_err(|_| ())?;
+    if !settings.git_config.is_absolute() || !config.is_file() {
+        return Err(());
+    }
+    let mut env = vec![
+        ("GIT_CONFIG_GLOBAL", config.into_os_string()),
+        ("PATH", OsString::from("/usr/bin:/bin")),
+    ];
+    if let Some(home) = settings.home {
+        if !home.is_absolute() {
+            return Err(());
+        }
+        env.push(("HOME", home.as_os_str().to_owned()));
+    }
+    if let Some(agent) = settings.ssh_auth_sock {
+        if !agent.is_absolute() {
+            return Err(());
+        }
+        env.push(("SSH_AUTH_SOCK", agent.as_os_str().to_owned()));
+    }
+    let request = ProcessRunRequest::new(
+        resolved_git_executable().map_err(|_| ())?,
+        [
+            "-c",
+            "push.followTags=false",
+            "-c",
+            "push.recurseSubmodules=no",
+            "-c",
+            "push.gpgSign=false",
+        ]
+        .iter()
+        .map(OsString::from)
+        .chain(hardened_args(args)),
+        &cwd,
+        &cwd,
+    )
+    .map_err(|_| ())?
+    .with_fixed_env(&HARDENED_ENV)
+    .with_trusted_git_env(env);
+    #[cfg(test)]
+    if let Some(Some(result)) =
+        PUBLICATION_FIXTURE.with(|slot| slot.borrow_mut().as_mut().map(|fixture| fixture(&request)))
+    {
+        return result;
+    }
+    let run = run_request(&request, "publication").map_err(|_| ())?;
+    if run.stdout_truncated {
+        return Err(());
+    }
+    // Transport/helper diagnostics can contain credentials. Never return stderr.
+    Ok(GitCapture {
+        success: run.success,
+        exit_status: format!("exit status: {}", run.code.unwrap_or(-1)),
+        stdout: String::from_utf8_lossy(&run.stdout).into_owned(),
+        stderr: String::new(),
+        raw_stdout: run.stdout,
+    })
+}
+
 pub(crate) const UNTRUSTED_CONFIG_PATTERN: &str = "^(filter|include|includeif)\\.";
 
 /// Refuses repositories whose effective configuration declares content
@@ -539,4 +605,42 @@ pub(crate) fn git_version_at_least(output: &str, major: u32, minor: u32) -> Opti
     let found_major: u32 = parts.next()?.parse().ok()?;
     let found_minor: u32 = parts.next()?.parse().ok()?;
     Some((found_major, found_minor) >= (major, minor))
+}
+
+#[cfg(test)]
+type PublicationFixture = Box<dyn FnMut(&ProcessRunRequest) -> Option<Result<GitCapture, ()>>>;
+#[cfg(test)]
+thread_local! {
+    static PUBLICATION_FIXTURE: std::cell::RefCell<Option<PublicationFixture>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(super) struct PublicationFixtureGuard;
+#[cfg(test)]
+impl Drop for PublicationFixtureGuard {
+    fn drop(&mut self) {
+        PUBLICATION_FIXTURE.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+#[cfg(test)]
+pub(super) fn publication_fixture(fixture: PublicationFixture) -> PublicationFixtureGuard {
+    PUBLICATION_FIXTURE.with(|slot| {
+        assert!(slot.borrow().is_none());
+        *slot.borrow_mut() = Some(fixture);
+    });
+    PublicationFixtureGuard
+}
+#[cfg(test)]
+pub(super) fn fixture_capture(success: bool, stdout: String) -> GitCapture {
+    GitCapture {
+        success,
+        exit_status: if success {
+            "exit status: 0"
+        } else {
+            "exit status: 1"
+        }
+        .into(),
+        raw_stdout: stdout.as_bytes().to_vec(),
+        stdout,
+        stderr: String::new(),
+    }
 }
