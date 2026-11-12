@@ -7,13 +7,14 @@ third-party external worker, and an OpenAI consumer subscription as
 needs-review for a paid third-party external worker. Running a case is a
 compatibility observation in the dispositioned context, nothing more.
 
-## Executables (passive observation, 2026-11-07)
+## Executables (passive observation, 2026-11-12)
 
 | Runtime | Path | Version |
 | --- | --- | --- |
-| Claude | `/Users/omkar/.local/bin/claude` | Claude Code 2.1.319 |
-| Codex | `/Users/omkar/.local/bin/codex` | codex-cli 0.167.0 |
+| Claude | `/Users/omkar/.local/bin/claude` | Claude Code 2.1.322 |
+| Codex | `/Users/omkar/.local/bin/codex` | codex-cli 0.167.2 |
 
+Previous observation (2026-11-07): Claude Code 2.1.319 and codex-cli 0.167.0. This is version drift, not compatibility evidence.
 Re-run `--version` immediately before execution. A different version needs a
 new plan entry; it is not silently substituted.
 
@@ -82,3 +83,89 @@ Scratch repositories and worktrees are removed when each fixture drops.
 Claude runs with `--no-session-persistence`. Codex may write session logs under
 its own home; record only whether new files appeared, do not copy them, and
 leave any deletion to USER.
+
+## Qualification cases (prepared, NOT RUN; 2026-11-12)
+
+These are additional to L1/L2. They use `ChildEnvAuthMode::ApiKey`, not the
+subscription environment above. A1 must disposition the exact provider,
+account, model, API-key external-worker use and runner before execution.
+An Anthropic subscription is not an eligible substitute. The operator supplies
+`ANTHROPIC_API_KEY` or `OPENAI_API_KEY` outside the evidence record; do not
+print, capture, inspect or copy its value. The child also receives the base
+names listed above, filtered absolute `PATH`, and the corresponding optional
+`CLAUDE_CONFIG_DIR` or `CODEX_HOME`. No proxy or extra names are admitted.
+An API key being present does not establish eligibility or network access.
+
+Use a clean exact reviewed SHA and an empty, operator-owned mode-0700 evidence
+directory outside the repository, separately for each invocation. Recheck
+`--version` on each actual executable immediately before the run, record its
+path, version, OS, SHA and date without credentials, and stop on drift pending
+an updated plan. The observations above are macOS installations: they do not
+assert any Linux installation version. The live tests are ignored and require
+both the named opt-in and explicit absolute executable path; each case has a
+180-second deadline plus five-second grace. Do not retry a case automatically.
+
+* Claude: an eligible API-key provider context on a disposable runner where the
+  CLI and its config are usable, with `/usr/bin/git`, Rust and an unprivileged
+  test process. Plan runs as an ordinary read-only task and reports reduced
+  isolation, not a sandbox. A separate ordinary task asks for a native JSON
+  schema and two-turn limit. A persistent implementation task starts once and
+  resumes once using its bound single-use ticket; the harness also verifies a
+  read-only resume and ticket reuse are refused. FIRST/SECOND and schema
+  outcomes are compatibility observations, not a guarantee of model behavior.
+  The resume case intentionally enables provider session persistence: its
+  session data may remain under the operator's CLI home. Do not copy or remove
+  that data; report its existence and leave deletion to its owner.
+
+  ```bash
+  RECEIPTS_QUALIFY_CLAUDE=1 RECEIPTS_LIVE_CLAUDE_EXE=<absolute-claude-path> \
+  RECEIPTS_LIVE_EVIDENCE_DIR=<private-absolute-dir> \
+  cargo test --locked -p receipts-runtime-adapters --lib \
+    qualification_tests::live_claude_qualification -- --ignored --exact --nocapture --test-threads=1
+  ```
+
+* Codex: a disposable, non-container Linux VM with cgroup v2 delegation and
+  the Workspace protected-custody host anchors administered by the operator.
+  Run the already-built test binary as the authorized host controller (root),
+  with controller UID/GID 61001, worker GID 61002 and unused worker UIDs
+  62000–62063, as required by the existing hosted fixture. The CLI and its
+  dependencies and eligible API-key context must be usable by the isolated
+  worker; the operator must arrange that without exposing a credential in
+  evidence. `RECEIPTS_RA_HOSTED_CGROUP` names the absolute, dedicated,
+  delegated cgroup. The host setup and teardown must establish and verify
+  owned custody anchors, cgroup emptiness, process reaping and cleanup; the
+  existing `.github/scripts/ra-w1-completion-linux/run.sh` is a synthetic-only
+  reference and does not invoke this case or forward provider credentials.
+  Do not run this on a workstation or adopt/delete existing custody objects.
+  Build unprivileged with `cargo test --locked -p receipts-runtime-adapters
+  --lib --no-run`, then invoke that exact test binary in the prepared host
+  context with these names:
+
+  ```text
+  RECEIPTS_QUALIFY_CODEX=1
+  RECEIPTS_LIVE_CODEX_EXE=<absolute-linux-codex-path>
+  RECEIPTS_LIVE_EVIDENCE_DIR=<private-absolute-dir>
+  RECEIPTS_RA_HOSTED_CGROUP=<absolute-delegated-cgroup>
+  OPENAI_API_KEY=<operator-provided eligible context; never record the value>
+  <test-binary> qualification_tests::live_codex_protected_reviewer --ignored --exact --nocapture --test-threads=1
+  ```
+
+  The case provisions a review workspace at the exact fixture commit. PASS
+  requires protected collection, a completed protocol, a nonzero execution of
+  the exact bounded write command with permission/read-only filesystem denial,
+  unchanged tracked bytes, unchanged Git status/head, successful custody
+  release and fixture removal. A model refusing to attempt the command, an
+  unrecognized output shape, truncated stdout or an unrelated command failure
+  is inconclusive and fails the test. If custody is unproven the fixture is
+  retained; the operator must preserve and investigate it, not force-delete it.
+  A PASS is limited to this run, host and CLI, not a universal sandbox claim.
+
+Each started and collected case saves bounded raw stdout/stderr privately,
+with separate head/tail files on truncation. Summaries contain only case,
+verdict and cleanup status; a start or collection refusal can lack raw streams.
+Create-new writes prevent overwriting existing evidence. A failed or interrupted
+run is retained, never relabeled as success. Operator inspection and any
+sanitization follow the output handling above. Synthetic `qualification_tests`
+exercise success, malformed/silent failure, write-refusal recognition, private
+create-new evidence and retained-on-unproven-cleanup behavior offline; they do
+not establish real provider behavior or Linux custody.

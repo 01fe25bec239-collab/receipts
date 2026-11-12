@@ -16,6 +16,8 @@ mod live_tests;
 mod protected_launch;
 #[cfg(all(test, unix))]
 mod protected_launch_tests;
+#[cfg(all(test, unix))]
+mod qualification_tests;
 pub use protected_launch::ProtectedLaunch;
 mod adapter;
 mod attempt;
