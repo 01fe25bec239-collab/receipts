@@ -1870,7 +1870,7 @@ pub(crate) fn request_command(
     if let Some(policy) = request.env_policy() {
         policy.apply(&mut command);
     }
-    command.envs(request.fixed_env().iter().copied());
+    command.envs(request.fixed_env().iter().map(|(key, value)| (*key, value)));
     command
 }
 

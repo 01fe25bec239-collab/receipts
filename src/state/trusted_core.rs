@@ -388,6 +388,28 @@ impl TrustedCoreStore {
         self.role_project(&binding.role_id)
     }
 
+    /// Trusted user-workflow boundary: verify explicit user direction before calling.
+    /// Consumes the durable authorization ID even if execution is interrupted.
+    pub fn authorize_remote_deletion_v1(
+        &mut self,
+        admission: StateWriteAdmission,
+        intent: &crate::RemotePublicationIntentV1,
+    ) -> Result<crate::RemoteDeletionAuthorizationV1, StateError> {
+        if intent.deletion_authorization.is_none() {
+            return Err(StateError::SetupRefused {
+                reason: crate::SetupRefusalV1::InvalidShape,
+            });
+        }
+        let outcome = self.reserve_remote_publication_v1(admission, intent)?;
+        if outcome != crate::SetupWriteOutcomeV1::Applied {
+            return Err(StateError::SetupRefused {
+                reason: crate::SetupRefusalV1::ConflictingReplay,
+            });
+        }
+        Ok(crate::RemoteDeletionAuthorizationV1 {
+            intent: intent.clone(),
+        })
+    }
     pub fn reserve_remote_publication_v1(
         &mut self,
         admission: StateWriteAdmission,

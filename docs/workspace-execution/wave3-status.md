@@ -67,12 +67,14 @@ branches only; Task and Workstream still require an eligible acceptance-gated mo
 Local-only returns before Git or remote access. Remote failure leaves local
 progress intact. Tests use owned local remotes and verify rejected checkpoint
 retention, non-fast-forward refusal and exact destination/commit publication.
-No remote deletion path exists. The adopted contract supplies no pruning age,
-eligibility or retention configuration API; absence of such authority retains
-all branches. Local teardown still retains task branches until integration.
-Only local file transport is enabled. Production credential-backed transport
-and admitted durable publication intent/result storage remain pending shared
-integration. Returned outcomes alone are not durable publication evidence.
+Explicit remote deletion now consumes a single-use authorization issued by the
+trusted State holder after user direction. State evaluates complete ref history
+and retains unresolved and PUSH_ALWAYS evidence. Expected-SHA readback plus a
+receive-side lease refuses moved refs. Reconciliation never repeats deletion.
+Local branches remain retained. HTTPS and SSH use explicit trusted configuration
+and credential-free endpoint identities. See [the D12 contract](d12-remote-policy.md)
+for trust requirements, replay behavior and controlled-fixture qualification
+limits. Historical SQL stays unchanged; v26 adds a version barrier against old writers.
 
 ## D4 recovery refusal
 

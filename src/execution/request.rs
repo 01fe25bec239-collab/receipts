@@ -82,8 +82,9 @@ pub struct ProcessRunRequest {
     stdin: ProcessStdin,
     env_policy: Option<ChildEnvPolicy>,
     // Crate-private fixed entries for Workspace's own hardened Git boundary.
-    // Never caller-supplied; ChildEnvPolicy still refuses GIT_* names.
-    fixed_env: Vec<(&'static str, &'static str)>,
+    // Trusted publication may add explicit config/agent paths; never worker input.
+    // ChildEnvPolicy still refuses GIT_* names.
+    fixed_env: Vec<(&'static str, OsString)>,
 }
 
 impl ProcessRunRequest {
@@ -175,11 +176,19 @@ impl ProcessRunRequest {
 
     /// Workspace-internal constant environment (hardened Git only).
     pub(crate) fn with_fixed_env(mut self, entries: &[(&'static str, &'static str)]) -> Self {
-        self.fixed_env = entries.to_vec();
+        self.fixed_env = entries
+            .iter()
+            .map(|(key, value)| (*key, OsString::from(value)))
+            .collect();
         self
     }
 
-    pub(crate) fn fixed_env(&self) -> &[(&'static str, &'static str)] {
+    pub(crate) fn with_trusted_git_env(mut self, entries: Vec<(&'static str, OsString)>) -> Self {
+        self.fixed_env.extend(entries);
+        self
+    }
+
+    pub(crate) fn fixed_env(&self) -> &[(&'static str, OsString)] {
         &self.fixed_env
     }
 }

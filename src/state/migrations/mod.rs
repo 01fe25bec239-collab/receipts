@@ -32,6 +32,7 @@ pub(crate) mod v0023_graph_publication_identity;
 
 pub(crate) mod v0024_wave3_setup;
 pub(crate) mod v0025_remote_publication;
+pub(crate) mod v0026_remote_workflow;
 
 use crate::error::StateError;
 
@@ -74,6 +75,7 @@ static REGISTERED: &[Migration] = &[
     v0023_graph_publication_identity::MIGRATION,
     v0024_wave3_setup::MIGRATION,
     v0025_remote_publication::MIGRATION,
+    v0026_remote_workflow::MIGRATION,
 ];
 
 /// The registered migration chain in application order.

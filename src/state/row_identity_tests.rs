@@ -95,11 +95,11 @@ fn every_supported_head_including18_preserves_values_through19() {
         assert!(SqliteStateRepository::open(tmp.db_path()).is_err());
         assert_eq!(
             SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).unwrap(),
-            25
+            26
         );
         assert_eq!(
             SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).unwrap(),
-            25
+            26
         );
         let repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
         assert_eq!(repo.find_logical_role("r").unwrap(), Some(role));
