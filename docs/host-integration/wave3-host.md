@@ -48,16 +48,18 @@ Positive flags, failed observations and missing fields leave trust/permission
 UNKNOWN. The existing observation composition selects conservative SUPERVISED;
 no separate Codex policy or discovery authority was introduced.
 
-Codex discovery and plugin registration remain pending admitted Q01 inputs.
-The supplied installed-host Q01 procedure records qualification as pending and
-contains no admitted plugin-list response shape or literal namespaced skill
-syntax. Existing `plugin list --json` probing is Claude-specific; reusing that
-argv or decoder for Codex would guess an unsupported vendor contract. The
-existing observation authority correctly keeps positive effective enablement,
-trust and admin facts UNKNOWN without an admitted supplier. Local files and
-hook invocation claims cannot establish those facts.
+Installed-host Q01 qualified five native observer paths with Codex 0.169.0 on
+macOS: `SessionStart`, `PostToolUse`, `PreCompact`, `PostCompact`, and
+`SessionEnd`. Each reached the Receipts inbox as `OBSERVED`. Both compaction
+events used the manual trigger. The untrusted control produced no inbox, and
+the disabled-hooks control preserved the existing inbox hash. See
+[Codex native observer delivery](native-delivery-status.md) for enrollment,
+trust and custody requirements.
 
-Installed-host Q01: PENDING. No installation, registration, trust change,
-provider execution or user settings mutation was performed. Full product
-command composition remains Wave 4. This partial package needs A1 disposition
-of native Codex discovery and qualification before all HI-W3-1–3 obligations can close.
+The installed qualification used an isolated plugin registration. Broader
+product discovery, automatic compaction, managed policy, Linux execution,
+verification that global settings were unchanged, and `EMBEDDED` readiness
+remain open. Positive effective enablement, trust and admin facts remain
+`UNKNOWN` without an admitted supplier. Local files and hook invocation claims
+cannot establish those facts. Supervised delivery remains available. Full
+product command composition remains Wave 4.
