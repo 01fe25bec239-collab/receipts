@@ -1,57 +1,57 @@
-# Codex native delivery dependency
+# Codex native observer delivery
 
-Native delivery remains unavailable; CodexHostAdapter continues to require a
-SUPERVISED report and accepts only INFERRED events. The CLI supports only
-`receipts hook claude <Event>`. No native Codex success is claimed.
+The production plugin registers SessionStart, SessionEnd, PostToolUse,
+PreCompact and PostCompact. `receipts hook codex <Event>` accepts bounded
+observer input only after checking an explicit local enrollment and live OS
+parent identity. Direct calls, unknown wrappers, trust-bypass launches,
+changed executable/plugin bytes, malformed input, event/project mismatch and
+missing/mismatched session bindings are refused with no inbox append.
 
-Q01's sanitized observations establish compatible shapes for SessionStart,
-SessionEnd, PostToolUse, PreCompact and PostCompact. The two compact records
-report `manual`; automatic compaction and managed policy remain unverified.
-The synthetic fixtures under src/hosts/codex/fixtures exercise the existing
-bounded normalizer. They do not establish delivery or trusted provenance.
+Enrollment is an operator action, separate from Codex hook trust. Supply
+canonical absolute paths:
 
-The production blocker is the missing admitted trust/enablement supplier.
-The existing observation contract explicitly allows local configuration to
-refute permission only. Neither a deserialized capability report, hook JSON,
-matching path, environment marker nor a historical positive capture can prove
-that this invocation came through an effectively enabled, trusted hook.
-Exposing `receipts hook codex` with any of those as authorization would defeat
-that boundary. A1 must settle the producer and transport contract before
-production delivery is wired. This is a contract dependency, not a request to
-change the frozen normalized-event schema.
+```
+receipts codex-native-enroll PRIVATE_DIRECTORY CODEX_EXECUTABLE PROJECT INSTALLED_PLUGIN
+```
 
-The required contract must bind current project/session, installed hook and
-launcher identity, effective trust/enablement/admin policy and freshness to the
-invocation, provide invalidation on disablement or drift, and deny replay and
-caller-forged claims. Host can then normalize admitted input and append through
-its existing source validator and spool. Generic adapter emit must continue to
-refuse caller-created OBSERVED events without that binding.
+Create PRIVATE_DIRECTORY outside the project and installed plugin, owned by
+the current user with mode 0700. Enrollment pins the reviewed Codex executable
+and installed manifest, hook definitions and launcher. Re-enroll after updates.
+Export RECEIPTS_CODEX_ENROLLMENT to this directory and RECEIPTS_BIN to the
+absolute installed Receipts binary before starting Codex. Review and trust
+only the installed Receipts hooks through Codex's normal UI. Never bypass hook
+trust. Codex enforces effective hook trust, enablement and managed policy;
+settings and capability-report JSON never grant delivery authority.
 
-Remaining operator sequence, after implementation and independent review:
+Receipts accepts the enrolled executable as the live parent, optionally through
+its fixed command-hook /bin/sh (or /bin/dash) invocation. Unknown process
+metadata or unsupported platforms fail closed. macOS and Linux have native
+ancestry implementations. The process birth identity prevents PID reuse from
+reusing a session binding. SessionStart establishes the session; later events
+must match. Only the native delivery method appends OBSERVED events; generic
+CodexHostAdapter emission continues to require INFERRED supervised events.
+The capability report remains conservative: five observer hooks do not prove
+full frozen coverage or EMBEDDED readiness.
 
-1. Use the Q01 runbook's fresh private root, disposable Git repository and
-   isolated CODEX_HOME. Verify installed CLI and Receipts binary paths/hashes,
-   package hashes, effective settings and zero unrelated hooks. Authenticate
-   directly if necessary; never copy credentials.
-2. Install the actual Receipts native plugin, inspect the cached launcher bytes
-   and hook definitions, and record the admitted delivery identity. Do not use
-   the observer fixture as a substitute for Receipts.
-3. With hooks enabled but untrusted, complete a no-tool control turn and exit;
-   verify the Receipts inbox was not created or changed.
-4. Trust only the installed Receipts hooks. In a fresh session complete one
-   shell control turn, invoke the supported manual compaction control and
-   confirm completion, then exit normally. Inspect sanitized normalized inbox
-   records for all five hooks; record phase and actual trigger separately.
-5. With the same installation trusted but hooks disabled, complete a fresh
-   no-tool control turn and exit. Verify the inbox was not created or changed.
-   Repeat mismatched project/session and malformed/oversized input refusals.
-6. Qualify automatic compaction and isolated managed policy separately if
-   available; otherwise retain UNKNOWN for each. Record executable/package
-   hashes, UTC, completed controls and per-event delivery counts, never raw
-   stdin, tool inputs/responses, transcripts or credentials.
-7. Remove only the isolated plugin/marketplace, verify settings and residue,
-   retain sanitized evidence outside the disposable root, then remove that root.
+This follows Host spool custody: the owning OS user is trusted. A hostile
+same-user process can alter enrollment or invoke enrolled programs; this is
+not OS confinement. Executable hashes detect drift, not an immutable execution
+object. Missing enrollment, identity drift or unavailable delivery preserves
+supervised behavior. Receipts does not change host policy, approve its own
+hooks, open State or read credentials. Enroll only the actual reviewed Codex
+executable and installed plugin, never arbitrary helper programs.
 
-No Computer Use/desktop Terminal capability was exposed to this A2 session.
-The installed-host run has not occurred. The sequence above depends on the
-missing production path and cannot currently qualify this checkout.
+Codex's trust semantics are documented at https://learn.chatgpt.com/docs/hooks
+and plugin packaging at https://developers.openai.com/plugins/build/plugins.
+
+Qualification uses a fresh private root, isolated CODEX_HOME and disposable Git
+repository. Install the actual plugin, verify installed hashes and sign in
+directly if needed. Complete an untrusted no-tool turn and verify no inbox;
+trust only Receipts hooks, start fresh, complete a shell turn, invoke /compact,
+confirm completion and exit normally. Inspect sanitized normalized event types,
+compaction phases and actual trigger. In a fresh --disable hooks session,
+complete another no-tool turn and verify the inbox hash/count is unchanged.
+Record automatic compaction and isolated managed policy separately when tested.
+Retain only sanitized counts, hashes, UTC and outcomes; remove isolated plugin
+and marketplace registrations and verify residue before disposable cleanup.
+Synthetic fixtures are parser tests, never installed delivery evidence.

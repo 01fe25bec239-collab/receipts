@@ -12,7 +12,7 @@ fn at() -> OrchestrationDateTimeV1 {
     OrchestrationDateTimeV1::try_new("2026-11-11T00:00:00Z").unwrap()
 }
 fn input(name: &str) -> Vec<u8> {
-    format!(r#"{{"hook_event_name":"{name}","session_id":"s","cwd":"/repo","tool_name":"Bash","tool_input":{{"secret":"SECRET"}}}}"#).into_bytes()
+    format!(r#"{{"hook_event_name":"{name}","session_id":"s","cwd":"/repo","tool_name":"Bash","source":"startup","reason":"other","trigger":"manual","tool_input":{{"secret":"SECRET"}}}}"#).into_bytes()
 }
 #[test]
 fn codex_hook_map_matches_claude_semantics_for_shared_events() {

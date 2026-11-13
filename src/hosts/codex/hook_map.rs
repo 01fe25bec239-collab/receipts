@@ -25,6 +25,14 @@ pub fn normalize_codex_hook(
         return Err(ClaudeHookError::UnknownEvent);
     }
     let parsed = parse_claude_hook(event_name, stdin)?;
+    match parsed.detail() {
+        crate::claude::ClaudeHookDetail::SessionStart { source: None }
+        | crate::claude::ClaudeHookDetail::SessionEnd { reason: None }
+        | crate::claude::ClaudeHookDetail::Compact { trigger: None } => {
+            return Err(ClaudeHookError::InvalidField("observer detail"));
+        }
+        _ => {}
+    }
     let event = parsed
         .observed_event(event_id, occurred_at)
         .ok_or(ClaudeHookError::UnknownEvent)?;

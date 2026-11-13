@@ -60,8 +60,12 @@ fn run(program: &Path, args: &[&str], env: &[(&str, &Path)], stdin: &[u8]) -> Ru
     }
     let start = Instant::now();
     let mut child = command.spawn().unwrap();
-    child.stdin.take().unwrap().write_all(stdin).unwrap();
+    let write_result = child.stdin.take().unwrap().write_all(stdin);
     let out = child.wait_with_output().unwrap();
+    // Refusals may exit before reading; still collect and assert their output.
+    if let Err(error) = write_result {
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe, "{error}");
+    }
     Run {
         stdout: String::from_utf8(out.stdout).unwrap(),
         stderr: String::from_utf8(out.stderr).unwrap(),
@@ -255,12 +259,15 @@ fn missing_project_dir_and_bad_usage_are_explicit() {
     );
     for args in [
         &["hook"][..],
-        &["hook", "codex", "SessionStart"],
+        &["hook", "unknown", "SessionStart"],
         &["status"],
     ] {
         let out = run(Path::new(BIN), args, &[], b"");
         assert_eq!(out.code, 1);
-        assert_eq!(out.stderr, "usage: receipts hook claude <Event>\n");
+        assert_eq!(
+            out.stderr,
+            "usage: receipts hook <claude|codex> <Event> | receipts codex-native-enroll <directory> <executable> <project> <plugin>\n"
+        );
     }
 }
 
@@ -679,12 +686,13 @@ fn launcher_passes_input_via_stdin_not_argv_interpolation() {
         "hook\nclaude\nPostToolUse\n"
     );
     // No absolute binary: observers fail open, WorktreeCreate refuses.
+    let unread_input = vec![b'x'; 1024 * 1024];
     for (event, code) in [("SessionStart", 0), ("WorktreeCreate", 1)] {
         let out = run(
             Path::new("/bin/sh"),
             &[launcher.to_str().unwrap(), event],
             &[],
-            b"{}",
+            &unread_input,
         );
         assert_eq!(out.code, code, "{event}");
         assert_eq!(out.stdout, "");

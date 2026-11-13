@@ -1,0 +1,7 @@
+#!/bin/sh
+# Hook input stays on stdin. Codex owns review, trust and policy enforcement.
+case "${RECEIPTS_BIN:-}" in
+  /*) [ -f "$RECEIPTS_BIN" ] && [ -x "$RECEIPTS_BIN" ] || exit 0 ;;
+  *) echo 'receipts: absolute RECEIPTS_BIN required; supervised fallback' >&2; exit 0 ;;
+esac
+exec "$RECEIPTS_BIN" hook codex "$1"

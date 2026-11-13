@@ -16,12 +16,32 @@ fn absolute(name: &str) -> Option<PathBuf> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let [command, directory, executable, project, plugin] = args.as_slice()
+        && command == "codex-native-enroll"
+    {
+        match receipts_host_integration::codex::native::enroll(
+            std::path::Path::new(directory),
+            std::path::Path::new(executable),
+            std::path::Path::new(project),
+            std::path::Path::new(plugin),
+        ) {
+            Ok(()) => return,
+            Err(error) => {
+                eprintln!("receipts: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     let [hook, host, event] = args.as_slice() else {
-        eprintln!("usage: receipts hook claude <Event>");
+        eprintln!(
+            "usage: receipts hook <claude|codex> <Event> | receipts codex-native-enroll <directory> <executable> <project> <plugin>"
+        );
         std::process::exit(1);
     };
-    if hook != "hook" || host != "claude" {
-        eprintln!("usage: receipts hook claude <Event>");
+    if hook != "hook" || !matches!(host.as_str(), "claude" | "codex") {
+        eprintln!(
+            "usage: receipts hook <claude|codex> <Event> | receipts codex-native-enroll <directory> <executable> <project> <plugin>"
+        );
         std::process::exit(1);
     }
     // One byte past the bound is enough to refuse oversized input.
@@ -32,6 +52,25 @@ fn main() {
         .read_to_end(&mut stdin);
     if read.is_err() {
         stdin.clear();
+    }
+    if host == "codex" {
+        let delivery = absolute("RECEIPTS_CODEX_ENROLLMENT")
+            .ok_or("native enrollment unavailable; supervised fallback required")
+            .and_then(|path| {
+                receipts_host_integration::codex::native::NativeCodexDelivery::admit(&path)
+            })
+            .and_then(|delivery| {
+                delivery.deliver(
+                    event,
+                    &stdin,
+                    receipts_cli::hook::new_event_id(),
+                    receipts_host_integration::claude::utc_now(),
+                )
+            });
+        if let Err(error) = delivery {
+            eprintln!("receipts: {error}");
+        }
+        return;
     }
     let ctx = ClaudeHookContext {
         claudecode: std::env::var_os("CLAUDECODE").is_some_and(|v| v == "1"),
