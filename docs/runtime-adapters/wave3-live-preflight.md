@@ -39,10 +39,19 @@ commands, evidence or source). Endpoint is fixed:
 Success model IDs: `openai/gpt-4.1-mini` only, for both nonstreaming strict schema
 and streaming strict schema. Negative model ID: `receipts/invalid-preflight-model`
 (deliberately nonexistent). No aliases, automatic substitution or model list.
+The only accepted returned identity is the literal `openai/gpt-4.1-mini`, matching
+this approved request ID. No canonical/datestamped alternatives are accepted:
+there is no offline evidence here establishing an equivalent identity. A future
+alias mapping needs documented provider evidence and fresh review, not an
+implicit relaxation after a failed live run. JSON must name this model; SSE
+must contain model evidence in at least one chunk, and every model-bearing
+chunk must match. PASS records include only the allowlisted `observed_model`;
+unrecognized model strings and provider messages are never printed.
 
 Offline command (does not read the key or use the network):
 
-    python3 .github/scripts/runtime-live-preflight/openrouter.py
+    python3 -B .github/scripts/runtime-live-preflight/openrouter.py
+    python3 -B .github/scripts/runtime-live-preflight/test_openrouter.py -v
 
 After separate provider/account/model/spend/runner authorization, operator:
 1. Use the exact reviewed clean commit on a disposable Linux host with Python3
@@ -57,8 +66,11 @@ After separate provider/account/model/spend/runner authorization, operator:
 
        RECEIPTS_OPENROUTER_SMOKE=1 python3 .github/scripts/runtime-live-preflight/openrouter.py --live
 
-4. Require exit 0 and two model PASS records plus invalid-model error PASS.
-   Failures stop immediately without retries. Remove the injected secret using
+4. Require exit 0 and two model PASS records (including observed_model) plus
+   invalid-model error PASS. Exit 2 with `invalid-model qualification INCONCLUSIVE`
+   is not acceptance: preserve the sanitized verdict and stop for disposition.
+   Other failures exit 1. No failure or inconclusive case is automatically retried.
+   Remove the injected secret using
    its operator-managed lifecycle. Preserve failed evidence. Do not upload raw
    responses, request headers, environment dumps or authentication artifacts.
 
@@ -66,10 +78,21 @@ Bounds: at most three requests, two successes with max_tokens=64 each and one
 invalid-model request; 20s socket timeout, 75s whole-process deadline, 64KiB
 response cap per request. TLS verification stays enabled. Ambient proxies and
 redirects are disabled. SSE comments are ignored; missing DONE, provider errors,
-non-stop termination, invalid JSON and wrong schema fail. Only sanitized fixed
-verdicts are emitted; raw bodies are not retained. This deliberately limits
+non-stop termination, invalid JSON and wrong schema fail. Only choice index 0
+is accepted, with at most one choice per event. Its complete answer must end
+with exactly one `stop` terminal choice followed by `[DONE]`; no further choice
+records may follow stop, and no data events may follow DONE. Empty-choice
+usage records may precede DONE, but cannot supply answer/termination evidence.
+Only sanitized fixed verdicts are emitted; raw bodies are not retained. This deliberately limits
 failure diagnostics. HTTP auth/rate/server errors and midstream failure handling
 are exercised offline; live negative case tests only invalid-model handling.
+Invalid-model PASS requires HTTP 400/404, a matching integer error.code and the
+exact diagnostic `receipts/invalid-preflight-model is not a valid model ID`.
+This is a conservative synthetic recognition rule, not a claim that the live
+provider currently emits that wording. Empty objects, unrelated errors,
+different model names or unrecognized wording produce INCONCLUSIVE (exit 2),
+never invalid-model proof. Unexpected HTTP status or oversize bodies fail
+(exit 1). No raw error text is emitted for either result.
 
 This is HTTP compatibility evidence only, not Receipts adapter qualification.
 Vercel remains an optional separate gateway with a separately reviewed harness,
@@ -117,11 +140,15 @@ References: [OpenRouter structured outputs](https://openrouter.ai/docs/guides/fe
 
 ## Offline validation scope
 
-Python default self-check covers JSON/SSE success, nine malformed/error/limit
-refusals and invalid-model response acceptance plus four refusal controls.
-Opt-in=0 refuses before credential lookup or network. Existing Linux diagnostic
-shell self-check passed locally (including interruption, retained custody,
-publication failure and cleanup controls); this is simulated host evidence.
-YAML parsed with PyYAML; bash -n and git diff --check passed. actionlint was
-unavailable. Rust fmt/Clippy/full suite were not rerun: no Rust source, manifests,
-lockfiles or existing diagnostic scripts changed; hosted execution is pending.
+Python default self-check retains the bounded JSON/SSE and HTTP error controls.
+`test_openrouter.py` adds regression controls for all three review findings,
+missing/inconsistent model evidence, mixed choices and invalid terminal order,
+plus mocked transport bounds, proxy/redirect refusal, opt-in refusal, immediate
+failure stop, three-request success and top-level redaction. All credentials and
+responses in these controls are synthetic; they do not perform network calls.
+
+The failing-before and passing-after logs and exact source snapshots are local
+review evidence, outside the product repository. Existing synthetic Linux
+workflow and diagnostic remain unchanged by this repair. Their prior shell
+self-check is harness evidence only; actual hosted execution remains pending.
+Rust fmt/Clippy/full suite are not rerun for these Python/runbook-only repairs.

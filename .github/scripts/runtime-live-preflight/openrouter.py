@@ -11,6 +11,11 @@ import urllib.request
 ENDPOINT = 'https://openrouter.ai/api/v1/chat/completions'
 MODELS = ('openai/gpt-4.1-mini',)
 LIMIT = 65536
+INVALID_MODEL = 'receipts/invalid-preflight-model'
+
+
+class Inconclusive(ValueError):
+    pass
 
 
 def payload(model, stream):
@@ -22,11 +27,12 @@ def payload(model, stream):
                                 required=['answer'], additionalProperties=False))))
 
 
-def validate(status, raw, stream):
+def validate(status, raw, stream, model=MODELS[0]):
     if status != 200:
         raise ValueError('http-error')
     if len(raw) > LIMIT:
         raise ValueError('capture-limit')
+    observed = None
     if stream:
         content, done, stopped = '', False, False
         for event in raw.decode().replace('\r\n', '\n').split('\n\n'):
@@ -42,7 +48,16 @@ def validate(status, raw, stream):
             item = json.loads(data)
             if 'error' in item:
                 raise ValueError('stream-error')
-            for choice in item.get('choices', []):
+            if 'model' in item:
+                if item['model'] != model:
+                    raise ValueError('model-mismatch')
+                observed = item['model']
+            choices = item.get('choices', [])
+            if not isinstance(choices, list) or len(choices) > 1:
+                raise ValueError('unexpected-choices')
+            for choice in choices:
+                if type(choice.get('index')) is not int or choice['index'] != 0 or stopped:
+                    raise ValueError('unexpected-choice-or-sequence')
                 reason = choice.get('finish_reason')
                 if reason is not None and reason != 'stop':
                     raise ValueError('incomplete-stream')
@@ -52,11 +67,19 @@ def validate(status, raw, stream):
             raise ValueError('incomplete-stream')
     else:
         item = json.loads(raw)
-        if 'error' in item or item['choices'][0]['finish_reason'] != 'stop':
+        observed = item.get('model')
+        choices = item.get('choices', [])
+        if (not isinstance(choices, list) or len(choices) != 1
+                or type(choices[0].get('index')) is not int or choices[0]['index'] != 0):
+            raise ValueError('unexpected-choices')
+        if 'error' in item or choices[0]['finish_reason'] != 'stop':
             raise ValueError('completion-error')
         content = item['choices'][0]['message']['content']
+    if observed != model:
+        raise ValueError('model-missing-or-mismatch')
     if json.loads(content) != {'answer': 'OK'}:
         raise ValueError('schema-mismatch')
+    return observed
 
 
 def exchange(body, key):
@@ -76,13 +99,22 @@ def exchange(body, key):
 
 
 def validate_error(status, raw):
-    if status not in (400, 404) or len(raw) > LIMIT or not isinstance(json.loads(raw).get('error'), dict):
+    if status not in (400, 404) or len(raw) > LIMIT:
         raise ValueError('expected invalid-model error')
+    try:
+        error = json.loads(raw).get('error')
+    except (ValueError, AttributeError):
+        raise Inconclusive('unclassified-model-error') from None
+    # Exact diagnostic only; unfamiliar wording is evidence to review, not a PASS.
+    if (not isinstance(error, dict) or type(error.get('code')) is not int
+            or error['code'] != status
+            or error.get('message') != f'{INVALID_MODEL} is not a valid model ID'):
+        raise Inconclusive('unclassified-model-error')
 
 
 def offline():
-    normal = json.dumps(dict(choices=[dict(finish_reason='stop', message=dict(content='{"answer":"OK"}'))])).encode()
-    chunk = json.dumps(dict(choices=[dict(finish_reason='stop', delta=dict(content='{"answer":"OK"}'))]))
+    normal = json.dumps(dict(model=MODELS[0], choices=[dict(index=0, finish_reason='stop', message=dict(content='{"answer":"OK"}'))])).encode()
+    chunk = json.dumps(dict(model=MODELS[0], choices=[dict(index=0, finish_reason='stop', delta=dict(content='{"answer":"OK"}'))]))
     sse = (': keepalive\n\ndata: ' + chunk + '\n\ndata: [DONE]\n\n').encode()
     validate(200, normal, False)
     validate(200, sse, True)
@@ -97,7 +129,8 @@ def offline():
         except (ValueError, KeyError, TypeError):
             continue
         raise AssertionError('accepted invalid response')
-    validate_error(400, b'{"error":{"code":400}}')
+    validate_error(400, json.dumps(dict(error=dict(code=400,
+        message=f'{INVALID_MODEL} is not a valid model ID'))).encode())
     for status, raw in [(200, b'{"error":{}}'), (401, b'{"error":{}}'),
                         (400, b'{}'), (404, b'{"error":"bad"}')]:
         try:
@@ -124,10 +157,10 @@ def main():
     for model in MODELS:
         for stream in (False, True):
             status, raw = exchange(payload(model, stream), key)
-            validate(status, raw, stream)
-            print(json.dumps(dict(model=model, stream=stream, verdict='PASS')))
+            observed = validate(status, raw, stream, model)
+            print(json.dumps(dict(model=model, observed_model=observed, stream=stream, verdict='PASS')))
     # Deliberately invalid model: one bounded error-path request, never retried.
-    status, raw = exchange(payload('receipts/invalid-preflight-model', False), key)
+    status, raw = exchange(payload(INVALID_MODEL, False), key)
     validate_error(status, raw)
     print('invalid-model error PASS')
 
@@ -135,6 +168,9 @@ def main():
 if __name__ == '__main__':
     try:
         main()
+    except Inconclusive:
+        print('invalid-model qualification INCONCLUSIVE; stopped without retry', file=sys.stderr)
+        sys.exit(2)
     except Exception:
         # Never print provider bodies, headers, exception text or secret values.
         print('preflight FAIL; stopped without retry', file=sys.stderr)
