@@ -23,13 +23,45 @@ use std::{
 pub struct CodexAdapter {
     executable: PathBuf,
     env: Option<ChildEnvPolicy>,
+    probe: crate::provider::ProbeCache,
 }
 impl CodexAdapter {
     pub fn new(executable: impl Into<PathBuf>) -> Self {
         Self {
             executable: executable.into(),
             env: None,
+            probe: crate::provider::ProbeCache::new(std::time::Duration::from_secs(300)),
         }
+    }
+    /// CLI probes do not establish account usage or remaining quota.
+    pub fn usage(&self) -> RuntimeObservation {
+        RuntimeObservation::Unknown
+    }
+    pub fn quota(&self) -> RuntimeObservation {
+        RuntimeObservation::Unknown
+    }
+    /// TTL bounds installation evidence; expiry never keeps stale capabilities.
+    pub fn with_probe_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.probe = crate::provider::ProbeCache::new(ttl);
+        self
+    }
+    /// Runs only bounded version/help probes, never a model invocation.
+    pub fn provider(
+        &self,
+        workspace: &WorkspaceHandle,
+        timeout: &receipts_workspace_execution::execution::ProcessTimeoutPolicy,
+    ) -> Provider {
+        let (report, at) = self.probe.observe(|| {
+            execute_codex_capability_probe(
+                &self.executable,
+                workspace.worktree_path(),
+                workspace.worktree_path(),
+                timeout,
+            )
+            .map(RuntimeCapabilities::Codex)
+            .unwrap_or(RuntimeCapabilities::Unknown)
+        });
+        crate::provider::provider("openai", "OpenAI", report, at)
     }
     pub fn with_env_policy(mut self, env: ChildEnvPolicy) -> Self {
         self.env = Some(env);
@@ -162,7 +194,7 @@ fn prompt(
                 || c.cost_policy().is_some()
                 || !c.required_capabilities().is_empty()
                 || c.time_budget_seconds()
-                    .is_some_and(|s| policy.timeout.run_timeout().as_secs_f64() > s as f64)
+                    .is_some_and(|s| !policy.fits_time_budget(s))
             {
                 return Err(FailureClass::PolicyBlocked);
             }
@@ -250,7 +282,7 @@ impl RuntimeAdapter for CodexAdapter {
         RuntimeAuthStatus::Unknown
     }
     fn capabilities(&self) -> RuntimeCapabilities {
-        RuntimeCapabilities::Unknown
+        self.probe.capabilities()
     }
     fn start(
         &self,
@@ -337,7 +369,13 @@ impl RuntimeAdapter for CodexAdapter {
         Ok(CodexAttemptResult {
             outcome: result.map_err(|e| e.classify_failure())?,
             protected: handle.protected(),
-            cancel: *handle.cancel.lock().unwrap_or_else(|e| e.into_inner()),
+            cancel: if handle.attempt.terminal_cause()
+                == Some(receipts_workspace_execution::execution::LiveProcessTerminalCause::TimedOut)
+            {
+                Some(CancelReason::Timeout)
+            } else {
+                *handle.cancel.lock().unwrap_or_else(|e| e.into_inner())
+            },
         })
     }
     fn cancel(&self, handle: &CodexAttemptHandle, reason: &CancelReason) {

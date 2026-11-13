@@ -287,6 +287,12 @@ impl LiveProcessAttempt {
     pub fn terminal_cause(&self) -> Option<LiveProcessTerminalCause> {
         lock(&self.lifecycle).cause
     }
+    /// True once a terminal claim exists or the controller closed after a fault.
+    /// This is an observation only; collection still verifies cleanup and readers.
+    pub fn is_terminating_or_closed(&self) -> bool {
+        let state = lock(&self.lifecycle);
+        state.closed || state.cause.is_some()
+    }
     /// Wait for execution/cleanup and verified reader joins. The explicit policy bounds
     /// execution; cleanup uses the accepted grace and private verification windows.
     pub fn wait_collect(&self) -> Result<LiveProcessOutcome, LiveProcessAttemptError> {

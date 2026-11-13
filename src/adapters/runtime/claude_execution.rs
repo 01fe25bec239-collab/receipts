@@ -59,6 +59,10 @@ pub struct ClaudeTaskExecutionRequest {
     permission_mode: ClaudePermissionMode,
     prompt: String,
     env_policy: Option<ChildEnvPolicy>,
+    pub(crate) turn_budget: Option<u64>,
+    pub(crate) schema: Option<String>,
+    pub(crate) persistence: bool,
+    pub(crate) resume: Option<String>,
 }
 impl ClaudeTaskExecutionRequest {
     pub fn new(
@@ -77,6 +81,10 @@ impl ClaudeTaskExecutionRequest {
             permission_mode,
             prompt: prompt.into(),
             env_policy: None,
+            turn_budget: None,
+            schema: None,
+            persistence: false,
+            resume: None,
         }
     }
     /// Explicit opt-in; omission preserves Workspace's empty environment.
@@ -129,19 +137,35 @@ pub(crate) fn build_claude_task_request(
     .into_bytes();
     encoded.push(b'\n');
     let stdin = ProcessStdin::bytes(encoded)?;
+    let mut args: Vec<String> = [
+        "--print",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--no-session-persistence",
+        "--permission-mode",
+        request.permission_mode.argument(),
+        "--verbose",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    if request.persistence {
+        args.retain(|arg| arg != "--no-session-persistence");
+    }
+    if let Some(turns) = request.turn_budget {
+        args.extend(["--max-turns".into(), turns.to_string()]);
+    }
+    if let Some(schema) = &request.schema {
+        args.extend(["--json-schema".into(), schema.clone()]);
+    }
+    if let Some(session) = &request.resume {
+        args.extend(["--resume".into(), session.clone()]);
+    }
     let process = ProcessRunRequest::new(
         &request.executable,
-        [
-            "--print",
-            "--input-format",
-            "stream-json",
-            "--output-format",
-            "stream-json",
-            "--no-session-persistence",
-            "--permission-mode",
-            request.permission_mode.argument(),
-            "--verbose",
-        ],
+        args,
         &request.workspace_root,
         &request.cwd,
     )?

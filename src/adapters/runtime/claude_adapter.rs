@@ -26,21 +26,63 @@ pub enum RuntimeObservation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelReason {
     UserRequested,
+    Timeout,
+    Superseded,
+    SafetyInterruption,
+    BudgetExhausted,
 }
 
 /// No default executable, inherited environment, capability or authentication claim.
 pub struct ClaudeAdapter {
+    issuer: Arc<()>,
     executable: PathBuf,
     env: Option<ChildEnvPolicy>,
+    probe: crate::provider::ProbeCache,
+    policy_probe: crate::provider::ProbeCache,
 }
 impl ClaudeAdapter {
     pub fn new(executable: impl Into<PathBuf>) -> Self {
         Self {
+            issuer: Arc::new(()),
             executable: executable.into(),
             env: None,
+            probe: crate::provider::ProbeCache::new(std::time::Duration::from_secs(300)),
+            policy_probe: crate::provider::ProbeCache::new(std::time::Duration::from_secs(300)),
         }
     }
+    /// CLI probes do not establish account usage or remaining quota.
+    pub fn usage(&self) -> RuntimeObservation {
+        RuntimeObservation::Unknown
+    }
+    pub fn quota(&self) -> RuntimeObservation {
+        RuntimeObservation::Unknown
+    }
+    /// TTL bounds installation evidence; expiry never keeps stale capabilities.
+    pub fn with_probe_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.probe = crate::provider::ProbeCache::new(ttl);
+        self.policy_probe = crate::provider::ProbeCache::new(ttl);
+        self
+    }
+    /// Runs only bounded version/help probes, never a model invocation.
+    pub fn provider(
+        &self,
+        workspace: &WorkspaceHandle,
+        timeout: &receipts_workspace_execution::execution::ProcessTimeoutPolicy,
+    ) -> Provider {
+        let (report, at) = self.probe.observe(|| {
+            execute_claude_capability_probe(
+                &self.executable,
+                workspace.worktree_path(),
+                workspace.worktree_path(),
+                timeout,
+            )
+            .map(RuntimeCapabilities::Claude)
+            .unwrap_or(RuntimeCapabilities::Unknown)
+        });
+        crate::provider::provider("anthropic", "Anthropic", report, at)
+    }
     pub fn with_env_policy(mut self, env: ChildEnvPolicy) -> Self {
+        self.issuer = Arc::new(());
         self.env = Some(env);
         self
     }
@@ -53,6 +95,8 @@ pub struct ClaudeAttemptHandle {
     collector: Mutex<Option<JoinHandle<()>>>,
     // Held across Workspace's cancel claim, so collection reads the accepted reason.
     cancel: Mutex<Option<CancelReason>>,
+    resume_binding: Option<ResumeBinding>,
+    turn_budget: Option<u64>,
 }
 impl Drop for ClaudeAttemptHandle {
     /// Cancel, join collection, then release custody only if Workspace proved
@@ -95,8 +139,14 @@ pub struct ClaudeAttemptResult {
     pub reduced_isolation: bool,
     protected: bool,
     cancel: Option<CancelReason>,
+    resume_ticket: Option<ClaudeResumeTicket>,
 }
 impl ClaudeAttemptResult {
+    /// Available only after clean collection of an opted-in task session.
+    pub fn resume_ticket(&self) -> Option<&ClaudeResumeTicket> {
+        self.resume_ticket.as_ref()
+    }
+
     pub fn provider_result(&self) -> ClaudeProviderResult {
         self.outcome
             .protocol()
@@ -136,7 +186,10 @@ fn prompt(
     workspace: &WorkspaceHandle,
     policy: &RuntimeExecutionPolicy,
 ) -> Result<String, FailureClass> {
-    if !policy.supported()
+    if policy.sandbox_mode.is_some()
+        || policy.network_access.is_some()
+        || policy.filesystem_scope.is_some()
+        || (policy.read_only && policy.session_persistence)
         || !matches!(
             workspace.state(),
             WorkspaceState::Provisioned | WorkspaceState::Active
@@ -156,11 +209,15 @@ fn prompt(
                 || workspace.task_id().is_some_and(|task| task != c.task_id())
                 || c.branch() != workspace.branch()
                 || c.start_sha() != workspace.base_sha().as_str()
-                || c.turn_budget().is_some()
+                || c.turn_budget().is_some_and(|cap| {
+                    policy
+                        .turn_budget
+                        .is_none_or(|budget| u64::try_from(cap).map_or(true, |cap| budget > cap))
+                })
                 || c.cost_policy().is_some()
                 || !c.required_capabilities().is_empty()
                 || c.time_budget_seconds()
-                    .is_some_and(|s| policy.timeout.run_timeout().as_secs_f64() > s as f64)
+                    .is_some_and(|s| !policy.fits_time_budget(s))
             {
                 return Err(FailureClass::PolicyBlocked);
             }
@@ -200,7 +257,7 @@ fn prompt(
                     "reviewer_floor": r.reviewer_floor().map(|v| v.as_str())
                 })),
                 "assurance_profile": c.assurance_profile().as_str(), "cost_policy": null,
-                "time_budget_seconds": c.time_budget_seconds(), "turn_budget": null,
+                "time_budget_seconds": c.time_budget_seconds(), "turn_budget": c.turn_budget(),
                 "branch": c.branch(), "worktree": c.worktree(),
                 "remote_publish_policy": c.remote_publish_policy().map(|v| v.as_str()),
                 "stop_conditions": c.stop_conditions(),
@@ -248,7 +305,7 @@ impl RuntimeAdapter for ClaudeAdapter {
         RuntimeAuthStatus::Unknown
     }
     fn capabilities(&self) -> RuntimeCapabilities {
-        RuntimeCapabilities::Unknown
+        self.probe.capabilities()
     }
     fn start(
         &self,
@@ -256,13 +313,176 @@ impl RuntimeAdapter for ClaudeAdapter {
         workspace: &WorkspaceHandle,
         policy: &RuntimeExecutionPolicy,
     ) -> Result<ClaudeAttemptHandle, FailureClass> {
+        self.launch(task, workspace, policy, None)
+    }
+    fn stream_events<'a>(&'a self, handle: &'a ClaudeAttemptHandle) -> ClaudeEventStream<'a> {
+        ClaudeEventStream::new(handle)
+    }
+    fn collect_result(&self, handle: &ClaudeAttemptHandle) -> Self::AttemptResult {
+        let receiver = handle
+            .result
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .ok_or(FailureClass::Unknown)?;
+        let result = receiver.recv().map_err(|_| FailureClass::Unknown)?;
+        if let Some(worker) = handle
+            .collector
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            worker.join().map_err(|_| FailureClass::Unknown)?;
+        }
+        let outcome = result.map_err(|e| e.classify_failure())?;
+        let resume_ticket = handle.resume_binding.as_ref().and_then(|binding| {
+            if !outcome.process().success() {
+                return None;
+            }
+            let protocol = outcome.protocol().ok()?;
+            let result = protocol.result().ok()?;
+            if result.provider_result() != ClaudeProviderResult::Success {
+                return None;
+            }
+            let session = result.session_id()?;
+            valid_session(session).then(|| ClaudeResumeTicket {
+                session: session.into(),
+                binding: binding.clone(),
+                consumed: Mutex::new(false),
+            })
+        });
+        let budget_exhausted = handle.turn_budget.is_some()
+            && outcome
+                .protocol()
+                .ok()
+                .and_then(|p| p.result().ok().map(|r| r.subtype()))
+                == Some(ClaudeResultSubtype::ErrorMaxTurns);
+        Ok(ClaudeAttemptResult {
+            outcome,
+            resume_ticket,
+            reduced_isolation: true,
+            protected: handle.protected(),
+            cancel: if handle.attempt.terminal_cause()
+                == Some(receipts_workspace_execution::execution::LiveProcessTerminalCause::TimedOut)
+            {
+                Some(CancelReason::Timeout)
+            } else {
+                (*handle.cancel.lock().unwrap_or_else(|e| e.into_inner()))
+                    .or(budget_exhausted.then_some(CancelReason::BudgetExhausted))
+            },
+        })
+    }
+    fn cancel(&self, handle: &ClaudeAttemptHandle, reason: &CancelReason) {
+        let mut accepted = handle.cancel.lock().unwrap_or_else(|e| e.into_inner());
+        if handle.attempt.cancel() == LiveProcessCancelAcceptance::CancelAccepted {
+            *accepted = Some(*reason);
+        }
+    }
+    fn classify_failure(&self, error: &RawFailure) -> FailureClass {
+        error.classify_failure()
+    }
+}
+
+impl registry::AttemptFailure for ClaudeAttemptResult {
+    fn failure(&self) -> Option<FailureClass> {
+        ClaudeAttemptResult::failure(self)
+    }
+}
+
+impl ClaudeAdapter {
+    /// Explicit current task/workspace/policy are required: a historical ID alone
+    /// cannot authorize continuation. Reviewers never enter this path.
+    pub fn resume_with_policy(
+        &self,
+        task: &RuntimeCapsuleFamily,
+        workspace: &WorkspaceHandle,
+        policy: &RuntimeExecutionPolicy,
+        ticket: &ClaudeResumeTicket,
+    ) -> Result<ClaudeAttemptHandle, FailureClass> {
+        let mut consumed = ticket.consumed.lock().unwrap_or_else(|e| e.into_inner());
+        let binding = &ticket.binding;
+        if *consumed
+            || !policy.session_persistence
+            || policy.read_only
+            || !matches!(task, RuntimeCapsuleFamily::Task(c) if c.task_id() == binding.task_id)
+            || !Arc::ptr_eq(&self.issuer, &binding.issuer)
+            || workspace != &binding.workspace
+            || policy.timeout.run_timeout() > binding.timeout
+            || binding
+                .turns
+                .is_some_and(|cap| policy.turn_budget.is_none_or(|budget| budget > cap))
+            || policy.structured_output_schema != binding.schema
+            || prompt(task, workspace, policy).map_or(true, |p| p != binding.capsule_prompt)
+        {
+            return Err(FailureClass::PolicyBlocked);
+        }
+        // Consume before launch: uncertainty must not permit duplicate continuation.
+        *consumed = true;
+        self.launch(task, workspace, policy, Some(&ticket.session))
+    }
+    fn launch(
+        &self,
+        task: &RuntimeCapsuleFamily,
+        workspace: &WorkspaceHandle,
+        policy: &RuntimeExecutionPolicy,
+        session: Option<&str>,
+    ) -> Result<ClaudeAttemptHandle, FailureClass> {
         let text = prompt(task, workspace, policy)?;
+        if policy
+            .turn_budget
+            .is_some_and(|n| n == 0 || n > 9_007_199_254_740_991)
+        {
+            return Err(FailureClass::PolicyBlocked);
+        }
+        if policy.structured_output_schema.as_ref().is_some_and(|s| {
+            serde_json::from_str::<serde_json::Value>(s).map_or(true, |v| !v.is_object())
+        }) {
+            return Err(FailureClass::PolicyBlocked);
+        }
+        if policy.turn_budget.is_some()
+            || policy.session_persistence
+            || policy.structured_output_schema.is_some()
+        {
+            let (report, _) = self.policy_probe.observe(|| {
+                crate::claude_policy_probe::probe(
+                    &self.executable,
+                    workspace,
+                    &policy.timeout,
+                    self.env.as_ref(),
+                )
+            });
+            for (required, flag) in [
+                (policy.turn_budget.is_some(), "--max-turns"),
+                (policy.session_persistence, "--resume"),
+                (policy.structured_output_schema.is_some(), "--json-schema"),
+            ] {
+                if required && !crate::claude_policy_probe::supports(&report, flag) {
+                    return Err(FailureClass::PolicyBlocked);
+                }
+            }
+        }
         let mode = if policy.read_only {
             ClaudePermissionMode::Plan
         } else {
             ClaudePermissionMode::AcceptEdits
         };
-        let request = ClaudeTaskExecutionRequest::new(
+        let resume_binding = if policy.session_persistence {
+            match task {
+                RuntimeCapsuleFamily::Task(c) => Some(ResumeBinding {
+                    issuer: self.issuer.clone(),
+                    capsule_prompt: text.clone(),
+                    workspace: workspace.clone(),
+                    task_id: c.task_id().into(),
+                    timeout: policy.timeout.run_timeout(),
+                    turns: policy.turn_budget,
+                    schema: policy.structured_output_schema.clone(),
+                }),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let mut request = ClaudeTaskExecutionRequest::new(
             &self.executable,
             workspace.worktree_path(),
             workspace.worktree_path(),
@@ -270,6 +490,10 @@ impl RuntimeAdapter for ClaudeAdapter {
             mode,
             text,
         );
+        request.turn_budget = policy.turn_budget;
+        request.schema = policy.structured_output_schema.clone();
+        request.persistence = policy.session_persistence;
+        request.resume = session.map(str::to_owned);
         let request = match &self.env {
             Some(env) => request.with_env_policy(env.clone()),
             None => request,
@@ -311,47 +535,36 @@ impl RuntimeAdapter for ClaudeAdapter {
             result: Mutex::new(Some(receiver)),
             collector: Mutex::new(Some(worker)),
             cancel: Mutex::new(None),
+            turn_budget: policy.turn_budget,
+            resume_binding,
         })
-    }
-    fn stream_events<'a>(&'a self, handle: &'a ClaudeAttemptHandle) -> ClaudeEventStream<'a> {
-        ClaudeEventStream::new(handle)
-    }
-    fn collect_result(&self, handle: &ClaudeAttemptHandle) -> Self::AttemptResult {
-        let receiver = handle
-            .result
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-            .ok_or(FailureClass::Unknown)?;
-        let result = receiver.recv().map_err(|_| FailureClass::Unknown)?;
-        if let Some(worker) = handle
-            .collector
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
-            worker.join().map_err(|_| FailureClass::Unknown)?;
-        }
-        Ok(ClaudeAttemptResult {
-            outcome: result.map_err(|e| e.classify_failure())?,
-            reduced_isolation: true,
-            protected: handle.protected(),
-            cancel: *handle.cancel.lock().unwrap_or_else(|e| e.into_inner()),
-        })
-    }
-    fn cancel(&self, handle: &ClaudeAttemptHandle, reason: &CancelReason) {
-        let mut accepted = handle.cancel.lock().unwrap_or_else(|e| e.into_inner());
-        if handle.attempt.cancel() == LiveProcessCancelAcceptance::CancelAccepted {
-            *accepted = Some(*reason);
-        }
-    }
-    fn classify_failure(&self, error: &RawFailure) -> FailureClass {
-        error.classify_failure()
     }
 }
 
-impl registry::AttemptFailure for ClaudeAttemptResult {
-    fn failure(&self) -> Option<FailureClass> {
-        ClaudeAttemptResult::failure(self)
-    }
+#[derive(Clone)]
+struct ResumeBinding {
+    issuer: Arc<()>,
+    workspace: WorkspaceHandle,
+    task_id: String,
+    capsule_prompt: String,
+    timeout: std::time::Duration,
+    turns: Option<u64>,
+    schema: Option<String>,
+}
+/// Opaque, single-use continuation evidence. No raw session ID or Debug output.
+/// A ticket is not dispatch admission; callers must re-admit the current task.
+pub struct ClaudeResumeTicket {
+    session: String,
+    binding: ResumeBinding,
+    consumed: Mutex<bool>,
+}
+fn valid_session(session: &str) -> bool {
+    session.len() == 36
+        && session.bytes().enumerate().all(|(i, b)| {
+            if [8, 13, 18, 23].contains(&i) {
+                b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        })
 }

@@ -35,3 +35,6 @@ mod facade_tests;
 
 #[cfg(test)]
 mod test_support;
+
+pub mod policy;
+pub use goal::CoreFacade;

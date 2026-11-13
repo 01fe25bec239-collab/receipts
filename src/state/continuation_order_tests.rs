@@ -512,7 +512,7 @@ fn upgraded_history_is_ambiguous_only_when_a_failure_sits_beside_a_success() {
         drop(conn);
         assert_eq!(
             SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).unwrap(),
-            24
+            25
         );
         SqliteStateRepository::open(tmp.db_path()).unwrap()
     };
@@ -585,11 +585,11 @@ fn v21_store_migrates_to_v22_and_a_failed_step_leaves_exact_v21() {
     drop(conn);
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).unwrap(),
-        24
+        25
     );
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).unwrap(),
-        24,
+        25,
         "idempotent on a current store"
     );
     let conn = rusqlite::Connection::open(tmp.db_path()).unwrap();

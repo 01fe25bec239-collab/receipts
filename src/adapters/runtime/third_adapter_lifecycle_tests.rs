@@ -283,7 +283,7 @@ impl Fixture {
         .unwrap();
         fs::write(workspace.worktree_path().join("suffix"), suffix).unwrap();
         let executable = root.join("worker");
-        fs::write(&executable, "#!/bin/sh\n/bin/cat > received\n: > ready\nwhile [ ! -f release ]; do /bin/sleep 0.01; done\n/bin/cat suffix\nif [ -f fail ]; then exit 9; fi\n").unwrap();
+        fs::write(&executable, "#!/bin/sh\nif [ \"$1\" = --help ]; then printf 'Usage: claude\\nOptions:\\n'; exit 0; fi\n/bin/cat > received\n: > ready\nwhile [ ! -f release ]; do /bin/sleep 0.01; done\n/bin/cat suffix\nif [ -f fail ]; then exit 9; fi\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         Self {

@@ -686,6 +686,7 @@ fn launcher_passes_input_via_stdin_not_argv_interpolation() {
         "hook\nclaude\nPostToolUse\n"
     );
     // No absolute binary: observers fail open, WorktreeCreate refuses.
+    // Exceed pipe capacity so an early exit deterministically interrupts the write.
     let unread_input = vec![b'x'; 1024 * 1024];
     for (event, code) in [("SessionStart", 0), ("WorktreeCreate", 1)] {
         let out = run(

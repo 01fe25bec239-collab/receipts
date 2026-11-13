@@ -546,7 +546,7 @@ fn v16_store_migrates_to_v17_preserving_rows_and_rejects_partial_v17() {
     drop(conn);
     assert_eq!(
         SqliteStateRepository::migrate_existing_to_current(tmp.db_path()).unwrap(),
-        24
+        25
     );
     let repo = SqliteStateRepository::open(tmp.db_path()).unwrap();
     assert_eq!(repo.count_table_rows("logical_role").unwrap(), 1);
