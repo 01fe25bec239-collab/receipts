@@ -12,7 +12,7 @@ fn at() -> OrchestrationDateTimeV1 {
     OrchestrationDateTimeV1::try_new("2026-11-11T00:00:00Z").unwrap()
 }
 fn input(name: &str) -> Vec<u8> {
-    format!(r#"{{"hook_event_name":"{name}","session_id":"s","cwd":"/repo","tool_name":"Bash","tool_input":{{"secret":"SECRET"}}}}"#).into_bytes()
+    format!(r#"{{"hook_event_name":"{name}","session_id":"s","cwd":"/repo","tool_name":"Bash","source":"startup","reason":"other","trigger":"manual","tool_input":{{"secret":"SECRET"}}}}"#).into_bytes()
 }
 #[test]
 fn codex_hook_map_matches_claude_semantics_for_shared_events() {
@@ -182,4 +182,47 @@ fn supervised_codex_delivery_and_three_host_core_view_parity() {
         Err(CodexAdapterError::WrongHost)
     ));
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn synthetic_native_observations_preserve_details_without_admitting_delivery() {
+    for (name, input, expected) in [
+        (
+            "SessionStart",
+            include_str!("fixtures/SessionStart.json"),
+            r#""start_source":"startup""#,
+        ),
+        (
+            "SessionEnd",
+            include_str!("fixtures/SessionEnd.json"),
+            r#""end_reason":"other""#,
+        ),
+        (
+            "PostToolUse",
+            include_str!("fixtures/PostToolUse.json"),
+            r#""tool_name":"shell_command""#,
+        ),
+        (
+            "PreCompact",
+            include_str!("fixtures/PreCompact.json"),
+            r#""phase":"PRE""#,
+        ),
+        (
+            "PostCompact",
+            include_str!("fixtures/PostCompact.json"),
+            r#""phase":"POST""#,
+        ),
+    ] {
+        let event = normalize_codex_hook(name, input.as_bytes(), id(), at()).unwrap();
+        let json = crate::wire::normalized_host_event_to_json(&event);
+        assert!(json.contains(expected), "{json}");
+        if name.ends_with("Compact") {
+            assert!(json.contains(r#""trigger":"manual""#));
+        }
+        assert!(event.raw_ref().is_none());
+        assert!(
+            normalize_codex_hook("SessionStart", input.as_bytes(), id(), at()).is_err()
+                || name == "SessionStart"
+        );
+    }
 }

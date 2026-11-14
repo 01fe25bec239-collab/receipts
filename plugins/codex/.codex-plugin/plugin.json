@@ -1,3 +1,7 @@
 {
-  "name": "receipts"
+  "name": "receipts",
+  "version": "0.1.0",
+  "description": "Receipts native observer hooks with supervised fallback",
+  "hooks": "./hooks/hooks.json",
+  "skills": "./skills/"
 }

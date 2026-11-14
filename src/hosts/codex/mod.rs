@@ -8,6 +8,7 @@ use crate::{
 };
 use std::future::{Ready, ready};
 pub mod hook_map;
+pub mod native;
 #[cfg(test)]
 mod tests;
 

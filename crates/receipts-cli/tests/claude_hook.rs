@@ -259,12 +259,15 @@ fn missing_project_dir_and_bad_usage_are_explicit() {
     );
     for args in [
         &["hook"][..],
-        &["hook", "codex", "SessionStart"],
+        &["hook", "unknown", "SessionStart"],
         &["status"],
     ] {
         let out = run(Path::new(BIN), args, &[], b"");
         assert_eq!(out.code, 1);
-        assert_eq!(out.stderr, "usage: receipts hook claude <Event>\n");
+        assert_eq!(
+            out.stderr,
+            "usage: receipts hook <claude|codex> <Event> | receipts codex-native-enroll <directory> <executable> <project> <plugin>\n"
+        );
     }
 }
 
