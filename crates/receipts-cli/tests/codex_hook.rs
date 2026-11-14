@@ -62,7 +62,17 @@ fn native_delivery_binds_parent_bytes_project_session_and_bounded_input() {
             .is_empty()
     );
     assert!(!spool.exists());
-    enroll(&fs::canonicalize(BIN).unwrap()); // This caller is not the enrolled executable.
+    // Cargo can hard-link its binary artifacts on Linux; enrollment requires one link.
+    let other_exe = root.join("receipts");
+    fs::copy(BIN, &other_exe).unwrap();
+    let alias = root.join("receipts-alias");
+    fs::hard_link(&other_exe, &alias).unwrap();
+    assert_eq!(
+        receipts_host_integration::codex::native::enroll(&directory, &other_exe, &project, &plugin),
+        Err("unsafe identity file")
+    );
+    fs::remove_file(alias).unwrap();
+    enroll(&other_exe); // This caller is not the enrolled executable.
     assert!(
         !hook(&directory, "SessionStart", start.as_bytes())
             .stderr
