@@ -168,7 +168,7 @@ fn handoff(s: &Scenario) -> A3HandoffNonTemporalCore {
     );
     A3HandoffNonTemporalCore::new(
         "task-1".into(),
-        "attempt-1".into(),
+        s.request.core().attempt_id().into(),
         s.base.clone(),
         s.implementation.clone(),
         "task/1".into(),
@@ -286,10 +286,22 @@ fn evaluate_with_content(
     dispositions: &[receipts_review_integration::FindingDisposition],
     content: Option<&dyn receipts_review_integration::ReviewContentResolver>,
 ) -> receipts_review_integration::GateOutcome {
+    evaluate_for_project(s, ticket, state, generation, dispositions, content, PROJECT)
+}
+
+fn evaluate_for_project(
+    s: &Scenario,
+    ticket: &receipts_review_integration::ReviewTicket,
+    state: &StateReader,
+    generation: u32,
+    dispositions: &[receipts_review_integration::FindingDisposition],
+    content: Option<&dyn receipts_review_integration::ReviewContentResolver>,
+    project: &str,
+) -> receipts_review_integration::GateOutcome {
     let review = ticket.review().unwrap().core().clone();
     let ireq = integration_request(s);
     AcceptanceGate::evaluate(&AcceptanceInput {
-        project_id: PROJECT,
+        project_id: project,
         integration_request: &ireq,
         review_request: &s.request,
         profile_floor: AssuranceProfile::Light,
@@ -721,4 +733,235 @@ fn supersession_order_is_verified_against_core_written_task_provenance() {
             outcome.checks
         );
     }
+}
+
+fn d4_scenario(tag: &str, workspace: &str) -> Scenario {
+    let mut s = scenario(tag);
+    let request = receipts_review_integration::wire::encode_review_request(&s.request)
+        .replace("attempt-1", d4::ATTEMPT);
+    s.request = receipts_review_integration::wire::decode_review_request(&request).unwrap();
+    d4::seed(&s.db, workspace, &s.base);
+    std::fs::create_dir(s.dir.0.join("gate-scratch")).unwrap();
+    s
+}
+
+#[derive(Debug, PartialEq)]
+enum D4HandoffRefusal {
+    ReviewAlreadyDispatched,
+    MissingClosureAuthority,
+}
+
+/// Conservative test-local refusal, not a new product recovery API. A missing
+/// event never proves that an outside handoff cannot still become eligible.
+fn d4_handoff_refusal(state: &StateReader) -> D4HandoffRefusal {
+    use receipts_review_integration::state::{EventQuery, EventSubject, SubjectKind};
+    let events = state
+        .list_events(&EventQuery {
+            project_id: PROJECT.into(),
+            subject: Some(EventSubject {
+                kind: SubjectKind::Task,
+                id: "task-1".into(),
+            }),
+            event_types: Some(vec![EventType::ReviewDispatched]),
+            limit: 100,
+        })
+        .unwrap();
+    if events.is_empty() {
+        D4HandoffRefusal::MissingClosureAuthority
+    } else {
+        D4HandoffRefusal::ReviewAlreadyDispatched
+    }
+}
+
+#[test]
+fn d4_published_acceptance_survives_reopen_but_cannot_issue_workspace_recovery_authority() {
+    use receipts_review_integration::state::{AttemptId, TrustedCoreStore};
+    for (tag, workspace) in [
+        ("d4-links", "ws-1"),
+        ("d4-foreign-workspace", "foreign-workspace"),
+    ] {
+        let s = d4_scenario(tag, workspace);
+        let clock = Clock::default();
+        let mut sink = open_sink(&s.db, &clock);
+        let ticket = review_through_core(&s, &mut sink, &Pass);
+        assert!(ticket.passed() && ticket.persisted.is_ok());
+        assert_eq!(ticket.capsule.as_ref().unwrap().attempt_id(), d4::ATTEMPT);
+        assert!(handoff(&s).ready_for_a4());
+        drop(sink);
+        let reader = StateReader::open_existing(&s.db).unwrap();
+        let accepted = evaluate(&s, &ticket, &reader, 1, &[]);
+        assert_eq!(
+            accepted.outcome,
+            IntegrationDecisionOutcome::Accept,
+            "{:#?}",
+            accepted.checks
+        );
+        let binding = accepted.proposal.as_ref().unwrap().binding().clone();
+        drop(reader);
+        let mut sink = open_sink(&s.db, &clock);
+        assert_eq!(accepted.record(&mut sink), Ok(Recorded::Published));
+        drop(sink);
+
+        // Read actual State after reopening, rather than using the local outcome.
+        let reader = StateReader::open_existing(&s.db).unwrap();
+        let store = TrustedCoreStore::open_exclusive(&s.db).unwrap();
+        let claim_id = receipts_e2e::CoreReviewSink::claim_id(&binding).unwrap();
+        let claim = store
+            .reader()
+            .find_review_claim(PROJECT, &claim_id)
+            .unwrap()
+            .unwrap();
+        let seal = store
+            .reader()
+            .find_review_seal(PROJECT, &claim_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.project_id, PROJECT);
+        assert_eq!(claim.task_id, "task-1");
+        assert_eq!(
+            claim.subject_sha.as_deref(),
+            Some(s.implementation.as_str())
+        );
+        assert_eq!(claim.state, S::Completed);
+        let decision = reader
+            .find_decision_record(
+                PROJECT,
+                DecisionRecordKind::IntegrationDecision,
+                claim.outcome_ref.as_ref().unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(decision.project_id(), PROJECT);
+        assert_eq!(
+            decision.task_id(),
+            None,
+            "task is nested provenance, not root metadata"
+        );
+        assert_eq!(
+            claim.outcome_sha256.as_deref(),
+            Some(decision.record_sha256())
+        );
+        assert_eq!(seal.subject_sha.as_deref(), Some(s.implementation.as_str()));
+        assert_eq!(seal.task_id, claim.task_id);
+        let recovered =
+            receipts_review_integration::wire::decode_integration_decision(decision.record_json())
+                .unwrap();
+        assert_eq!(recovered.core(), accepted.decision.core());
+        let provenance = &recovered.core().provenance_chain().unwrap()[0];
+        assert_eq!(provenance.task_id(), "task-1");
+        assert_eq!(
+            provenance.acceptance_sha(),
+            &IntegrationDecisionNullableString::String(s.implementation.clone())
+        );
+        assert!(
+            reader
+                .find_decision_record(
+                    "foreign-project",
+                    DecisionRecordKind::IntegrationDecision,
+                    decision.record_id()
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            d4_handoff_refusal(&reader),
+            D4HandoffRefusal::ReviewAlreadyDispatched
+        );
+        drop(reader);
+
+        let attempt = store
+            .reader()
+            .find_attempt(&AttemptId::parse(d4::ATTEMPT).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.project_id(), PROJECT);
+        assert_eq!(attempt.node_id(), "task-1");
+        assert_eq!(attempt.workspace_id(), workspace);
+        assert!(
+            !attempt.is_finished(),
+            "acceptance publication does not finish this independent attempt row"
+        );
+        let expected = if workspace == "ws-1" {
+            Ok(())
+        } else {
+            Err(d4::Refusal::ForeignAttempt)
+        };
+        assert_eq!(
+            d4::current_unfinished(&store, store.store_id(), "ws-1", &s.base),
+            expected
+        );
+        // Even matching rows lack an accepted-workspace anchor and closed-handoff
+        // authority. This witness intentionally has no path returning a permit.
+        assert!(
+            store
+                .reader()
+                .find_finalization_v1(PROJECT, &AttemptId::parse(d4::ATTEMPT).unwrap())
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn d4_stale_and_foreign_review_inputs_and_missing_disposition_refuse() {
+    let mut s = d4_scenario("d4-refusals", "ws-1");
+    let clock = Clock::default();
+    let mut sink = open_sink(&s.db, &clock);
+    let ticket = review_through_core(&s, &mut sink, &Pass);
+    assert!(ticket.passed());
+    drop(sink);
+    let reader = StateReader::open_existing(&s.db).unwrap();
+    assert_ne!(
+        evaluate_for_project(&s, &ticket, &reader, 1, &[], None, "foreign-project").outcome,
+        IntegrationDecisionOutcome::Accept
+    );
+    let original = s.request.clone();
+    let encoded = receipts_review_integration::wire::encode_review_request(&original);
+    for altered in [
+        encoded.replace(d4::ATTEMPT, "01ARZ3NDEKTSV4RRFFQ69G5FAW"),
+        encoded.replace(&s.implementation, &s.base),
+    ] {
+        s.request = receipts_review_integration::wire::decode_review_request(&altered).unwrap();
+        let outcome = evaluate(&s, &ticket, &reader, 1, &[]);
+        assert_ne!(outcome.outcome, IntegrationDecisionOutcome::Accept);
+        assert!(
+            outcome
+                .failed()
+                .contains(&AcceptanceCheckId::VerdictAndFindings)
+        );
+    }
+    s.request = original;
+    assert_eq!(
+        evaluate(&s, &ticket, &reader, 1, &[]).outcome,
+        IntegrationDecisionOutcome::Accept
+    );
+
+    let missing = d4_scenario("d4-missing-disposition", "ws-1");
+    let before = StateReader::open_existing(&missing.db).unwrap();
+    assert_eq!(
+        d4_handoff_refusal(&before),
+        D4HandoffRefusal::MissingClosureAuthority
+    );
+    drop(before);
+    let mut sink = open_sink(&missing.db, &clock);
+    let runtime = Synthetic {
+        nonblocking: true,
+        ..Synthetic::default()
+    };
+    let ticket = review_through_core(&missing, &mut sink, &runtime);
+    assert!(ticket.persisted.is_ok());
+    assert!(
+        !ticket.passed(),
+        "nonblocking findings remain pending disposition"
+    );
+    assert_eq!(ticket.pending_dispositions(), ["n1"]);
+    drop(sink);
+    let reader = StateReader::open_existing(&missing.db).unwrap();
+    let outcome = evaluate(&missing, &ticket, &reader, 1, &[]);
+    assert_eq!(outcome.outcome, IntegrationDecisionOutcome::Blocked);
+    assert!(
+        outcome
+            .failed()
+            .contains(&AcceptanceCheckId::VerdictAndFindings)
+    );
 }
