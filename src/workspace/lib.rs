@@ -73,6 +73,17 @@ mod protected_linux;
 pub mod provision;
 pub use plain_worktree::OwnedPlainWorktree;
 pub mod recovery_preparation;
+#[cfg(all(
+    test,
+    any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
+))]
+mod recovery_supervisor;
 pub mod remote_publish_policy;
 pub mod review_evidence;
 pub mod teardown;
