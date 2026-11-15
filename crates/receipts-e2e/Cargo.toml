@@ -16,5 +16,6 @@ receipts-review-integration = { path = "../receipts-review-integration" }
 receipts-workspace-execution = { path = "../receipts-workspace-execution" }
 
 [dev-dependencies]
+receipts-host-integration = { path = "../receipts-host-integration" }
 receipts-review-contracts = { path = "../receipts-review-contracts" }
 receipts-runtime-bindings = { path = "../receipts-runtime-bindings" }
