@@ -34,7 +34,7 @@ def validate(status, raw, stream, model=MODELS[0]):
         raise ValueError('capture-limit')
     observed = None
     if stream:
-        content, done, stopped = '', False, False
+        content, done, stopped, usage_trailer = '', False, False, False
         for event in raw.decode().replace('\r\n', '\n').split('\n\n'):
             lines = [line[5:].lstrip() for line in event.splitlines() if line.startswith('data:')]
             if not lines:
@@ -56,9 +56,21 @@ def validate(status, raw, stream, model=MODELS[0]):
             if not isinstance(choices, list) or len(choices) > 1:
                 raise ValueError('unexpected-choices')
             for choice in choices:
-                if type(choice.get('index')) is not int or choice['index'] != 0 or stopped:
+                if type(choice.get('index')) is not int or choice['index'] != 0:
                     raise ValueError('unexpected-choice-or-sequence')
                 reason = choice.get('finish_reason')
+                if stopped:
+                    # A usage trailer can repeat the finished choice without adding output.
+                    delta = choice.get('delta')
+                    if (usage_trailer or not isinstance(item.get('usage'), dict)
+                            or reason not in (None, 'stop')
+                            or not isinstance(delta, dict)
+                            or any(value is not None and (key, value) not in (
+                                ('content', ''), ('role', 'assistant'))
+                                for key, value in delta.items())):
+                        raise ValueError('unexpected-choice-or-sequence')
+                    usage_trailer = True
+                    continue
                 if reason is not None and reason != 'stop':
                     raise ValueError('incomplete-stream')
                 stopped |= reason == 'stop'

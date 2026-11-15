@@ -80,9 +80,11 @@ response cap per request. TLS verification stays enabled. Ambient proxies and
 redirects are disabled. SSE comments are ignored; missing DONE, provider errors,
 non-stop termination, invalid JSON and wrong schema fail. Only choice index 0
 is accepted, with at most one choice per event. Its complete answer must end
-with exactly one `stop` terminal choice followed by `[DONE]`; no further choice
-records may follow stop, and no data events may follow DONE. Empty-choice
-usage records may precede DONE, but cannot supply answer/termination evidence.
+with a `stop` terminal choice followed by `[DONE]`. Before DONE, one usage
+record may repeat choice 0 with a null or `stop` finish reason and a delta
+containing only null fields, empty content, or the assistant role. This
+record and empty-choice usage records supply no answer or termination evidence.
+Data events after DONE fail.
 Only sanitized fixed verdicts are emitted; raw bodies are not retained. This deliberately limits
 failure diagnostics. HTTP auth/rate/server errors and midstream failure handling
 are exercised offline; live negative case tests only invalid-model handling.

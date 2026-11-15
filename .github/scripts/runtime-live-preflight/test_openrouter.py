@@ -78,6 +78,23 @@ class Validation(unittest.TestCase):
             with self.subTest(raw=raw), self.assertRaises((ValueError, KeyError, TypeError)):
                 probe['validate'](200, raw, stream)
 
+    def test_usage_trailer_with_finished_choice(self):
+        stopped = chunk('{"answer":"OK"}', 'stop')
+        trailer = dict(chunk(reason='stop'), usage=dict(total_tokens=10))
+        self.assertEqual(probe['validate'](200, sse(stopped, trailer), True), MODEL)
+        trailer['choices'][0]['delta'].update(role='assistant', reasoning=None, tool_calls=None)
+        self.assertEqual(probe['validate'](200, sse(stopped, trailer), True), MODEL)
+        for trailing in (dict(trailer, choices=chunk('extra')['choices']),
+                         dict(trailer, choices=chunk(index=1)['choices'])):
+            with self.subTest(trailing=trailing), self.assertRaises(ValueError):
+                probe['validate'](200, sse(stopped, trailing), True)
+        trailer['choices'][0]['delta']['reasoning'] = 'extra'
+        with self.assertRaises(ValueError):
+            probe['validate'](200, sse(stopped, trailer), True)
+        trailer['choices'][0]['delta']['reasoning'] = None
+        with self.assertRaises(ValueError):
+            probe['validate'](200, sse(stopped, trailer, trailer), True)
+
     def test_classified_invalid_model(self):
         probe['validate_error'](400, json.dumps(dict(error=dict(
             code=400, message=f'{INVALID} is not a valid model ID'))).encode())
