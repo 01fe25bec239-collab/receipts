@@ -67,6 +67,7 @@
 //! and process isolation belong to the runtime/host sandbox layer.
 
 mod capture;
+mod cleanup_evidence;
 mod env_policy;
 mod error;
 mod live_attempt;
@@ -82,6 +83,10 @@ mod unix_signal;
 pub use capture::{
     CapturedProcessRun, CapturedStream, STREAM_CAPTURE_LIMIT_BYTES, STREAM_HEAD_RETENTION_BYTES,
     STREAM_TAIL_RETENTION_BYTES,
+};
+pub use cleanup_evidence::{
+    CLEANUP_EVIDENCE_TIMEOUT, CleanupEvidenceBarrier, CleanupEvidenceReason, CleanupEvidenceReport,
+    CleanupEvidenceRequest, CleanupEvidenceStatus,
 };
 pub use env_policy::{
     BASE_NAMES, ChildEnvAuthMode, ChildEnvPolicy, ChildEnvProvider, MAX_PROJECT_ENV_BYTES,
@@ -109,7 +114,7 @@ pub use live_attempt::{
     LiveProcessAttempt, LiveProcessAttemptError, LiveProcessCancelAcceptance,
     LiveProcessCancellationPreparation, LiveProcessOutcome, LiveProcessOutput,
     LiveProcessPreparedCancelAcceptance, LiveProcessStartError, LiveProcessTerminalCause,
-    start_live_process_attempt,
+    start_live_process_attempt, start_live_process_attempt_with_cleanup_evidence,
 };
 
 #[cfg(any(target_os = "linux", test))]

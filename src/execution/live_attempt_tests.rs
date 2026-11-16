@@ -810,3 +810,195 @@ fn prepared_cancel_expiry_cannot_steal_the_timeout_claim() {
     outcome(&attempt, LiveProcessTerminalCause::TimedOut, false);
     prove_empty(&ws, caller_process_group());
 }
+
+#[test]
+fn cleanup_evidence_acknowledgement_precedes_cancel_and_timeout_signals() {
+    for timeout in [false, true] {
+        let ws = Workspace::new();
+        ws.write("stdout-bytes", b"37");
+        let (barrier, requests) = CleanupEvidenceBarrier::channel();
+        let report = barrier.report();
+        let attempt = start_live_process_attempt_with_cleanup_evidence(
+            &ws.request(),
+            &ProcessTimeoutPolicy::new(
+                if timeout {
+                    Duration::from_millis(500)
+                } else {
+                    LIMIT
+                },
+                GRACE,
+            )
+            .unwrap(),
+            barrier,
+        )
+        .unwrap();
+        ws.ready();
+        if !timeout {
+            attempt.cancel();
+        }
+        let request = requests.recv_timeout(LIMIT).unwrap();
+        assert_eq!(
+            request.reason,
+            if timeout {
+                CleanupEvidenceReason::Timeout
+            } else {
+                CleanupEvidenceReason::Cancellation
+            }
+        );
+        assert!(request.output.stdout().head().ends_with(&[b'O'; 37]));
+        assert_eq!(request.output.stdout().digest(), None);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            process_alive(ws.value("pid")),
+            "no signal before acknowledgement"
+        );
+        assert_eq!(report.status(), CleanupEvidenceStatus::Pending);
+        assert!(request.acknowledge());
+        let terminal = attempt.wait_collect().unwrap();
+        assert_eq!(
+            terminal.cleanup_evidence_status(),
+            CleanupEvidenceStatus::Acknowledged
+        );
+        assert_eq!(report.status(), CleanupEvidenceStatus::Acknowledged);
+        assert_eq!(
+            terminal.terminal_cause(),
+            if timeout {
+                LiveProcessTerminalCause::TimedOut
+            } else {
+                LiveProcessTerminalCause::Cancelled
+            }
+        );
+        prove_empty(&ws, caller_process_group());
+    }
+}
+
+#[test]
+fn cleanup_evidence_missing_or_late_acknowledgement_still_terminates_owned_process() {
+    for late in [false, true] {
+        let ws = Workspace::new();
+        let (barrier, requests) = CleanupEvidenceBarrier::channel();
+        let report = barrier.report();
+        let attempt = start_live_process_attempt_with_cleanup_evidence(
+            &ws.request(),
+            &ProcessTimeoutPolicy::new(LIMIT, GRACE).unwrap(),
+            barrier,
+        )
+        .unwrap();
+        ws.ready();
+        attempt.cancel();
+        let request = requests.recv_timeout(LIMIT).unwrap();
+        let started = Instant::now();
+        if late {
+            until(|| report.status() == CleanupEvidenceStatus::Failed);
+            assert!(!request.acknowledge());
+        } else {
+            drop(request);
+        }
+        let terminal = attempt.wait_collect().unwrap();
+        assert!(started.elapsed() < CLEANUP_EVIDENCE_TIMEOUT + Duration::from_secs(3));
+        assert_eq!(
+            terminal.cleanup_evidence_status(),
+            CleanupEvidenceStatus::Failed
+        );
+        assert_eq!(
+            terminal.terminal_cause(),
+            LiveProcessTerminalCause::Cancelled
+        );
+        prove_empty(&ws, caller_process_group());
+    }
+}
+
+#[test]
+fn cleanup_evidence_covers_natural_completion_and_drop() {
+    for natural in [false, true] {
+        let ws = Workspace::new();
+        let (barrier, requests) = CleanupEvidenceBarrier::channel();
+        let report = barrier.report();
+        let attempt = start_live_process_attempt_with_cleanup_evidence(
+            &ws.request(),
+            &ProcessTimeoutPolicy::new(LIMIT, GRACE).unwrap(),
+            barrier,
+        )
+        .unwrap();
+        ws.ready();
+        if natural {
+            ws.write("release-child", b"");
+        }
+        std::thread::scope(|scope| {
+            let finish = scope.spawn(|| {
+                if natural {
+                    let terminal = attempt.wait_collect().unwrap();
+                    assert!(terminal.success());
+                    assert_eq!(
+                        terminal.cleanup_evidence_status(),
+                        CleanupEvidenceStatus::Acknowledged
+                    );
+                } else {
+                    drop(attempt);
+                }
+            });
+            let request = requests.recv_timeout(LIMIT).unwrap();
+            assert_eq!(
+                request.reason,
+                if natural {
+                    CleanupEvidenceReason::NaturalCompletion
+                } else {
+                    CleanupEvidenceReason::Cancellation
+                }
+            );
+            assert!(request.acknowledge());
+            finish.join().unwrap();
+        });
+        assert_eq!(report.status(), CleanupEvidenceStatus::Acknowledged);
+        prove_empty(&ws, caller_process_group());
+    }
+}
+
+#[test]
+fn cleanup_evidence_covers_setup_failure_and_controller_unwind() {
+    for setup in [false, true] {
+        let ws = Workspace::new();
+        let (barrier, requests) = CleanupEvidenceBarrier::channel();
+        let report = barrier.report();
+        // A failed pre-exec hook is an actual post-fork setup failure. The
+        // unwind is injected only after a real owned child has been created.
+        let customization = super::live_attempt::LaunchCustomization {
+            cleanup_evidence: Some(barrier),
+            pre_exec: setup.then(|| {
+                Box::new(|| Err(std::io::Error::other("owned setup failure")))
+                    as super::live_attempt::PreExecHook
+            }),
+            ..Default::default()
+        };
+        std::thread::scope(|scope| {
+            let controller = scope.spawn(|| {
+                if !setup {
+                    super::live_attempt::START_CONTROLLER_PANIC.set(true);
+                }
+                match super::live_attempt::start_customized_attempt(
+                    &ws.request(),
+                    &ProcessTimeoutPolicy::new(LIMIT, GRACE).unwrap(),
+                    customization,
+                ) {
+                    Ok(attempt) => assert!(attempt.wait_collect().is_err()),
+                    Err(_) => assert!(setup),
+                }
+            });
+            let request = requests.recv_timeout(LIMIT).unwrap();
+            assert_eq!(
+                request.reason,
+                if setup {
+                    CleanupEvidenceReason::SetupFailure
+                } else {
+                    CleanupEvidenceReason::ControllerFault
+                }
+            );
+            assert!(request.acknowledge());
+            controller.join().unwrap();
+        });
+        assert_eq!(report.status(), CleanupEvidenceStatus::Acknowledged);
+        if ws.0.join("pid").exists() {
+            prove_empty(&ws, caller_process_group());
+        }
+    }
+}

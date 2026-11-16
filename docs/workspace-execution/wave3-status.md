@@ -2,8 +2,8 @@
 
 `persisted_attempt::run_persisted_attempt` is the opt-in Workspace lifecycle
 entrypoint. It persists the start checkpoint before launch, captures interval
-checkpoints while waiting, prepares explicit cancellation and persists its
-bounded snapshot before competing for cancellation, and persists a finish
+checkpoints while waiting, competes for explicit cancellation, acknowledges
+pre-signal evidence through the controller barrier, and persists a finish
 checkpoint after collection. It uses the existing Workspace runner. The legacy
 launch API and Runtime consumers remain compatible.
 
@@ -14,14 +14,32 @@ not an unretained full stream. Untracked paths are recorded; untracked contents
 and ignored files are not captured. Observations are bounded snapshots, not an
 atomic filesystem transaction against concurrent worker writes.
 
-Cancellation acceptance is returned explicitly. Timeout or natural completion
-can win while persistence runs; captured evidence remains, without claiming
-pre-cleanup ordering for that winner. Persistence failure returns an error and
-drops the owned attempt, preserving bounded cleanup. External persistence never
-runs under controller locks. The wait loop also observes controller closure,
-so a fault before any terminal claim returns a collection failure instead of
-polling forever. The synchronous caller can block in a slow sink,
-but the process controller still enforces its deadline independently.
+Cancellation acceptance is returned explicitly. After a winning cancellation
+or timeout, the controller requests a bounded output snapshot and waits at most
+one second for trusted composition to acknowledge durable evidence before
+signalling. Natural-completion signalling, post-spawn setup failure, Drop and
+controller fault/unwind use the same single-use barrier. The lifecycle lock is
+released while waiting. A cancellation accepted before persistence remains the
+terminal cause even if the child exits during that wait.
+
+`start_live_process_attempt_with_cleanup_evidence` and
+`start_workspace_attempt_with_cleanup_evidence` expose this opt-in channel to
+trusted supervisors. Retain `CleanupEvidenceReport` to observe evidence status
+even after a failed start or Drop. Its receiver must be serviced independently
+of collection, including during startup. The persisted driver services it in its
+normal polling loop and writes a PRE_TERMINATION checkpoint before acknowledging.
+An acknowledgement is a trusted assertion of durability, not a grant to signal
+another process, reset a workspace or accept work.
+
+Missing, failed or late acknowledgement permits bounded emergency cleanup of
+the original owned process group. `CleanupEvidenceStatus` reports assurance
+separately from process success; `PersistedAttemptError::EvidenceFailure` retains
+both the persistence/acknowledgement failure and the actual collection result.
+Late durable evidence is retained but cannot retroactively establish pre-action
+ordering. The synchronous driver can still block inside an arbitrary slow sink;
+the owning controller's additional wait remains bounded independently. Setup
+failures before a handle is returned cannot be serviced by the polling driver
+and use the emergency path. Legacy launch APIs do not request this barrier.
 
 `TrustedAttemptEvidenceSinkV1::persist_verified_finalization` compares fresh
 mechanical finalization evidence with the exact persisted checkpoint and binds
@@ -88,7 +106,10 @@ reset while durable platform process identity and provisioning physical
 continuity are unavailable. The function neither alters attempts nor accepts
 partial work. No post-restart signal or destructive reset is implemented.
 
-Timeout, Drop and controller-fault cleanup retain existing bounds and have no
-durable evidence acknowledgement barrier. These paths cannot guarantee durable
-capture before cleanup. Full D4 execution and durable automatic-cleanup evidence
-remain pending A1's shared contracts, as explicitly scoped for this continuation.
+The Workspace cleanup acknowledgement increment above does not install
+production D4 composition. The existing surviving recovery supervisor remains
+a test-only fixture. Trusted acceptance/provisioning joins, attempt-bound handoff
+closure, durable production launch, controller restart, per-action State guards,
+physical reset/readback and durable recovery resolution remain open. CLI,
+manifest and lockfile integration is held for A1 disposition. Protected-custody
+quarantine and unsupported-host refusal remain unchanged.

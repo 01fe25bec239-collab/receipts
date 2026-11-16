@@ -82,6 +82,26 @@ pub fn start_workspace_attempt(
     request: &ProcessRunRequest,
     policy: &ProcessTimeoutPolicy,
 ) -> Result<(WorkspaceHandle, WorkspaceAttempt), WorkspaceLifecycleError> {
+    start_workspace_attempt_inner(handle, request, policy, None)
+}
+
+/// Start with a bounded trusted cleanup-evidence channel. The receiver must be
+/// serviced independently of collection, including during automatic cleanup.
+pub fn start_workspace_attempt_with_cleanup_evidence(
+    handle: &WorkspaceHandle,
+    request: &ProcessRunRequest,
+    policy: &ProcessTimeoutPolicy,
+    barrier: crate::execution::CleanupEvidenceBarrier,
+) -> Result<(WorkspaceHandle, WorkspaceAttempt), WorkspaceLifecycleError> {
+    start_workspace_attempt_inner(handle, request, policy, Some(barrier))
+}
+
+fn start_workspace_attempt_inner(
+    handle: &WorkspaceHandle,
+    request: &ProcessRunRequest,
+    policy: &ProcessTimeoutPolicy,
+    barrier: Option<crate::execution::CleanupEvidenceBarrier>,
+) -> Result<(WorkspaceHandle, WorkspaceAttempt), WorkspaceLifecycleError> {
     checked(handle, WorkspaceState::Active)?;
     let canonical = |path: &std::path::Path| std::fs::canonicalize(path).ok();
     match (
@@ -91,8 +111,13 @@ pub fn start_workspace_attempt(
         (Some(root), Some(worktree)) if root == worktree => {}
         _ => return Err(WorkspaceLifecycleError::AttemptOutsideWorkspace),
     }
-    let attempt =
-        start_live_process_attempt(request, policy).map_err(WorkspaceLifecycleError::Start)?;
+    let attempt = match barrier {
+        Some(barrier) => crate::execution::start_live_process_attempt_with_cleanup_evidence(
+            request, policy, barrier,
+        ),
+        None => start_live_process_attempt(request, policy),
+    }
+    .map_err(WorkspaceLifecycleError::Start)?;
     let active = handle
         .transitioned(WorkspaceState::Active, None)
         .expect("transition was checked before start");

@@ -1,14 +1,17 @@
 //! Opt-in lifecycle driver. Persistence runs outside the process controller;
-//! timeout, Drop and fault cleanup never wait for the sink.
+//! cleanup waits at most the bounded acknowledgement window for the sink.
 use crate::{
     AttemptEvidenceSinkV1, WorkspaceCheckpointEvidenceCaptureRequest, WorkspaceCheckpointKind,
     WorkspaceDateTimeV1, WorkspaceHandle,
     checkpoint_writer::{CheckpointWriteError, capture_and_persist},
     execution::{
-        ExecutionError, LiveProcessOutcome, LiveProcessPreparedCancelAcceptance, ProcessRunRequest,
-        ProcessTimeoutPolicy,
+        CleanupEvidenceBarrier, CleanupEvidenceStatus, ExecutionError, LiveProcessOutcome,
+        LiveProcessPreparedCancelAcceptance, ProcessRunRequest, ProcessTimeoutPolicy,
     },
-    lifecycle::{WorkspaceCollectionFailure, WorkspaceLifecycleError, start_workspace_attempt},
+    lifecycle::{
+        WorkspaceCollectionFailure, WorkspaceLifecycleError,
+        start_workspace_attempt_with_cleanup_evidence,
+    },
     output_store::store_output,
 };
 use receipts_state::{OutputRef, StateError, TrustedClockV1};
@@ -32,7 +35,16 @@ pub struct PersistedAttemptRequest<'a> {
 #[derive(Debug)]
 pub enum PersistedAttemptError {
     InvalidInterval,
-    Lifecycle(WorkspaceLifecycleError),
+    Lifecycle {
+        error: WorkspaceLifecycleError,
+        cleanup_evidence: CleanupEvidenceStatus,
+    },
+    /// Evidence failed independently of the actual owned-process cleanup result.
+    EvidenceFailure {
+        source: Box<PersistedAttemptError>,
+        cleanup: Result<Box<LiveProcessOutcome>, WorkspaceCollectionFailure>,
+    },
+    CleanupAcknowledgementFailed,
     Checkpoint(CheckpointWriteError),
     State(StateError),
     Output(std::io::Error),
@@ -137,10 +149,11 @@ impl PersistedAttemptRequest<'_> {
     }
 }
 
-/// Starts only after the start checkpoint is durable. Cancellation captures
-/// bounded output, persists evidence, then competes for the terminal claim.
-/// A persistence error returns and drops the owned live attempt: bounded cleanup
-/// still runs, with no claim of durable evidence for that cleanup.
+/// Starts only after the start checkpoint is durable. Cancellation competes for
+/// a terminal claim; the controller then requests evidence before signalling.
+/// Every automatic cleanup also requests a durable checkpoint before signalling.
+/// Missing/late acknowledgement triggers bounded emergency cleanup; errors retain
+/// the independent cleanup result and never claim durable pre-action evidence.
 pub fn run_persisted_attempt<S: AttemptEvidenceSinkV1>(
     request: PersistedAttemptRequest<'_>,
     sink: &mut S,
@@ -149,60 +162,102 @@ pub fn run_persisted_attempt<S: AttemptEvidenceSinkV1>(
         return Err(PersistedAttemptError::InvalidInterval);
     }
     request.persist(sink, 0, WorkspaceCheckpointKind::Progress, &[])?;
-    let (_, attempt) = start_workspace_attempt(request.handle, request.process, request.timeout)
-        .map_err(PersistedAttemptError::Lifecycle)?;
+    let (barrier, cleanup_requests) = CleanupEvidenceBarrier::channel();
+    let report = barrier.report();
+    let (_, attempt) = start_workspace_attempt_with_cleanup_evidence(
+        request.handle,
+        request.process,
+        request.timeout,
+        barrier,
+    )
+    .map_err(|error| PersistedAttemptError::Lifecycle {
+        error,
+        cleanup_evidence: report.status(),
+    })?;
     let mut sequence = 1;
     let mut last = Instant::now();
     let mut cancellation = None;
     let mut cancellation_open = true;
-    while !attempt.is_terminating_or_closed() {
-        if cancellation_open {
-            match request.cancellation.try_recv() {
-                Ok(()) => {
-                    cancellation_open = false;
-                    if let Some(prepared) = attempt
-                        .prepare_cancellation()
-                        .map_err(PersistedAttemptError::Execution)?
-                    {
-                        let output = prepared.output();
-                        request.persist(
-                            sink,
-                            sequence,
-                            WorkspaceCheckpointKind::PreTermination,
-                            &[("stdout", output.stdout()), ("stderr", output.stderr())],
-                        )?;
-                        sequence += 1;
-                        cancellation = Some(attempt.cancel_prepared(&prepared));
-                    }
+    let driven = (|| {
+        while !attempt.is_terminating_or_closed()
+            || report.status() == CleanupEvidenceStatus::Pending
+        {
+            if let Ok(cleanup) = cleanup_requests.try_recv() {
+                request.persist(
+                    sink,
+                    sequence,
+                    WorkspaceCheckpointKind::PreTermination,
+                    &[
+                        ("stdout", cleanup.output.stdout()),
+                        ("stderr", cleanup.output.stderr()),
+                    ],
+                )?;
+                sequence += 1;
+                if !cleanup.acknowledge() {
+                    return Err(PersistedAttemptError::CleanupAcknowledgementFailed);
                 }
-                Err(TryRecvError::Disconnected) => cancellation_open = false,
-                Err(TryRecvError::Empty) => {}
             }
+            if cancellation_open {
+                match request.cancellation.try_recv() {
+                    Ok(()) => {
+                        cancellation_open = false;
+                        if let Some(prepared) = attempt
+                            .prepare_cancellation()
+                            .map_err(PersistedAttemptError::Execution)?
+                        {
+                            cancellation = Some(attempt.cancel_prepared(&prepared));
+                        }
+                    }
+                    Err(TryRecvError::Disconnected) => cancellation_open = false,
+                    Err(TryRecvError::Empty) => {}
+                }
+            }
+            if last.elapsed() >= request.interval && !attempt.is_terminating_or_closed() {
+                let output = attempt
+                    .snapshot_output()
+                    .map_err(PersistedAttemptError::Execution)?;
+                request.persist(
+                    sink,
+                    sequence,
+                    WorkspaceCheckpointKind::Progress,
+                    &[("stdout", output.stdout()), ("stderr", output.stderr())],
+                )?;
+                sequence += 1;
+                last = Instant::now();
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
-        if last.elapsed() >= request.interval && !attempt.is_terminating_or_closed() {
-            let output = attempt
-                .snapshot_output()
-                .map_err(PersistedAttemptError::Execution)?;
-            request.persist(
-                sink,
-                sequence,
-                WorkspaceCheckpointKind::Progress,
-                &[("stdout", output.stdout()), ("stderr", output.stderr())],
-            )?;
-            sequence += 1;
-            last = Instant::now();
+        if report.status() != CleanupEvidenceStatus::Acknowledged {
+            return Err(PersistedAttemptError::CleanupAcknowledgementFailed);
         }
-        std::thread::sleep(Duration::from_millis(10));
+        Ok(())
+    })();
+    // Disconnect first: a failed sink cannot add another acknowledgement wait.
+    drop(cleanup_requests);
+    if let Err(source) = driven {
+        attempt.cancel();
+        return Err(PersistedAttemptError::EvidenceFailure {
+            source: Box::new(source),
+            cleanup: attempt.wait_collect().map(Box::new),
+        });
     }
     let terminal = attempt
         .wait_collect()
         .map_err(PersistedAttemptError::Collection)?;
-    let finish_receipt = request.persist(
+    let finish_receipt = match request.persist(
         sink,
         sequence,
         WorkspaceCheckpointKind::Progress,
         &[("stdout", terminal.stdout()), ("stderr", terminal.stderr())],
-    )?;
+    ) {
+        Ok(receipt) => receipt,
+        Err(source) => {
+            return Err(PersistedAttemptError::EvidenceFailure {
+                source: Box::new(source),
+                cleanup: Ok(Box::new(terminal)),
+            });
+        }
+    };
     Ok(PersistedAttemptOutcome {
         terminal,
         finish_receipt,

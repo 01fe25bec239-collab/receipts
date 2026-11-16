@@ -6,7 +6,10 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
-use super::{CapturedStream, ExecutionError, ProcessRunRequest, ProcessTimeoutPolicy};
+use super::{
+    CapturedStream, CleanupEvidenceBarrier, CleanupEvidenceReason, CleanupEvidenceStatus,
+    ExecutionError, ProcessRunRequest, ProcessTimeoutPolicy,
+};
 
 /// Why the attempt ended, independently of how its group was cleaned up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +144,7 @@ pub struct LiveProcessOutcome {
     termination: TerminalEvidence,
     exit_code: Option<i32>,
     output: LiveProcessOutput,
+    cleanup_evidence: CleanupEvidenceStatus,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TerminalEvidence {
@@ -149,6 +153,9 @@ enum TerminalEvidence {
     TimedOut { forced: bool },
 }
 impl LiveProcessOutcome {
+    pub fn cleanup_evidence_status(&self) -> CleanupEvidenceStatus {
+        self.cleanup_evidence
+    }
     pub fn terminal_cause(&self) -> LiveProcessTerminalCause {
         match self.termination {
             TerminalEvidence::Completed { .. } => LiveProcessTerminalCause::Completed,
@@ -205,7 +212,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-type Retention = Arc<Mutex<super::capture::BoundedStreamRetention>>;
+pub(super) type Retention = Arc<Mutex<super::capture::BoundedStreamRetention>>;
 type Controller = JoinHandle<Result<LiveProcessOutcome, ExecutionError>>;
 
 /// One non-cloneable typed ownership handle; no raw child or signal capability escapes.
@@ -314,7 +321,7 @@ impl Drop for LiveProcessAttempt {
     }
 }
 
-fn snapshot(
+pub(super) fn snapshot(
     stdout: &Retention,
     stderr: &Retention,
     complete: bool,
@@ -347,6 +354,24 @@ pub fn start_live_process_attempt(
     start_customized_attempt(request, policy, LaunchCustomization::default())
 }
 
+/// Opt-in evidence barrier for every applicable cleanup boundary, including
+/// automatic timeout, Drop and controller unwind. Service the receiver outside
+/// the controller. Failure permits emergency cleanup and fails the report.
+pub fn start_live_process_attempt_with_cleanup_evidence(
+    request: &ProcessRunRequest,
+    policy: &ProcessTimeoutPolicy,
+    barrier: CleanupEvidenceBarrier,
+) -> Result<LiveProcessAttempt, LiveProcessStartError> {
+    start_customized_attempt(
+        request,
+        policy,
+        LaunchCustomization {
+            cleanup_evidence: Some(barrier),
+            ..LaunchCustomization::default()
+        },
+    )
+}
+
 /// Crate-private containment for protected launches: kill every member and
 /// prove emptiness. Runs during cleanup after process-group handling and
 /// before reader verification; it is a cleanup step, never a second timer.
@@ -360,6 +385,7 @@ pub(crate) type PreExecHook = Box<dyn FnMut() -> std::io::Result<()> + Send + Sy
 /// Crate-private launch customization. The default is the public behavior.
 #[derive(Default)]
 pub(crate) struct LaunchCustomization {
+    pub(crate) cleanup_evidence: Option<CleanupEvidenceBarrier>,
     pub(crate) pre_exec: Option<PreExecHook>,
     pub(crate) containment: Option<Arc<dyn AttemptContainment>>,
 }
@@ -431,9 +457,18 @@ mod platform {
         readers: Vec<(&'static str, Reader)>,
         stdin: super::super::stdin::StdinDelivery,
         containment: Option<Arc<dyn AttemptContainment>>,
+        evidence: Option<CleanupEvidenceBarrier>,
+        stdout: Retention,
+        stderr: Retention,
     }
     impl Resources {
+        fn acknowledge(&mut self, reason: CleanupEvidenceReason) {
+            if let Some(barrier) = self.evidence.take() {
+                barrier.acknowledge(reason, &self.stdout, &self.stderr);
+            }
+        }
         fn cleanup(&mut self, primary: Option<&ExecutionError>) -> Result<(), ExecutionError> {
+            self.acknowledge(CleanupEvidenceReason::ControllerFault);
             if let Some(child) = self.child.take() {
                 runner::cleanup_owned_attempt(child, self.group, primary)?;
             }
@@ -549,10 +584,14 @@ mod platform {
         stderr: Retention,
         stdin: super::super::stdin::StdinDelivery,
         containment: Option<Arc<dyn AttemptContainment>>,
+        mut evidence: Option<CleanupEvidenceBarrier>,
     ) -> Result<Resources, ExecutionError> {
         let child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
+                if let Some(barrier) = evidence.take() {
+                    barrier.acknowledge(CleanupEvidenceReason::SetupFailure, &stdout, &stderr);
+                }
                 // A failed pre-exec setup may already have placed the forked
                 // child in containment; prove it empty before reporting.
                 if let Some(containment) = &containment {
@@ -568,6 +607,9 @@ mod platform {
         command.stdin(Stdio::null()); // Release the parent's stdin read end.
 
         let Some(group) = runner::owned_process_group(child.id()) else {
+            if let Some(barrier) = evidence.take() {
+                barrier.acknowledge(CleanupEvidenceReason::SetupFailure, &stdout, &stderr);
+            }
             let error = runner::process_group_ownership_failed(child);
             if let Some(containment) = &containment {
                 let _ = containment.kill_and_verify_empty();
@@ -580,6 +622,9 @@ mod platform {
             readers: Vec::with_capacity(2),
             stdin,
             containment,
+            evidence,
+            stdout: stdout.clone(),
+            stderr: stderr.clone(),
         };
         let setup = (|| {
             let child = resources.child.as_mut().unwrap();
@@ -606,6 +651,7 @@ mod platform {
             Ok(())
         })();
         if let Err(error) = setup {
+            resources.acknowledge(CleanupEvidenceReason::SetupFailure);
             resources.cleanup(Some(&error))?;
             resources.join_readers()?;
             return Err(error);
@@ -631,6 +677,7 @@ mod platform {
             .stderr(Stdio::piped())
             .process_group(0);
         let LaunchCustomization {
+            cleanup_evidence,
             pre_exec,
             containment,
         } = customization;
@@ -639,6 +686,9 @@ mod platform {
             // and performs only async-signal-safe raw system calls.
             unsafe { command.pre_exec(hook) };
         }
+        let report = cleanup_evidence
+            .as_ref()
+            .map(CleanupEvidenceBarrier::report);
         let stdin = super::super::stdin::StdinDelivery::prepare(&mut command, request.stdin())?;
         let closed_stdin = matches!(request.stdin(), super::super::ProcessStdin::Closed);
         let lifecycle = Arc::new(Mutex::new(Lifecycle::default()));
@@ -675,14 +725,20 @@ mod platform {
                 #[cfg(test)]
                 let _faults = runner::inject_capture_test_faults(faults);
                 let _closed = CloseLifecycle(state.clone());
-                let mut resources =
-                    match setup(&mut command, out.clone(), err.clone(), stdin, containment) {
-                        Ok(resources) => resources,
-                        Err(error) => {
-                            let _ = ready.send(false);
-                            return Err(error);
-                        }
-                    };
+                let mut resources = match setup(
+                    &mut command,
+                    out.clone(),
+                    err.clone(),
+                    stdin,
+                    containment,
+                    cleanup_evidence,
+                ) {
+                    Ok(resources) => resources,
+                    Err(error) => {
+                        let _ = ready.send(false);
+                        return Err(error);
+                    }
+                };
                 if closed_stdin {
                     lock(&state).ready = true;
                     let _ = ready.send(true);
@@ -711,6 +767,8 @@ mod platform {
                     termination,
                     exit_code,
                     output: snapshot(&out, &err, true)?,
+                    cleanup_evidence: report
+                        .map_or(CleanupEvidenceStatus::NotRequested, |r| r.status()),
                 })
             })
             .map_err(|error| ExecutionError::ProcessSpawnFailed {
@@ -754,6 +812,10 @@ mod platform {
                 if let Some(gate) = AFTER_CLAIM.take() {
                     gate.wait();
                 }
+                resources.acknowledge(match cause {
+                    LiveProcessTerminalCause::Cancelled => CleanupEvidenceReason::Cancellation,
+                    _ => CleanupEvidenceReason::Timeout,
+                });
                 let (status, forced) = runner::terminate_owned_attempt(
                     resources.child.take().unwrap(),
                     resources.group,
@@ -774,6 +836,16 @@ mod platform {
                 .all(|(_, reader)| reader.is_finished())
             {
                 resources.join_readers()?;
+                if resources.evidence.is_some()
+                    && runner::owned_leader_exited(resources.child.as_ref().unwrap())?
+                {
+                    drop(state);
+                    resources.acknowledge(CleanupEvidenceReason::NaturalCompletion);
+                    state = lock(lifecycle);
+                    if state.cause.is_some() || Instant::now() >= deadline {
+                        continue;
+                    }
+                }
                 match runner::try_complete_owned_child(
                     resources.child.as_mut().unwrap(),
                     resources.group,

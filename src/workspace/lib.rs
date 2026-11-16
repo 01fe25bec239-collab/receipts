@@ -168,6 +168,7 @@ pub use handle_wire::{
 pub use lifecycle::{
     WorkspaceAttempt, WorkspaceCheckpointLifecycleInput, WorkspaceCollectionFailure,
     WorkspaceLifecycleError, checkpoint_workspace, orphan_workspace, start_workspace_attempt,
+    start_workspace_attempt_with_cleanup_evidence,
 };
 pub use protected::{
     ControllerChannel, ControllerCredentials, ControllerOperation, ControllerRequest,
