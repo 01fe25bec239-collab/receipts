@@ -819,8 +819,8 @@ impl SqliteStateRepository {
 // Shared guards run inside the writer's existing transaction. Historical schema
 // checkers count triggers on old tables, so new SQL guards protect D4 records;
 // all reachable legacy writer paths use these typed preflights.
-// Historical migration fixtures retain their pre-D4 writer semantics. Public
-// current-store entry points verify v27 before reaching these shared helpers.
+// Only historical migration fixtures need writers before D4 tables exist.
+#[cfg(test)]
 fn historical_writer(conn: &Connection) -> Result<bool, StateError> {
     conn.query_row(
         "SELECT MAX(version)<27 FROM state_schema_version",
@@ -828,6 +828,10 @@ fn historical_writer(conn: &Connection) -> Result<bool, StateError> {
         |r| r.get(0),
     )
     .map_err(sql)
+}
+#[cfg(not(test))]
+fn historical_writer(_: &Connection) -> Result<bool, StateError> {
+    Ok(false)
 }
 pub(crate) fn guard_project(conn: &Connection, project: &str) -> Result<(), StateError> {
     if historical_writer(conn)? {
