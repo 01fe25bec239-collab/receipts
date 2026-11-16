@@ -69,7 +69,7 @@ impl SqliteStateRepository {
         Ok(repo)
     }
 
-    /// Explicitly upgrades an exact v11–v25 State database to v26.
+    /// Explicitly upgrades an exact v11–v26 State database to v27.
     pub(crate) fn migrate_existing_to_current(path: impl AsRef<Path>) -> Result<u32, StateError> {
         let mut conn =
             Connection::open_with_flags(path.as_ref(), OpenFlags::SQLITE_OPEN_READ_WRITE)
@@ -106,8 +106,9 @@ impl SqliteStateRepository {
                 migrations::v0023_graph_publication_identity::apply(&conn)?;
                 migrations::v0024_wave3_setup::apply(&conn)?;
                 migrations::v0025_remote_publication::apply(&conn)?;
-                migrations::v0026_remote_workflow::apply(&conn)?;
-                return Ok(26);
+                migrations::v0027_workspace_recovery::through_v26(&conn)?;
+                migrations::v0027_workspace_recovery::apply(&conn)?;
+                return Ok(27);
             }
             Some(20) => {
                 migrations::v0021_publication_claims::apply(&conn)?;
@@ -115,43 +116,54 @@ impl SqliteStateRepository {
                 migrations::v0023_graph_publication_identity::apply(&conn)?;
                 migrations::v0024_wave3_setup::apply(&conn)?;
                 migrations::v0025_remote_publication::apply(&conn)?;
-                migrations::v0026_remote_workflow::apply(&conn)?;
-                return Ok(26);
+                migrations::v0027_workspace_recovery::through_v26(&conn)?;
+                migrations::v0027_workspace_recovery::apply(&conn)?;
+                return Ok(27);
             }
             Some(21) => {
                 migrations::v0022_order_and_seal::apply(&conn)?;
                 migrations::v0023_graph_publication_identity::apply(&conn)?;
                 migrations::v0024_wave3_setup::apply(&conn)?;
                 migrations::v0025_remote_publication::apply(&conn)?;
-                migrations::v0026_remote_workflow::apply(&conn)?;
-                return Ok(26);
+                migrations::v0027_workspace_recovery::through_v26(&conn)?;
+                migrations::v0027_workspace_recovery::apply(&conn)?;
+                return Ok(27);
             }
             Some(22) => {
                 migrations::v0023_graph_publication_identity::apply(&conn)?;
                 migrations::v0024_wave3_setup::apply(&conn)?;
                 migrations::v0025_remote_publication::apply(&conn)?;
-                migrations::v0026_remote_workflow::apply(&conn)?;
-                return Ok(26);
+                migrations::v0027_workspace_recovery::through_v26(&conn)?;
+                migrations::v0027_workspace_recovery::apply(&conn)?;
+                return Ok(27);
             }
             Some(23) => {
                 graph_repository::verify_v23(&conn, GraphPhase::Migration)?;
                 migrations::v0024_wave3_setup::apply(&conn)?;
                 migrations::v0025_remote_publication::apply(&conn)?;
-                migrations::v0026_remote_workflow::apply(&conn)?;
-                return Ok(26);
+                migrations::v0027_workspace_recovery::through_v26(&conn)?;
+                migrations::v0027_workspace_recovery::apply(&conn)?;
+                return Ok(27);
             }
             Some(24) => {
                 migrations::v0025_remote_publication::apply(&conn)?;
-                migrations::v0026_remote_workflow::apply(&conn)?;
-                return Ok(26);
+                migrations::v0027_workspace_recovery::through_v26(&conn)?;
+                migrations::v0027_workspace_recovery::apply(&conn)?;
+                return Ok(27);
             }
             Some(25) => {
-                migrations::v0026_remote_workflow::apply(&conn)?;
-                return Ok(26);
+                migrations::v0027_workspace_recovery::through_v26(&conn)?;
+                migrations::v0027_workspace_recovery::apply(&conn)?;
+                return Ok(27);
             }
             Some(26) => {
+                graph_repository::verify_v26(&conn, GraphPhase::Migration)?;
+                migrations::v0027_workspace_recovery::apply(&conn)?;
+                return Ok(27);
+            }
+            Some(27) => {
                 graph_repository::verify_current(&conn, GraphPhase::Migration)?;
-                return Ok(26);
+                return Ok(27);
             }
             // v1–v10 and unknown heads are typed unsupported legacy: no
             // automatic migration and no corruption misclassification.
@@ -192,8 +204,9 @@ impl SqliteStateRepository {
         migrations::v0023_graph_publication_identity::apply(&conn)?;
         migrations::v0024_wave3_setup::apply(&conn)?;
         migrations::v0025_remote_publication::apply(&conn)?;
-        migrations::v0026_remote_workflow::apply(&conn)?;
-        Ok(26)
+        migrations::v0027_workspace_recovery::through_v26(&conn)?;
+        migrations::v0027_workspace_recovery::apply(&conn)?;
+        Ok(27)
     }
 
     /// Version-reconciliation core of [`Self::open`], parameterized by the
@@ -659,7 +672,11 @@ fn bootstrap(conn: &mut Connection, chain: &[Migration]) -> Result<(), StateErro
             continue;
         }
         if migration.version == 26 && migration.name == "remote_workflow" {
-            migrations::v0026_remote_workflow::apply(conn)?;
+            migrations::v0027_workspace_recovery::through_v26(conn)?;
+            continue;
+        }
+        if migration.version == 27 && migration.name == "workspace_recovery" {
+            migrations::v0027_workspace_recovery::apply(conn)?;
             continue;
         }
         let tx = conn

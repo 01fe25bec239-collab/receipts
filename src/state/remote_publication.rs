@@ -556,6 +556,7 @@ mod tests {
         let dir = Dir::new("d12-migration");
         drop(TrustedCoreStore::open_exclusive(dir.db()).unwrap());
         let conn = rusqlite::Connection::open(dir.db()).unwrap();
+        crate::workspace_recovery_tests::remove_v27(&conn);
         conn.execute_batch("DROP TABLE remote_publication_result; DROP TABLE remote_publication_intent; DELETE FROM state_schema_version WHERE version>=25; CREATE TRIGGER fail25 BEFORE INSERT ON state_schema_version WHEN NEW.version=25 BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
         assert!(TrustedCoreStore::migrate_exclusive(dir.db()).is_err());
         assert_eq!(
@@ -578,8 +579,8 @@ mod tests {
         conn.execute_batch("DROP TRIGGER fail25").unwrap();
         drop(conn);
         let (store, head) = TrustedCoreStore::migrate_exclusive(dir.db()).unwrap();
-        assert_eq!(head, 26);
-        assert_eq!(store.reader().schema_version().unwrap(), 26);
+        assert_eq!(head, 27);
+        assert_eq!(store.reader().schema_version().unwrap(), 27);
     }
 }
 
@@ -657,6 +658,7 @@ mod workflow_migration_tests {
                 |r| r.get(0),
             )
             .unwrap();
+        crate::workspace_recovery_tests::remove_v27(&conn);
         conn.execute_batch("DELETE FROM state_schema_version WHERE version=26; CREATE TRIGGER fail26 BEFORE INSERT ON state_schema_version WHEN NEW.version=26 BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
         assert!(TrustedCoreStore::open_exclusive(dir.db()).is_err());
         assert!(TrustedCoreStore::migrate_exclusive(dir.db()).is_err());
@@ -670,7 +672,7 @@ mod workflow_migration_tests {
         );
         conn.execute_batch("DROP TRIGGER fail26").unwrap();
         let (mut store, version) = TrustedCoreStore::migrate_exclusive(dir.db()).unwrap();
-        assert_eq!(version, 26);
+        assert_eq!(version, 27);
         assert_eq!(
             before,
             conn.query_row(

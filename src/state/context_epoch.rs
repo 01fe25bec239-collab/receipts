@@ -699,6 +699,7 @@ fn insert_invalidated_roles(
     epoch: &StateEpochValueV1,
     role_ids: &[String],
 ) -> Result<(), StateError> {
+    crate::workspace_recovery::guard_project(conn, project_id)?;
     let mut statement = conn
         .prepare(INSERT_INVALIDATED_ROLE_SQL)
         .map_err(invalidation_write_failure)?;
@@ -781,6 +782,7 @@ fn insert_context_epoch(
     epoch: &ContextEpoch,
     sources: &ChangedSources,
 ) -> Result<(), StateError> {
+    crate::workspace_recovery::guard_project(conn, &epoch.project_id)?;
     let duplicate: Option<i64> = conn
         .query_row(
             EPOCH_EXISTS_SQL,

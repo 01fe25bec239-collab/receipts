@@ -330,6 +330,15 @@ impl SqliteStateRepository {
         }
         let identity = encode(&(request, start.canonical()))?;
         graph::write_transaction(self.connection(), |conn| {
+            crate::workspace_recovery::guard_attempt(conn, start.attempt_id().as_str())?;
+            crate::workspace_recovery::guard_start(
+                conn,
+                start.project_id(),
+                start.workspace_id(),
+                start.start_sha(),
+                start.graph_id(),
+                start.node_id(),
+            )?;
             let stored: Option<String> = conn
                 .query_row(
                     "SELECT request_json FROM goal_dispatch WHERE project_id=?1 AND dispatch_id=?2",
@@ -372,7 +381,7 @@ impl SqliteStateRepository {
             }
             // A previous unfinished external boundary blocks a replacement for
             // that node, while unrelated nodes may reserve concurrently.
-            let unresolved:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM goal_dispatch d JOIN attempt_started a ON a.attempt_id=d.attempt_id LEFT JOIN goal_dispatch_resolution r ON r.project_id=d.project_id AND r.dispatch_id=d.dispatch_id LEFT JOIN attempt_finished f ON f.attempt_id=a.attempt_id WHERE d.project_id=?1 AND d.goal_id=?2 AND a.node_id=?3 AND (r.resolution IS NULL OR r.resolution='UNCERTAIN' OR (r.resolution='LAUNCHED' AND f.attempt_id IS NULL)))",params![request.project_id,request.goal_id,start_json[3].as_str()],|r|r.get(0)).map_err(sql)?;
+            let unresolved:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM goal_dispatch d JOIN attempt_started a ON a.attempt_id=d.attempt_id LEFT JOIN goal_dispatch_resolution r ON r.project_id=d.project_id AND r.dispatch_id=d.dispatch_id LEFT JOIN attempt_finished f ON f.attempt_id=a.attempt_id WHERE d.project_id=?1 AND d.goal_id=?2 AND a.node_id=?3 AND NOT EXISTS(SELECT 1 FROM workspace_recovery_resolution z WHERE z.project_id=d.project_id AND z.attempt_id=a.attempt_id) AND (r.resolution IS NULL OR r.resolution='UNCERTAIN' OR (r.resolution='LAUNCHED' AND f.attempt_id IS NULL)))",params![request.project_id,request.goal_id,start_json[3].as_str()],|r|r.get(0)).map_err(sql)?;
             if unresolved {
                 return Err(refuse(SetupRefusalV1::UnresolvedLaunch));
             }
@@ -414,6 +423,7 @@ impl SqliteStateRepository {
         graph::write_transaction(self.connection(), |conn| {
             let record = dispatch_in_tx(conn, project, dispatch)?
                 .ok_or_else(|| refuse(SetupRefusalV1::MissingEvidence))?;
+            crate::workspace_recovery::guard_attempt(conn, record.attempt_id.as_str())?;
             if let Some(stored) = record.resolution {
                 return if stored == resolution
                     && record.evidence_ref.as_deref() == Some(evidence_ref)
@@ -562,6 +572,7 @@ impl SqliteStateRepository {
         let json = encode(record)?;
         let finish_json = encode(&finish.canonical())?;
         graph::write_transaction(self.connection(), |conn| {
+            crate::workspace_recovery::guard_attempt(conn, id.as_str())?;
             let existing:Option<(String,String)>=conn.query_row("SELECT record_json,finish_json FROM attempt_finalization WHERE project_id=?1 AND attempt_id=?2",params![record.project_id,record.attempt_id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(sql)?;
             if let Some((a, b)) = existing {
                 return if a == json && b == finish_json {
@@ -614,7 +625,7 @@ impl SqliteStateRepository {
     }
 }
 
-fn validate_finalization_evidence(
+pub(crate) fn validate_finalization_evidence(
     conn: &Connection,
     record: &FinalizationRecordV1,
     id: &AttemptId,

@@ -568,6 +568,7 @@ pub(crate) fn insert_record(
     conn: &Connection,
     record: &DecisionRecordV1,
 ) -> Result<(), StateError> {
+    crate::workspace_recovery::guard_decision(conn, record)?;
     let exists = conn
         .query_row(
             "SELECT 1 FROM decision_records WHERE project_id=?1 AND record_kind=?2 AND record_id=?3",
