@@ -324,6 +324,15 @@ fn current(
     now: &CanonicalTimestampV1,
 ) -> Result<(), StateError> {
     let target = anchor(conn, a)?;
+    let baseline = progress_baseline(conn, &a.subject.project_id, &a.workspace_id)?
+        .ok_or_else(|| refuse(R::MissingEvidence))?;
+    let generation_matches: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workspace_recovery_progress WHERE project_id=?1 AND workspace_id=?2 AND kind='START' AND attempt_id=?3 AND baseline_sequence=?4)",
+        params![a.subject.project_id,a.workspace_id,a.subject.attempt_id,baseline.0], |r|r.get(0),
+    ).map_err(sql)?;
+    if baseline.1.anchor_id != a.accepted_anchor_id || !generation_matches {
+        return Err(refuse(R::StaleAuthority));
+    }
     let id = a.subject.validate()?;
     let attempt =
         crate::attempt::read_attempt_in_tx(conn, &id)?.ok_or_else(|| refuse(R::MissingEvidence))?;
@@ -519,6 +528,122 @@ fn advance(
     })
 }
 
+#[cfg(test)]
+fn historical_progress(conn: &Connection) -> Result<bool, StateError> {
+    conn.query_row(
+        "SELECT MAX(version)<28 FROM state_schema_version",
+        [],
+        |r| r.get(0),
+    )
+    .map_err(sql)
+}
+#[cfg(not(test))]
+fn historical_progress(_: &Connection) -> Result<bool, StateError> {
+    Ok(false)
+}
+
+/// A missing baseline is safe only when no legacy recovery history exists.
+fn progress_baseline(
+    conn: &Connection,
+    project: &str,
+    workspace: &str,
+) -> Result<Option<(i64, WorkspaceAcceptedTargetV1)>, StateError> {
+    let row: Option<(i64, String)> = conn.query_row(
+        "SELECT p.sequence,a.record_json FROM workspace_recovery_progress p JOIN workspace_recovery_acceptance a ON a.project_id=p.project_id AND a.anchor_id=p.anchor_id WHERE p.project_id=?1 AND p.workspace_id=?2 AND p.kind IN('RESET','ACCEPT') ORDER BY p.sequence DESC LIMIT 1",
+        params![project,workspace], |r| Ok((r.get(0)?,r.get(1)?)),
+    ).optional().map_err(sql)?;
+    if let Some((sequence, json)) = row {
+        let target: WorkspaceAcceptedTargetV1 = decode(&json)?;
+        if target.subject.project_id != project || target.workspace_id != workspace {
+            return Err(graph::corrupt());
+        }
+        validate_acceptance(conn, &target)?;
+        return Ok(Some((sequence, target)));
+    }
+    let legacy: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workspace_recovery_control WHERE project_id=?1 AND workspace_id=?2)",
+        params![project,workspace], |r| r.get(0),
+    ).map_err(sql)?;
+    if legacy {
+        Err(refuse(R::MissingEvidence))
+    } else {
+        Ok(None)
+    }
+}
+fn append_progress(
+    conn: &Connection,
+    subject: &WorkspaceRecoverySubjectV1,
+    workspace: &str,
+    kind: &str,
+    anchor: Option<&str>,
+    recovery: Option<&str>,
+) -> Result<(), StateError> {
+    let baseline = progress_baseline(conn, &subject.project_id, workspace)?.map_or(0, |b| b.0);
+    let last: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(sequence),0) FROM workspace_recovery_progress WHERE project_id=?1 AND workspace_id=?2",
+        params![subject.project_id,workspace], |r| r.get(0),
+    ).map_err(sql)?;
+    let next = last.checked_add(1).ok_or_else(|| refuse(R::InvalidShape))?;
+    conn.execute(
+        "INSERT INTO workspace_recovery_progress VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![
+            subject.project_id,
+            workspace,
+            next,
+            kind,
+            baseline,
+            subject.attempt_id,
+            anchor,
+            recovery
+        ],
+    )
+    .map_err(sql)?;
+    crate::write_fault::boundary()
+}
+pub(crate) fn record_workspace_start(
+    conn: &Connection,
+    start: &crate::AttemptStart,
+) -> Result<(), StateError> {
+    if historical_progress(conn)? {
+        return Ok(());
+    }
+    append_progress(
+        conn,
+        &WorkspaceRecoverySubjectV1 {
+            project_id: start.project_id().into(),
+            graph_id: start.graph_id().into(),
+            attempt_id: start.attempt_id().as_str().into(),
+        },
+        start.workspace_id(),
+        "START",
+        None,
+        None,
+    )
+}
+fn check_accepted_progress(
+    conn: &Connection,
+    target: &WorkspaceAcceptedTargetV1,
+) -> Result<(), StateError> {
+    let baseline = progress_baseline(conn, &target.subject.project_id, &target.workspace_id)?;
+    let generation = baseline.as_ref().map_or(0, |b| b.0);
+    let recorded: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workspace_recovery_progress WHERE project_id=?1 AND workspace_id=?2 AND kind='START' AND attempt_id=?3 AND baseline_sequence=?4)",
+        params![target.subject.project_id,target.workspace_id,target.subject.attempt_id,generation], |r| r.get(0),
+    ).map_err(sql)?;
+    if !recorded {
+        return Err(refuse(R::StaleAuthority));
+    }
+    if let Some((_, prior)) = baseline {
+        let attempt = crate::attempt::read_attempt_in_tx(conn, &target.subject.validate()?)?
+            .ok_or_else(|| refuse(R::MissingEvidence))?;
+        if target.subject.graph_id != prior.subject.graph_id
+            || attempt.start_sha() != prior.accepted_commit
+        {
+            return Err(refuse(R::ForeignEvidence));
+        }
+    }
+    Ok(())
+}
 impl SqliteStateRepository {
     pub(crate) fn bind_workspace_acceptance_v1(
         &mut self,
@@ -536,11 +661,21 @@ impl SqliteStateRepository {
                 };
             }
             guard_project(conn, &t.subject.project_id)?;
+            check_accepted_progress(conn, t)?;
             conn.execute(
                 "INSERT INTO workspace_recovery_acceptance VALUES(?1,?2,?3,?4)",
                 params![t.subject.project_id, t.anchor_id, t.workspace_id, json],
             )
             .map_err(sql)?;
+            crate::write_fault::boundary()?;
+            append_progress(
+                conn,
+                &t.subject,
+                &t.workspace_id,
+                "ACCEPT",
+                Some(&t.anchor_id),
+                None,
+            )?;
             Ok(crate::SetupWriteOutcomeV1::Applied)
         })
     }
@@ -802,6 +937,14 @@ impl SqliteStateRepository {
             )
             .map_err(sql)?;
             crate::write_fault::boundary()?;
+            append_progress(
+                conn,
+                &a.subject,
+                &a.workspace_id,
+                "RESET",
+                Some(&a.accepted_anchor_id),
+                Some(&auth.recovery_id),
+            )?;
             advance(conn, &r, "RESOLVED", &json, false)
         })
     }
@@ -904,6 +1047,23 @@ pub(crate) fn guard_attempt(conn: &Connection, attempt: &str) -> Result<(), Stat
         None => Ok(()),
     }
 }
+pub(crate) fn guard_start_custody(
+    conn: &Connection,
+    project: &str,
+    workspace: &str,
+    graph_id: &str,
+    node_id: &str,
+) -> Result<(), StateError> {
+    if historical_writer(conn)? {
+        return Ok(());
+    }
+    let node_held:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workspace_recovery_admission a JOIN workspace_recovery_control c USING(project_id,attempt_id) JOIN attempt_started s ON s.attempt_id=a.attempt_id WHERE a.project_id=?1 AND s.graph_id=?2 AND a.task_id=?3 AND c.active=1)",params![project,graph_id,node_id],|r|r.get(0)).map_err(sql)?;
+    if node_held {
+        return Err(refuse(R::ActiveRecovery));
+    }
+    guard_workspace(conn, project, workspace)?;
+    Ok(())
+}
 pub(crate) fn guard_start(
     conn: &Connection,
     project: &str,
@@ -916,18 +1076,19 @@ pub(crate) fn guard_start(
         return Ok(());
     }
 
-    let node_held:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM workspace_recovery_admission a JOIN workspace_recovery_control c USING(project_id,attempt_id) JOIN attempt_started s ON s.attempt_id=a.attempt_id WHERE a.project_id=?1 AND s.graph_id=?2 AND a.task_id=?3 AND c.active=1)",params![project,graph_id,node_id],|r|r.get(0)).map_err(sql)?;
-    if node_held {
-        return Err(refuse(R::ActiveRecovery));
+    guard_start_custody(conn, project, workspace, graph_id, node_id)?;
+    if historical_progress(conn)? {
+        return Ok(());
     }
-    guard_workspace(conn, project, workspace)?;
-    let previous:Option<String>=conn.query_row("SELECT a.record_json FROM workspace_recovery_admission a JOIN workspace_recovery_control c USING(project_id,attempt_id) WHERE a.project_id=?1 AND a.workspace_id=?2 AND c.active=0 ORDER BY c.revision DESC,c.recovery_id LIMIT 1",params![project,workspace],|r|r.get(0)).optional().map_err(sql)?;
-    if let Some(json) = previous {
-        let a: WorkspaceRecoveryAdmissionV1 = decode(&json)?;
-        let t = anchor(conn, &a)?;
-        if start_sha != t.accepted_commit || graph_id != a.subject.graph_id {
-            return Err(refuse(R::ForeignEvidence));
-        }
+    let recovered: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workspace_recovery_control WHERE project_id=?1 AND workspace_id=?2)",
+        params![project,workspace], |r| r.get(0),
+    ).map_err(sql)?;
+    if let Some((_, target)) = progress_baseline(conn, project, workspace)?
+        && recovered
+        && (start_sha != target.accepted_commit || graph_id != target.subject.graph_id)
+    {
+        return Err(refuse(R::ForeignEvidence));
     }
     Ok(())
 }

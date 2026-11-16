@@ -331,11 +331,10 @@ impl SqliteStateRepository {
         let identity = encode(&(request, start.canonical()))?;
         graph::write_transaction(self.connection(), |conn| {
             crate::workspace_recovery::guard_attempt(conn, start.attempt_id().as_str())?;
-            crate::workspace_recovery::guard_start(
+            crate::workspace_recovery::guard_start_custody(
                 conn,
                 start.project_id(),
                 start.workspace_id(),
-                start.start_sha(),
                 start.graph_id(),
                 start.node_id(),
             )?;
@@ -354,6 +353,14 @@ impl SqliteStateRepository {
                     Err(refuse(SetupRefusalV1::ConflictingReplay))
                 };
             }
+            crate::workspace_recovery::guard_start(
+                conn,
+                start.project_id(),
+                start.workspace_id(),
+                start.start_sha(),
+                start.graph_id(),
+                start.node_id(),
+            )?;
             let mut goal = expected_goal(
                 conn,
                 &request.project_id,

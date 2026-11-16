@@ -579,8 +579,8 @@ mod tests {
         conn.execute_batch("DROP TRIGGER fail25").unwrap();
         drop(conn);
         let (store, head) = TrustedCoreStore::migrate_exclusive(dir.db()).unwrap();
-        assert_eq!(head, 27);
-        assert_eq!(store.reader().schema_version().unwrap(), 27);
+        assert_eq!(head, 28);
+        assert_eq!(store.reader().schema_version().unwrap(), 28);
     }
 }
 
@@ -672,7 +672,7 @@ mod workflow_migration_tests {
         );
         conn.execute_batch("DROP TRIGGER fail26").unwrap();
         let (mut store, version) = TrustedCoreStore::migrate_exclusive(dir.db()).unwrap();
-        assert_eq!(version, 27);
+        assert_eq!(version, 28);
         assert_eq!(
             before,
             conn.query_row(

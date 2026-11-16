@@ -601,6 +601,7 @@ pub(crate) fn insert_start_in_tx(
                     start.role.as_str(), start.runtime_ref, start.workspace_id, start.start_sha, start.started_at.as_str()],
             )
             .map_err(sqlite_error)?;
+    crate::workspace_recovery::record_workspace_start(conn, start)?;
     Ok(())
 }
 

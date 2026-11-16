@@ -174,7 +174,7 @@ fn check_values(sql: &str, column: &str) -> Vec<String> {
 fn t01_fresh_database_bootstraps_to_schema_version_7() {
     let tmp = TempDir::new("ev-t01");
     let repo = SqliteStateRepository::open(tmp.db_path()).expect("fresh database bootstraps");
-    assert_eq!(repo.schema_version().expect("version read"), 27);
+    assert_eq!(repo.schema_version().expect("version read"), 28);
     assert!(
         repo.table_exists("event").expect("table check"),
         "event must exist after migration 4"
@@ -182,7 +182,7 @@ fn t01_fresh_database_bootstraps_to_schema_version_7() {
     // Exactly one metadata row per applied migration.
     assert_eq!(
         repo.count_table_rows("state_schema_version").expect("rows"),
-        27
+        28
     );
 }
 
@@ -192,10 +192,10 @@ fn t02_version_7_database_reopens() {
     let tmp = TempDir::new("ev-t02");
     for _ in 0..3 {
         let repo = SqliteStateRepository::open(tmp.db_path()).expect("every reopen succeeds");
-        assert_eq!(repo.schema_version().expect("version read"), 27);
+        assert_eq!(repo.schema_version().expect("version read"), 28);
         assert_eq!(
             repo.count_table_rows("state_schema_version").expect("rows"),
-            27,
+            28,
             "one metadata row per applied migration, never duplicated by reopen"
         );
     }
@@ -218,7 +218,7 @@ fn t03_ordinary_open_of_version_3_database_fails() {
             error,
             StateError::SchemaVersionMismatch {
                 found: 3,
-                supported: 27
+                supported: 28
             }
         ),
         "unexpected error: {error}"
@@ -552,7 +552,7 @@ fn t21_malformed_ulid_rejected_before_persistence() {
     let invalid_ids = [
         "",                                     // empty
         "01ARZ3NDEKTSV4RRFFQ69G5FA",            // 25 chars: too short
-        "01ARZ3NDEKTSV4RRFFQ69G5FAKZ",          // 27 chars: too long
+        "01ARZ3NDEKTSV4RRFFQ69G5FAKZ",          // 28 chars: too long
         "01ARZ3NDEKTSV4RRFFQ69G5FAiZ",          // lowercase i: non-canonical
         "01ARZ3NDEKTSV4RRFFQ69G5FAKl",          // lowercase l: non-canonical
         "01ARZ3NDEKTSV4RRFFQ69G5FAKo",          // lowercase o: non-canonical
@@ -1059,6 +1059,7 @@ fn t47_migration4_creates_only_event_schema() {
         "workspace_recovery_control",
         "workspace_recovery_evidence",
         "workspace_recovery_resolution",
+        "workspace_recovery_progress",
     ];
     expected.sort_unstable();
     assert_eq!(

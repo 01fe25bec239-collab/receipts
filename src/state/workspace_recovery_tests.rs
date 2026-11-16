@@ -619,7 +619,7 @@ fn workspace_recovery_existing_renewal_completion_rebind_and_dispatch_writers_ar
 
 #[test]
 fn workspace_recovery_interruption_readback_atomic_resolution_and_terminal_replay() {
-    for fail in 1..=3 {
+    for fail in 1..=4 {
         let mut f = Fixture::new();
         let (auth, observation) = f.prepare_reset();
         let before = crate::atomic_publication_tests::fingerprint(&f.store);
@@ -1019,7 +1019,7 @@ fn workspace_recovery_v26_migration_preserves_rows_rolls_back_and_verifies_guard
         TrustedCoreStore::open_exclusive(dir.db()),
         Err(StateError::SchemaVersionMismatch {
             found: 26,
-            supported: 27
+            supported: 28
         })
     ));
     let conn = rusqlite::Connection::open(dir.db()).unwrap();
@@ -1038,7 +1038,7 @@ fn workspace_recovery_v26_migration_preserves_rows_rolls_back_and_verifies_guard
     conn.execute_batch("DROP TRIGGER fail27").unwrap();
     drop(conn);
     let (store, version) = TrustedCoreStore::migrate_exclusive(dir.db()).unwrap();
-    assert_eq!(version, 27);
+    assert_eq!(version, 28);
     assert_eq!(store.store_id(), id);
     assert_eq!(
         store.reader().find_attempt(legacy.attempt_id()).unwrap(),
@@ -1046,7 +1046,7 @@ fn workspace_recovery_v26_migration_preserves_rows_rolls_back_and_verifies_guard
     );
     drop(store);
     let (store, version) = TrustedCoreStore::migrate_exclusive(dir.db()).unwrap();
-    assert_eq!(version, 27);
+    assert_eq!(version, 28);
     drop(store);
     let conn = rusqlite::Connection::open(dir.db()).unwrap();
     conn.execute_batch("DROP TRIGGER workspace_recovery_control_update")
@@ -1060,7 +1060,7 @@ fn workspace_recovery_v26_migration_preserves_rows_rolls_back_and_verifies_guard
 fn workspace_recovery_external_v26_upgrade() {
     let path = std::env::var_os("D4_V26_DB").expect("external archived-v26 fixture path");
     let (store, head) = TrustedCoreStore::migrate_exclusive(path).unwrap();
-    assert_eq!(head, 27);
+    assert_eq!(head, 28);
     let row = store
         .reader()
         .find_attempt(&AttemptId::parse(ACCEPTED).unwrap())
@@ -1076,6 +1076,7 @@ fn workspace_recovery_external_v26_upgrade() {
 
 /// Strip only v27 successor objects when constructing historical test databases.
 pub(crate) fn remove_v27(conn: &rusqlite::Connection) {
+    remove_v28(conn);
     conn.execute_batch("DROP TABLE IF EXISTS workspace_recovery_resolution; DROP TABLE IF EXISTS workspace_recovery_evidence; DROP TABLE IF EXISTS workspace_recovery_control; DROP TABLE IF EXISTS workspace_recovery_handoff; DROP TABLE IF EXISTS workspace_recovery_admission; DROP TABLE IF EXISTS workspace_recovery_acceptance; DELETE FROM state_schema_version WHERE version=27;").unwrap();
 }
 
@@ -1184,5 +1185,638 @@ fn workspace_recovery_evidence_and_action_prepare_failures_retain_custody() {
             reason(append_start(&mut f.store, FRESH, &"b".repeat(40))),
             WorkspaceRecoveryRefusalV1::ActiveRecovery
         );
+    }
+}
+
+const ACCEPT_C_AT: &str = "2026-11-08T10:11:00.000000000Z";
+fn publish_progress_acceptance(store: &mut TrustedCoreStore) {
+    let json = serde_json::json!({"decision_id":"accept-c","request_id":"request-c","outcome":"ACCEPT","checks_evaluated":[{"check":"fixture","result":"PASS"}],"provenance_chain":[{"task_id":"n2","start_sha":"b".repeat(40),"implementation_sha":"c".repeat(40),"review_sha":"c".repeat(40),"acceptance_sha":"c".repeat(40)}],"decided_at":ACCEPT_C_AT});
+    let decision = DecisionRecordV1::parse(
+        PROJECT,
+        DecisionRecordKind::IntegrationDecision,
+        "accept-c",
+        &json.to_string(),
+    )
+    .unwrap();
+    let settlement = ReviewClaimSettlementV1::completed(
+        "ACCEPTANCE_EVALUATED",
+        Some("accept-c"),
+        Some(decision.record_sha256()),
+    )
+    .unwrap();
+    let request = ReviewClaimRequestV1::new(
+        PROJECT,
+        "acceptance-claim-c",
+        "n2",
+        Some(&"c".repeat(40)),
+        &"c".repeat(64),
+    )
+    .unwrap();
+    let g = grant(store, StateWriteOperationV1::ReviewClaim, false);
+    let ticket = match store
+        .claim_review_v1(g, &trusted_clock_at(ACCEPT_C_AT), &request)
+        .unwrap()
+    {
+        ReviewClaimOutcomeV1::Claimed(t) => t,
+        _ => panic!(),
+    };
+    let package = DecisionPublicationV1::new(
+        PROJECT,
+        "acceptance-publication-c",
+        vec![decision],
+        vec![],
+        vec![],
+    )
+    .unwrap()
+    .with_claim_settlement(&ticket, settlement)
+    .unwrap();
+    let data = b"controlled trusted acceptance producer";
+    let seal_request = ReviewSealRequestV1::new(
+        &request,
+        &package,
+        ReviewRecoveryDataV1::new(
+            "D4_FIXTURE_V1",
+            data.to_vec(),
+            &crate::review_claim::sha256_hex(data),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let g = grant(store, StateWriteOperationV1::ReviewClaim, false);
+    let seal = store
+        .seal_review_claim_v1(g, &trusted_clock_at(ACCEPT_C_AT), &ticket, &seal_request)
+        .unwrap();
+    let g = grant(store, StateWriteOperationV1::DecisionPublication, false);
+    // Rebuild from the persisted decision bytes for the restart publication path.
+    let decision = DecisionRecordV1::parse(
+        PROJECT,
+        DecisionRecordKind::IntegrationDecision,
+        "accept-c",
+        &json.to_string(),
+    )
+    .unwrap();
+    let published = DecisionPublicationV1::new(
+        PROJECT,
+        "acceptance-publication-c",
+        vec![decision],
+        vec![],
+        vec![],
+    )
+    .unwrap()
+    .with_sealed_claim(&seal)
+    .unwrap();
+    store
+        .publish_decision_package_v1(g, &trusted_clock_at(ACCEPT_C_AT), &published)
+        .unwrap();
+}
+
+fn before_c_anchor() -> Fixture {
+    let mut f = Fixture::new();
+    let (auth, observation) = f.prepare_reset();
+    let g = recovery_grant(&f.store);
+    f.store
+        .acknowledge_workspace_recovery_v1(
+            g,
+            &trusted_clock_at(T_LATER),
+            &auth,
+            WorkspaceRecoveryEvidenceStageV1::Quiescent,
+            &observation.evidence,
+        )
+        .unwrap();
+    let g = recovery_grant(&f.store);
+    let guard = f
+        .store
+        .begin_workspace_recovery_action_v1(
+            g,
+            &trusted_clock_at(T_LATER),
+            &f.auth(4),
+            WorkspaceRecoveryActionKindV1::Reset,
+        )
+        .unwrap();
+    assert_eq!(guard.revision(), 5);
+    drop(guard);
+    let g = recovery_grant(&f.store);
+    f.store
+        .resolve_workspace_recovery_v1(g, &trusted_clock_at(T_LATER), &f.auth(5), &observation)
+        .unwrap();
+    assert_eq!(
+        reason(append_start(&mut f.store, FRESH, &"c".repeat(40))),
+        WorkspaceRecoveryRefusalV1::ForeignEvidence
+    );
+    f.dispatch(FRESH).unwrap();
+    let g = grant(&f.store, StateWriteOperationV1::GoalDispatch, true);
+    f.store
+        .resolve_goal_dispatch_v1(
+            g,
+            PROJECT,
+            &format!("dispatch-{FRESH}"),
+            LaunchResolutionV1::Launched,
+            "fixture:progress",
+        )
+        .unwrap();
+
+    let g = grant(&f.store, StateWriteOperationV1::ExecutorBinding, false);
+    f.store
+        .rebind_role(
+            g,
+            &trusted_clock_at(ACCEPT_C_AT),
+            &RoleRebindRequestV1 {
+                role_id: "role-1".into(),
+                expected_binding_id: Some("b1".into()),
+                release_current: Some(ReleaseReason::Crash),
+                binding: binding("b2", "role-1", "2026-11-08T11:00:00.000000000Z"),
+                authority: crate::recovery_tests::authority(),
+                reason: None,
+            },
+        )
+        .unwrap();
+    let mut admission = f.admission.clone();
+    admission.subject = subject(FRESH);
+    admission.binding_id = "b2".into();
+    admission.lease_deadline = "2026-11-08T11:00:00.000000000Z".into();
+    admission.expected_execution_deadline = "2026-11-08T11:10:00.000000000Z".into();
+    let g = recovery_grant(&f.store);
+    f.store
+        .admit_workspace_recovery_v1(g, &trusted_clock_at(ACCEPT_C_AT), &admission)
+        .unwrap();
+    checkpoint(
+        &mut f.store,
+        "progress-c",
+        FRESH,
+        &"c".repeat(40),
+        "PROGRESS",
+    );
+    let g = grant(&f.store, StateWriteOperationV1::Finalization, true);
+    f.store
+        .finish_with_finalization_v1(
+            g,
+            &FinalizationRecordV1 {
+                project_id: PROJECT.into(),
+                graph_id: "graph".into(),
+                attempt_id: FRESH.into(),
+                workspace_id: "workspace".into(),
+                checkpoint_id: "progress-c".into(),
+                final_sha: "c".repeat(40),
+                write_scope_verdict: "PASS".into(),
+                check_results: vec![],
+                output_refs: vec![],
+            },
+            &AttemptFinish::new(
+                AttemptId::parse(FRESH).unwrap(),
+                ACCEPT_C_AT,
+                Some(&"c".repeat(40)),
+                None,
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let g = recovery_grant(&f.store);
+    f.store
+        .record_workspace_handoff_v1(
+            g,
+            &trusted_clock_at(ACCEPT_C_AT),
+            &WorkspaceHandoffRecordV1 {
+                subject: subject(FRESH),
+                expected_revision: 0,
+                disposition: WorkspaceHandoffDispositionV1::Eligible,
+                evidence_ref: "fixture:handoff-c".into(),
+                evidence_sha256: "5".repeat(64),
+                provisioning_identity: admission.provisioning_identity,
+            },
+        )
+        .unwrap();
+    publish_progress_acceptance(&mut f.store);
+    f
+}
+fn c_anchor() -> WorkspaceAcceptedTargetV1 {
+    WorkspaceAcceptedTargetV1 {
+        subject: subject(FRESH),
+        anchor_id: "anchor-c".into(),
+        workspace_id: "workspace".into(),
+        accepted_commit: "c".repeat(40),
+        accepted_tree: "6".repeat(40),
+        acceptance_claim_id: "acceptance-claim-c".into(),
+        decision_id: "accept-c".into(),
+        provisioning_identity: "7".repeat(64),
+    }
+}
+fn progressed_workspace() -> Fixture {
+    let mut f = before_c_anchor();
+    let g = recovery_grant(&f.store);
+    f.store
+        .bind_workspace_acceptance_v1(g, &c_anchor())
+        .unwrap();
+    let path = f._tmp.db_path();
+    drop(f.store);
+    f.store = TrustedCoreStore::open_exclusive(path).unwrap();
+    f
+}
+
+#[test]
+fn workspace_recovery_f1_acceptance_advances_the_enforced_workspace_baseline() {
+    let mut f = progressed_workspace();
+    let before = progress_rows(&f);
+    assert_eq!(
+        reason(append_start(
+            &mut f.store,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAZ",
+            &"b".repeat(40)
+        )),
+        WorkspaceRecoveryRefusalV1::ForeignEvidence
+    );
+    assert_eq!(before, progress_rows(&f));
+    let request = GoalDispatchV1 {
+        project_id: PROJECT.into(),
+        goal_id: "goal".into(),
+        dispatch_id: "dispatch-c".into(),
+        expected_revision: "2".into(),
+        context_epoch: "0".into(),
+        graph_version: "1".into(),
+    };
+    let g = grant(&f.store, StateWriteOperationV1::GoalDispatch, true);
+    assert_eq!(
+        reason(f.store.reserve_goal_dispatch_v1(
+            g,
+            &request,
+            &start("01ARZ3NDEKTSV4RRFFQ69G5FAY", &"b".repeat(40))
+        )),
+        WorkspaceRecoveryRefusalV1::ForeignEvidence
+    );
+    assert_eq!(before, progress_rows(&f));
+    let g = grant(&f.store, StateWriteOperationV1::GoalDispatch, true);
+    assert_eq!(
+        f.store
+            .reserve_goal_dispatch_v1(
+                g,
+                &request,
+                &start("01ARZ3NDEKTSV4RRFFQ69G5FAY", &"c".repeat(40))
+            )
+            .unwrap(),
+        SetupWriteOutcomeV1::Applied,
+        "verified acceptance for this workspace must advance its enforceable baseline"
+    );
+    append_start(&mut f.store, "01ARZ3NDEKTSV4RRFFQ69G5FAZ", &"c".repeat(40)).unwrap();
+    let after = progress_rows(&f);
+    assert_eq!(after.len(), before.len() + 2);
+    assert!(after.last().unwrap().contains("START"));
+}
+
+pub(crate) fn remove_v28(conn: &rusqlite::Connection) {
+    conn.execute_batch("DROP TABLE IF EXISTS workspace_recovery_progress; DELETE FROM state_schema_version WHERE version=28;").unwrap();
+}
+
+fn progress_rows(f: &Fixture) -> Vec<String> {
+    let mut q=f.store.reader().connection().prepare("SELECT json_array(sequence,kind,baseline_sequence,attempt_id,anchor_id,recovery_id) FROM workspace_recovery_progress WHERE project_id=?1 AND workspace_id='workspace' ORDER BY sequence").unwrap();
+    q.query_map([PROJECT], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+fn capture_progress(
+    store: &mut TrustedCoreStore,
+    attempt: &str,
+    recovery: &str,
+    at: &str,
+) -> WorkspaceRecoveryEvidenceV1 {
+    let value = serde_json::json!({"checkpoint_id":"second-reset","workspace_id":"workspace","attempt_id":attempt,
+        "head_sha":"c".repeat(40),"kind":"RECOVERY_CAPTURE","captured_at":at,"modified_files":[],"untracked_files":[],
+        "dirty_diff_ref":{"ref_type":"ARTIFACT_ID","target":"second-reset","digest":"3".repeat(64)}});
+    let cp = CheckpointRecord::parse_json(PROJECT, &value.to_string()).unwrap();
+    let json = cp.to_json().unwrap();
+    let g = grant(store, StateWriteOperationV1::Checkpoint, false);
+    store.append_checkpoint(g, cp).unwrap();
+    let g = grant(store, StateWriteOperationV1::OutputRef, false);
+    store
+        .append_output_ref(
+            g,
+            OutputRef::new(
+                PROJECT,
+                "second-reset",
+                &"3".repeat(64),
+                "artifact:fixture",
+                "0",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    WorkspaceRecoveryEvidenceV1 {
+        recovery_id: recovery.into(),
+        checkpoint_id: "second-reset".into(),
+        checkpoint_sha256: crate::review_claim::sha256_hex(json.as_bytes()),
+        output_refs: vec!["second-reset".into()],
+    }
+}
+#[test]
+fn workspace_recovery_f1_newer_reset_wins_despite_lower_local_revision() {
+    let mut f = progressed_workspace();
+    const NEXT: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAY";
+    let next = AttemptStart::new(
+        AttemptId::parse(NEXT).unwrap(),
+        PROJECT,
+        "graph",
+        "n2",
+        "1",
+        AttemptRole::RuntimeA3,
+        "runtime-r",
+        "workspace",
+        &"c".repeat(40),
+        ACCEPT_C_AT,
+    )
+    .unwrap();
+    let g = grant(&f.store, StateWriteOperationV1::Attempt, true);
+    f.store.append_attempt_started(g, next).unwrap();
+    let mut admission = f.admission.clone();
+    admission.subject = subject(NEXT);
+    admission.binding_id = "b2".into();
+    admission.lease_deadline = "2026-11-08T11:00:00.000000000Z".into();
+    admission.expected_execution_deadline = "2026-11-08T11:10:00.000000000Z".into();
+    admission.accepted_anchor_id = "anchor-c".into();
+    let g = recovery_grant(&f.store);
+    let hash = f
+        .store
+        .admit_workspace_recovery_v1(g, &trusted_clock_at(ACCEPT_C_AT), &admission)
+        .unwrap();
+    let g = recovery_grant(&f.store);
+    f.store
+        .record_workspace_handoff_v1(
+            g,
+            &trusted_clock_at(ACCEPT_C_AT),
+            &WorkspaceHandoffRecordV1 {
+                subject: subject(NEXT),
+                expected_revision: 0,
+                disposition: WorkspaceHandoffDispositionV1::ClosedWithoutHandoff,
+                evidence_ref: "fixture:second".into(),
+                evidence_sha256: "2".repeat(64),
+                provisioning_identity: admission.provisioning_identity.clone(),
+            },
+        )
+        .unwrap();
+    let at = "2026-11-08T11:10:00.000000000Z";
+    let g = recovery_grant(&f.store);
+    f.store
+        .claim_workspace_recovery_v1(
+            g,
+            &trusted_clock_at(at),
+            &WorkspaceRecoveryClaimRequestV1 {
+                subject: subject(NEXT),
+                recovery_id: "second".into(),
+                admission_sha256: hash,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        reason(f.dispatch(FRESH)),
+        WorkspaceRecoveryRefusalV1::ActiveRecovery
+    );
+    let mut auth = WorkspaceRecoveryAuthorityV1 {
+        subject: subject(NEXT),
+        recovery_id: "second".into(),
+        expected_revision: 0,
+        provisioning_identity: admission.provisioning_identity,
+        supervisor_identity: admission.supervisor_identity,
+    };
+    let e = capture_progress(&mut f.store, NEXT, "second", at);
+    for stage in [
+        WorkspaceRecoveryEvidenceStageV1::Captured,
+        WorkspaceRecoveryEvidenceStageV1::Quiescent,
+    ] {
+        let g = recovery_grant(&f.store);
+        let r = f
+            .store
+            .acknowledge_workspace_recovery_v1(g, &trusted_clock_at(at), &auth, stage, &e)
+            .unwrap();
+        auth.expected_revision = r.revision;
+    }
+    let g = recovery_grant(&f.store);
+    let guard = f
+        .store
+        .begin_workspace_recovery_action_v1(
+            g,
+            &trusted_clock_at(at),
+            &auth,
+            WorkspaceRecoveryActionKindV1::Reset,
+        )
+        .unwrap();
+    auth.expected_revision = guard.revision();
+    drop(guard);
+    let observation = WorkspaceRecoveryResetObservationV1 {
+        evidence: e,
+        observed_commit: "c".repeat(40),
+        index_tree: "6".repeat(40),
+        tracked_tree: "6".repeat(40),
+    };
+    let g = recovery_grant(&f.store);
+    let newer = f
+        .store
+        .resolve_workspace_recovery_v1(g, &trusted_clock_at(at), &auth, &observation)
+        .unwrap();
+    let older = f
+        .store
+        .reader()
+        .find_workspace_recovery_v1(&subject(CRASHED), "recovery")
+        .unwrap();
+    assert!(newer.revision < older.revision);
+    let before = progress_rows(&f);
+    let g = recovery_grant(&f.store);
+    assert_eq!(
+        f.store
+            .resolve_workspace_recovery_v1(g, &trusted_clock_at(at), &auth, &observation)
+            .unwrap(),
+        newer
+    );
+    let g = recovery_grant(&f.store);
+    assert_eq!(
+        f.store.bind_workspace_acceptance_v1(g, &f.anchor).unwrap(),
+        SetupWriteOutcomeV1::Replayed
+    );
+    let json:String=f.store.reader().connection().query_row("SELECT record_json FROM workspace_recovery_resolution WHERE project_id=?1 AND recovery_id='recovery'",[PROJECT],|r|r.get(0)).unwrap();
+    let (old_auth, old_observation): (
+        WorkspaceRecoveryAuthorityV1,
+        WorkspaceRecoveryResetObservationV1,
+    ) = serde_json::from_str(&json).unwrap();
+    let g = recovery_grant(&f.store);
+    assert_eq!(
+        f.store
+            .resolve_workspace_recovery_v1(g, &trusted_clock_at(at), &old_auth, &old_observation)
+            .unwrap(),
+        older
+    );
+    let mut late = c_anchor();
+    late.anchor_id = "late-old-generation".into();
+    let g = recovery_grant(&f.store);
+    assert_eq!(
+        reason(f.store.bind_workspace_acceptance_v1(g, &late)),
+        WorkspaceRecoveryRefusalV1::StaleAuthority
+    );
+    assert_eq!(before, progress_rows(&f));
+    let path = f._tmp.db_path();
+    drop(f.store);
+    f.store = TrustedCoreStore::open_exclusive(path).unwrap();
+    assert_eq!(before, progress_rows(&f));
+    assert_eq!(
+        reason(append_start(
+            &mut f.store,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAZ",
+            &"b".repeat(40)
+        )),
+        WorkspaceRecoveryRefusalV1::ForeignEvidence
+    );
+    append_start(&mut f.store, "01ARZ3NDEKTSV4RRFFQ69G5FAZ", &"c".repeat(40)).unwrap();
+}
+
+#[test]
+fn workspace_recovery_f1_journal_writes_roll_back_and_replays_do_not_append() {
+    let mut f = Fixture::new();
+    let (auth, observation) = f.prepare_reset();
+    let g = recovery_grant(&f.store);
+    f.store
+        .resolve_workspace_recovery_v1(g, &trusted_clock_at(T_LATER), &auth, &observation)
+        .unwrap();
+    let before = progress_rows(&f);
+    let g = grant(&f.store, StateWriteOperationV1::Attempt, true);
+    let (result, seen) = with_fault(Some(1), || {
+        f.store
+            .append_attempt_started(g, start(FRESH, &"b".repeat(40)))
+    });
+    assert!(result.is_err());
+    assert_eq!(seen, 1);
+    assert_eq!(before, progress_rows(&f));
+    assert!(
+        f.store
+            .reader()
+            .find_attempt(&AttemptId::parse(FRESH).unwrap())
+            .unwrap()
+            .is_none()
+    );
+    append_start(&mut f.store, FRESH, &"b".repeat(40)).unwrap();
+    let after = progress_rows(&f);
+    assert!(append_start(&mut f.store, FRESH, &"b".repeat(40)).is_err());
+    assert_eq!(after, progress_rows(&f));
+
+    let mut f = before_c_anchor();
+    let before = progress_rows(&f);
+    let fingerprint = crate::atomic_publication_tests::fingerprint(&f.store);
+    for fail in 1..=2 {
+        let g = recovery_grant(&f.store);
+        let (result, seen) = with_fault(Some(fail), || {
+            f.store.bind_workspace_acceptance_v1(g, &c_anchor())
+        });
+        assert!(result.is_err());
+        assert_eq!(seen, fail);
+        assert_eq!(before, progress_rows(&f));
+        assert_eq!(
+            fingerprint,
+            crate::atomic_publication_tests::fingerprint(&f.store)
+        );
+    }
+    let g = recovery_grant(&f.store);
+    f.store
+        .bind_workspace_acceptance_v1(g, &c_anchor())
+        .unwrap();
+    let after = progress_rows(&f);
+    let g = recovery_grant(&f.store);
+    assert_eq!(
+        f.store
+            .bind_workspace_acceptance_v1(g, &c_anchor())
+            .unwrap(),
+        SetupWriteOutcomeV1::Replayed
+    );
+    assert_eq!(f.dispatch(FRESH).unwrap(), SetupWriteOutcomeV1::Replayed);
+    assert_eq!(after, progress_rows(&f));
+}
+
+#[test]
+fn workspace_recovery_f1_v27_history_is_preserved_without_inventing_order() {
+    for active in [false, true] {
+        let mut f = Fixture::new();
+        if active {
+            f.claim();
+        } else {
+            let (auth, observation) = f.prepare_reset();
+            let g = recovery_grant(&f.store);
+            f.store
+                .resolve_workspace_recovery_v1(g, &trusted_clock_at(T_LATER), &auth, &observation)
+                .unwrap();
+        }
+        let prior = f
+            .store
+            .reader()
+            .find_workspace_recovery_v1(&subject(CRASHED), "recovery")
+            .unwrap();
+        let path = f._tmp.db_path();
+        drop(f.store);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        remove_v28(&conn);
+        crate::graph_repository::verify_v27(&conn, GraphPhase::Read).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail28 BEFORE INSERT ON state_schema_version WHEN NEW.version=28 BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+        assert!(TrustedCoreStore::migrate_exclusive(&path).is_err());
+        crate::graph_repository::verify_v27(&conn, GraphPhase::Read).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='workspace_recovery_progress'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        conn.execute_batch("DROP TRIGGER fail28").unwrap();
+        drop(conn);
+        assert!(matches!(
+            TrustedCoreStore::open_exclusive(&path),
+            Err(StateError::SchemaVersionMismatch {
+                found: 27,
+                supported: 28
+            })
+        ));
+        let (store, head) = TrustedCoreStore::migrate_exclusive(&path).unwrap();
+        assert_eq!(head, 28);
+        f.store = store;
+        assert_eq!(
+            prior,
+            f.store
+                .reader()
+                .find_workspace_recovery_v1(&subject(CRASHED), "recovery")
+                .unwrap()
+        );
+        assert!(progress_rows(&f).is_empty());
+        assert_eq!(
+            reason(append_start(&mut f.store, FRESH, &"b".repeat(40))),
+            if active {
+                WorkspaceRecoveryRefusalV1::ActiveRecovery
+            } else {
+                WorkspaceRecoveryRefusalV1::MissingEvidence
+            }
+        );
+        let mut target = f.anchor.clone();
+        target.anchor_id = "legacy-alias".into();
+        let g = recovery_grant(&f.store);
+        assert_eq!(
+            reason(f.store.bind_workspace_acceptance_v1(g, &target)),
+            if active {
+                WorkspaceRecoveryRefusalV1::ActiveRecovery
+            } else {
+                WorkspaceRecoveryRefusalV1::MissingEvidence
+            }
+        );
+        assert!(progress_rows(&f).is_empty());
+        if !active {
+            let g = grant(&f.store, StateWriteOperationV1::Attempt, true);
+            let other = AttemptStart::new(
+                AttemptId::parse(FRESH).unwrap(),
+                PROJECT,
+                "graph",
+                "n2",
+                "1",
+                AttemptRole::RuntimeA3,
+                "runtime-r",
+                "unaffected",
+                &"a".repeat(40),
+                T_BOUND,
+            )
+            .unwrap();
+            f.store.append_attempt_started(g, other).unwrap();
+        }
     }
 }

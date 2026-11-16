@@ -35,7 +35,9 @@ pub(crate) mod v0025_remote_publication;
 // Historical entrypoint refers to its old current head; retain its source unchanged.
 #[allow(dead_code)]
 pub(crate) mod v0026_remote_workflow;
+#[allow(dead_code)]
 pub(crate) mod v0027_workspace_recovery;
+pub(crate) mod v0028_workspace_recovery_progress;
 
 use crate::error::StateError;
 
@@ -80,6 +82,7 @@ static REGISTERED: &[Migration] = &[
     v0025_remote_publication::MIGRATION,
     v0026_remote_workflow::MIGRATION,
     v0027_workspace_recovery::MIGRATION,
+    v0028_workspace_recovery_progress::MIGRATION,
 ];
 
 /// The registered migration chain in application order.

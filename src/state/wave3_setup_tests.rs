@@ -235,7 +235,7 @@ fn stale_foreign_conflicting_and_malformed_reservations_write_nothing() {
 
 #[test]
 fn every_reservation_write_failure_rolls_back_start_budget_and_reservation() {
-    for boundary in 1..=3 {
+    for boundary in 1..=4 {
         let (_dir, mut store) = seed();
         let (result, seen) = with_fault(Some(boundary), || {
             reserve(&mut store, &dispatch("d", "0"), &start(A, "n2"))
@@ -438,7 +438,7 @@ fn v24_upgrade_is_forward_only_atomic_and_exactly_guarded() {
     conn.execute_batch("DROP TRIGGER fail24").unwrap();
     drop(conn);
     let (store, version) = TrustedCoreStore::migrate_exclusive(dir.db()).unwrap();
-    assert_eq!(version, 27);
+    assert_eq!(version, 28);
     assert!(
         store
             .reader()
@@ -448,7 +448,7 @@ fn v24_upgrade_is_forward_only_atomic_and_exactly_guarded() {
     );
     drop(store);
     let (mut store, version) = TrustedCoreStore::migrate_exclusive(dir.db()).unwrap();
-    assert_eq!(version, 27);
+    assert_eq!(version, 28);
     let conn = rusqlite::Connection::open(dir.db()).unwrap();
     for table in [
         "goal_history",
