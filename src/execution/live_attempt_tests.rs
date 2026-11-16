@@ -198,6 +198,13 @@ fn live_probe() {
         scope.spawn(|| emit("stdout", &mut std::io::stdout(), b'O'));
         scope.spawn(|| emit("stderr", &mut std::io::stderr(), b'E'));
     });
+    if Path::new("close-output").exists() {
+        unsafe extern "C" {
+            fn close(fd: i32) -> i32;
+        }
+        assert_eq!(unsafe { close(1) }, 0);
+        assert_eq!(unsafe { close(2) }, 0);
+    }
     fs::write(format!("{prefix}ready"), b"1").unwrap();
     if Path::new("exit-now").exists() {
         let code = fs::read_to_string("exit-now").unwrap().parse().unwrap();
@@ -1001,4 +1008,36 @@ fn cleanup_evidence_covers_setup_failure_and_controller_unwind() {
             prove_empty(&ws, caller_process_group());
         }
     }
+}
+
+#[test]
+fn cleanup_evidence_child_exit_between_eligibility_and_probe_cannot_bypass_ack() {
+    let ws = Workspace::new();
+    ws.write("close-output", b"");
+    let (arrived, release) = gate(&super::live_attempt::AFTER_COMPLETION_ELIGIBILITY);
+    let (barrier, requests) = CleanupEvidenceBarrier::channel();
+    let attempt = start_live_process_attempt_with_cleanup_evidence(
+        &ws.request(),
+        &ProcessTimeoutPolicy::new(LIMIT, GRACE).unwrap(),
+        barrier,
+    )
+    .unwrap();
+    ws.ready();
+    arrive(&arrived); // Both pipes closed, but the leader was observed alive.
+    ws.write("release-child", b"");
+    until(|| {
+        super::unix_signal::observe_leader_without_reaping(ws.value("pid")).unwrap()
+            == super::unix_signal::LeaderState::Exited
+    });
+    release.send(()).unwrap();
+    let request = requests.recv_timeout(LIMIT).unwrap();
+    assert_eq!(request.reason, CleanupEvidenceReason::NaturalCompletion);
+    assert_eq!(
+        super::unix_signal::observe_leader_without_reaping(ws.value("pid")).unwrap(),
+        super::unix_signal::LeaderState::Exited,
+        "the leader must remain waitable until acknowledgement"
+    );
+    assert!(request.acknowledge());
+    assert!(attempt.wait_collect().unwrap().success());
+    prove_empty(&ws, caller_process_group());
 }

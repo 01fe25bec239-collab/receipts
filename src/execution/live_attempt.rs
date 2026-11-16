@@ -434,6 +434,7 @@ thread_local! {
     pub(super) static AFTER_START_FAILURE: std::cell::RefCell<Option<TestGate>> = const { std::cell::RefCell::new(None) };
     pub(super) static BEFORE_READY: std::cell::RefCell<Option<TestGate>> = const { std::cell::RefCell::new(None) };
     pub(super) static BEFORE_MONITOR: std::cell::RefCell<Option<TestGate>> = const { std::cell::RefCell::new(None) };
+    pub(super) static AFTER_COMPLETION_ELIGIBILITY: std::cell::RefCell<Option<TestGate>> = const { std::cell::RefCell::new(None) };
     pub(super) static AFTER_CLAIM: std::cell::RefCell<Option<TestGate>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -708,6 +709,8 @@ mod platform {
         #[cfg(test)]
         let after_claim = AFTER_CLAIM.take();
         #[cfg(test)]
+        let after_completion_eligibility = AFTER_COMPLETION_ELIGIBILITY.take();
+        #[cfg(test)]
         let eof_gates = READER_EOF_GATES.take();
         #[cfg(test)]
         let eof_observation = EOF_OBSERVATION.take();
@@ -716,6 +719,8 @@ mod platform {
             .spawn(move || {
                 #[cfg(test)]
                 AFTER_CLAIM.set(after_claim);
+                #[cfg(test)]
+                AFTER_COMPLETION_ELIGIBILITY.set(after_completion_eligibility);
                 #[cfg(test)]
                 BEFORE_READY.set(before_ready);
                 #[cfg(test)]
@@ -836,9 +841,14 @@ mod platform {
                 .all(|(_, reader)| reader.is_finished())
             {
                 resources.join_readers()?;
-                if resources.evidence.is_some()
-                    && runner::owned_leader_exited(resources.child.as_ref().unwrap())?
-                {
+                // The completion probe may signal; pending evidence must exclude the probe.
+                let eligible = resources.evidence.is_none()
+                    || runner::owned_leader_exited(resources.child.as_ref().unwrap())?;
+                #[cfg(test)]
+                if let Some(gate) = AFTER_COMPLETION_ELIGIBILITY.take() {
+                    gate.wait();
+                }
+                if resources.evidence.is_some() && eligible {
                     drop(state);
                     resources.acknowledge(CleanupEvidenceReason::NaturalCompletion);
                     state = lock(lifecycle);
@@ -846,31 +856,33 @@ mod platform {
                         continue;
                     }
                 }
-                match runner::try_complete_owned_child(
-                    resources.child.as_mut().unwrap(),
-                    resources.group,
-                    Some(deadline),
-                ) {
-                    Ok(Some(status)) => {
-                        resources.child.take(); // Already reaped; never signal this PGID again.
-                        assert!(state.claim(LiveProcessTerminalCause::Completed));
-                        drop(state);
-                        #[cfg(test)]
-                        if let Some(gate) = AFTER_CLAIM.take() {
-                            gate.wait();
+                if eligible {
+                    match runner::try_complete_owned_child(
+                        resources.child.as_mut().unwrap(),
+                        resources.group,
+                        Some(deadline),
+                    ) {
+                        Ok(Some(status)) => {
+                            resources.child.take(); // Already reaped; never signal this PGID again.
+                            assert!(state.claim(LiveProcessTerminalCause::Completed));
+                            drop(state);
+                            #[cfg(test)]
+                            if let Some(gate) = AFTER_CLAIM.take() {
+                                gate.wait();
+                            }
+                            return Ok((
+                                TerminalEvidence::Completed {
+                                    success: status.success(),
+                                },
+                                status.code(),
+                            ));
                         }
-                        return Ok((
-                            TerminalEvidence::Completed {
-                                success: status.success(),
-                            },
-                            status.code(),
-                        ));
-                    }
-                    Ok(None) => {}
-                    Err(runner::OwnedWaitError::Owned(error)) => return Err(error),
-                    Err(runner::OwnedWaitError::NoFurtherSignal(error)) => {
-                        resources.child.take();
-                        return Err(error);
+                        Ok(None) => {}
+                        Err(runner::OwnedWaitError::Owned(error)) => return Err(error),
+                        Err(runner::OwnedWaitError::NoFurtherSignal(error)) => {
+                            resources.child.take();
+                            return Err(error);
+                        }
                     }
                 }
             } else if resources
