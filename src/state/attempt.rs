@@ -139,6 +139,16 @@ impl AttemptStart {
     pub fn graph_id(&self) -> &str {
         &self.graph_id
     }
+    pub(crate) fn node_id(&self) -> &str {
+        &self.node_id
+    }
+    pub(crate) fn workspace_id(&self) -> &str {
+        &self.workspace_id
+    }
+    pub(crate) fn start_sha(&self) -> &str {
+        &self.start_sha
+    }
+
     pub(crate) fn canonical(&self) -> serde_json::Value {
         serde_json::json!([
             self.attempt_id.as_str(),
@@ -567,6 +577,14 @@ pub(crate) fn insert_start_in_tx(
     conn: &Connection,
     start: &AttemptStart,
 ) -> Result<(), StateError> {
+    crate::workspace_recovery::guard_start(
+        conn,
+        start.project_id(),
+        &start.workspace_id,
+        &start.start_sha,
+        start.graph_id(),
+        start.node_id(),
+    )?;
     let duplicate: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM attempt_started WHERE attempt_id=?1",
@@ -583,6 +601,7 @@ pub(crate) fn insert_start_in_tx(
                     start.role.as_str(), start.runtime_ref, start.workspace_id, start.start_sha, start.started_at.as_str()],
             )
             .map_err(sqlite_error)?;
+    crate::workspace_recovery::record_workspace_start(conn, start)?;
     Ok(())
 }
 
@@ -590,6 +609,7 @@ pub(crate) fn insert_finish_in_tx(
     conn: &Connection,
     finish: &AttemptFinish,
 ) -> Result<(), StateError> {
+    crate::workspace_recovery::guard_attempt(conn, finish.attempt_id().as_str())?;
     let started: Option<String> = conn
         .query_row(
             "SELECT started_at FROM attempt_started WHERE attempt_id=?1",

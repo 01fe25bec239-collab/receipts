@@ -8,6 +8,8 @@ mod json_value;
 mod remote_policy;
 mod review_claims;
 mod state_write_authority;
+mod workspace_recovery;
+pub use workspace_recovery::*;
 
 pub use date_time::{OrchestrationDateTimeError, OrchestrationDateTimeV1};
 pub use decision_publication::{CoreEventV1, CorePublicationInputV1, publication_id_v1};
@@ -61,3 +63,6 @@ mod decision_publication_tests;
 
 #[cfg(test)]
 mod review_claim_tests;
+
+#[cfg(test)]
+mod workspace_recovery_tests;

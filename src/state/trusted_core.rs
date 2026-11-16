@@ -112,6 +112,7 @@ use crate::trusted_time::TrustedClockV1;
 /// Closed operation families a single admission can authorize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateWriteOperationV1 {
+    WorkspaceRecovery,
     RemotePublication,
     Goal,
     GoalDispatch,
@@ -1539,5 +1540,112 @@ mod secure {
     }
     pub(super) fn verify_after_open(_: &Held) -> Result<(), StateError> {
         Err(refused(R::UnsupportedPlatform))
+    }
+}
+
+impl TrustedCoreStore {
+    /// Trusted composition only; never accepts worker-issued recovery authority.
+    pub fn bind_workspace_acceptance_v1(
+        &mut self,
+        admission: StateWriteAdmission,
+        target: &crate::WorkspaceAcceptedTargetV1,
+    ) -> Result<crate::SetupWriteOutcomeV1, StateError> {
+        self.check(
+            admission,
+            StateWriteOperationV1::WorkspaceRecovery,
+            Bound::graph(&target.subject.project_id, &target.subject.graph_id),
+        )?;
+        self.repo.bind_workspace_acceptance_v1(target)
+    }
+    /// Trusted composition only; never accepts worker-issued recovery authority.
+    pub fn admit_workspace_recovery_v1(
+        &mut self,
+        admission: StateWriteAdmission,
+        clock: &dyn TrustedClockV1,
+        request: &crate::WorkspaceRecoveryAdmissionV1,
+    ) -> Result<String, StateError> {
+        self.check(
+            admission,
+            StateWriteOperationV1::WorkspaceRecovery,
+            Bound::graph(&request.subject.project_id, &request.subject.graph_id),
+        )?;
+        self.repo.admit_workspace_recovery_v1(clock, request)
+    }
+    /// Trusted composition only; never accepts worker-issued recovery authority.
+    pub fn record_workspace_handoff_v1(
+        &mut self,
+        admission: StateWriteAdmission,
+        clock: &dyn TrustedClockV1,
+        request: &crate::WorkspaceHandoffRecordV1,
+    ) -> Result<i64, StateError> {
+        self.check(
+            admission,
+            StateWriteOperationV1::WorkspaceRecovery,
+            Bound::graph(&request.subject.project_id, &request.subject.graph_id),
+        )?;
+        self.repo.record_workspace_handoff_v1(clock, request)
+    }
+    /// Trusted composition only; never accepts worker-issued recovery authority.
+    pub fn claim_workspace_recovery_v1(
+        &mut self,
+        admission: StateWriteAdmission,
+        clock: &dyn TrustedClockV1,
+        request: &crate::WorkspaceRecoveryClaimRequestV1,
+    ) -> Result<crate::WorkspaceRecoveryRecordV1, StateError> {
+        self.check(
+            admission,
+            StateWriteOperationV1::WorkspaceRecovery,
+            Bound::graph(&request.subject.project_id, &request.subject.graph_id),
+        )?;
+        self.repo.claim_workspace_recovery_v1(clock, request)
+    }
+    /// Trusted composition only; never accepts worker-issued recovery authority.
+    pub fn acknowledge_workspace_recovery_v1(
+        &mut self,
+        admission: StateWriteAdmission,
+        clock: &dyn TrustedClockV1,
+        authority: &crate::WorkspaceRecoveryAuthorityV1,
+        stage: crate::WorkspaceRecoveryEvidenceStageV1,
+        evidence: &crate::WorkspaceRecoveryEvidenceV1,
+    ) -> Result<crate::WorkspaceRecoveryRecordV1, StateError> {
+        self.check(
+            admission,
+            StateWriteOperationV1::WorkspaceRecovery,
+            Bound::graph(&authority.subject.project_id, &authority.subject.graph_id),
+        )?;
+        self.repo
+            .acknowledge_workspace_recovery_v1(clock, authority, stage, evidence)
+    }
+    /// Trusted composition only; never accepts worker-issued recovery authority.
+    pub fn begin_workspace_recovery_action_v1(
+        &mut self,
+        admission: StateWriteAdmission,
+        clock: &dyn TrustedClockV1,
+        authority: &crate::WorkspaceRecoveryAuthorityV1,
+        kind: crate::WorkspaceRecoveryActionKindV1,
+    ) -> Result<crate::WorkspaceRecoveryActionGuardV1<'_>, StateError> {
+        self.check(
+            admission,
+            StateWriteOperationV1::WorkspaceRecovery,
+            Bound::graph(&authority.subject.project_id, &authority.subject.graph_id),
+        )?;
+        self.repo
+            .begin_workspace_recovery_action_v1(clock, authority, kind)
+    }
+    /// Trusted composition only; never accepts worker-issued recovery authority.
+    pub fn resolve_workspace_recovery_v1(
+        &mut self,
+        admission: StateWriteAdmission,
+        clock: &dyn TrustedClockV1,
+        authority: &crate::WorkspaceRecoveryAuthorityV1,
+        observation: &crate::WorkspaceRecoveryResetObservationV1,
+    ) -> Result<crate::WorkspaceRecoveryRecordV1, StateError> {
+        self.check(
+            admission,
+            StateWriteOperationV1::WorkspaceRecovery,
+            Bound::graph(&authority.subject.project_id, &authority.subject.graph_id),
+        )?;
+        self.repo
+            .resolve_workspace_recovery_v1(clock, authority, observation)
     }
 }

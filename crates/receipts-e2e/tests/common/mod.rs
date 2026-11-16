@@ -5,6 +5,8 @@
 
 #![allow(dead_code)]
 
+pub mod d4;
+
 use receipts_e2e::CoreReviewSink;
 use receipts_orchestration::orchestration::{CoreAdmissionIdentity, CoreStateWriter};
 use receipts_review_integration::runtime::FailureClass;

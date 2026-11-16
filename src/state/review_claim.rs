@@ -720,6 +720,12 @@ impl SqliteStateRepository {
     ) -> Result<(bool, ReviewClaimRecordV1), StateError> {
         let (sample, timestamp) = sample(clock)?;
         graph::write_transaction(self.connection(), |conn| {
+            crate::workspace_recovery::guard_review(
+                conn,
+                &request.project_id,
+                &request.task_id,
+                request.subject_sha.as_deref(),
+            )?;
             if let Some(existing) = read_claim(conn, &request.project_id, &request.claim_id)? {
                 if existing.task_id != request.task_id
                     || existing.subject_sha != request.subject_sha
@@ -790,6 +796,12 @@ impl SqliteStateRepository {
         let (sample, timestamp) = sample(clock)?;
         let digest = request.seal_sha256();
         graph::write_transaction(self.connection(), |conn| {
+            crate::workspace_recovery::guard_review(
+                conn,
+                &request.project_id,
+                &request.task_id,
+                request.subject_sha.as_deref(),
+            )?;
             let claim = read_claim(conn, &request.project_id, &request.claim_id)?
                 .ok_or_else(|| failure(Code::ClaimNotFound))?;
             if claim.task_id != request.task_id

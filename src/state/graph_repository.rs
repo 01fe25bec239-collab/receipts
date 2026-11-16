@@ -1549,12 +1549,38 @@ pub(crate) fn verify_v18(conn: &Connection, phase: Phase) -> Result<(), StateErr
     Ok(())
 }
 /// The supported current State schema head.
-pub(crate) const CURRENT_SCHEMA_HEAD: i64 = 26;
+pub(crate) const CURRENT_SCHEMA_HEAD: i64 = 28;
 
 /// Verifies the current ledger, including the remote workflow version barrier.
 pub(crate) fn verify_current(conn: &Connection, phase: Phase) -> Result<(), StateError> {
+    verify_v27_objects(conn, phase)?;
+    verify_ledger(conn, 28, phase)?;
+    if !migrations::v0028_workspace_recovery_progress::objects_match(conn)
+        .map_err(|e| schema_error(phase, e))?
+    {
+        return Err(failure(phase, Code::CorruptStore, None));
+    }
+    Ok(())
+}
+pub(crate) fn verify_v27(conn: &Connection, phase: Phase) -> Result<(), StateError> {
+    verify_v27_objects(conn, phase)?;
+    verify_ledger(conn, 27, phase)
+}
+fn verify_v27_objects(conn: &Connection, phase: Phase) -> Result<(), StateError> {
+    verify_v26_objects(conn, phase)?;
+    if !migrations::v0027_workspace_recovery::objects_match(conn)
+        .map_err(|e| schema_error(phase, e))?
+    {
+        return Err(failure(phase, Code::CorruptStore, None));
+    }
+    Ok(())
+}
+pub(crate) fn verify_v26(conn: &Connection, phase: Phase) -> Result<(), StateError> {
+    verify_v26_objects(conn, phase)?;
+    verify_ledger(conn, 26, phase)
+}
+fn verify_v26_objects(conn: &Connection, phase: Phase) -> Result<(), StateError> {
     verify_v24_objects(conn, phase)?;
-    verify_ledger(conn, 26, phase)?;
     if !migrations::v0025_remote_publication::objects_match(conn)
         .map_err(|e| schema_error(phase, e))?
     {

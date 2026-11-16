@@ -274,3 +274,8 @@ pub use remote_publication::{
     RemoteDeletionAuthorizationV1, RemotePublicationIntentV1, RemotePublicationOutcomeV1,
     RemotePublicationRecordV1, RemotePublicationResultV1, remote_endpoint_allowed,
 };
+
+pub mod workspace_recovery;
+pub use workspace_recovery::*;
+#[cfg(test)]
+mod workspace_recovery_tests;

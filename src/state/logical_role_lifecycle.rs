@@ -491,6 +491,7 @@ fn apply(
     next: Pointers,
     evidence: &RoleChangeEvidenceV1,
 ) -> Result<(), StateError> {
+    crate::workspace_recovery::guard_role(conn, &role.role_id)?;
     conn.execute(
         "INSERT INTO logical_role_history(role_id,project_id,sequence,change_kind,from_status,to_status,from_binding_id,to_binding_id,from_epoch,to_epoch,from_manifest_id,to_manifest_id,changed_at,reason) SELECT ?1,?2,COALESCE(MAX(sequence),0)+1,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13 FROM logical_role_history WHERE role_id=?1",
         params![

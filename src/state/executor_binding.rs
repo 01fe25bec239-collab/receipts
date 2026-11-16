@@ -431,6 +431,7 @@ WHERE binding_id = ?2 AND released_at IS NULL AND release_reason IS NULL";
 /// `binding_id` first, then role existence, then the same-role
 /// not-fully-released guard, then the INSERT itself.
 fn insert_executor_binding(conn: &Connection, binding: &ExecutorBinding) -> Result<(), StateError> {
+    crate::workspace_recovery::guard_role(conn, &binding.role_id)?;
     let duplicate: Option<i64> = conn
         .query_row(BINDING_EXISTS_SQL, [&binding.binding_id], |row| row.get(0))
         .optional()
@@ -563,6 +564,7 @@ pub(crate) fn apply_release(
     released_at: &str,
     release_reason: ReleaseReason,
 ) -> Result<(), StateError> {
+    crate::workspace_recovery::guard_binding(conn, binding_id)?;
     require_unreleased_binding(conn, binding_id)?;
     let changed = conn
         .execute(
@@ -593,6 +595,14 @@ pub(crate) fn apply_lease_renewal(
     binding_id: &str,
     lease_expires_at: &str,
 ) -> Result<(), StateError> {
+    crate::workspace_recovery::guard_binding(conn, binding_id)?;
+    // Enforce monotonicity at the shared mutation, including internal callers.
+    if let Some(old) = read_executor_binding(conn, binding_id)?
+        && crate::CanonicalTimestampV1::parse(lease_expires_at)?
+            <= crate::CanonicalTimestampV1::parse(&old.lease_expires_at)?
+    {
+        return Err(crate::workspace_recovery::stale_lease());
+    }
     require_unreleased_binding(conn, binding_id)?;
     let changed = conn
         .execute(RENEW_LEASE_SQL, params![lease_expires_at, binding_id])

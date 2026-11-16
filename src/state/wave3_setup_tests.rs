@@ -235,7 +235,7 @@ fn stale_foreign_conflicting_and_malformed_reservations_write_nothing() {
 
 #[test]
 fn every_reservation_write_failure_rolls_back_start_budget_and_reservation() {
-    for boundary in 1..=3 {
+    for boundary in 1..=4 {
         let (_dir, mut store) = seed();
         let (result, seen) = with_fault(Some(boundary), || {
             reserve(&mut store, &dispatch("d", "0"), &start(A, "n2"))
@@ -414,6 +414,7 @@ fn goal_definition_is_immutable_and_budget_domain_is_not_a_machine_integer() {
 
 /// Historical migration fixtures remove successors before testing old heads.
 pub(crate) fn remove_v24(conn: &rusqlite::Connection) {
+    crate::workspace_recovery_tests::remove_v27(conn);
     conn.execute_batch("DROP TABLE IF EXISTS remote_publication_result; DROP TABLE IF EXISTS remote_publication_intent; DELETE FROM state_schema_version WHERE version>=25; DROP TABLE IF EXISTS attempt_finalization; DROP TABLE IF EXISTS goal_dispatch_resolution; DROP TABLE IF EXISTS goal_dispatch; DROP TABLE IF EXISTS goal_history; DELETE FROM state_schema_version WHERE version=24;").unwrap();
 }
 
@@ -437,7 +438,7 @@ fn v24_upgrade_is_forward_only_atomic_and_exactly_guarded() {
     conn.execute_batch("DROP TRIGGER fail24").unwrap();
     drop(conn);
     let (store, version) = TrustedCoreStore::migrate_exclusive(dir.db()).unwrap();
-    assert_eq!(version, 26);
+    assert_eq!(version, 28);
     assert!(
         store
             .reader()
@@ -447,7 +448,7 @@ fn v24_upgrade_is_forward_only_atomic_and_exactly_guarded() {
     );
     drop(store);
     let (mut store, version) = TrustedCoreStore::migrate_exclusive(dir.db()).unwrap();
-    assert_eq!(version, 26);
+    assert_eq!(version, 28);
     let conn = rusqlite::Connection::open(dir.db()).unwrap();
     for table in [
         "goal_history",

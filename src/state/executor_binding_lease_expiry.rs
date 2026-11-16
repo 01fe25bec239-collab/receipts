@@ -89,6 +89,7 @@ impl SqliteStateRepository {
         let (sample, timestamp) = validate_sample(clock.sample()?)?;
         ensure_identifier("binding_id", binding_id)?;
         self.run_serialized_transaction(|uow| {
+            crate::workspace_recovery::guard_binding(uow.tx(), binding_id)?;
             let binding = require_binding(uow.tx(), binding_id)?;
             let project_id = binding_project_id(uow.tx(), &binding)?;
             accept_sample(uow.tx(), &project_id, &sample, &timestamp)?;
