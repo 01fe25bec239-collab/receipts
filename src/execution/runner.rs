@@ -108,8 +108,11 @@ const SHELL_BASENAMES: [&str; 6] = ["sh", "bash", "zsh", "fish", "dash", "ksh"];
 /// the runner never busy-spins and never overshoots a deadline by more
 /// than one short poll.
 #[cfg(unix)]
-// Short Git commands must not each pay a 10 ms observation delay.
-const POLL_INTERVAL: Duration = Duration::from_millis(1);
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+// Fast commands should not pay the cleanup retry cadence for normal completion.
+#[cfg(unix)]
+const COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Strictly bounded window for verifying, after a forced group `SIGKILL`,
 /// that no attempt-owned member survives. Generous relative to SIGKILL
@@ -853,7 +856,7 @@ fn finish_readers_bounded(
                 window,
             ));
         }
-        std::thread::sleep(POLL_INTERVAL.min(remaining));
+        std::thread::sleep(COMPLETION_POLL_INTERVAL.min(remaining));
     }
 }
 
@@ -998,7 +1001,7 @@ fn await_owned_child_until(
         if remaining.is_zero() {
             return Ok(Awaited::DeadlineReached);
         }
-        std::thread::sleep(POLL_INTERVAL.min(remaining));
+        std::thread::sleep(COMPLETION_POLL_INTERVAL.min(remaining));
     }
 }
 
