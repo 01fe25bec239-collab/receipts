@@ -10,7 +10,10 @@ Ubuntu evidence remain distinct from any new Linux provider proof.
     python3 -B .github/scripts/runtime-live-preflight/openrouter.py
     python3 -B .github/scripts/runtime-live-preflight/test_openrouter.py -v
     python3 -B .github/scripts/wave3-qualification/test_openrouter_job.py -v
-    python3 -B .github/scripts/wave3-qualification/openrouter_job.py
+    GITHUB_WORKSPACE="$(pwd -P)" python3 -I .github/scripts/wave3-qualification/openrouter_job.py
+
+Run from the checkout root. The launcher requires the canonical absolute
+checkout path in `GITHUB_WORKSPACE` even when running offline.
 
 On a disposable Linux runner only, as root:
 
@@ -28,14 +31,12 @@ Runtime/Workspace custody self-checks and synthetic adapter tests remain needed.
 
 ## Manually dispatched bounded OpenRouter job
 
-`openrouter-live.workflow.yml` here is an inactive, complete workflow template.
-The shared `.github/scripts/security/workflow_policy.rb` currently rejects all
-secret-consuming jobs. Before activation A1 must approve the minimal shared
-write set: that policy's tightly scoped admission plus positive/refusal controls
-in its security selftest, and moving this template into `.github/workflows`.
-No Cargo manifest/lockfile, product interface, State schema, provider endpoint
-or probe change is required. This preparation does not edit shared policy.
-Do not activate by weakening the blanket check or hiding the secret expression.
+The live workflow candidate is `.github/workflows/wave3-openrouter-live.yml`.
+The security policy permits the secret reference only for that workflow
+at the exact reviewed workflow and executed-source digests. Every other
+secret-consuming workflow remains subject to the general refusal. The
+documentation template is retained as preparation history. A1 must verify
+the deployed environment settings and authorize the live run separately.
 
 Operator inputs before live execution: exact independently reviewed published
 SHA, an environment named `wave3-openrouter` restricted to the exact branch,
