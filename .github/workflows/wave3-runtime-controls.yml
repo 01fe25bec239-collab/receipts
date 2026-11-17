@@ -1,0 +1,26 @@
+name: Wave 3 Runtime credential-free controls
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  custody:
+    if: >-
+      github.repository == '01fe25bec239-collab/receipts' &&
+      github.ref == 'refs/heads/codex/wave3-live-qualification' && github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Synthetic custody and offline bounded HTTP controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 -B .github/scripts/runtime-live-preflight/test_openrouter.py -v
+          python3 -B .github/scripts/wave3-qualification/test_openrouter_job.py -v
+          python3 -B .github/scripts/wave3-qualification/openrouter_job.py
+          sudo -n env -i PATH=/usr/bin:/bin /usr/bin/python3 -I .github/scripts/wave3-qualification/custody.py
