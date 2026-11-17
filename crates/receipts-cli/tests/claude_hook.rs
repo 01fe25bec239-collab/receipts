@@ -239,6 +239,10 @@ fn observer_hooks_spool_exact_events_fail_open_and_never_touch_state() {
             .join("../..")
             .join(dir);
         for f in files(&root) {
+            // The trusted supervisor is a separate entry from the observer bridge.
+            if dir == "crates/receipts-cli/src" && f == "workspace_recovery.rs" {
+                continue;
+            }
             let text = std::fs::read_to_string(root.join(&f)).unwrap();
             for needle in ["receipts_state", "rusqlite", "TrustedCoreStore"] {
                 assert!(!text.contains(needle), "{dir}/{f} mentions {needle}");
