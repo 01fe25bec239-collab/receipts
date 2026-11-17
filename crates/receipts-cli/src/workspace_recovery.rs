@@ -940,24 +940,10 @@ mod platform {
             };
             let result = (|| {
                 while let Ok(request) = active.requests.try_recv() {
-                    let cp = self.capture(
-                        &active.id,
-                        WorkspaceCheckpointKind::PreTermination,
-                        &[
-                            ("stdout", request.output.stdout()),
-                            ("stderr", request.output.stderr()),
-                        ],
-                    );
-                    match cp {
-                        Ok(_) => {
-                            if !request.acknowledge() {
-                                return Err(error("cleanup acknowledgement expired"));
-                            }
-                        }
-                        Err(e) => {
-                            drop(request);
-                            return Err(e);
-                        }
+                    self.verify_root()?;
+                    persist_cleanup_snapshot(&self.root, &active.id, &request)?;
+                    if !request.acknowledge() {
+                        return Err(error("cleanup acknowledgement expired"));
                     }
                 }
                 if active.live.is_terminating_or_closed()
@@ -966,8 +952,10 @@ mod platform {
                 {
                     let terminal = active.live.wait_collect().map_err(error)?;
                     let evidence = terminal.cleanup_evidence_status();
-                    self.journal("COLLECTED",json!({"attempt":active.id,"cause":format!("{:?}",terminal.terminal_cause()),"cleanup_evidence":format!("{evidence:?}")}))?;
+                    let cause = format!("{:?}", terminal.terminal_cause());
                     active.terminal = Some(terminal);
+                    self.custody.verify()?;
+                    self.journal("COLLECTED",json!({"attempt":active.id,"cause":cause,"cleanup_evidence":format!("{evidence:?}")}))?;
                     if evidence != CleanupEvidenceStatus::Acknowledged {
                         return Err(error(
                             "owned process cleaned up without acknowledged evidence",
@@ -1422,6 +1410,34 @@ mod platform {
             "owned process cleanup collected; evidence/custody assurance unavailable",
         ))
     }
+    fn persist_cleanup_snapshot(
+        root: &Path,
+        attempt: &str,
+        request: &CleanupEvidenceRequest,
+    ) -> io::Result<()> {
+        let mut artifacts = Vec::new();
+        for (name, stream) in [
+            ("stdout", request.output.stdout()),
+            ("stderr", request.output.stderr()),
+        ] {
+            let mut bytes = stream.head().to_vec();
+            bytes.extend_from_slice(stream.tail());
+            let (digest, path) = receipts_workspace_execution::output_store::store_output(
+                &root.join("outputs"),
+                &bytes,
+            )?;
+            artifacts.push(json!({"stream":name,"digest":digest,"path":path}));
+        }
+        create(
+            &root.join(format!("cleanup-{attempt}")),
+            &serde_json::to_vec(&json!({
+                "attempt": attempt,
+                "reason": format!("{:?}", request.reason),
+                "artifacts": artifacts,
+            }))
+            .map_err(error)?,
+        )
+    }
     fn collect_locally(root: &Path, active: &mut Active) -> io::Result<()> {
         if active.terminal.is_some() {
             return Ok(());
@@ -1433,23 +1449,7 @@ mod platform {
                 .recv_timeout(CLEANUP_EVIDENCE_TIMEOUT + Duration::from_millis(100))
             {
                 Ok(request) => {
-                    let persisted = (|| {
-                        let mut artifacts = Vec::new();
-                        for (name, stream) in [
-                            ("stdout", request.output.stdout()),
-                            ("stderr", request.output.stderr()),
-                        ] {
-                            let mut bytes = stream.head().to_vec();
-                            bytes.extend_from_slice(stream.tail());
-                            let (digest, path) =
-                                receipts_workspace_execution::output_store::store_output(
-                                    &root.join("outputs"),
-                                    &bytes,
-                                )?;
-                            artifacts.push(json!({"stream":name,"digest":digest,"path":path}));
-                        }
-                        create(&root.join(format!("cleanup-{}",active.id)),&serde_json::to_vec(&json!({"attempt":active.id,"reason":format!("{:?}",request.reason),"artifacts":artifacts})).map_err(error)?)
-                    })();
+                    let persisted = persist_cleanup_snapshot(root, &active.id, &request);
                     match persisted {
                         Ok(()) => {
                             if request.acknowledge() {

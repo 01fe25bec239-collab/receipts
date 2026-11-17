@@ -149,8 +149,11 @@ already matches is resolved through readback without repeating the action.
 Recovery never writes a successful finish or acceptance for the discarded attempt.
 
 The supervisor services the cleanup acknowledgement barrier for automatic
-completion/timeout and uses bounded local acknowledgement during explicit
-recovery or shutdown. Failed evidence preserves owned-process emergency cleanup
+completion/timeout and uses the same durable local snapshot path during explicit
+recovery or shutdown. It fsyncs the attempt-bound stdout/stderr artifacts and
+receipt before acknowledging. Full Git checkpoints remain at launch,
+finalization and recovery boundaries, outside the one-second cleanup snapshot
+window; recovery action guards still require fresh acknowledged State evidence. Failed evidence preserves owned-process emergency cleanup
 and reports assurance separately. An unresolved admission, failed assurance or
 lost supervisor retains quarantine/reservations; no stale marker is removed to
 permit adoption. Existing protected custody is refused before provisioning.

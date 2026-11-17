@@ -1372,3 +1372,36 @@ fn bootstrap_incomplete_startup_keeps_owner_deadline_and_reaps() {
         start.elapsed().as_millis()
     );
 }
+
+#[test]
+fn automatic_cleanup_persists_the_attempt_snapshot_before_acknowledgement() {
+    use sha2::{Digest, Sha256};
+    let mut f = Fixture::new();
+    f.launch(ACCEPTED, "1", "accept");
+    let status = f.settled();
+    assert_eq!(status["attempt"]["cleanup_evidence"], "Acknowledged");
+    let receipt: Value = serde_json::from_slice(
+        &fs::read(f.control().join(format!("supervisor/cleanup-{ACCEPTED}"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["attempt"], ACCEPTED);
+    assert_eq!(receipt["reason"], "NaturalCompletion");
+    assert_eq!(receipt["artifacts"].as_array().unwrap().len(), 2);
+    for artifact in receipt["artifacts"].as_array().unwrap() {
+        let bytes = fs::read(artifact["path"].as_str().unwrap()).unwrap();
+        let digest = Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        assert_eq!(artifact["digest"], digest);
+        if artifact["stream"] == "stdout" {
+            assert!(
+                String::from_utf8(bytes)
+                    .unwrap()
+                    .contains("test result: ok")
+            );
+        }
+    }
+    f.client.finalize().unwrap();
+    f.stop();
+}
