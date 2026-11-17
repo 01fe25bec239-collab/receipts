@@ -71,12 +71,17 @@ jobs:
         run: cargo check --workspace --locked
 
       # The latency contract requires a quiet host: run this test alone,
-      # then run every other test with the suite's normal concurrency.
+      # then run the remaining tests with the suite's normal concurrency.
       - name: Worktree creation under 500 ms
         run: cargo test -p receipts-workspace-execution --lib --locked worktree_create::tests::completes_under_500ms_on_small_repo -- --exact --nocapture
 
+      # Real Git + State persistence must meet the one-second cleanup budget.
+      # Exercise it without competing fixture I/O, retaining workspace features.
+      - name: State-backed cleanup acknowledgement
+        run: cargo test --workspace --lib --locked persisted_attempt_tests::actual_state_sink_reopens_checkpoint_and_bound_output_metadata -- --exact --nocapture
+
       - name: cargo test
-        run: cargo test --workspace --locked -- --skip worktree_create::tests::completes_under_500ms_on_small_repo
+        run: cargo test --workspace --locked -- --skip worktree_create::tests::completes_under_500ms_on_small_repo --skip persisted_attempt_tests::actual_state_sink_reopens_checkpoint_and_bound_output_metadata
 
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
@@ -115,9 +120,14 @@ jobs:
           sw_vers
 
       # The latency contract requires a quiet host: run this test alone,
-      # then run every other test with the suite's normal concurrency.
+      # then run the remaining tests with the suite's normal concurrency.
       - name: Worktree creation under 500 ms
         run: cargo test -p receipts-workspace-execution --lib --locked worktree_create::tests::completes_under_500ms_on_small_repo -- --exact --nocapture
 
+      # Real Git + State persistence must meet the one-second cleanup budget.
+      # Exercise it without competing fixture I/O, retaining workspace features.
+      - name: State-backed cleanup acknowledgement
+        run: cargo test --workspace --lib --locked persisted_attempt_tests::actual_state_sink_reopens_checkpoint_and_bound_output_metadata -- --exact --nocapture
+
       - name: cargo test
-        run: cargo test --workspace --locked -- --skip worktree_create::tests::completes_under_500ms_on_small_repo
+        run: cargo test --workspace --locked -- --skip worktree_create::tests::completes_under_500ms_on_small_repo --skip persisted_attempt_tests::actual_state_sink_reopens_checkpoint_and_bound_output_metadata

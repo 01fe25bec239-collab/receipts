@@ -1313,6 +1313,7 @@ fn unproven_controller_cleanup_quarantines_release() {
     impl git::ControllerLaunch for Failing {
         fn customization(&self) -> Result<crate::execution::LaunchCustomization, String> {
             Ok(crate::execution::LaunchCustomization {
+                cleanup_evidence: None,
                 pre_exec: None,
                 containment: Some(Arc::new(Unprovable)),
             })

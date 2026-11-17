@@ -494,6 +494,7 @@ mod imp {
 
     fn customization(hook: Hook, cgroup: Cgroup) -> LaunchCustomization {
         LaunchCustomization {
+            cleanup_evidence: None,
             pre_exec: Some(Box::new(move || hook.apply())),
             containment: Some(Arc::new(cgroup)),
         }

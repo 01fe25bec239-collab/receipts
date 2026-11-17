@@ -6,9 +6,13 @@ rust-version = "1.97.1"
 publish = false
 license = "Apache-2.0"
 
-# Host-owned (D2) composition layer. This step adds only the admitted Host
-# probe/process composition; no product commands or binary yet.
+# Trusted Host and Workspace composition. Full goal commands remain out of scope.
 [dependencies]
 receipts-host-integration = { path = "../receipts-host-integration" }
 receipts-workspace-execution = { path = "../receipts-workspace-execution" }
 sha2 = "=0.11.0"
+receipts-orchestration = { path = "../receipts-orchestration" }
+receipts-review-integration = { path = "../receipts-review-integration" }
+receipts-state = { path = "../.." }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"

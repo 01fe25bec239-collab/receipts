@@ -72,6 +72,14 @@ mod protected_custody;
 mod protected_linux;
 pub mod provision;
 pub use plain_worktree::OwnedPlainWorktree;
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+pub mod recovery_custody;
 pub mod recovery_preparation;
 #[cfg(all(
     test,
@@ -168,6 +176,7 @@ pub use handle_wire::{
 pub use lifecycle::{
     WorkspaceAttempt, WorkspaceCheckpointLifecycleInput, WorkspaceCollectionFailure,
     WorkspaceLifecycleError, checkpoint_workspace, orphan_workspace, start_workspace_attempt,
+    start_workspace_attempt_with_cleanup_evidence,
 };
 pub use protected::{
     ControllerChannel, ControllerCredentials, ControllerOperation, ControllerRequest,

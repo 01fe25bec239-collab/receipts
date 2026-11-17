@@ -1005,6 +1005,14 @@ fn await_owned_child_until(
     }
 }
 
+/// Read-only eligibility check before requesting pre-signal durable evidence.
+#[cfg(unix)]
+pub(crate) fn owned_leader_exited(child: &Child) -> Result<bool, ExecutionError> {
+    observe_leader_without_reaping(child.id())
+        .map(|state| state == LeaderState::Exited)
+        .map_err(wait_failed)
+}
+
 /// One non-reaping completion probe with the accepted quiescence/reap boundary.
 #[cfg(unix)]
 pub(crate) fn try_complete_owned_child(

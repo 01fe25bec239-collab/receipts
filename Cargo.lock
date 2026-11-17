@@ -607,7 +607,12 @@ name = "receipts-cli"
 version = "0.1.0"
 dependencies = [
  "receipts-host-integration",
+ "receipts-orchestration",
+ "receipts-review-integration",
+ "receipts-state",
  "receipts-workspace-execution",
+ "serde",
+ "serde_json",
  "sha2",
 ]
 

@@ -1,4 +1,4 @@
-//! `receipts hook claude <Event>`: the only command in this build (W2).
+//! Host delivery plus the private, authenticated Workspace supervisor entry.
 //! The full product CLI is HI-W4-1. Hook JSON is read from stdin (bounded);
 //! only exact host-set variable names are read from the environment.
 
@@ -16,6 +16,37 @@ fn absolute(name: &str) -> Option<PathBuf> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let [command, root] = args.as_slice()
+        && command == "__workspace-supervisor"
+    {
+        #[cfg(any(
+            all(target_os = "macos", target_arch = "aarch64"),
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        ))]
+        match receipts_cli::workspace_recovery::run_internal_supervisor(std::path::Path::new(root))
+        {
+            Ok(()) => return,
+            Err(e) => {
+                eprintln!("receipts: {e}");
+                std::process::exit(1);
+            }
+        }
+        #[cfg(not(any(
+            all(target_os = "macos", target_arch = "aarch64"),
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )))]
+        {
+            let _ = root;
+            eprintln!("receipts: production recovery supervisor unsupported on this host");
+            std::process::exit(1);
+        }
+    }
     if let [command, directory, executable, project, plugin] = args.as_slice()
         && command == "codex-native-enroll"
     {

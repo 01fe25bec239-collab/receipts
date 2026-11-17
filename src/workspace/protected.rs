@@ -895,6 +895,7 @@ impl git::ControllerLaunch for SeamController {
             .create_controller_cgroup(&self.seam.root, &self.binding.attempt_id)?;
         (self.seam.reserved)(self.role, &dir);
         Ok(crate::execution::LaunchCustomization {
+            cleanup_evidence: None,
             pre_exec: None,
             containment: Some(Arc::new(SeamCgroup(dir))),
         })

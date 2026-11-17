@@ -1078,3 +1078,105 @@ fn context_role_succession_and_lease_families_succeed_and_refuse_through_the_cor
         .unwrap();
     assert_eq!(released.released_at.as_deref(), Some(at));
 }
+
+#[test]
+fn atomic_finalization_forwarder_resolves_the_stored_attempt_and_retains_state_validation() {
+    use receipts_state::{
+        AttemptFinish, AttemptId, AttemptRole, AttemptStart, CheckpointRecord,
+        FinalizationRecordV1, SetupWriteOutcomeV1,
+    };
+    let dir = Dir::new();
+    let mut writer = CoreStateWriter::open(dir.db(), identity("policy")).unwrap();
+    writer
+        .create_initial_graph(&Clock, genesis(COMPILER, "policy"))
+        .unwrap();
+    let id = AttemptId::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+    writer
+        .append_attempt_started(
+            AttemptStart::new(
+                id.clone(),
+                "p",
+                "g",
+                "n",
+                "1",
+                AttemptRole::RuntimeA3,
+                "runtime",
+                "workspace",
+                &"a".repeat(40),
+                "2026-11-08T10:00:00.000000000Z",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let cp = serde_json::json!({"checkpoint_id":"cp","workspace_id":"workspace","task_id":"n","attempt_id":id.as_str(),"kind":"PROGRESS","head_sha":"b".repeat(40),"base_sha":"a".repeat(40),"modified_files":[],"untracked_files":[],"executed_checks":[],"captured_at":"2026-11-08T10:00:00.000000000Z"});
+    writer
+        .append_checkpoint(CheckpointRecord::parse_json("p", &cp.to_string()).unwrap())
+        .unwrap();
+    let mut record = FinalizationRecordV1 {
+        project_id: "foreign".into(),
+        graph_id: "g".into(),
+        attempt_id: id.as_str().into(),
+        workspace_id: "workspace".into(),
+        checkpoint_id: "cp".into(),
+        final_sha: "b".repeat(40),
+        write_scope_verdict: "PASS".into(),
+        check_results: vec![],
+        output_refs: vec![],
+    };
+    let finish = AttemptFinish::new(
+        id.clone(),
+        "2026-11-08T10:00:00.000000000Z",
+        Some(&record.final_sha),
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(
+        writer
+            .finish_with_finalization_v1(&record, &finish)
+            .is_err()
+    );
+    assert!(
+        !writer
+            .reader()
+            .find_attempt(&id)
+            .unwrap()
+            .unwrap()
+            .is_finished()
+    );
+    record.project_id = "p".into();
+    assert_eq!(
+        writer
+            .finish_with_finalization_v1(&record, &finish)
+            .unwrap(),
+        SetupWriteOutcomeV1::Applied
+    );
+    assert_eq!(
+        writer
+            .finish_with_finalization_v1(&record, &finish)
+            .unwrap(),
+        SetupWriteOutcomeV1::Replayed
+    );
+    assert!(
+        writer
+            .reader()
+            .find_attempt(&id)
+            .unwrap()
+            .unwrap()
+            .is_finished()
+    );
+    drop(writer);
+    let unadmitted = CoreAdmissionIdentity::new(
+        GraphCompilerRefV1::parse(COMPILER).unwrap(),
+        "policy".into(),
+    )
+    .unwrap();
+    let mut writer = CoreStateWriter::open(dir.db(), unadmitted).unwrap();
+    assert!(matches!(
+        writer.finish_with_finalization_v1(&record, &finish),
+        Err(CoreStateWriteError::Policy(
+            CorePolicyRefusal::ProjectNotAdmitted
+        ))
+    ));
+    assert!(writer.reader().find_finalization_v1("p", &id).unwrap() == Some(record));
+}

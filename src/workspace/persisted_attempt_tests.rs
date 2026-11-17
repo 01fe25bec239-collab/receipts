@@ -54,7 +54,7 @@ fn exercise(
     cancel: bool,
     timeout: Duration,
     fail: Option<usize>,
-    pause: bool,
+    pause: Option<Duration>,
 ) -> (
     Result<PersistedAttemptOutcome<usize>, PersistedAttemptError>,
     Sink,
@@ -87,7 +87,7 @@ fn exercise(
     let mut sink = Sink {
         kinds: vec![],
         fail,
-        pause_pre_cancel: pause.then_some(Duration::from_millis(180)),
+        pause_pre_cancel: pause,
     };
     let result = run_persisted_attempt(
         PersistedAttemptRequest {
@@ -107,10 +107,10 @@ fn exercise(
 }
 #[test]
 fn start_interval_finish_and_explicit_cancel_are_persisted_in_order() {
-    let (result, sink) = exercise(false, Duration::from_secs(3), None, false);
+    let (result, sink) = exercise(false, Duration::from_secs(3), None, None);
     assert!(result.unwrap().terminal.success());
     assert!(sink.kinds.len() >= 3, "start, interval, finish");
-    let (result, sink) = exercise(true, Duration::from_secs(3), None, false);
+    let (result, sink) = exercise(true, Duration::from_secs(3), None, None);
     let result = result.unwrap();
     assert_eq!(
         result.cancellation,
@@ -123,8 +123,13 @@ fn start_interval_finish_and_explicit_cancel_are_persisted_in_order() {
     assert_eq!(sink.kinds, ["PROGRESS", "PRE_TERMINATION", "PROGRESS"]);
 }
 #[test]
-fn timeout_wins_while_persistence_runs_and_failure_preserves_bounded_cleanup() {
-    let (result, sink) = exercise(true, Duration::from_millis(70), None, true);
+fn automatic_timeout_waits_for_evidence_and_failure_preserves_bounded_cleanup() {
+    let (result, sink) = exercise(
+        false,
+        Duration::from_millis(70),
+        None,
+        Some(Duration::from_millis(180)),
+    );
     let result = result.unwrap();
     assert_eq!(
         result.terminal.terminal_cause(),
@@ -137,8 +142,22 @@ fn timeout_wins_while_persistence_runs_and_failure_preserves_bounded_cleanup() {
     assert!(sink.kinds.contains(&"PRE_TERMINATION".into()));
     for fail in [1, 2, 3] {
         let started = std::time::Instant::now();
-        let (result, sink) = exercise(true, Duration::from_secs(3), Some(fail), false);
-        assert!(matches!(result, Err(PersistedAttemptError::Checkpoint(_))));
+        let (result, sink) = exercise(true, Duration::from_secs(3), Some(fail), None);
+        match (fail, result) {
+            (1, Err(PersistedAttemptError::Checkpoint(_))) => {}
+            (_, Err(PersistedAttemptError::EvidenceFailure { source, cleanup })) => {
+                assert!(matches!(*source, PersistedAttemptError::Checkpoint(_)));
+                let terminal = cleanup.expect("evidence failure must preserve observed cleanup");
+                assert!(!terminal.success());
+                if fail == 2 {
+                    assert_eq!(
+                        terminal.cleanup_evidence_status(),
+                        crate::execution::CleanupEvidenceStatus::Failed
+                    );
+                }
+            }
+            (_, _) => panic!("unexpected persistence failure at write {fail}"),
+        }
         assert_eq!(sink.kinds.len(), fail);
         assert!(started.elapsed() < Duration::from_secs(3));
     }
@@ -251,7 +270,7 @@ fn actual_state_sink_reopens_checkpoint_and_bound_output_metadata() {
     .unwrap();
     let mut sink = crate::TrustedAttemptEvidenceSinkV1::new(&mut store);
     let refs = ["stdout", "stderr", "dirty-diff"]
-        .map(|name| format!("{id}:1:{name}"))
+        .map(|name| format!("{id}:2:{name}"))
         .to_vec();
     let foreign_finish = AttemptFinish::new(
         AttemptId::parse("01ARZ3NDEKTSV4RRFFQ69G5FAW").unwrap(),
@@ -303,7 +322,7 @@ fn actual_state_sink_reopens_checkpoint_and_bound_output_metadata() {
             .is_finished()
     );
     for name in ["stdout", "stderr", "dirty-diff"] {
-        let reference = format!("{id}:1:{name}");
+        let reference = format!("{id}:2:{name}");
         assert!(
             store
                 .reader()
@@ -315,7 +334,7 @@ fn actual_state_sink_reopens_checkpoint_and_bound_output_metadata() {
 }
 
 #[test]
-fn natural_completion_wins_prepared_cancel_during_slow_sink() {
+fn accepted_cancellation_survives_slow_cleanup_evidence_sink() {
     let repo = TestRepo::new("completion-race");
     let handle = WorkspaceProvisionRequest::new(
         repo.path(),
@@ -362,9 +381,9 @@ fn natural_completion_wins_prepared_cancel_during_slow_sink() {
     .unwrap();
     assert_eq!(
         outcome.terminal.terminal_cause(),
-        LiveProcessTerminalCause::Completed
+        LiveProcessTerminalCause::Cancelled
     );
-    assert_ne!(
+    assert_eq!(
         outcome.cancellation,
         Some(LiveProcessPreparedCancelAcceptance::CancelAccepted)
     );
@@ -420,8 +439,12 @@ fn failed_start_persistence_never_launches_child_and_interval_failure_cleans_up(
         .is_err()
     );
     assert!(!marker.exists());
-    let (result, sink) = exercise(false, Duration::from_secs(3), Some(2), false);
-    assert!(matches!(result, Err(PersistedAttemptError::Checkpoint(_))));
+    let (result, sink) = exercise(false, Duration::from_secs(3), Some(2), None);
+    assert!(matches!(
+        result,
+        Err(PersistedAttemptError::Checkpoint(_))
+            | Err(PersistedAttemptError::EvidenceFailure { .. })
+    ));
     assert_eq!(sink.kinds, ["PROGRESS", "PROGRESS"]);
 }
 
@@ -430,7 +453,7 @@ fn controller_fault_before_terminal_claim_returns_instead_of_polling_forever() {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         crate::execution::inject_collection_failure_for_test();
-        let (result, _) = exercise(false, Duration::from_secs(3), None, false);
+        let (result, _) = exercise(false, Duration::from_secs(3), None, None);
         tx.send(matches!(result, Err(PersistedAttemptError::Collection(_))))
             .unwrap();
     });
@@ -438,4 +461,47 @@ fn controller_fault_before_terminal_claim_returns_instead_of_polling_forever() {
         rx.recv_timeout(Duration::from_secs(5))
             .expect("faulted controller must leave the polling loop")
     );
+}
+
+#[test]
+fn automatic_timeout_has_pretermination_evidence() {
+    let (result, sink) = exercise(false, Duration::from_millis(70), None, None);
+    assert_eq!(
+        result.unwrap().terminal.terminal_cause(),
+        LiveProcessTerminalCause::TimedOut
+    );
+    assert!(
+        sink.kinds.contains(&"PRE_TERMINATION".into()),
+        "automatic timeout must acknowledge evidence before signalling: {:?}",
+        sink.kinds
+    );
+}
+
+#[test]
+fn late_durable_evidence_is_an_assurance_failure_with_separate_cleanup() {
+    let (result, _) = exercise(
+        false,
+        Duration::from_millis(70),
+        None,
+        Some(Duration::from_millis(1500)),
+    );
+    match result {
+        Err(PersistedAttemptError::EvidenceFailure { source, cleanup }) => {
+            assert!(matches!(
+                *source,
+                PersistedAttemptError::CleanupAcknowledgementFailed
+            ));
+            let terminal = cleanup.expect("emergency cleanup must remain observable");
+            assert_eq!(
+                terminal.terminal_cause(),
+                LiveProcessTerminalCause::TimedOut
+            );
+            assert_eq!(
+                terminal.cleanup_evidence_status(),
+                crate::execution::CleanupEvidenceStatus::Failed
+            );
+            assert!(!terminal.success());
+        }
+        _ => panic!("late persistence must not claim pre-action evidence success"),
+    }
 }
