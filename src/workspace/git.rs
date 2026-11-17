@@ -65,10 +65,11 @@ static RESOLVED_GIT_EXECUTABLE: OnceLock<Option<PathBuf>> = OnceLock::new();
 /// still works when `PATH` is empty or missing. All are absolute and
 /// conventional for macOS/Linux hosts.
 const FALLBACK_GIT_LOCATIONS: [&str; 4] = [
+    // Prefer an installed current Git over older OS shims when PATH is absent.
+    "/opt/homebrew/bin/git",
+    "/usr/local/bin/git",
     "/usr/bin/git",
     "/bin/git",
-    "/usr/local/bin/git",
-    "/opt/homebrew/bin/git",
 ];
 
 /// Captured result of one completed Git invocation.

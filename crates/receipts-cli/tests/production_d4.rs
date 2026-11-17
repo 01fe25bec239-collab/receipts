@@ -54,6 +54,7 @@ fn git(root: &Path, args: &[&str]) -> String {
     );
     String::from_utf8(output.stdout).unwrap().trim().into()
 }
+#[track_caller]
 fn until(mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(15);
     while !condition() {
@@ -263,6 +264,7 @@ impl Fixture {
         let mut status = Value::Null;
         until(|| {
             status = self.client.inspect().unwrap();
+            assert!(status["assurance_failure"].is_null(), "{status}");
             status["attempt"]["collected"] == true
         });
         status
