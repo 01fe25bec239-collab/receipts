@@ -1,0 +1,57 @@
+# REVIEW TEMPLATE ONLY: workflow_policy.rb currently forbids secret-consuming jobs.
+# Activate in .github/workflows only after A1 settles that shared policy surface,
+# independent A3 review, USER publication and separate live-execution authority.
+name: Wave 3 bounded OpenRouter Linux HTTP
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  openrouter:
+    if: >-
+      github.repository == '01fe25bec239-collab/receipts' &&
+      github.ref == 'refs/heads/codex/wave3-live-qualification' && github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    environment: wave3-openrouter
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Provenance and credential-free preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          mkdir -m 700 "$RUNNER_TEMP/openrouter-evidence"
+          { git rev-parse HEAD 'HEAD^{tree}'; python3 --version; uname -sm; sha256sum .github/scripts/runtime-live-preflight/openrouter.py .github/scripts/wave3-qualification/openrouter_job.py; } > "$RUNNER_TEMP/openrouter-evidence/provenance.txt"
+          python3 -B .github/scripts/runtime-live-preflight/test_openrouter.py
+          python3 -B .github/scripts/wave3-qualification/test_openrouter_job.py
+          python3 -B .github/scripts/wave3-qualification/openrouter_job.py
+      - name: Exactly one bounded probe, secret scoped to this step
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          RECEIPTS_OPENROUTER_SMOKE: '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B .github/scripts/wave3-qualification/openrouter_job.py --live > "$RUNNER_TEMP/openrouter-evidence/result.txt"
+      - name: Seal sanitized evidence including failed runs
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/openrouter-evidence"
+          sha256sum provenance.txt result.txt > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: wave3-openrouter-${{ github.run_id }}
+          retention-days: 3
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/openrouter-evidence/provenance.txt
+            ${{ runner.temp }}/openrouter-evidence/result.txt
+            ${{ runner.temp }}/openrouter-evidence/SHA256SUMS

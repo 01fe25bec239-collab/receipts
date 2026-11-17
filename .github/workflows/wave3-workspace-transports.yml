@@ -1,0 +1,56 @@
+name: Wave 3 owned Workspace transports
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  transports:
+    if: >-
+      github.repository == '01fe25bec239-collab/receipts' &&
+      github.ref == 'refs/heads/codex/wave3-live-qualification' && github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Prepare owned transport prerequisites
+        run: |
+          sudo -n apt-get update -qq
+          sudo -n apt-get install -y openssh-server openssl
+          sudo -n install -d -m 0755 /run/sshd
+      - name: Build exact merged-interface fixture unprivileged
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          mkdir -m 700 "$RUNNER_TEMP/qualification-evidence"
+          { git rev-parse HEAD 'HEAD^{tree}'; rustc --version; python3 --version; uname -sm; } > "$RUNNER_TEMP/qualification-evidence/provenance.txt"
+          {
+            /usr/bin/git --version
+            /usr/bin/openssl version
+            /usr/bin/ssh -V 2>&1
+            sha256sum /usr/sbin/sshd
+          } >> "$RUNNER_TEMP/qualification-evidence/provenance.txt"
+          cargo test --locked -p receipts-workspace-execution --lib --no-run --message-format=json > "$RUNNER_TEMP/build.jsonl"
+          python3 -c 'import json,os; rows=[json.loads(x) for x in open(os.environ["RUNNER_TEMP"]+"/build.jsonl")]; bins=[r["executable"] for r in rows if r.get("executable") and r.get("profile",{}).get("test")]; assert len(bins)==1; open(os.environ["RUNNER_TEMP"]+"/workspace-test-binary","w").write(bins[0])'
+      - name: Generated credentials only, TLS and pinned SSH through durable publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B .github/scripts/wave3-qualification/workspace.py "$(cat "$RUNNER_TEMP/workspace-test-binary")" > "$RUNNER_TEMP/qualification-evidence/result.txt"
+          sha256sum "$(cat "$RUNNER_TEMP/workspace-test-binary")" .github/scripts/wave3-qualification/workspace.py >> "$RUNNER_TEMP/qualification-evidence/provenance.txt"
+          cd "$RUNNER_TEMP/qualification-evidence"
+          sha256sum provenance.txt result.txt > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: wave3-workspace-transports-${{ github.run_id }}
+          retention-days: 3
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/qualification-evidence/provenance.txt
+            ${{ runner.temp }}/qualification-evidence/result.txt
+            ${{ runner.temp }}/qualification-evidence/SHA256SUMS

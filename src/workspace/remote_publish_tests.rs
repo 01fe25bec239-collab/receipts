@@ -1271,3 +1271,108 @@ fn uncertain_deletion_local_refusal(obstacle: &str) {
         receipts_state::SetupWriteOutcomeV1::Applied
     );
 }
+
+/// Invoked only by the owned loopback fixture; never accepts an external account.
+#[test]
+#[ignore = "requires generated TLS/SSH loopback fixture"]
+fn owned_network_qualification() {
+    use receipts_state::{RemotePublicationOutcomeV1 as O, TrustedCoreStore};
+    let root = std::path::PathBuf::from(std::env::var("RECEIPTS_TRANSPORT_FIXTURE").unwrap());
+    let endpoint = std::env::var("RECEIPTS_TRANSPORT_ENDPOINT").unwrap();
+    let kind = std::env::var("RECEIPTS_TRANSPORT_KIND").unwrap();
+    assert!(matches!(kind.as_str(), "https" | "ssh"));
+    assert!(endpoint.starts_with(&format!("{kind}://")));
+    assert!(endpoint.contains("127.0.0.1:"));
+    let source = TestRepo::new("owned-network");
+    git(source.path(), &["branch", "task/transport"]);
+    let sha = source.head_sha();
+    let (db, mut store) = transport_store(&source);
+    let mut request = PublicationRequest {
+        repository: source.path(),
+        remote: &endpoint,
+        branch: "task/transport",
+        commit: &sha,
+        wire: W::PushOnAccept,
+        mode: ProjectRemoteMode::PushAcceptedA3,
+        class: PublicationBranchClass::Task,
+        accepted_commit: Some(&sha),
+    };
+    let run = |store: &mut TrustedCoreStore,
+               request: &PublicationRequest<'_>,
+               operation,
+               config: &str| {
+        let config = root.join(format!("{kind}-{config}"));
+        let settings = TrustedTransportSettings {
+            git_config: &config,
+            home: Some(&root),
+            ssh_auth_sock: None,
+        };
+        let intent = transport_intent(&source, &endpoint, request.commit, operation);
+        let admission = publication_admission(store);
+        publish_durable_with_transport(
+            store,
+            admission,
+            &intent,
+            request,
+            &PublicationClock,
+            Some(&settings),
+        )
+        .unwrap()
+    };
+    // Failed identity/authentication readback must remain uncertain, never Published.
+    for config in ["bad-trust", "bad-auth"] {
+        assert_eq!(run(&mut store, &request, config, config), O::Uncertain);
+        let output = crate::test_support::git_raw(&root.join("repo.git"), &["show-ref", "--heads"]);
+        assert!(output.stdout.is_empty());
+    }
+    request.accepted_commit = None;
+    assert_eq!(run(&mut store, &request, "policy", "good"), O::Refused);
+    request.accepted_commit = Some(&sha);
+    assert_eq!(run(&mut store, &request, "publish", "good"), O::Published);
+    assert_eq!(
+        crate::test_support::stdout_trimmed(&git(
+            &root.join("repo.git"),
+            &["rev-parse", "refs/heads/task/transport"]
+        )),
+        sha
+    );
+    drop(store);
+    let mut store = TrustedCoreStore::open_exclusive(&db).unwrap();
+    assert_eq!(run(&mut store, &request, "publish", "good"), O::Published);
+    let history = store
+        .reader()
+        .read_remote_publication_v1("p", "publish")
+        .unwrap()
+        .unwrap();
+    assert_eq!(history.outcome(), O::Published);
+    assert!(
+        history
+            .results
+            .iter()
+            .any(|r| r.evidence_ref == "d12:exact-remote-readback")
+    );
+    // An unrelated root cannot overwrite the remote through the non-force path.
+    git(source.path(), &["checkout", "--orphan", "unrelated"]);
+    git(
+        source.path(),
+        &["commit", "--allow-empty", "-m", "unrelated"],
+    );
+    let unrelated = source.head_sha();
+    git(
+        source.path(),
+        &["update-ref", "refs/heads/task/transport", &unrelated],
+    );
+    request.commit = &unrelated;
+    request.accepted_commit = Some(&unrelated);
+    assert_eq!(
+        run(&mut store, &request, "non-fast-forward", "good"),
+        O::RemoteFailed
+    );
+    assert_eq!(
+        crate::test_support::stdout_trimmed(&git(
+            &root.join("repo.git"),
+            &["rev-parse", "refs/heads/task/transport"]
+        )),
+        sha
+    );
+}
