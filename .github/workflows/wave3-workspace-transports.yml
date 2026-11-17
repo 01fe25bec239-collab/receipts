@@ -28,6 +28,10 @@ jobs:
           test -z "$(git status --porcelain)"
           mkdir -m 700 "$RUNNER_TEMP/qualification-evidence"
           { git rev-parse HEAD 'HEAD^{tree}'; rustc --version; python3 --version; uname -sm; } > "$RUNNER_TEMP/qualification-evidence/provenance.txt"
+          /usr/bin/git --version >> "$RUNNER_TEMP/qualification-evidence/provenance.txt"
+          /usr/bin/openssl version >> "$RUNNER_TEMP/qualification-evidence/provenance.txt"
+          /usr/bin/ssh -V >> "$RUNNER_TEMP/qualification-evidence/provenance.txt" 2>&1
+          sha256sum /usr/sbin/sshd >> "$RUNNER_TEMP/qualification-evidence/provenance.txt"
           cargo test --locked -p receipts-workspace-execution --lib --no-run --message-format=json > "$RUNNER_TEMP/build.jsonl"
           python3 -c 'import json,os; rows=[json.loads(x) for x in open(os.environ["RUNNER_TEMP"]+"/build.jsonl")]; bins=[r["executable"] for r in rows if r.get("executable") and r.get("profile",{}).get("test")]; assert len(bins)==1; open(os.environ["RUNNER_TEMP"]+"/workspace-test-binary","w").write(bins[0])'
       - name: Generated credentials only, TLS and pinned SSH through durable publication
