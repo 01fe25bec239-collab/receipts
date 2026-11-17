@@ -188,6 +188,8 @@ check "submodule entries are unsupported content, not silently skipped" test "$r
 check "…reported as such" has "$T/gl/evidence/summary.md" "unsupported content"
 
 echo "== F11b workflow trust through YAML semantics =="
+check "exact OpenRouter admission and mutation/refusal controls" \
+  ruby "$here/openrouter_policy_controls.rb" "$here/workflow_policy.rb"
 bad_inline="$T/wf-bad"
 mkdir -p "$bad_inline"
 while IFS='|' read -r file phrases; do
