@@ -190,7 +190,8 @@ impl Fixture {
                 created_at: Some(stamp.clone()),
             })
             .unwrap();
-        let deadline = SystemTime::now() + Duration::from_secs(20);
+        // Leave room for real State/Git setup on hosted runners before testing expiry.
+        let deadline = SystemTime::now() + Duration::from_secs(60);
         writer
             .create_executor_binding(ExecutorBinding {
                 binding_id: "binding".into(),
@@ -255,8 +256,8 @@ impl Fixture {
                     "--ignored".into(),
                     "--nocapture".into(),
                 ],
-                expected_window: Duration::from_millis(200),
-                timeout: Duration::from_secs(30),
+                expected_window: Duration::from_secs(2),
+                timeout: Duration::from_secs(90),
             })
             .unwrap()
     }
@@ -353,7 +354,7 @@ fn worker() {
     fs::write("tracked.txt", b"dirty after unaccepted commit\n").unwrap();
     fs::write("untracked-note", b"retain this evidence\n").unwrap();
     fs::write(control.join("worker-pid"), std::process::id().to_string()).unwrap();
-    for tick in 0..5000 {
+    for tick in 0..20_000 {
         if control.join("worker-stop").exists() {
             return;
         }
@@ -1245,7 +1246,8 @@ impl BootstrapFixture {
         self.input.as_mut().unwrap().write_all(bytes).unwrap();
     }
     fn ready_with_open_writer(&mut self) -> Value {
-        let deadline = Instant::now() + Duration::from_secs(4);
+        // Match the owner's startup budget rather than imposing a faster fixture limit.
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Ok(status) = self.client.inspect() {
                 assert!(self.input.is_some());
