@@ -80,7 +80,7 @@ struct Fixture {
     deadline: SystemTime,
 }
 impl Fixture {
-    fn new() -> Self {
+    fn seeded() -> (Dir, SupervisorConfig, String, SystemTime) {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let root = fs::canonicalize("/tmp").unwrap().join(format!(
             "receipts-production-d4-{}-{}",
@@ -218,6 +218,11 @@ impl Fixture {
             )
             .unwrap();
         drop(writer);
+        (dir, config, base, deadline)
+    }
+    fn new() -> Self {
+        let (dir, config, base, deadline) = Self::seeded();
+        let root = dir.0.clone();
         let (child, client) = spawn_supervisor(
             Path::new(env!("CARGO_BIN_EXE_receipts")),
             &root.join("supervisor"),
@@ -1184,4 +1189,184 @@ fn concurrent_supervisor_startup_retains_independent_custody() {
             );
         });
     }
+}
+
+struct BootstrapFixture {
+    child: Child,
+    input: Option<std::process::ChildStdin>,
+    client: SupervisorClient,
+    config: SupervisorConfig,
+    dir: Dir,
+}
+impl BootstrapFixture {
+    const CAPABILITY: [u8; 32] = [0xa5; 32];
+    fn new() -> Self {
+        let (dir, config, _, _) = Fixture::seeded();
+        let root = dir.0.join("supervisor");
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        for (name, bytes) in [
+            ("config", serde_json::to_vec(&config).unwrap()),
+            ("capability", Self::CAPABILITY.to_vec()),
+        ] {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(root.join(name))
+                .unwrap();
+            file.write_all(&bytes).unwrap();
+            file.sync_all().unwrap();
+        }
+        let mut child = Command::new(env!("CARGO_BIN_EXE_receipts"))
+            .arg("__workspace-supervisor")
+            .arg(&root)
+            .env_clear()
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let input = child.stdin.take();
+        let client = SupervisorClient::connect(&root).unwrap();
+        Self {
+            child,
+            input,
+            client,
+            config,
+            dir,
+        }
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        use std::io::Write;
+        self.input.as_mut().unwrap().write_all(bytes).unwrap();
+    }
+    fn ready_with_open_writer(&mut self) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            if let Ok(status) = self.client.inspect() {
+                assert!(self.input.is_some());
+                assert!(self.child.try_wait().unwrap().is_none());
+                return status;
+            }
+            assert!(
+                self.child.try_wait().unwrap().is_none(),
+                "bootstrap exited before authenticated readiness"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "authenticated readiness must not await stdin EOF"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    fn refused(&mut self) {
+        until(|| self.child.try_wait().unwrap().is_some());
+        assert!(!self.child.wait().unwrap().success());
+        assert!(!self.dir.0.join("supervisor/started").exists());
+        assert!(!self.dir.0.join("supervisor/socket").exists());
+        assert!(!self.config.worktree.exists());
+    }
+}
+impl Drop for BootstrapFixture {
+    fn drop(&mut self) {
+        let writer_was_open = self.input.take().is_some();
+        let killed = if self.child.try_wait().is_ok_and(|s| s.is_none()) {
+            Some(self.child.kill().is_ok())
+        } else {
+            None
+        };
+        let reaped = self.child.wait().is_ok();
+        eprintln!(
+            "BOOTSTRAP_FIXTURE writer_was_open={writer_was_open} kill_requested={} reaped={reaped}",
+            killed.is_some()
+        );
+        if let Some(base) = std::env::var_os("D4_EVIDENCE_DIR") {
+            let base = PathBuf::from(base);
+            let _ = fs::create_dir_all(&base);
+            let _ = fs::write(
+                base.join(format!(
+                    "bootstrap-cleanup-{}-{}.json",
+                    std::process::id(),
+                    self.child.id()
+                )),
+                serde_json::to_vec(
+                    &json!({"writer_was_open":writer_was_open,"kill_ok":killed,"reaped":reaped}),
+                )
+                .unwrap(),
+            );
+        }
+    }
+}
+#[test]
+fn bootstrap_frame_readiness_does_not_wait_for_writer_eof() {
+    let mut f = BootstrapFixture::new();
+    f.write(&BootstrapFixture::CAPABILITY);
+    let status = f.ready_with_open_writer();
+    assert!(!status["incarnation"].as_str().unwrap().is_empty());
+    assert_eq!(status["head"], f.config.base);
+    f.client.stop().unwrap();
+    until(|| f.child.try_wait().unwrap().is_some());
+    assert!(f.child.wait().unwrap().success());
+}
+#[test]
+fn bootstrap_frame_trailing_bytes_are_never_another_command() {
+    let mut f = BootstrapFixture::new();
+    let mut bytes = BootstrapFixture::CAPABILITY.to_vec();
+    bytes.extend_from_slice(&serde_json::to_vec(&json!({"op":"Stop"})).unwrap());
+    f.write(&bytes);
+    let before = f.ready_with_open_writer();
+    f.write(&serde_json::to_vec(&json!({"op":"Recover","recovery":"untrusted-stdin"})).unwrap());
+    assert_eq!(
+        f.client.inspect().unwrap()["incarnation"],
+        before["incarnation"]
+    );
+    f.client.stop().unwrap();
+    until(|| f.child.try_wait().unwrap().is_some());
+    assert!(f.child.wait().unwrap().success());
+}
+#[test]
+fn bootstrap_frame_wrong_capability_and_short_frames_refuse_before_provisioning() {
+    let mut wrong = BootstrapFixture::new();
+    let mut token = BootstrapFixture::CAPABILITY;
+    token[0] ^= 1;
+    wrong.write(&token);
+    wrong.refused();
+    for length in [0, 31] {
+        let mut short = BootstrapFixture::new();
+        short.write(&BootstrapFixture::CAPABILITY[..length]);
+        drop(short.input.take());
+        short.refused();
+    }
+}
+#[test]
+fn bootstrap_incomplete_startup_keeps_owner_deadline_and_reaps() {
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, config, _, _) = Fixture::seeded();
+    let exe = dir.0.join("no-bootstrap.sh");
+    let pidfile = dir.0.join("owned-pid");
+    fs::write(
+        &exe,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nexec /bin/sleep 30\n",
+            pidfile.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&exe, fs::Permissions::from_mode(0o700)).unwrap();
+    let start = Instant::now();
+    let refused = spawn_supervisor(&exe, &dir.0.join("supervisor"), &config)
+        .err()
+        .unwrap();
+    assert!(refused.to_string().contains("startup deadline"));
+    assert!((Duration::from_secs(10)..Duration::from_secs(12)).contains(&start.elapsed()));
+    let pid = fs::read_to_string(pidfile).unwrap().parse().unwrap();
+    assert!(!alive(pid));
+    assert!(!dir.0.join("supervisor/started").exists());
+    assert!(!config.worktree.exists());
+    eprintln!(
+        "BOOTSTRAP_OWNER deadline_ms={} owned_child_absent=true",
+        start.elapsed().as_millis()
+    );
 }

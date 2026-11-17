@@ -1506,9 +1506,10 @@ mod platform {
         let capability: [u8; 32] = read_private(root, "capability", 32)?
             .try_into()
             .map_err(|_| error("invalid capability"))?;
-        let mut supplied = Vec::new();
-        std::io::stdin().take(33).read_to_end(&mut supplied)?;
-        if supplied.as_slice() != capability {
+        // One fixed capability frame; trailing stdin bytes are never commands.
+        let mut supplied = [0; 32];
+        std::io::stdin().read_exact(&mut supplied)?;
+        if supplied != capability {
             return Err(error("internal supervisor bootstrap refused"));
         }
         create(&root.join("started"), hash(&capability).as_bytes())?;

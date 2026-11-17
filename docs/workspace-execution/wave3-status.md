@@ -104,6 +104,13 @@ never adopts an existing workspace or reconstructs a process from a persisted
 PID. Original process ownership and pinned worktree/Git directories remain in
 the surviving supervisor when a controller exits or disconnects.
 
+Supervisor bootstrap is one fixed 32-byte capability frame, authenticated before
+provisioning. Readiness does not require stdin EOF. Trailing stdin bytes are
+outside that frame, remain unread, and must never be interpreted as another
+command. Commands continue to use the authenticated local socket. Incomplete
+bootstrap retains the existing ten-second owner deadline and owned-child
+kill/reap behavior.
+
 `SupervisorClient` implements Review's actual `ReviewRecordSink` over bounded,
 authenticated local frames. ReviewController and AcceptanceGate use this port;
 the supervisor claims, seals and publishes through Core, rebuilding State's
