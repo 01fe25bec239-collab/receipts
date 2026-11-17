@@ -76,9 +76,9 @@ jobs:
         run: cargo test -p receipts-workspace-execution --lib --locked worktree_create::tests::completes_under_500ms_on_small_repo -- --exact --nocapture
 
       # Real Git + State persistence must meet the one-second cleanup budget.
-      # Exercise that wall-clock contract without competing fixture I/O.
+      # Exercise it without competing fixture I/O, retaining workspace features.
       - name: State-backed cleanup acknowledgement
-        run: cargo test -p receipts-workspace-execution --lib --locked persisted_attempt_tests::actual_state_sink_reopens_checkpoint_and_bound_output_metadata -- --exact --nocapture
+        run: cargo test --workspace --lib --locked persisted_attempt_tests::actual_state_sink_reopens_checkpoint_and_bound_output_metadata -- --exact --nocapture
 
       - name: cargo test
         run: cargo test --workspace --locked -- --skip worktree_create::tests::completes_under_500ms_on_small_repo --skip persisted_attempt_tests::actual_state_sink_reopens_checkpoint_and_bound_output_metadata
@@ -125,9 +125,9 @@ jobs:
         run: cargo test -p receipts-workspace-execution --lib --locked worktree_create::tests::completes_under_500ms_on_small_repo -- --exact --nocapture
 
       # Real Git + State persistence must meet the one-second cleanup budget.
-      # Exercise that wall-clock contract without competing fixture I/O.
+      # Exercise it without competing fixture I/O, retaining workspace features.
       - name: State-backed cleanup acknowledgement
-        run: cargo test -p receipts-workspace-execution --lib --locked persisted_attempt_tests::actual_state_sink_reopens_checkpoint_and_bound_output_metadata -- --exact --nocapture
+        run: cargo test --workspace --lib --locked persisted_attempt_tests::actual_state_sink_reopens_checkpoint_and_bound_output_metadata -- --exact --nocapture
 
       - name: cargo test
         run: cargo test --workspace --locked -- --skip worktree_create::tests::completes_under_500ms_on_small_repo --skip persisted_attempt_tests::actual_state_sink_reopens_checkpoint_and_bound_output_metadata
