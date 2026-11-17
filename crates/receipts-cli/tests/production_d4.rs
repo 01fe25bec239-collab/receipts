@@ -1156,3 +1156,32 @@ fn unsupported_socket_path_refuses_before_workspace_provisioning() {
         .unwrap();
     assert!(!branch.status.success());
 }
+
+#[test]
+fn concurrent_supervisor_startup_retains_independent_custody() {
+    for round in 0..3 {
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            let mut threads = Vec::new();
+            for slot in 0..8 {
+                let barrier = &barrier;
+                threads.push(scope.spawn(move || {
+                    barrier.wait();
+                    let mut f = Fixture::new();
+                    let status = f.client.inspect().unwrap();
+                    assert!(!status["incarnation"].as_str().unwrap().is_empty());
+                    f.stop();
+                    eprintln!("CONCURRENT round={round} slot={slot} ready-and-reaped");
+                    status["incarnation"].as_str().unwrap().to_owned()
+                }));
+            }
+            let incarnations: std::collections::HashSet<_> =
+                threads.into_iter().map(|t| t.join().unwrap()).collect();
+            assert_eq!(
+                incarnations.len(),
+                8,
+                "each startup has independent custody"
+            );
+        });
+    }
+}
