@@ -94,22 +94,77 @@ and credential-free endpoint identities. See [the D12 contract](d12-remote-polic
 for trust requirements, replay behavior and controlled-fixture qualification
 limits. Historical SQL stays unchanged; v26 adds a version barrier against old writers.
 
-## D4 recovery refusal
+## Production D4 composition
 
-`orphan_sweep::detect_recovery_candidates` projects State's startup report of
-unfinished attempts, preserving exact identities and rejecting foreign reports.
-Unfinished attempts are candidates, not proven orphans: there is no admitted
-attempt-to-lease/expected-window association. The exact last-accepted target is
-required from trusted acceptance evidence; a recent checkpoint is insufficient.
-Missing/invalid targets refuse. Even a valid target always refuses signaling or
-reset while durable platform process identity and provisioning physical
-continuity are unavailable. The function neither alters attempts nor accepts
-partial work. No post-restart signal or destructive reset is implemented.
+The trusted launcher calls `receipts_cli::workspace_recovery::spawn_supervisor`.
+The binary's internal `__workspace-supervisor` entry authenticates a fresh,
+private bootstrap, opens the exclusive Core writer, provisions a new task
+workspace and persists provisioning identity before accepting commands. It
+never adopts an existing workspace or reconstructs a process from a persisted
+PID. Original process ownership and pinned worktree/Git directories remain in
+the surviving supervisor when a controller exits or disconnects.
 
-The Workspace cleanup acknowledgement increment above does not install
-production D4 composition. The existing surviving recovery supervisor remains
-a test-only fixture. Trusted acceptance/provisioning joins, attempt-bound handoff
-closure, durable production launch, controller restart, per-action State guards,
-physical reset/readback and durable recovery resolution remain open. CLI,
-manifest and lockfile integration is held for A1 disposition. Protected-custody
-quarantine and unsupported-host refusal remain unchanged.
+`SupervisorClient` implements Review's actual `ReviewRecordSink` over bounded,
+authenticated local frames. ReviewController and AcceptanceGate use this port;
+the supervisor claims, seals and publishes through Core, rebuilding State's
+stored seal. There is no receipts-e2e dependency. Mechanical finalization uses
+fresh owning terminal evidence and the exact persisted checkpoint, then Core's
+atomic finalization forwarder. Only an actually published ACCEPT for that
+finished attempt can bind the exact physical workspace, commit and tree.
+Publication without a matching physical anchor remains fail-closed.
+
+Launch writes durable intent, attempt start, recovery admission (once an accepted
+baseline exists), a start checkpoint and an attempt-bound Pending handoff before
+returning launch success. Failure after durable attempt registration quarantines
+further launch even if checkpoint storage is later restored. The supervisor holds
+the original process handle;
+worker output, a caller-supplied SHA and socket access alone are not recovery
+authority. Trusted closure records ClosedWithoutHandoff. Verified successful
+finalization records Eligible and cannot later be rewritten as closed.
+
+`prepare_recovery`, `prepare_reset` and `recover` support controller reconnect
+across durable prepared states. Recovery requires expired lease and execution
+window, closed handoff and current exclusive State action authority. A fresh
+State guard remains held through each recovery signal or physical reset and
+readback. Pre-action checkpoint/output evidence is acknowledged in State; while
+the action guard borrows the writer, cleanup output is fsynced locally before
+the process controller's acknowledgement. Verified cleanup precedes stable
+quiescent evidence. Post-reset evidence is persisted under the same exclusive
+writer before State atomically records resolution and releases reservations.
+Only then can stopping the supervisor release physical custody.
+
+Reset uses the State-bound last accepted target, never a recent checkpoint.
+HEAD and index tree must match, and physical tracked bytes and execute bits are
+compared with accepted blobs. Index stat caches and assume-unchanged flags cannot
+replace readback. All untracked and ignored paths are retained; obstructions
+refuse reset and retain prepared custody. A prepared reset whose physical result
+already matches is resolved through readback without repeating the action.
+Recovery never writes a successful finish or acceptance for the discarded attempt.
+
+The supervisor services the cleanup acknowledgement barrier for automatic
+completion/timeout and uses bounded local acknowledgement during explicit
+recovery or shutdown. Failed evidence preserves owned-process emergency cleanup
+and reports assurance separately. An unresolved admission, failed assurance or
+lost supervisor retains quarantine/reservations; no stale marker is removed to
+permit adoption. Existing protected custody is refused before provisioning.
+
+The startup `orphan_sweep` remains detection-only: an unfinished attempt or
+persisted PID cannot substitute for the surviving owner's original custody.
+Full goal commands and general product orchestration remain outside this entry.
+
+### Qualification limits
+
+Executed production-entry proof is local macOS arm64. The same supported Unix
+primitives compile for Linux x86_64/aarch64, but new Linux execution qualification
+is not claimed. Other hosts refuse the internal entry. Tracked symlinks and
+submodules are unsupported reset targets. Existing Git capture bounds apply
+(including the per-blob capture limit), and physical readback/preflight has an
+aggregate time budget between bounded Git operations. Oversize or ambiguous
+inputs refuse. Local socket path limits apply at startup before provisioning.
+
+This is Workspace isolation, not a security sandbox. Same-user hostile mutation
+is outside the existing Core/custody boundary; deployment must separate
+lower-trust principals from State and supervisor credentials. This plain-workspace
+path never adopts protected-custody workspaces or asserts protected-launch,
+live-provider or whole-platform confinement qualification. Existing stores must
+retain the supervisor clock contract; a different clock source is refused.

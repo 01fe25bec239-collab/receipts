@@ -466,6 +466,27 @@ impl CoreStateWriter {
         Ok(self.store.append_attempt_finished(admission, finish)?)
     }
 
+    /// Atomically retain the mechanical receipt and successful finish. State
+    /// revalidates the exact checkpoint, scope, checks and output references.
+    pub fn finish_with_finalization_v1(
+        &mut self,
+        record: &receipts_state::FinalizationRecordV1,
+        finish: &AttemptFinish,
+    ) -> Result<receipts_state::SetupWriteOutcomeV1, CoreStateWriteError> {
+        let attempt = self
+            .reader()
+            .find_attempt(finish.attempt_id())?
+            .ok_or(CorePolicyRefusal::UnknownSubject)?;
+        let admission = self.admit(
+            Op::Finalization,
+            attempt.project_id(),
+            Some(attempt.graph_id()),
+        )?;
+        Ok(self
+            .store
+            .finish_with_finalization_v1(admission, record, finish)?)
+    }
+
     pub fn append_checkpoint(
         &mut self,
         value: CheckpointRecord,

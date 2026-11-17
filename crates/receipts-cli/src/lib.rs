@@ -18,6 +18,7 @@
 //! execute-by-descriptor primitive the Workspace runner does not provide.
 
 pub mod hook;
+pub mod workspace_recovery;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

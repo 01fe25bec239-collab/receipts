@@ -72,6 +72,14 @@ mod protected_custody;
 mod protected_linux;
 pub mod provision;
 pub use plain_worktree::OwnedPlainWorktree;
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+pub mod recovery_custody;
 pub mod recovery_preparation;
 #[cfg(all(
     test,
