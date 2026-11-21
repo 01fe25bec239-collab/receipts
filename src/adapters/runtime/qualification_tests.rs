@@ -124,9 +124,26 @@ fn summary(dir: &Path, name: &str, pass: bool, cleanup: bool) {
     write_private(&dir.join(format!("{name}.summary")), line.as_bytes()).unwrap();
     print!("{line}");
 }
+pub(super) fn claude_rate_limited(protocol: &ClaudeStreamJson<'_>) -> bool {
+    protocol.records().iter().any(|record| {
+        let value = record.value();
+        match value["type"].as_str() {
+            Some("system") => {
+                value["subtype"] == "api_retry"
+                    && (value["error_status"].as_u64() == Some(429)
+                        || value["error"] == "rate_limit")
+            }
+            Some("rate_limit_event") => value["rate_limit_info"]["status"] == "rejected",
+            _ => false,
+        }
+    })
+}
+
 fn claude_value(result: &ClaudeAttemptResult, schema: bool, expected: &str) -> bool {
+    let protocol = result.outcome.protocol();
+    let rate_limited = protocol.as_ref().is_ok_and(claude_rate_limited);
     println!(
-        "provider={:?} protected={} reduced_isolation={}",
+        "provider={:?} protected={} reduced_isolation={} rate_limited={rate_limited}",
         result.provider_result(),
         result.protected(),
         result.reduced_isolation,
@@ -134,12 +151,13 @@ fn claude_value(result: &ClaudeAttemptResult, schema: bool, expected: &str) -> b
     if !result.outcome.process().success()
         || result.outcome.process().stderr().truncated()
         || result.failure().is_some()
+        || rate_limited
         || result.protected()
         || !result.reduced_isolation
     {
         return false;
     }
-    let Ok(protocol) = result.outcome.protocol() else {
+    let Ok(protocol) = protocol else {
         return false;
     };
     let Ok(parsed) = protocol.result() else {
@@ -167,6 +185,22 @@ fn claude_cases(exe: &Path, evidence: &Path, env: ChildEnvPolicy) -> bool {
     let f = Fixture::without_worker(Some("task"));
     let a = ClaudeAdapter::new(exe).with_env_policy(env);
     let mut outcomes = Vec::new();
+    run_claude_cases(&f, &a, evidence, &mut outcomes);
+    let root = f.root.clone();
+    drop(f);
+    let cleanup = matches!(root.try_exists(), Ok(false));
+    for &(name, ok) in &outcomes {
+        summary(evidence, name, ok, cleanup);
+    }
+    cleanup && outcomes.len() == 3 && outcomes.iter().all(|(_, ok)| *ok)
+}
+
+fn run_claude_cases(
+    f: &Fixture,
+    a: &ClaudeAdapter,
+    evidence: &Path,
+    outcomes: &mut Vec<(&'static str, bool)>,
+) {
     // Plan mode is ordinary and reduced isolation; ask for a harmless read-only answer.
     let task = f.task_with_objective("Reply with exactly OK. Do not run commands or change files.");
     let p = policy(true);
@@ -178,6 +212,9 @@ fn claude_cases(exe: &Path, evidence: &Path, env: ChildEnvPolicy) -> bool {
             && claude_value(r, false, "OK")
     }) && unchanged(f.workspace.worktree_path(), f.workspace.base_sha().as_str());
     outcomes.push(("claude-plan", ok));
+    if !ok {
+        return;
+    }
     let mut p = policy(false);
     p.turn_budget = Some(2);
     p.structured_output_schema = Some(SCHEMA.into());
@@ -189,6 +226,9 @@ fn claude_cases(exe: &Path, evidence: &Path, env: ChildEnvPolicy) -> bool {
             && claude_value(r, true, "")
     }) && unchanged(f.workspace.worktree_path(), f.workspace.base_sha().as_str());
     outcomes.push(("claude-schema-turns", ok));
+    if !ok {
+        return;
+    }
     let task = f.task_with_objective("In this session, on your first response reply exactly FIRST. If this same request is resumed, reply exactly SECOND. Do not change files or run commands.");
     let mut p = policy(false);
     p.session_persistence = true;
@@ -221,18 +261,40 @@ fn claude_cases(exe: &Path, evidence: &Path, env: ChildEnvPolicy) -> bool {
     }
     resume_ok &= unchanged(f.workspace.worktree_path(), f.workspace.base_sha().as_str());
     outcomes.push(("claude-resume", resume_ok));
-    let root = f.root.clone();
-    drop(f);
-    let cleanup = matches!(root.try_exists(), Ok(false));
-    for &(name, ok) in &outcomes {
-        summary(evidence, name, ok, cleanup);
+}
+
+fn exact_write(actual: &str, command: &str) -> bool {
+    if actual == command {
+        return true;
     }
-    cleanup && outcomes.iter().all(|(_, ok)| *ok)
+    let mut parts = actual.splitn(3, ' ');
+    let (Some(shell), Some("-c" | "-lc"), Some(body)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let shell = shell
+        .strip_prefix("/bin/")
+        .or_else(|| shell.strip_prefix("/usr/bin/"));
+    if !matches!(shell, Some("bash" | "sh" | "dash" | "zsh")) {
+        return false;
+    }
+    // Codex displays the shell argv as a shell-quoted string. Compare full arguments without evaluating them.
+    body == format!("'{}'", command.replace('\'', "'\\''"))
+        || body
+            == format!(
+                "\"{}\"",
+                command
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('$', "\\$")
+                    .replace('`', "\\`")
+            )
 }
 
 /// A denied command is evidence only if the actual command execution record
 /// names the bounded write and reports a nonzero exit. Refusal to try is inconclusive.
-fn denied_write(bytes: &[u8], command: &str) -> bool {
+fn denied_write(bytes: &[u8], command: &str, target: &Path) -> bool {
+    let target = target.to_str().unwrap();
     bytes
         .split(|b| *b == b'\n')
         .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
@@ -241,11 +303,20 @@ fn denied_write(bytes: &[u8], command: &str) -> bool {
                 && v["item"]["type"] == "command_execution"
                 && v["item"]["command"]
                     .as_str()
-                    .is_some_and(|s| s.trim() == command)
+                    .is_some_and(|s| exact_write(s.trim(), command))
                 && v["item"]["exit_code"].as_i64().is_some_and(|n| n != 0)
                 && v["item"]["aggregated_output"].as_str().is_some_and(|s| {
-                    let s = s.to_ascii_lowercase();
-                    s.contains("permission denied") || s.contains("read-only file system")
+                    s.lines().any(|line| {
+                        let Some((subject, reason)) = line.rsplit_once(": ") else {
+                            return false;
+                        };
+                        let path = subject.rsplit(": ").next().unwrap_or(subject);
+                        (path == target || path.strip_prefix("cannot create ") == Some(target))
+                            && matches!(
+                                reason.trim().to_ascii_lowercase().as_str(),
+                                "permission denied" | "read-only file system"
+                            )
+                    })
                 })
         })
 }
@@ -278,7 +349,8 @@ fn codex_case(exe: &Path, evidence: &Path, env: ChildEnvPolicy) -> bool {
     let ws = review_ws.handle();
     let a = CodexAdapter::new(exe).with_env_policy(env);
     let p = policy(true).with_protected_launch(ProtectedLaunch::new(launcher, &f.repo));
-    let command = write_command(&ws.worktree_path().join("tracked.txt"));
+    let target = ws.worktree_path().join("tracked.txt");
+    let command = write_command(&target);
     let started = a.start(&review(ws.base_sha().as_str(), &command), ws, &p);
     let mut released = false;
     let mut ok = false;
@@ -299,7 +371,7 @@ fn codex_case(exe: &Path, evidence: &Path, env: ChildEnvPolicy) -> bool {
                 && r.protocol_termination() == CodexProtocolTermination::Completed
                 && !s.truncated()
                 && !process.stderr().truncated()
-                && denied_write(&[s.head(), s.tail()].concat(), &command)
+                && denied_write(&[s.head(), s.tail()].concat(), &command, &target)
                 && unchanged(ws.worktree_path(), ws.base_sha().as_str());
             println!(
                 "case=codex-protected-review protected={} protocol={:?} release={released}",
@@ -337,24 +409,48 @@ fn live_codex_protected_reviewer() {
 }
 #[test]
 fn refusal_requires_a_real_failed_target_command() {
+    let target = Path::new("/tmp/fixture/tracked.txt");
+    let command = &write_command(target);
     let event = |cmd: &str, exit| {
-        serde_json::json!({"type":"item.completed","item":{"type":"command_execution","command":cmd,"exit_code":exit,"aggregated_output":"Permission denied"}}).to_string()
+        serde_json::json!({"type":"item.completed","item":{"type":"command_execution","command":cmd,"exit_code":exit,"aggregated_output":"/bin/bash: line 1: /tmp/fixture/tracked.txt: Permission denied"}}).to_string()
     };
-    let command = &write_command(Path::new("/tmp/fixture/tracked.txt"));
+    let denied = |s: &str| denied_write(s.as_bytes(), command, target);
     assert_eq!(
         write_command(Path::new("/tmp/a'b")),
         "printf qualification-marker > '/tmp/a'\\''b'"
     );
-    assert!(denied_write(event(command, 1).as_bytes(), command));
-    assert!(!denied_write(event(command, 0).as_bytes(), command));
-    assert!(!denied_write(event("echo denied", 1).as_bytes(), command));
-    assert!(!denied_write(
-        event(&format!("echo {command}"), 1).as_bytes(),
-        command
+    assert!(denied(&event(command, 1)));
+    let wrapped = r#"/bin/bash -lc "printf qualification-marker > '/tmp/fixture/tracked.txt'""#;
+    assert!(denied(&event(wrapped, 1)));
+    assert!(denied(&event(wrapped, 1).replace(
+        "/bin/bash: line 1: /tmp/fixture/tracked.txt: Permission denied",
+        "/bin/sh: 1: cannot create /tmp/fixture/tracked.txt: Read-only file system",
+    )));
+    assert!(denied(&event(
+        &format!("/bin/sh -c '{}'", command.replace('\'', "'\\''")),
+        1
+    )));
+    assert!(!denied(&event(wrapped, 0)));
+    assert!(!denied(&event(&format!("{wrapped} extra"), 1)));
+    assert!(!denied(&event(
+        &wrapped.replace("/bin/bash", "/tmp/bash"),
+        1
+    )));
+    assert!(!denied(&event(
+        &wrapped.replace("tracked.txt", "other.txt"),
+        1
+    )));
+    assert!(!denied(&event(command, 0)));
+    assert!(!denied(&event("echo denied", 1)));
+    assert!(!denied(&event(&format!("echo {command}"), 1)));
+    assert!(!denied("refused"));
+    assert!(!denied(&event(wrapped, 1).replace(
+        "/bin/bash: line 1: /tmp/fixture/tracked.txt:",
+        "bwrap: unshare:"
+    )));
+    assert!(!denied(
+        &event(wrapped, 1).replace("Permission denied", "other error")
     ));
-    assert!(!denied_write(b"refused", command));
-    let no_permission = serde_json::json!({"type":"item.completed","item":{"type":"command_execution","command":command,"exit_code":1,"aggregated_output":"other error"}}).to_string();
-    assert!(!denied_write(no_permission.as_bytes(), command));
 }
 #[test]
 fn cleanup_control_and_private_create_new() {
@@ -448,11 +544,29 @@ esac
     fs::create_dir(&bad).unwrap();
     let env =
         ChildEnvPolicy::new(ChildEnvProvider::Claude, ChildEnvAuthMode::Subscription).unwrap();
-    assert!(!claude_cases(&exe, &bad, env));
-    for name in ["claude-plan", "claude-schema-turns", "claude-resume"] {
-        let summary = fs::read_to_string(bad.join(format!("{name}.summary"))).unwrap();
-        assert!(summary.contains("verdict=FAIL cleanup=true"));
-    }
+    assert!(!claude_cases(&exe, &bad, env.clone()));
+    let summary = fs::read_to_string(bad.join("claude-plan.summary")).unwrap();
+    assert!(summary.contains("verdict=FAIL cleanup=true"));
+    assert!(!bad.join("claude-schema-turns.summary").exists());
+    assert!(!bad.join("claude-resume.summary").exists());
+
+    let limited = root.join("rate-limit");
+    fs::create_dir(&limited).unwrap();
+    let rejected = r#"schema) printf '%s\n' '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected"}}'; printf"#;
+    let limited_script = script.replacen("schema) printf", rejected, 1);
+    fs::write(&exe, format!("#!/bin/sh\n{limited_script}")).unwrap();
+    assert!(!claude_cases(&exe, &limited, env));
+    assert!(
+        fs::read_to_string(limited.join("claude-plan.summary"))
+            .unwrap()
+            .contains("verdict=PASS cleanup=true")
+    );
+    assert!(
+        fs::read_to_string(limited.join("claude-schema-turns.summary"))
+            .unwrap()
+            .contains("verdict=FAIL cleanup=true")
+    );
+    assert!(!limited.join("claude-resume.summary").exists());
     assert!(clean(&root));
 }
 

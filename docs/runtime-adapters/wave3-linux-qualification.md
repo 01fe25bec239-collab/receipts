@@ -209,11 +209,11 @@ run_case() {
 
 run_case codex-ordinary 420s live_tests::live_codex_ordinary_success_and_cancel \
   HOME="$codex_home" CODEX_HOME="$codex_config" TMPDIR="$codex_tmp" \
-  RECEIPTS_LIVE_CODEX=1 RECEIPTS_LIVE_CODEX_EXE="$codex"
+  RECEIPTS_LIVE_CODEX=1 RECEIPTS_LIVE_CODEX_EXE="$codex" &&
 
 run_case claude-ordinary 420s live_tests::live_claude_ordinary_success_and_cancel \
   HOME="$claude_home" CLAUDE_CONFIG_DIR="$claude_config" TMPDIR="$claude_tmp" \
-  RECEIPTS_LIVE_CLAUDE=1 RECEIPTS_LIVE_CLAUDE_EXE="$claude"
+  RECEIPTS_LIVE_CLAUDE=1 RECEIPTS_LIVE_CLAUDE_EXE="$claude" &&
 
 run_case claude-qualification 1400s qualification_tests::live_claude_qualification \
   HOME="$claude_home" CLAUDE_CONFIG_DIR="$claude_config" TMPDIR="$claude_tmp" \
@@ -224,9 +224,14 @@ Require an outer exit of 0 and exactly one executed test for each invocation.
 The process cap per attempt is 180s plus 5s grace and Workspace's bounded
 cleanup checks. Ordinary L1 requires completed process, exit 0, valid success
 protocol, unchanged worktree and fixture removal. L2 uses a 30s first-event
-bound, then requires an actual record, accepted `UserRequested` cancellation
-and `USER_CANCELLED` classification with verified collection and removal.
+bound and requires a recognized Codex progress event or Claude initialization,
+accepted `UserRequested` cancellation and `USER_CANCELLED` classification with
+verified collection and removal.
 Intentional cancellation can end before a provider terminal result.
+The harness stops launching subcases after a failed verdict and retains the
+completed attempt's evidence. A Claude rate-limit retry or rejection fails
+the attempt even if the CLI later reports success. A failed invocation stops this
+command sequence. Preserve the output and review it before any further runs.
 
 Record Claude plan, schema/turn limit (exact schema and 1–2 turns) and
 FIRST/SECOND resume separately. The resume case also requires read-only and
@@ -302,8 +307,9 @@ run_case codex-protected 240s qualification_tests::live_codex_protected_reviewer
 ```
 
 Require collected protected launch and completed Codex JSONL with exit 0.
-The actual command execution record must name the exact bounded target write
-and report nonzero permission/read-only filesystem denial. A refusal to try,
+The actual command execution record must name the exact bounded target write,
+including when Codex displays it in supported shell argv, and report nonzero
+exit with a filesystem denial for that target. A refusal to try,
 unrelated error or unrecognized capture shape fails. Require custody release,
 then verify restored ownership, unchanged Git HEAD/status and the tracked
 bytes. Require fixture removal and observe the owned cgroup proven empty and

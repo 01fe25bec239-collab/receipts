@@ -18,7 +18,7 @@
 //! executables; they are harness evidence only, never provider evidence.
 use super::*;
 use crate::protected_launch_tests::{Fixture, block_on};
-use crate::qualification_tests::live_env;
+use crate::qualification_tests::{claude_rate_limited, live_env};
 use crate::registry::{DynAdapter, DynAttemptEvent, DynAttemptResult};
 use receipts_workspace_execution::execution::{
     CapturedStream, ChildEnvAuthMode, ChildEnvProvider, LiveProcessOutcome,
@@ -151,22 +151,28 @@ struct Observed {
     /// Claude `Success` result / Codex `Completed` protocol termination.
     provider_success: bool,
     provider_output_valid: bool,
+    rate_limited: bool,
     cancel: Option<CancelReason>,
     label: String,
 }
 fn observe(result: &DynAttemptResult) -> Result<(Observed, &LiveProcessOutcome), String> {
     let failure = result.failure();
-    let obs =
-        |p: &LiveProcessOutcome, provider_success, provider_output_valid, cancel, label| Observed {
-            cause: p.terminal_cause(),
-            exit: p.exit_code(),
-            forced_kill: p.forced_kill_required(),
-            failure,
-            provider_success,
-            provider_output_valid,
-            cancel,
-            label,
-        };
+    let obs = |p: &LiveProcessOutcome,
+               provider_success,
+               provider_output_valid,
+               rate_limited,
+               cancel,
+               label| Observed {
+        cause: p.terminal_cause(),
+        exit: p.exit_code(),
+        forced_kill: p.forced_kill_required(),
+        failure,
+        provider_success,
+        provider_output_valid,
+        rate_limited,
+        cancel,
+        label,
+    };
     if let Some(r) = result.downcast_ref::<Result<ClaudeAttemptResult, FailureClass>>() {
         let r = r
             .as_ref()
@@ -179,15 +185,19 @@ fn observe(result: &DynAttemptResult) -> Result<(Observed, &LiveProcessOutcome),
             r.reduced_isolation,
         );
         let success = provider == ClaudeProviderResult::Success;
-        let valid = r
-            .outcome
-            .protocol()
+        let protocol = r.outcome.protocol();
+        let rate_limited = protocol.as_ref().is_ok_and(claude_rate_limited);
+        let valid = protocol
+            .as_ref()
             .is_ok_and(|protocol| match protocol.result() {
                 Ok(result) => result.provider_result() == ClaudeProviderResult::Success,
                 Err(ClaudeResultError::MissingResult) => true,
                 Err(_) => false,
             });
-        return Ok((obs(p, success, valid, r.cancel_reason(), label), p));
+        return Ok((
+            obs(p, success, valid, rate_limited, r.cancel_reason(), label),
+            p,
+        ));
     }
     let r = result
         .downcast_ref::<Result<CodexAttemptResult, FailureClass>>()
@@ -205,7 +215,17 @@ fn observe(result: &DynAttemptResult) -> Result<(Observed, &LiveProcessOutcome),
                 .iter()
                 .any(|event| event.kind() == CodexJsonlEventKind::Error)
     });
-    Ok((obs(p, success, valid, r.cancel_reason(), label), p))
+    Ok((
+        obs(
+            p,
+            success,
+            valid,
+            failure == Some(FailureClass::RateLimited),
+            r.cancel_reason(),
+            label,
+        ),
+        p,
+    ))
 }
 
 /// Git inspection must itself succeed, and the scratch worktree must be clean
@@ -248,6 +268,7 @@ fn l1_verdict(o: &Observed) -> Result<(), String> {
         && !o.forced_kill
         && o.failure.is_none()
         && o.provider_success
+        && !o.rate_limited
         && o.cancel.is_none();
     ok.then_some(())
         .ok_or_else(|| format!("L1 not a success: {o:?}"))
@@ -256,6 +277,7 @@ fn l1_verdict(o: &Observed) -> Result<(), String> {
 fn l2_verdict(first_record: bool, o: &Observed) -> Result<(), String> {
     let ok = first_record
         && o.provider_output_valid
+        && !o.rate_limited
         && o.cancel == Some(CancelReason::UserRequested)
         && o.cause == LiveProcessTerminalCause::Cancelled
         && o.failure == Some(FailureClass::UserCancelled);
@@ -264,6 +286,25 @@ fn l2_verdict(first_record: bool, o: &Observed) -> Result<(), String> {
             "L2 not an accepted cancel after a first record (first_record={first_record}): {o:?}"
         )
     })
+}
+
+fn cancellation_progress(runtime: &str, record: &[u8]) -> bool {
+    if runtime == "codex" {
+        return crate::codex_jsonl::interpret_stdout(record).is_ok_and(|p| {
+            p.events().first().is_some_and(|event| {
+                matches!(
+                    event.kind(),
+                    CodexJsonlEventKind::ThreadStarted
+                        | CodexJsonlEventKind::TurnStarted
+                        | CodexJsonlEventKind::ItemStarted
+                        | CodexJsonlEventKind::ItemUpdated
+                        | CodexJsonlEventKind::ItemCompleted
+                )
+            })
+        });
+    }
+    serde_json::from_slice::<serde_json::Value>(record)
+        .is_ok_and(|event| event["type"] == "system" && event["subtype"] == "init")
 }
 
 struct Case<'a> {
@@ -314,7 +355,7 @@ impl Case<'_> {
                     .ok_or_else(|| "fixture retained".into())
             });
         let summary = format!(
-            "runtime={} case={case} cause={:?} exit={:?} forced_kill={} failure={:?} cancel={:?} first_record={first_record:?} provider_output_valid={} {} {stdout} {stderr} {blank} worktree={} cleanup={cleanup} verdict={}\n",
+            "runtime={} case={case} cause={:?} exit={:?} forced_kill={} failure={:?} cancel={:?} first_record={first_record:?} provider_output_valid={} rate_limited={} {} {stdout} {stderr} {blank} worktree={} cleanup={cleanup} verdict={}\n",
             self.runtime,
             o.cause,
             o.exit,
@@ -322,6 +363,7 @@ impl Case<'_> {
             o.failure,
             o.cancel,
             o.provider_output_valid,
+            o.rate_limited,
             o.label,
             git.map_or_else(|e| e, |()| "unchanged".into()),
             if verdict.is_ok() { "PASS" } else { "FAIL" },
@@ -362,7 +404,7 @@ impl Case<'_> {
             let mut stream = self.adapter.stream_events(&h).unwrap();
             let first = matches!(
                 block_on(stream.next_event()),
-                Some(DynAttemptEvent::Record(_))
+                Some(DynAttemptEvent::Record(record)) if cancellation_progress(self.adapter.runtime_id(), &record)
             );
             before_cancel(&mut stream);
             first
@@ -405,10 +447,8 @@ fn run(live: Live) {
         git: Path::new(GIT),
     };
     let policy = policy(Duration::from_secs(180));
-    // Both cases run (each at most once); either failure fails the test.
-    let l1 = case.l1(&policy);
-    let l2 = case.l2(&policy, |_| {});
-    assert!(l1.is_ok() && l2.is_ok(), "L1={l1:?} L2={l2:?}");
+    case.l1(&policy).expect("L1 failed; L2 was not launched");
+    case.l2(&policy, |_| {}).expect("L2 failed");
 }
 
 #[test]
@@ -436,6 +476,8 @@ fn live_codex_ordinary_success_and_cancel() {
 const CLAUDE_SUCCESS: &str =
     "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\"}";
 const CODEX_SUCCESS: &str = "{\"type\":\"thread.started\",\"thread_id\":\"t\"}\n{\"type\":\"turn.started\"}\n{\"type\":\"item.completed\",\"item\":{\"id\":\"i\",\"type\":\"agent_message\",\"text\":\"ok\"}}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"cached_input_tokens\":0,\"output_tokens\":1}}";
+const CLAUDE_START: &str = r#"{"type":"system","subtype":"init"}"#;
+const CODEX_START: &str = r#"{"type":"thread.started","thread_id":"t"}"#;
 
 /// Owned private scratch for one synthetic control: executable + evidence.
 struct Synthetic {
@@ -500,6 +542,11 @@ fn ordinary_auth_selection_reaches_both_adapters() {
         ),
     ] {
         let test = format!("live_tests::live_{provider}_ordinary_success_and_cancel");
+        let start = if provider == "codex" {
+            CODEX_START
+        } else {
+            CLAUDE_START
+        };
         for (selection, expected_key) in [
             (None, "absent"),
             (Some("subscription"), "absent"),
@@ -511,7 +558,7 @@ fn ordinary_auth_selection_reaches_both_adapters() {
                     "[ \"${{{own_key}-absent}}\" = '{expected_key}' ] && \
                      [ -z \"${{{other_key}+x}}\" ] || exit 9\n\
                      case \"$(/bin/cat)\" in\n\
-                     *'Count slowly'*) printf '%s\\n' '{{\"type\":\"system\"}}'; exec /bin/sleep 60;;\n\
+                     *'Count slowly'*) printf '%s\\n' '{start}'; exec /bin/sleep 60;;\n\
                      *) printf '%s\\n' '{result}';; esac\n"
                 ),
             );
@@ -537,6 +584,7 @@ fn ordinary_auth_selection_reaches_both_adapters() {
 fn synthetic_valid_success_and_cancel_pass_the_live_verdicts() {
     for codex in [false, true] {
         let line = if codex { CODEX_SUCCESS } else { CLAUDE_SUCCESS };
+        let start = if codex { CODEX_START } else { CLAUDE_START };
         let s = Synthetic::new(
             &format!("ok-{codex}"),
             &format!("/bin/cat >/dev/null\nprintf '%s\\n' '{line}'\n"),
@@ -546,12 +594,61 @@ fn synthetic_valid_success_and_cancel_pass_the_live_verdicts() {
         assert_eq!(case.l1(&policy(Duration::from_secs(30))), Ok(()));
         let c = Synthetic::new(
             &format!("cancel-{codex}"),
-            "/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"system\"}'\nexec /bin/sleep 60\n",
+            &format!("/bin/cat >/dev/null\nprintf '%s\\n' '{start}'\nexec /bin/sleep 60\n"),
         );
         let a = adapter(codex, &c.exe());
         let case = c.case(&a, Path::new(GIT));
         assert_eq!(case.l2(&policy(Duration::from_secs(30)), |_| {}), Ok(()));
     }
+}
+
+#[test]
+fn synthetic_cancel_refuses_unknown_codex_and_rate_limited_claude() {
+    for (codex, event) in [
+        (true, r#"{"type":"unrecognized"}"#),
+        (
+            false,
+            r#"{"type":"system","subtype":"api_retry","error":"rate_limit","error_status":429}"#,
+        ),
+    ] {
+        let s = Synthetic::new(
+            "cancel-without-progress",
+            &format!("/bin/cat >/dev/null\nprintf '%s\\n' '{event}'\nexec /bin/sleep 60\n"),
+        );
+        let a = adapter(codex, &s.exe());
+        let case = s.case(&a, Path::new(GIT));
+        assert!(case.l2(&policy(Duration::from_secs(30)), |_| {}).is_err());
+    }
+}
+
+#[test]
+fn synthetic_rate_limit_stops_before_the_next_attempt() {
+    let s = Synthetic::new(
+        "rate-limit-stop",
+        r#"if /bin/cat | /usr/bin/grep -q 'Count slowly'; then
+  printf '%s\n' '{"type":"system","subtype":"init"}'
+  exec /bin/sleep 60
+fi
+printf '%s\n' '{"type":"system","subtype":"api_retry","error":"rate_limit","error_status":429}' '{"type":"result","subtype":"success","is_error":false,"result":"OK"}'
+"#,
+    );
+    fs::set_permissions(&s.evidence, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .env_clear()
+        .env("RECEIPTS_LIVE_CLAUDE", "1")
+        .env("RECEIPTS_LIVE_CLAUDE_EXE", s.exe())
+        .env("RECEIPTS_LIVE_EVIDENCE_DIR", &s.evidence)
+        .args([
+            "live_tests::live_claude_ordinary_success_and_cancel",
+            "--ignored",
+            "--exact",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let summary = fs::read_to_string(s.evidence.join("claude-L1-success.summary")).unwrap();
+    assert!(summary.contains("rate_limited=true"));
+    assert!(!s.evidence.join("claude-L2-cancel.summary").exists());
 }
 
 #[test]
@@ -600,7 +697,10 @@ fn synthetic_false_successes_never_pass_the_live_verdicts() {
         // Cancellation after the worker already finished is not accepted.
         let s = Synthetic::new(
             &format!("late-cancel-{codex}"),
-            "/bin/cat >/dev/null\nprintf '%s\\n' '{\"type\":\"system\"}'\nexit 0\n",
+            &format!(
+                "/bin/cat >/dev/null\nprintf '%s\\n' '{}'\nexit 0\n",
+                if codex { CODEX_START } else { CLAUDE_START }
+            ),
         );
         let a = adapter(codex, &s.exe());
         assert!(
@@ -638,6 +738,7 @@ fn verdicts_require_the_promised_outcomes() {
         failure: None,
         provider_success: true,
         provider_output_valid: true,
+        rate_limited: false,
         cancel: None,
         label: String::new(),
     };
@@ -681,6 +782,7 @@ fn verdicts_require_the_promised_outcomes() {
         failure: Some(FailureClass::UserCancelled),
         provider_success: false,
         provider_output_valid: true,
+        rate_limited: false,
         cancel: Some(CancelReason::UserRequested),
         label: String::new(),
     };
