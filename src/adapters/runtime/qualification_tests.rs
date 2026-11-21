@@ -20,12 +20,14 @@ use std::{
 
 const SCHEMA: &str = r#"{"type":"object","properties":{"answer":{"type":"string","enum":["OK"]}},"required":["answer"],"additionalProperties":false}"#;
 const WRITE: &str = "printf qualification-marker > ";
+pub(super) const AUTH_MODE: &str = "RECEIPTS_LIVE_AUTH_MODE";
 
-fn live(flag: &str, exe: &str) -> (PathBuf, PathBuf) {
+fn live(flag: &str, exe: &str, provider: ChildEnvProvider) -> (PathBuf, PathBuf, ChildEnvPolicy) {
     assert!(
         std::env::var(flag).ok().as_deref() == Some("1"),
         "{flag} must be set to 1 for an explicitly selected qualification test"
     );
+    let env = live_env(provider, ChildEnvAuthMode::ApiKey);
     let executable = PathBuf::from(std::env::var_os(exe).expect("explicit executable"));
     let evidence =
         PathBuf::from(std::env::var_os("RECEIPTS_LIVE_EVIDENCE_DIR").expect("evidence directory"));
@@ -41,7 +43,7 @@ fn live(flag: &str, exe: &str) -> (PathBuf, PathBuf) {
         0,
         "private evidence directory required"
     );
-    (executable, evidence)
+    (executable, evidence, env)
 }
 fn policy(read_only: bool) -> RuntimeExecutionPolicy {
     RuntimeExecutionPolicy::new(
@@ -49,10 +51,16 @@ fn policy(read_only: bool) -> RuntimeExecutionPolicy {
         read_only,
     )
 }
-fn env(provider: ChildEnvProvider) -> ChildEnvPolicy {
-    let p = ChildEnvPolicy::new(provider, ChildEnvAuthMode::ApiKey).unwrap();
+pub(super) fn live_env(provider: ChildEnvProvider, default: ChildEnvAuthMode) -> ChildEnvPolicy {
+    let mode = match std::env::var_os(AUTH_MODE).as_deref() {
+        None => default,
+        Some(value) if value == "api-key" => ChildEnvAuthMode::ApiKey,
+        Some(value) if value == "subscription" => ChildEnvAuthMode::Subscription,
+        Some(_) => panic!("invalid {AUTH_MODE}: expected exactly api-key or subscription"),
+    };
+    let p = ChildEnvPolicy::new(provider, mode).unwrap();
     println!(
-        "admitted environment names: {:?}",
+        "auth_mode={mode:?} admitted environment names: {:?}",
         p.names().collect::<Vec<_>>()
     );
     p
@@ -77,7 +85,18 @@ fn capture(dir: &Path, name: &str, p: &LiveProcessOutcome) -> std::io::Result<()
             )?;
         }
     }
-    Ok(())
+    write_private(
+        &dir.join(format!("{name}.process")),
+        format!(
+            "cause={:?} exit={:?} forced_kill={} stdout_truncated={} stderr_truncated={}\n",
+            p.terminal_cause(),
+            p.exit_code(),
+            p.forced_kill_required(),
+            p.stdout().truncated(),
+            p.stderr().truncated(),
+        )
+        .as_bytes(),
+    )
 }
 fn unchanged(worktree: &Path, base: &str) -> bool {
     let git = |args: &[&str]| {
@@ -88,9 +107,10 @@ fn unchanged(worktree: &Path, base: &str) -> bool {
     };
     matches!(git(&["status", "--porcelain", "--untracked-files=all", "--ignored=matching"]), Ok(o) if o.status.success() && o.stdout.is_empty())
         && matches!(git(&["rev-parse", "HEAD"]), Ok(o) if o.status.success() && o.stdout.trim_ascii() == base.as_bytes())
+        && fs::read(worktree.join("tracked.txt")).is_ok_and(|bytes| bytes == b"original\n")
 }
 fn clean(root: &Path) -> bool {
-    fs::remove_dir_all(root).is_ok() && !root.exists()
+    fs::remove_dir_all(root).is_ok() && matches!(root.try_exists(), Ok(false))
 }
 fn cleanup_after_release(released: bool, root: &Path) -> bool {
     released && clean(root)
@@ -105,7 +125,14 @@ fn summary(dir: &Path, name: &str, pass: bool, cleanup: bool) {
     print!("{line}");
 }
 fn claude_value(result: &ClaudeAttemptResult, schema: bool, expected: &str) -> bool {
+    println!(
+        "provider={:?} protected={} reduced_isolation={}",
+        result.provider_result(),
+        result.protected(),
+        result.reduced_isolation,
+    );
     if !result.outcome.process().success()
+        || result.outcome.process().stderr().truncated()
         || result.failure().is_some()
         || result.protected()
         || !result.reduced_isolation
@@ -136,13 +163,9 @@ fn claude_value(result: &ClaudeAttemptResult, schema: bool, expected: &str) -> b
         parsed.text() == Some(expected)
     }
 }
-fn claude_cases(exe: &Path, evidence: &Path, env: Option<ChildEnvPolicy>) -> bool {
+fn claude_cases(exe: &Path, evidence: &Path, env: ChildEnvPolicy) -> bool {
     let f = Fixture::without_worker(Some("task"));
-    let a = ClaudeAdapter::new(exe);
-    let a = match env {
-        Some(env) => a.with_env_policy(env),
-        None => a,
-    };
+    let a = ClaudeAdapter::new(exe).with_env_policy(env);
     let mut outcomes = Vec::new();
     // Plan mode is ordinary and reduced isolation; ask for a harmless read-only answer.
     let task = f.task_with_objective("Reply with exactly OK. Do not run commands or change files.");
@@ -182,28 +205,25 @@ fn claude_cases(exe: &Path, evidence: &Path, env: Option<ChildEnvPolicy>) -> boo
                 a.resume_with_policy(&task, &f.workspace, &refused, ticket),
                 Err(FailureClass::PolicyBlocked)
             );
-            let resumed = a
-                .resume_with_policy(&task, &f.workspace, &p, ticket)
-                .and_then(|h| a.collect_result(&h));
-            let resumed_ok = resumed.as_ref().is_ok_and(|r| {
-                let saved = capture(evidence, "claude-resume-second", r.outcome.process()).is_ok();
-                saved && claude_value(r, false, "SECOND")
-            });
-            resume_ok = saved
-                && refused
-                && claude_value(r, false, "FIRST")
-                && resumed_ok
-                && matches!(
+            if saved && refused && claude_value(r, false, "FIRST") {
+                let resumed = a
+                    .resume_with_policy(&task, &f.workspace, &p, ticket)
+                    .and_then(|h| a.collect_result(&h));
+                resume_ok = resumed.as_ref().is_ok_and(|r| {
+                    capture(evidence, "claude-resume-second", r.outcome.process()).is_ok()
+                        && claude_value(r, false, "SECOND")
+                }) && matches!(
                     a.resume_with_policy(&task, &f.workspace, &p, ticket),
                     Err(FailureClass::PolicyBlocked)
                 );
+            }
         }
     }
     resume_ok &= unchanged(f.workspace.worktree_path(), f.workspace.base_sha().as_str());
     outcomes.push(("claude-resume", resume_ok));
     let root = f.root.clone();
     drop(f);
-    let cleanup = !root.exists();
+    let cleanup = matches!(root.try_exists(), Ok(false));
     for &(name, ok) in &outcomes {
         summary(evidence, name, ok, cleanup);
     }
@@ -242,9 +262,10 @@ fn review(sha: &str, command: &str) -> RuntimeCapsuleFamily {
     ).unwrap())
 }
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn codex_case(exe: &Path, evidence: &Path) -> bool {
+fn codex_case(exe: &Path, evidence: &Path, env: ChildEnvPolicy) -> bool {
     use crate::protected_launch_tests::launcher;
     use std::mem::ManuallyDrop;
+    let launcher = launcher();
     let f = ManuallyDrop::new(Fixture::without_worker(Some("task")));
     let review_ws = provision_review_workspace(&ReviewWorkspaceRequest {
         repository_root: f.repo.clone(),
@@ -255,8 +276,8 @@ fn codex_case(exe: &Path, evidence: &Path) -> bool {
     })
     .unwrap();
     let ws = review_ws.handle();
-    let a = CodexAdapter::new(exe).with_env_policy(env(ChildEnvProvider::Codex));
-    let p = policy(true).with_protected_launch(ProtectedLaunch::new(launcher(), &f.repo));
+    let a = CodexAdapter::new(exe).with_env_policy(env);
+    let p = policy(true).with_protected_launch(ProtectedLaunch::new(launcher, &f.repo));
     let command = write_command(&ws.worktree_path().join("tracked.txt"));
     let started = a.start(&review(ws.base_sha().as_str(), &command), ws, &p);
     let mut released = false;
@@ -268,16 +289,23 @@ fn codex_case(exe: &Path, evidence: &Path) -> bool {
             let process = r.outcome.process();
             let saved = capture(evidence, "codex-protected-review", process).is_ok();
             let s = process.stdout();
+            released = matches!(h.release_custody(), Some(Ok(())));
+            // Git inspection runs under the original owner after custody is restored.
             ok = saved
+                && released
+                && r.protected()
                 && process.success()
                 && r.failure().is_none()
                 && r.protocol_termination() == CodexProtocolTermination::Completed
                 && !s.truncated()
+                && !process.stderr().truncated()
                 && denied_write(&[s.head(), s.tail()].concat(), &command)
-                && unchanged(ws.worktree_path(), ws.base_sha().as_str())
-                && fs::read(ws.worktree_path().join("tracked.txt"))
-                    .is_ok_and(|v| v == b"original\n");
-            released = matches!(h.release_custody(), Some(Ok(())));
+                && unchanged(ws.worktree_path(), ws.base_sha().as_str());
+            println!(
+                "case=codex-protected-review protected={} protocol={:?} release={released}",
+                r.protected(),
+                r.protocol_termination()
+            );
         }
         drop(h);
     }
@@ -289,19 +317,23 @@ fn codex_case(exe: &Path, evidence: &Path) -> bool {
 #[test]
 #[ignore = "live provider; A1 context disposition required"]
 fn live_claude_qualification() {
-    let (exe, evidence) = live("RECEIPTS_QUALIFY_CLAUDE", "RECEIPTS_LIVE_CLAUDE_EXE");
-    assert!(claude_cases(
-        &exe,
-        &evidence,
-        Some(env(ChildEnvProvider::Claude))
-    ));
+    let (exe, evidence, env) = live(
+        "RECEIPTS_QUALIFY_CLAUDE",
+        "RECEIPTS_LIVE_CLAUDE_EXE",
+        ChildEnvProvider::Claude,
+    );
+    assert!(claude_cases(&exe, &evidence, env));
 }
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "live provider; disposable admitted Linux host and A1 disposition required"]
 fn live_codex_protected_reviewer() {
-    let (exe, evidence) = live("RECEIPTS_QUALIFY_CODEX", "RECEIPTS_LIVE_CODEX_EXE");
-    assert!(codex_case(&exe, &evidence));
+    let (exe, evidence, env) = live(
+        "RECEIPTS_QUALIFY_CODEX",
+        "RECEIPTS_LIVE_CODEX_EXE",
+        ChildEnvProvider::Codex,
+    );
+    assert!(codex_case(&exe, &evidence, env));
 }
 #[test]
 fn refusal_requires_a_real_failed_target_command() {
@@ -349,8 +381,7 @@ fn synthetic_claude_cases_and_failure_are_bounded() {
     let root = std::env::temp_dir().join(format!("ra-qualification-cli-{}", std::process::id()));
     fs::create_dir(&root).unwrap();
     let exe = root.join("claude");
-    fs::write(&exe, r##"#!/bin/sh
-[ -z "${ANTHROPIC_API_KEY+x}" ] || exit 9
+    let script = r##"
 if [ "$1" = --help ]; then
   printf 'Usage: claude\nOptions:\n  --max-turns <n>  limit\n  --resume <id>  resume\n  --json-schema <schema>  schema\n'
   exit 0
@@ -366,19 +397,58 @@ case "$mode" in
   *) case " $* " in *" --no-session-persistence "*) text=OK;; *) text=FIRST;; esac
      printf '{"type":"result","subtype":"success","is_error":false,"result":"%s","session_id":"12345678-1234-1234-1234-123456789abc"}\n' "$text";;
 esac
-"##).unwrap();
-    fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
-    let good = root.join("good");
-    fs::create_dir(&good).unwrap();
-    assert!(claude_cases(&exe, &good, None));
-    for name in ["claude-plan", "claude-schema-turns", "claude-resume"] {
-        let summary = fs::read_to_string(good.join(format!("{name}.summary"))).unwrap();
-        assert!(summary.contains("verdict=PASS cleanup=true"));
+"##;
+    for (selection, expected_key) in [
+        (None, "claude-sentinel"),
+        (Some("api-key"), "claude-sentinel"),
+        (Some("subscription"), "absent"),
+    ] {
+        fs::write(
+            &exe,
+            format!(
+                "#!/bin/sh\n[ \"${{ANTHROPIC_API_KEY-absent}}\" = '{expected_key}' ] && \
+                 [ -z \"${{OPENAI_API_KEY+x}}${{CODEX_HOME+x}}\" ] && \
+                 [ \"${{CLAUDE_CONFIG_DIR-absent}}\" = 'claude-config' ] || exit 9\n{script}"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+        let good = root.join(selection.unwrap_or("default"));
+        fs::create_dir(&good).unwrap();
+        fs::set_permissions(&good, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.env_clear()
+            .env("RECEIPTS_QUALIFY_CLAUDE", "1")
+            .env("RECEIPTS_LIVE_CLAUDE_EXE", &exe)
+            .env("RECEIPTS_LIVE_EVIDENCE_DIR", &good)
+            .env("ANTHROPIC_API_KEY", "claude-sentinel")
+            .env("OPENAI_API_KEY", "codex-sentinel")
+            .env("CLAUDE_CONFIG_DIR", "claude-config")
+            .env("CODEX_HOME", "codex-config")
+            .args([
+                "qualification_tests::live_claude_qualification",
+                "--ignored",
+                "--exact",
+            ]);
+        if let Some(selection) = selection {
+            cmd.env(AUTH_MODE, selection);
+        }
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "synthetic Claude {selection:?}: {out:?}"
+        );
+        for name in ["claude-plan", "claude-schema-turns", "claude-resume"] {
+            let summary = fs::read_to_string(good.join(format!("{name}.summary"))).unwrap();
+            assert!(summary.contains("verdict=PASS cleanup=true"));
+        }
     }
     fs::write(&exe, "#!/bin/sh\nexit 0\n").unwrap();
     let bad = root.join("bad");
     fs::create_dir(&bad).unwrap();
-    assert!(!claude_cases(&exe, &bad, None));
+    let env =
+        ChildEnvPolicy::new(ChildEnvProvider::Claude, ChildEnvAuthMode::Subscription).unwrap();
+    assert!(!claude_cases(&exe, &bad, env));
     for name in ["claude-plan", "claude-schema-turns", "claude-resume"] {
         let summary = fs::read_to_string(bad.join(format!("{name}.summary"))).unwrap();
         assert!(summary.contains("verdict=FAIL cleanup=true"));
@@ -413,24 +483,37 @@ fn review_fixture_is_bound_and_ordinary_launch_is_refused() {
 }
 
 #[test]
-fn explicit_qualification_requires_opt_in_before_provider_setup() {
+fn live_entry_points_require_opt_in_and_reject_invalid_selection() {
     let root = std::env::temp_dir().join(format!("ra-qualification-optin-{}", std::process::id()));
     fs::create_dir(&root).unwrap();
     let exe = root.join("provider");
-    fs::write(&exe, "#!/bin/sh\n/usr/bin/touch provider-started\n").unwrap();
+    let marker = root.join("provider-started");
+    fs::write(&exe, format!("#!/bin/sh\n{}\n", write_command(&marker))).unwrap();
     fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
-    let mut cases = vec![(
-        "qualification_tests::live_claude_qualification",
-        "RECEIPTS_QUALIFY_CLAUDE",
-        "RECEIPTS_LIVE_CLAUDE_EXE",
-    )];
-    if cfg!(target_os = "linux") {
-        cases.push((
+    let cases = [
+        (
+            "qualification_tests::live_claude_qualification",
+            "RECEIPTS_QUALIFY_CLAUDE",
+            "RECEIPTS_LIVE_CLAUDE_EXE",
+        ),
+        (
+            "live_tests::live_claude_ordinary_success_and_cancel",
+            "RECEIPTS_LIVE_CLAUDE",
+            "RECEIPTS_LIVE_CLAUDE_EXE",
+        ),
+        (
+            "live_tests::live_codex_ordinary_success_and_cancel",
+            "RECEIPTS_LIVE_CODEX",
+            "RECEIPTS_LIVE_CODEX_EXE",
+        ),
+        #[cfg(target_os = "linux")]
+        (
             "qualification_tests::live_codex_protected_reviewer",
             "RECEIPTS_QUALIFY_CODEX",
             "RECEIPTS_LIVE_CODEX_EXE",
-        ));
-    }
+        ),
+    ];
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
     for (test, flag, exe_var) in cases {
         for value in [None, Some("0"), Some("")] {
             for prepared in [false, true] {
@@ -457,6 +540,33 @@ fn explicit_qualification_requires_opt_in_before_provider_setup() {
                 );
                 assert!(!root.join("provider-started").exists());
             }
+        }
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+        for value in [
+            OsStr::new("api-key,subscription"),
+            OsStr::new("Subscription"),
+            OsStr::new(""),
+            OsStr::from_bytes(b"subscription\xff"),
+        ] {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .env_clear()
+                .env(flag, "1")
+                .env(exe_var, &exe)
+                .env("RECEIPTS_LIVE_EVIDENCE_DIR", &root)
+                .env(AUTH_MODE, value)
+                .args([test, "--ignored", "--exact", "--nocapture"])
+                .output()
+                .unwrap();
+            assert!(!out.status.success());
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains("invalid RECEIPTS_LIVE_AUTH_MODE"),
+                "{stderr}"
+            );
+            assert!(
+                !marker.exists(),
+                "{test}: invalid selector started the synthetic CLI"
+            );
         }
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .env_clear()

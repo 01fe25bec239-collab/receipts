@@ -1,7 +1,7 @@
 //! Prepared live-proof cases (docs/runtime-adapters/live-proof-plan.md).
 //!
 //! The two `live_*` tests are NOT RUN by any suite: each is `#[ignore]`d AND
-//! returns unless its explicit opt-in variable is exactly `1`. Running one
+//! refuses unless its explicit opt-in variable is exactly `1`. Running one
 //! executes a real provider CLI with the caller's existing login, so it
 //! requires A1's separate context disposition first. These use the ORDINARY,
 //! non-authoritative adapter path (protected launch is unavailable on Darwin);
@@ -18,9 +18,10 @@
 //! executables; they are harness evidence only, never provider evidence.
 use super::*;
 use crate::protected_launch_tests::{Fixture, block_on};
+use crate::qualification_tests::live_env;
 use crate::registry::{DynAdapter, DynAttemptEvent, DynAttemptResult};
 use receipts_workspace_execution::execution::{
-    CapturedStream, ChildEnvAuthMode, ChildEnvPolicy, ChildEnvProvider, LiveProcessOutcome,
+    CapturedStream, ChildEnvAuthMode, ChildEnvProvider, LiveProcessOutcome,
     LiveProcessTerminalCause, ProcessTimeoutPolicy,
 };
 use std::{
@@ -41,10 +42,11 @@ struct Live {
     executable: PathBuf,
     evidence: PathBuf,
 }
-fn opted_in(runtime: &'static str, flag: &str, exe: &str) -> Option<Live> {
-    if std::env::var(flag).ok().as_deref() != Some("1") {
-        return None;
-    }
+fn opted_in(runtime: &'static str, flag: &str, exe: &str) -> Live {
+    assert!(
+        std::env::var(flag).ok().as_deref() == Some("1"),
+        "{flag} must be set to 1 for an explicitly selected live test"
+    );
     let executable = PathBuf::from(std::env::var_os(exe).expect("explicit executable path"));
     let evidence =
         PathBuf::from(std::env::var_os("RECEIPTS_LIVE_EVIDENCE_DIR").expect("evidence dir"));
@@ -55,11 +57,16 @@ fn opted_in(runtime: &'static str, flag: &str, exe: &str) -> Option<Live> {
         !evidence_real.starts_with(repo.parent().unwrap().parent().unwrap()),
         "evidence must stay outside the repository"
     );
-    Some(Live {
+    assert_eq!(
+        fs::metadata(&evidence_real).unwrap().permissions().mode() & 0o077,
+        0,
+        "private evidence directory required"
+    );
+    Live {
         runtime,
         executable,
         evidence: evidence_real,
-    })
+    }
 }
 fn private_write(path: PathBuf, bytes: &[u8]) {
     fs::OpenOptions::new()
@@ -143,29 +150,44 @@ struct Observed {
     failure: Option<FailureClass>,
     /// Claude `Success` result / Codex `Completed` protocol termination.
     provider_success: bool,
+    provider_output_valid: bool,
     cancel: Option<CancelReason>,
     label: String,
 }
 fn observe(result: &DynAttemptResult) -> Result<(Observed, &LiveProcessOutcome), String> {
     let failure = result.failure();
-    let obs = |p: &LiveProcessOutcome, provider_success, cancel, label| Observed {
-        cause: p.terminal_cause(),
-        exit: p.exit_code(),
-        forced_kill: p.forced_kill_required(),
-        failure,
-        provider_success,
-        cancel,
-        label,
-    };
+    let obs =
+        |p: &LiveProcessOutcome, provider_success, provider_output_valid, cancel, label| Observed {
+            cause: p.terminal_cause(),
+            exit: p.exit_code(),
+            forced_kill: p.forced_kill_required(),
+            failure,
+            provider_success,
+            provider_output_valid,
+            cancel,
+            label,
+        };
     if let Some(r) = result.downcast_ref::<Result<ClaudeAttemptResult, FailureClass>>() {
         let r = r
             .as_ref()
             .map_err(|c| format!("collection failed: {c:?}"))?;
         let p = r.outcome.process();
         let provider = r.provider_result();
-        let label = format!("provider={provider:?} protected={}", r.protected());
+        let label = format!(
+            "provider={provider:?} protected={} reduced_isolation={}",
+            r.protected(),
+            r.reduced_isolation,
+        );
         let success = provider == ClaudeProviderResult::Success;
-        return Ok((obs(p, success, r.cancel_reason(), label), p));
+        let valid = r
+            .outcome
+            .protocol()
+            .is_ok_and(|protocol| match protocol.result() {
+                Ok(result) => result.provider_result() == ClaudeProviderResult::Success,
+                Err(ClaudeResultError::MissingResult) => true,
+                Err(_) => false,
+            });
+        return Ok((obs(p, success, valid, r.cancel_reason(), label), p));
     }
     let r = result
         .downcast_ref::<Result<CodexAttemptResult, FailureClass>>()
@@ -176,7 +198,14 @@ fn observe(result: &DynAttemptResult) -> Result<(Observed, &LiveProcessOutcome),
     let protocol = r.protocol_termination();
     let label = format!("protocol={protocol:?} protected={}", r.protected());
     let success = protocol == CodexProtocolTermination::Completed;
-    Ok((obs(p, success, r.cancel_reason(), label), p))
+    let valid = r.outcome.protocol().is_ok_and(|protocol| {
+        !protocol.turn_failed_observed()
+            && !protocol
+                .events()
+                .iter()
+                .any(|event| event.kind() == CodexJsonlEventKind::Error)
+    });
+    Ok((obs(p, success, valid, r.cancel_reason(), label), p))
 }
 
 /// Git inspection must itself succeed, and the scratch worktree must be clean
@@ -193,12 +222,22 @@ fn worktree_unchanged(git: &Path, f: &Fixture) -> Result<(), String> {
         }
         Ok(out.stdout)
     };
-    if !run(&["status", "--porcelain", "--untracked-files=all"])?.is_empty() {
+    if !run(&[
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+        "--ignored=matching",
+    ])?
+    .is_empty()
+    {
         return Err("worktree changed".into());
     }
     let head = run(&["rev-parse", "HEAD"])?;
     if head.trim_ascii() != f.workspace.base_sha().as_str().as_bytes() {
         return Err("worktree HEAD moved".into());
+    }
+    if !fs::read(f.path("tracked.txt")).is_ok_and(|bytes| bytes == b"original\n") {
+        return Err("tracked bytes changed or unavailable".into());
     }
     Ok(())
 }
@@ -213,9 +252,10 @@ fn l1_verdict(o: &Observed) -> Result<(), String> {
     ok.then_some(())
         .ok_or_else(|| format!("L1 not a success: {o:?}"))
 }
-/// The provider's own termination is NOT asserted for an intentional cancel.
+/// An intentional cancel may end before the provider reports a result.
 fn l2_verdict(first_record: bool, o: &Observed) -> Result<(), String> {
     let ok = first_record
+        && o.provider_output_valid
         && o.cancel == Some(CancelReason::UserRequested)
         && o.cause == LiveProcessTerminalCause::Cancelled
         && o.failure == Some(FailureClass::UserCancelled);
@@ -237,9 +277,9 @@ impl Case<'_> {
     fn finish(
         &self,
         case: &str,
-        f: &Fixture,
+        f: Fixture,
         result: &DynAttemptResult,
-        verdict: impl FnOnce(&Observed) -> Result<(), String>,
+        first_record: Option<bool>,
     ) -> Result<(), String> {
         let stem = format!("{}-{case}", self.runtime);
         let (o, process) = observe(result)?;
@@ -256,16 +296,32 @@ impl Case<'_> {
             ),
             BlankRecords::Unavailable => "stdout_blank_records=unavailable(truncated)".into(),
         };
-        let git = worktree_unchanged(self.git, f);
-        let verdict = verdict(&o).and(git.clone());
+        let git = worktree_unchanged(self.git, &f);
+        let root = f.root.clone();
+        drop(f);
+        let cleanup = matches!(root.try_exists(), Ok(false));
+        let verdict = first_record
+            .map_or_else(|| l1_verdict(&o), |first| l2_verdict(first, &o))
+            .and(git.clone())
+            .and_then(|()| {
+                (!process.stdout().truncated() && !process.stderr().truncated())
+                    .then_some(())
+                    .ok_or_else(|| "incomplete provider capture".into())
+            })
+            .and_then(|()| {
+                cleanup
+                    .then_some(())
+                    .ok_or_else(|| "fixture retained".into())
+            });
         let summary = format!(
-            "runtime={} case={case} cause={:?} exit={:?} forced_kill={} failure={:?} cancel={:?} {} {stdout} {stderr} {blank} worktree={} verdict={}\n",
+            "runtime={} case={case} cause={:?} exit={:?} forced_kill={} failure={:?} cancel={:?} first_record={first_record:?} provider_output_valid={} {} {stdout} {stderr} {blank} worktree={} cleanup={cleanup} verdict={}\n",
             self.runtime,
             o.cause,
             o.exit,
             o.forced_kill,
             o.failure,
             o.cancel,
+            o.provider_output_valid,
             o.label,
             git.map_or_else(|e| e, |()| "unchanged".into()),
             if verdict.is_ok() { "PASS" } else { "FAIL" },
@@ -279,14 +335,15 @@ impl Case<'_> {
     }
     /// L1: one bounded read-only success attempt.
     fn l1(&self, policy: &RuntimeExecutionPolicy) -> Result<(), String> {
-        let f = Fixture::new(Some("task"));
+        let f = Fixture::without_worker(Some("task"));
         let task = f.task_with_objective(SUCCESS_OBJECTIVE);
         let h = self
             .adapter
             .start(&task, &f.workspace, policy)
             .map_err(|c| format!("L1 start refused: {c:?}"))?;
         let result = self.adapter.collect_result(&h).unwrap();
-        self.finish("L1-success", &f, &result, l1_verdict)
+        drop(h);
+        self.finish("L1-success", f, &result, None)
     }
     /// L2: cancel with `UserRequested` after the first event (30 s wakeup cap).
     /// `before_cancel` is only for synthetic controls.
@@ -295,7 +352,7 @@ impl Case<'_> {
         policy: &RuntimeExecutionPolicy,
         before_cancel: impl FnOnce(&mut crate::registry::DynEventStream<'_>),
     ) -> Result<(), String> {
-        let f = Fixture::new(Some("task"));
+        let f = Fixture::without_worker(Some("task"));
         let task = f.task_with_objective(CANCEL_OBJECTIVE);
         let h = self
             .adapter
@@ -314,7 +371,8 @@ impl Case<'_> {
             .cancel(&h, &CancelReason::UserRequested)
             .unwrap();
         let result = self.adapter.collect_result(&h).unwrap();
-        self.finish("L2-cancel", &f, &result, |o| l2_verdict(first_record, o))
+        drop(h);
+        self.finish("L2-cancel", f, &result, Some(first_record))
     }
 }
 
@@ -324,11 +382,7 @@ fn adapter(codex: bool, executable: &Path) -> DynAdapter {
     } else {
         ChildEnvProvider::Claude
     };
-    let env = ChildEnvPolicy::new(provider, ChildEnvAuthMode::Subscription).unwrap();
-    println!(
-        "admitted environment NAMES: {:?}",
-        env.names().collect::<Vec<_>>()
-    );
+    let env = live_env(provider, ChildEnvAuthMode::Subscription);
     if codex {
         DynAdapter::new(CodexAdapter::new(executable).with_env_policy(env))
     } else {
@@ -360,17 +414,21 @@ fn run(live: Live) {
 #[test]
 #[ignore = "live provider CLI; requires A1 context disposition"]
 fn live_claude_ordinary_success_and_cancel() {
-    if let Some(live) = opted_in("claude", "RECEIPTS_LIVE_CLAUDE", "RECEIPTS_LIVE_CLAUDE_EXE") {
-        run(live);
-    }
+    run(opted_in(
+        "claude",
+        "RECEIPTS_LIVE_CLAUDE",
+        "RECEIPTS_LIVE_CLAUDE_EXE",
+    ));
 }
 
 #[test]
 #[ignore = "live provider CLI; requires A1 context disposition"]
 fn live_codex_ordinary_success_and_cancel() {
-    if let Some(live) = opted_in("codex", "RECEIPTS_LIVE_CODEX", "RECEIPTS_LIVE_CODEX_EXE") {
-        run(live);
-    }
+    run(opted_in(
+        "codex",
+        "RECEIPTS_LIVE_CODEX",
+        "RECEIPTS_LIVE_CODEX_EXE",
+    ));
 }
 
 // ---- synthetic harness controls (owned executables, never providers) ----
@@ -419,6 +477,60 @@ fn drain(stream: &mut crate::registry::DynEventStream<'_>) {
     while block_on(stream.next_event()).is_some() {}
     // Stdout EOF precedes the process becoming terminal by a moment.
     std::thread::sleep(Duration::from_millis(500));
+}
+
+#[test]
+fn ordinary_auth_selection_reaches_both_adapters() {
+    for (provider, flag, exe_var, result, own_key, other_key) in [
+        (
+            "claude",
+            "RECEIPTS_LIVE_CLAUDE",
+            "RECEIPTS_LIVE_CLAUDE_EXE",
+            CLAUDE_SUCCESS,
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+        ),
+        (
+            "codex",
+            "RECEIPTS_LIVE_CODEX",
+            "RECEIPTS_LIVE_CODEX_EXE",
+            CODEX_SUCCESS,
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+        ),
+    ] {
+        let test = format!("live_tests::live_{provider}_ordinary_success_and_cancel");
+        for (selection, expected_key) in [
+            (None, "absent"),
+            (Some("subscription"), "absent"),
+            (Some("api-key"), "selected-sentinel"),
+        ] {
+            let s = Synthetic::new(
+                &format!("auth-{provider}"),
+                &format!(
+                    "[ \"${{{own_key}-absent}}\" = '{expected_key}' ] && \
+                     [ -z \"${{{other_key}+x}}\" ] || exit 9\n\
+                     case \"$(/bin/cat)\" in\n\
+                     *'Count slowly'*) printf '%s\\n' '{{\"type\":\"system\"}}'; exec /bin/sleep 60;;\n\
+                     *) printf '%s\\n' '{result}';; esac\n"
+                ),
+            );
+            fs::set_permissions(&s.evidence, fs::Permissions::from_mode(0o700)).unwrap();
+            let mut cmd = Command::new(std::env::current_exe().unwrap());
+            cmd.env_clear()
+                .env(flag, "1")
+                .env(exe_var, s.exe())
+                .env("RECEIPTS_LIVE_EVIDENCE_DIR", &s.evidence)
+                .env(own_key, "selected-sentinel")
+                .env(other_key, "foreign-sentinel")
+                .args([&test, "--ignored", "--exact"]);
+            if let Some(selection) = selection {
+                cmd.env(crate::qualification_tests::AUTH_MODE, selection);
+            }
+            let out = cmd.output().unwrap();
+            assert!(out.status.success(), "{provider} {selection:?}: {out:?}");
+        }
+    }
 }
 
 #[test]
@@ -525,6 +637,7 @@ fn verdicts_require_the_promised_outcomes() {
         forced_kill: false,
         failure: None,
         provider_success: true,
+        provider_output_valid: true,
         cancel: None,
         label: String::new(),
     };
@@ -566,8 +679,8 @@ fn verdicts_require_the_promised_outcomes() {
         exit: None,
         forced_kill: false,
         failure: Some(FailureClass::UserCancelled),
-        // Provider termination of an intentional cancel is not asserted.
         provider_success: false,
+        provider_output_valid: true,
         cancel: Some(CancelReason::UserRequested),
         label: String::new(),
     };
@@ -588,6 +701,10 @@ fn verdicts_require_the_promised_outcomes() {
         },
         Observed {
             failure: None,
+            ..cancelled()
+        },
+        Observed {
+            provider_output_valid: false,
             ..cancelled()
         },
     ] {
@@ -641,4 +758,17 @@ fn truncated_capture_keeps_separate_fragments_and_no_blank_count() {
     assert!(summary.contains("stdout_total_bytes=1100001"));
     assert!(summary.contains("stdout_blank_records=unavailable(truncated)"));
     assert!(!summary.contains("stdout_records="));
+
+    let s = Synthetic::new(
+        "truncated-stderr",
+        &format!(
+            "/bin/cat >/dev/null\n/usr/bin/head -c 1100000 /dev/zero >&2\nprintf '%s\\n' '{CLAUDE_SUCCESS}'\n"
+        ),
+    );
+    let a = adapter(false, &s.exe());
+    let error = s
+        .case(&a, Path::new(GIT))
+        .l1(&policy(Duration::from_secs(30)))
+        .unwrap_err();
+    assert_eq!(error, "incomplete provider capture");
 }
