@@ -6,6 +6,8 @@ policy records Anthropic subscription credentials as disallowed for a
 third-party external worker, and an OpenAI consumer subscription as
 needs-review for a paid third-party external worker. Running a case is a
 compatibility observation in the dispositioned context, nothing more.
+For the personal local Linux context, use the current
+[Linux qualification checklist](wave3-linux-qualification.md).
 
 ## Executables (passive observation, 2026-11-12)
 
@@ -38,7 +40,7 @@ credential file, keychain item, token or value is inspected or copied.
 | L1-success | Trivial read-only capsule in a fresh scratch Git worktree: reply OK, change nothing | PASS only for `Completed`, exit 0, no forced kill, no failure class, Claude `Success` / Codex `Completed`, no cancellation, successful Git inspection and an unchanged worktree at its base revision |
 | L2-cancel | Long read-only capsule; cancel with `UserRequested` after the first event | PASS only when the first event is a record, the cancellation was accepted (`UserRequested` reason), the cause is `Cancelled` and the class `USER_CANCELLED`, with successful Git inspection and an unchanged worktree. The provider's own termination of an intentional cancel is recorded, not asserted |
 
-Both cases always run once and the test fails if either verdict fails, so a
+L2 runs once after a passing L1. The test fails if either attempted verdict fails, so a
 silent exit, an unknown or invalid result, a missing first record, an
 unaccepted cancellation or a failed Git inspection is never a pass. Owned
 synthetic executables exercise exactly these verdicts in the ordinary suite
@@ -86,8 +88,9 @@ leave any deletion to USER.
 
 ## Qualification cases (prepared, NOT RUN; 2026-11-12)
 
-These are additional to L1/L2. They use `ChildEnvAuthMode::ApiKey`, not the
-subscription environment above. A1 must disposition the exact provider,
+These are additional to L1/L2. The commands below use the qualification default
+of `ChildEnvAuthMode::ApiKey`. The Linux personal-use checklist explicitly
+selects Subscription under its own disposition. A1 must disposition the exact provider,
 account, model, API-key external-worker use and runner before execution.
 An Anthropic subscription is not an eligible substitute. The operator supplies
 `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` outside the evidence record; do not
