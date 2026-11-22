@@ -198,9 +198,21 @@ fn option_rows(text: &str) -> Option<std::collections::BTreeMap<&str, &str>> {
 
     lines.find(|line| *line == "Options:")?;
     let mut rows = std::collections::BTreeMap::new();
-    // The two-space declaration column excludes wrapped option descriptions.
+    let mut has_description_context = false;
     for line in lines.take_while(|line| *line != "Commands:") {
-        if line.trim().is_empty() || line.starts_with("   ") {
+        if line.trim().is_empty() {
+            has_description_context = false;
+            continue;
+        }
+        // Wrapped text belongs to a contiguous, validated declaration in this table.
+        if line.starts_with("   ") {
+            if !has_description_context
+                || line
+                    .trim_start_matches(' ')
+                    .starts_with(char::is_whitespace)
+            {
+                return None;
+            }
             continue;
         }
         let row = line.strip_prefix("  ")?;
@@ -244,6 +256,7 @@ fn option_rows(text: &str) -> Option<std::collections::BTreeMap<&str, &str>> {
                 return None;
             }
         }
+        has_description_context = true;
     }
     Some(rows)
 }
@@ -311,6 +324,36 @@ mod tests {
                 format!("{valid}  --resume, --max-turns <id>\n"),
                 "",
             ),
+            (
+                "unanchored resume",
+                "Usage: claude [options]\nOptions:\n   --resume\n  --resume [id]\n".into(),
+                "",
+            ),
+            (
+                "unanchored malformed turn cap",
+                "Usage: claude [options]\nOptions:\n   --max-turns <>x>\n  --bare\n  -p, --print\n".into(),
+                "",
+            ),
+            (
+                "leading blank lines do not anchor a continuation",
+                "Usage: claude [options]\nOptions:\n\n   \n   --resume\n  --resume [id]\n".into(),
+                "",
+            ),
+            (
+                "arguments do not anchor Options",
+                "Usage: claude [options] [prompt]\nArguments:\n  prompt\nOptions:\n   --resume\n  --resume [id]\n".into(),
+                "",
+            ),
+            (
+                "blank line ends the preceding declaration context",
+                format!("{valid}\n   --max-turns <>x>\n"),
+                "",
+            ),
+            (
+                "mixed indentation is not anchored prose",
+                format!("{valid}   \t--max-turns <>x>\n"),
+                "",
+            ),
         ];
         let mut unexpected = Vec::new();
         for (label, stdout, stderr) in cases {
@@ -332,7 +375,18 @@ mod tests {
 
     #[test]
     fn missing_ambiguous_or_prose_flags_never_admit_policy() {
-        let entries = policy_entries(b"Usage: claude\nOptions:\n  --max-turns <n>  limit turns\n  --resume <id>  resume\n  --other <x>  --json-schema <file>\n    --resume <id> in wrapped prose\nCommands:\n  --resume <id> in another section\n", b"", || panic!("no validation needed"));
+        let help = concat!(
+            "Usage: claude\nOptions:\n\n",
+            "  --max-turns <n>  limit turns\n",
+            "  --resume <id>  resume\n",
+            "  --other <x>  --json-schema <file>\n",
+            "    --resume <id> in wrapped prose\n\n",
+            "  --another\n",
+            "      --json-schema <file> in wrapped prose\n",
+            "      continued description\n",
+            "Commands:\n  --resume <id> in another section\n",
+        );
+        let entries = policy_entries(help.as_bytes(), b"", || panic!("no validation needed"));
         assert_eq!(
             entries.map(|(_, s)| s),
             [

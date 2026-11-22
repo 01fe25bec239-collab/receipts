@@ -995,6 +995,14 @@ fn unproven_policy_help_never_starts_worker_or_hidden_probe() {
             "resume",
             r"Usage: claude [options]\nOptions:\n  --resume <id>\n\nUsage: claude [options]\nOptions:\n  --resume\n",
         ),
+        (
+            "resume continuation",
+            r"Usage: claude [options]\nOptions:\n   --resume\n  --resume [id]\n",
+        ),
+        (
+            "turns continuation",
+            r"Usage: claude [options]\nOptions:\n   --max-turns <>x>\n  --bare\n  -p, --print\n",
+        ),
     ] {
         let f = Fixture::new("", "");
         fs::write(
@@ -1003,7 +1011,10 @@ fn unproven_policy_help_never_starts_worker_or_hidden_probe() {
                 r#"#!/bin/sh
 case "$1" in
   --help) printf '%b' '{help}'; exit 0;;
-  --bare) : > hidden; exit 9;;
+  --bare)
+    : > hidden
+    printf '%s\n' "error: option '--max-turns <turns>' argument 'receipts-invalid' is invalid. must be a number" >&2
+    exit 1;;
 esac
 : > worker
 /bin/cat >/dev/null
@@ -1012,8 +1023,8 @@ esac
         )
         .unwrap();
         let mut p = policy(false);
-        p.turn_budget = (label == "turns").then_some(2);
-        p.session_persistence = label == "resume";
+        p.turn_budget = label.starts_with("turns").then_some(2);
+        p.session_persistence = label.starts_with("resume");
         p.structured_output_schema = (label == "schema").then(|| r#"{"type":"object"}"#.into());
         let refused = matches!(
             f.adapter().start(&f.task(), &f.workspace, &p),
