@@ -980,6 +980,56 @@ fn native_turn_cap_and_conformance_refusal_controls() {
 }
 
 #[test]
+fn unproven_policy_help_never_starts_worker_or_hidden_probe() {
+    let mut admitted = Vec::new();
+    for (label, help) in [
+        (
+            "schema",
+            r"Usage: claude inspect [options]\nOptions:\n  --json-schema <schema>\n",
+        ),
+        (
+            "turns",
+            r"Usage: claude [options]\nOptions:\n  --bare\n  --print\n  --max-turns <>x>\n",
+        ),
+        (
+            "resume",
+            r"Usage: claude [options]\nOptions:\n  --resume <id>\n\nUsage: claude [options]\nOptions:\n  --resume\n",
+        ),
+    ] {
+        let f = Fixture::new("", "");
+        fs::write(
+            &f.executable,
+            format!(
+                r#"#!/bin/sh
+case "$1" in
+  --help) printf '%b' '{help}'; exit 0;;
+  --bare) : > hidden; exit 9;;
+esac
+: > worker
+/bin/cat >/dev/null
+"#
+            ),
+        )
+        .unwrap();
+        let mut p = policy(false);
+        p.turn_budget = (label == "turns").then_some(2);
+        p.session_persistence = label == "resume";
+        p.structured_output_schema = (label == "schema").then(|| r#"{"type":"object"}"#.into());
+        let refused = matches!(
+            f.adapter().start(&f.task(), &f.workspace, &p),
+            Err(FailureClass::PolicyBlocked)
+        );
+        if !refused
+            || f.workspace.worktree_path().join("worker").exists()
+            || f.workspace.worktree_path().join("hidden").exists()
+        {
+            admitted.push(label);
+        }
+    }
+    assert!(admitted.is_empty(), "{admitted:?}");
+}
+
+#[test]
 fn conformance_reports_isolation_failure_and_cancellation() {
     use crate::conformance::{ConformanceCase, run_conformance};
     let f = Fixture::new(RESULT, "");

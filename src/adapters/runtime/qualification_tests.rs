@@ -537,10 +537,19 @@ esac
         let case_script = match validation {
             None => script.to_owned(),
             Some(recognized) => {
-                let help = script.replace(
-                    r"  --max-turns <n>  limit\n",
-                    r"  --background  Background a session\n               --resume <id> in the background\n",
-                );
+                let help = script
+                    .replace(
+                        r"Usage: claude\nOptions:",
+                        r"Usage: claude [options] [command] [prompt]\n\nArguments:\n  prompt  The prompt\n\nOptions:",
+                    )
+                    .replace(
+                        r"  --max-turns <n>  limit\n",
+                        r"  --background  Background a session\n               --resume <id> in the background\n",
+                    )
+                    .replace(
+                        r"  --json-schema <schema>  schema\n",
+                        r"  --json-schema <schema>  schema\n\nCommands:\n  inspect  Display information\n",
+                    );
                 let response = if recognized {
                     r#"printf "%s\n" "error: option '--max-turns <turns>' argument 'receipts-invalid' is invalid. must be a number" >&2; exit 1"#
                 } else {

@@ -111,30 +111,41 @@ fn policy_entries(
     stderr: &[u8],
     hidden_turns: impl FnOnce() -> bool,
 ) -> [(&'static str, CapabilityStatus); 3] {
+    let unknown = FLAGS.map(|flag| (flag, CapabilityStatus::Unknown));
     let (Ok(stdout), Ok(stderr)) = (std::str::from_utf8(stdout), std::str::from_utf8(stderr))
     else {
-        return FLAGS.map(|flag| (flag, CapabilityStatus::Unknown));
+        return unknown;
     };
-    let rows: Vec<_> = [stdout, stderr].into_iter().flat_map(option_rows).collect();
-    let mut entries = FLAGS.map(|flag| {
-        let mut matches = rows.iter().filter(|(name, _)| *name == flag);
-        let supported = matches.next().is_some_and(|(_, value)| {
-            let required = value.strip_prefix('<').and_then(|v| v.strip_suffix('>'));
-            let optional = value.strip_prefix('[').and_then(|v| v.strip_suffix(']'));
-            required
-                .or(optional.filter(|_| flag == "--resume"))
-                .is_some_and(|v| !v.is_empty() && !v.contains(char::is_whitespace))
-        }) && matches.next().is_none();
-        (flag, status(supported))
-    });
+    let help = match (stdout.trim().is_empty(), stderr.trim().is_empty()) {
+        (false, true) => stdout,
+        (true, false) => stderr,
+        _ => return unknown,
+    };
+    let Some(rows) = option_rows(help) else {
+        return unknown;
+    };
+    for (name, prefix) in [
+        ("--max-turns", "<"),
+        ("--json-schema", "<"),
+        ("--resume", "<["),
+    ] {
+        if rows.get(name).is_some_and(|value| {
+            !value.starts_with(|c| prefix.contains(c)) || value.contains("...")
+        }) {
+            return unknown;
+        }
+    }
+    if ["--bare", "--print"]
+        .iter()
+        .any(|flag| rows.get(flag).is_some_and(|value| !value.is_empty()))
+    {
+        return unknown;
+    }
+    let mut entries = FLAGS.map(|flag| (flag, status(rows.contains_key(flag))));
     // Only absence can use the hidden-option check. Ambiguous declarations stay Unknown.
-    let unique_switch = |flag| {
-        let mut matches = rows.iter().filter(|(name, _)| *name == flag);
-        matches.next() == Some(&(flag, "")) && matches.next().is_none()
-    };
-    if !rows.iter().any(|(name, _)| *name == "--max-turns")
-        && unique_switch("--bare")
-        && unique_switch("--print")
+    if !rows.contains_key("--max-turns")
+        && rows.contains_key("--bare")
+        && rows.contains_key("--print")
         && hidden_turns()
     {
         entries[0].1 = CapabilityStatus::Supported;
@@ -152,24 +163,89 @@ fn status(supported: bool) -> CapabilityStatus {
 }
 
 #[cfg(any(unix, test))]
-fn option_rows(text: &str) -> impl Iterator<Item = (&str, &str)> {
+fn option_rows(text: &str) -> Option<std::collections::BTreeMap<&str, &str>> {
     let mut lines = text.lines();
-    let has_options = lines.any(|line| {
-        line.strip_prefix("Usage: ")
-            .is_some_and(|usage| usage.split_ascii_whitespace().next() == Some("claude"))
-    }) && lines.any(|line| line == "Options:");
-    // The two-space declaration column excludes wrapped option descriptions.
-    lines
-        .take_while(move |line| has_options && (line.is_empty() || line.starts_with(' ')))
-        .filter_map(|line| {
-            let row = line.strip_prefix("  ").filter(|row| row.starts_with('-'))?;
-            let declaration = row.split_once("  ").map_or(row, |(before, _)| before);
-            let declaration = declaration
-                .strip_prefix("-r, ")
-                .or_else(|| declaration.strip_prefix("-p, "))
-                .unwrap_or(declaration);
-            Some(declaration.split_once(' ').unwrap_or((declaration, "")))
+    if !matches!(
+        lines.find(|line| !line.trim().is_empty())?,
+        "Usage: claude"
+            | "Usage: claude [options]"
+            | "Usage: claude [options] [prompt]"
+            | "Usage: claude [options] [command] [prompt]"
+    ) {
+        return None;
+    }
+    // Check section order across the whole page, including after the option table.
+    let mut headings = lines
+        .clone()
+        .filter(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("Usage:")
+                || matches!(trimmed, "Arguments:" | "Options:" | "Commands:")
+                || (!line.starts_with(' ') && trimmed.ends_with(':'))
         })
+        .peekable();
+    if headings.peek() == Some(&"Arguments:") {
+        headings.next();
+    }
+    if headings.next() != Some("Options:")
+        || !matches!(
+            (headings.next(), headings.next()),
+            (None | Some("Commands:"), None)
+        )
+    {
+        return None;
+    }
+
+    lines.find(|line| *line == "Options:")?;
+    let mut rows = std::collections::BTreeMap::new();
+    // The two-space declaration column excludes wrapped option descriptions.
+    for line in lines.take_while(|line| *line != "Commands:") {
+        if line.trim().is_empty() || line.starts_with("   ") {
+            continue;
+        }
+        let row = line.strip_prefix("  ")?;
+        let declaration = row.split_once("  ").map_or(row, |(before, _)| before);
+        let (names, value) = match declaration.rsplit_once(' ') {
+            Some((names, value)) if value.starts_with(['<', '[']) => {
+                let metavar = if let Some(value) = value.strip_prefix('<') {
+                    value.strip_suffix('>')?
+                } else {
+                    value.strip_prefix('[')?.strip_suffix(']')?
+                };
+                if !metavar.split('|').all(|part| {
+                    let word = part.strip_suffix("...").unwrap_or(part);
+                    word.starts_with(|c: char| c.is_ascii_alphanumeric())
+                        && word
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+                }) {
+                    return None;
+                }
+                (names, value)
+            }
+            _ => (declaration, ""),
+        };
+        if names
+            .split(", ")
+            .filter(|name| FLAGS.contains(name) || matches!(*name, "--bare" | "--print"))
+            .count()
+            > 1
+        {
+            return None;
+        }
+        for name in names.split(", ") {
+            let valid = if let Some(long) = name.strip_prefix("--") {
+                long.starts_with(|c: char| c.is_ascii_alphanumeric())
+                    && long.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            } else {
+                matches!(name.as_bytes(), [b'-', short] if short.is_ascii_alphanumeric())
+            };
+            if !valid || rows.insert(name, value).is_some() {
+                return None;
+            }
+        }
+    }
+    Some(rows)
 }
 
 pub(crate) fn supports(report: &RuntimeCapabilities, flag: &str) -> bool {
@@ -179,6 +255,80 @@ pub(crate) fn supports(report: &RuntimeCapabilities, flag: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refuses_unproven_policy_help_without_hidden_validation() {
+        let valid =
+            "Usage: claude [options] [command] [prompt]\nOptions:\n  --bare\n  -p, --print\n";
+        let cases = [
+            (
+                "subcommand usage",
+                "Usage: claude inspect [options]\n\nOptions:\n  --json-schema <schema>  inspect option\n".into(),
+                "",
+            ),
+            (
+                "malformed metavar",
+                format!("{valid}  --max-turns <>x>  broken declaration\n"),
+                "",
+            ),
+            (
+                "conflicting help pages",
+                "Usage: claude [options]\nOptions:\n  --resume <id>  resume\n\nUsage: claude [options]\nOptions:\n  --resume  interactive switch\n".into(),
+                "",
+            ),
+            (
+                "second Options section",
+                format!("{valid}  --json-schema <schema>\n\nOptions:\n  --json-schema\n"),
+                "",
+            ),
+            (
+                "cross-stream section",
+                format!("{valid}  --json-schema <schema>\n"),
+                "Options:\n  --json-schema\n",
+            ),
+            (
+                "cross-stream help page",
+                format!("{valid}  --json-schema <schema>\n"),
+                "Usage: claude inspect [options]\nOptions:\n  --resume [id]\n",
+            ),
+            (
+                "duplicate alias",
+                format!("{valid}  -r, --resume [id]\n  --resume <id>\n  --json-schema <schema>\n"),
+                "",
+            ),
+            (
+                "malformed option declaration",
+                format!("{valid}  --max-turns=<n>\n  --json-schema <schema>\n"),
+                "",
+            ),
+            (
+                "second Options section after commands",
+                format!("{valid}  --resume [id]\n\nCommands:\n  inspect\n\nOptions:\n  --resume\n"),
+                "",
+            ),
+            (
+                "distinct policies declared as aliases",
+                format!("{valid}  --resume, --max-turns <id>\n"),
+                "",
+            ),
+        ];
+        let mut unexpected = Vec::new();
+        for (label, stdout, stderr) in cases {
+            let mut validated = false;
+            let entries = policy_entries(stdout.as_bytes(), stderr.as_bytes(), || {
+                validated = true;
+                true
+            });
+            if validated
+                || entries
+                    .iter()
+                    .any(|(_, status)| *status != CapabilityStatus::Unknown)
+            {
+                unexpected.push((label, validated, entries));
+            }
+        }
+        assert!(unexpected.is_empty(), "{unexpected:?}");
+    }
 
     #[test]
     fn missing_ambiguous_or_prose_flags_never_admit_policy() {
