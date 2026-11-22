@@ -747,6 +747,75 @@ printf '%s\n' "$@" > argv
 }
 
 #[test]
+fn invalid_hidden_turn_evidence_never_starts_the_task() {
+    let expected = "error: option '--max-turns <turns>' argument 'receipts-invalid' is invalid. must be a number";
+    for (label, response) in [
+        ("unknown flag", "exit 1".to_owned()),
+        (
+            "wrong exit",
+            format!("printf '%s\\n' \"{expected}\" >&2; exit 0"),
+        ),
+        (
+            "wrong stream",
+            format!("printf '%s\\n' \"{expected}\"; exit 1"),
+        ),
+        (
+            "ambiguous",
+            format!("printf '%s\\n' \"{expected}\" \"{expected}\" >&2; exit 1"),
+        ),
+        (
+            "truncated",
+            format!(
+                "printf '%s\\n' \"{expected}\" >&2; /usr/bin/head -c {} /dev/zero >&2; exit 1",
+                receipts_workspace_execution::execution::STREAM_CAPTURE_LIMIT_BYTES + 1,
+            ),
+        ),
+        (
+            "timeout",
+            format!("printf '%s\\n' \"{expected}\" >&2; /bin/sleep 4; exit 1"),
+        ),
+        (
+            "changed executable",
+            format!("printf '# changed\\n' >> \"$0\"; printf '%s\\n' \"{expected}\" >&2; exit 1"),
+        ),
+    ] {
+        let f = Fixture::new("", "");
+        fs::write(&f.executable, format!(r#"#!/bin/sh
+if [ "$1" = --help ]; then
+  printf 'Usage: claude\nOptions:\n  --bare  minimal\n  -p, --print  print\n  --json-schema <schema>  schema\n'
+  exit 0
+fi
+if [ "$#" = 4 ] && [ "$1" = --bare ] && [ "$2" = --print ] && [ "$3" = --help ] && [ "$4" = --max-turns=receipts-invalid ]; then
+  if read -r entry; then exit 9; fi
+  printf '%s\n' probe > probe
+  {response}
+fi
+printf '%s\n' worker > worker
+"#)).unwrap();
+        let mut p = policy(false);
+        p.timeout =
+            ProcessTimeoutPolicy::new(Duration::from_secs(2), Duration::from_millis(100)).unwrap();
+        p.turn_budget = Some(2);
+        p.structured_output_schema = Some("{\"type\":\"object\"}".into());
+        assert!(
+            matches!(
+                f.adapter().start(&f.task(), &f.workspace, &p),
+                Err(FailureClass::PolicyBlocked)
+            ),
+            "{label}"
+        );
+        assert!(
+            f.workspace.worktree_path().join("probe").is_file(),
+            "{label}"
+        );
+        assert!(
+            !f.workspace.worktree_path().join("worker").exists(),
+            "{label}"
+        );
+    }
+}
+
+#[test]
 fn policy_controls_resume_tickets_and_reviewer_refusal() {
     let f = Fixture::new(
         "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\",\"session_id\":\"12345678-1234-1234-1234-123456789abc\"}\n",

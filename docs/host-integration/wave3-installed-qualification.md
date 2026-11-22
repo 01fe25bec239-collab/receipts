@@ -19,10 +19,21 @@ Do not run a provider turn during preparation.
 
 ## Credential-free preparation
 
-Build `cargo build --locked -p receipts-cli --bin receipts` and canonicalize
-its binary path. Record source SHA/tree, OS, UTC, CLI version, executable hash,
-and hashes of the three installed plugin files named by enrollment. Inspect
-`codex --help`, `codex login --help`, plugin add/remove and marketplace
+Build the optimized observer with
+`cargo build --release --locked -p receipts-cli --bin receipts`. Set
+`RECEIPTS_BIN` to the canonical path of that release binary. Record the build
+profile, source SHA/tree, OS, UTC, CLI version, executable hash, and hashes of
+the three installed plugin files named by enrollment.
+
+Codex 0.169.0 gives each
+[SessionEnd hook a maximum of three seconds](https://github.com/openai/codex/blob/rust-v0.169.0/codex-rs/hooks/src/events/session_end.rs).
+Observer startup and validation must fit inside that hook budget. On the
+recorded ARM64 guest, enrollment against the same large Codex executable took
+2.542s with the debug observer and 0.177s with the release observer. Use the
+release profile for the installed witness and require its native SessionEnd
+event within the host's existing budget.
+
+Inspect `codex --help`, `codex login --help`, plugin add/remove and marketplace
 add/remove help using this installed version. No login/status/config/cache
 inspection is needed to prepare. Stop on incompatible help or plugin format.
 

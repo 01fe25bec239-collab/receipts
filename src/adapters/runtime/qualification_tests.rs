@@ -195,6 +195,26 @@ fn claude_cases(exe: &Path, evidence: &Path, env: ChildEnvPolicy) -> bool {
     cleanup && outcomes.len() == 3 && outcomes.iter().all(|(_, ok)| *ok)
 }
 
+fn collect_claude_case(
+    adapter: &ClaudeAdapter,
+    evidence: &Path,
+    name: &str,
+    started: Result<ClaudeAttemptHandle, FailureClass>,
+) -> Option<ClaudeAttemptResult> {
+    let failure = |stage, class: FailureClass| {
+        eprintln!("case={name} stage={stage} failure={}", class.as_str());
+    };
+    let handle = started.map_err(|class| failure("start", class)).ok()?;
+    let result = adapter
+        .collect_result(&handle)
+        .map_err(|class| failure("collect", class))
+        .ok()?;
+    capture(evidence, name, result.outcome.process())
+        .map_err(|error| eprintln!("case={name} stage=capture failure={:?}", error.kind()))
+        .ok()?;
+    Some(result)
+}
+
 fn run_claude_cases(
     f: &Fixture,
     a: &ClaudeAdapter,
@@ -204,13 +224,9 @@ fn run_claude_cases(
     // Plan mode is ordinary and reduced isolation; ask for a harmless read-only answer.
     let task = f.task_with_objective("Reply with exactly OK. Do not run commands or change files.");
     let p = policy(true);
-    let plan = a
-        .start(&task, &f.workspace, &p)
-        .and_then(|h| a.collect_result(&h));
-    let ok = plan.as_ref().is_ok_and(|r| {
-        capture(evidence, "claude-plan", r.outcome.process()).is_ok()
-            && claude_value(r, false, "OK")
-    }) && unchanged(f.workspace.worktree_path(), f.workspace.base_sha().as_str());
+    let plan = collect_claude_case(a, evidence, "claude-plan", a.start(&task, &f.workspace, &p));
+    let ok = plan.as_ref().is_some_and(|r| claude_value(r, false, "OK"))
+        && unchanged(f.workspace.worktree_path(), f.workspace.base_sha().as_str());
     outcomes.push(("claude-plan", ok));
     if !ok {
         return;
@@ -218,13 +234,14 @@ fn run_claude_cases(
     let mut p = policy(false);
     p.turn_budget = Some(2);
     p.structured_output_schema = Some(SCHEMA.into());
-    let schema = a
-        .start(&task, &f.workspace, &p)
-        .and_then(|h| a.collect_result(&h));
-    let ok = schema.as_ref().is_ok_and(|r| {
-        capture(evidence, "claude-schema-turns", r.outcome.process()).is_ok()
-            && claude_value(r, true, "")
-    }) && unchanged(f.workspace.worktree_path(), f.workspace.base_sha().as_str());
+    let schema = collect_claude_case(
+        a,
+        evidence,
+        "claude-schema-turns",
+        a.start(&task, &f.workspace, &p),
+    );
+    let ok = schema.as_ref().is_some_and(|r| claude_value(r, true, ""))
+        && unchanged(f.workspace.worktree_path(), f.workspace.base_sha().as_str());
     outcomes.push(("claude-schema-turns", ok));
     if !ok {
         return;
@@ -232,31 +249,36 @@ fn run_claude_cases(
     let task = f.task_with_objective("In this session, on your first response reply exactly FIRST. If this same request is resumed, reply exactly SECOND. Do not change files or run commands.");
     let mut p = policy(false);
     p.session_persistence = true;
-    let initial = a
-        .start(&task, &f.workspace, &p)
-        .and_then(|h| a.collect_result(&h));
+    let initial = collect_claude_case(
+        a,
+        evidence,
+        "claude-resume-first",
+        a.start(&task, &f.workspace, &p),
+    );
     let mut resume_ok = false;
-    if let Ok(r) = initial.as_ref() {
-        let saved = capture(evidence, "claude-resume-first", r.outcome.process()).is_ok();
-        if let Some(ticket) = r.resume_ticket() {
-            let mut refused = p.clone();
-            refused.read_only = true;
-            let refused = matches!(
-                a.resume_with_policy(&task, &f.workspace, &refused, ticket),
-                Err(FailureClass::PolicyBlocked)
+    if let Some(r) = initial.as_ref()
+        && let Some(ticket) = r.resume_ticket()
+    {
+        let mut refused = p.clone();
+        refused.read_only = true;
+        let refused = matches!(
+            a.resume_with_policy(&task, &f.workspace, &refused, ticket),
+            Err(FailureClass::PolicyBlocked)
+        );
+        if refused && claude_value(r, false, "FIRST") {
+            let resumed = collect_claude_case(
+                a,
+                evidence,
+                "claude-resume-second",
+                a.resume_with_policy(&task, &f.workspace, &p, ticket),
             );
-            if saved && refused && claude_value(r, false, "FIRST") {
-                let resumed = a
-                    .resume_with_policy(&task, &f.workspace, &p, ticket)
-                    .and_then(|h| a.collect_result(&h));
-                resume_ok = resumed.as_ref().is_ok_and(|r| {
-                    capture(evidence, "claude-resume-second", r.outcome.process()).is_ok()
-                        && claude_value(r, false, "SECOND")
-                }) && matches!(
+            resume_ok = resumed
+                .as_ref()
+                .is_some_and(|r| claude_value(r, false, "SECOND"))
+                && matches!(
                     a.resume_with_policy(&task, &f.workspace, &p, ticket),
                     Err(FailureClass::PolicyBlocked)
                 );
-            }
         }
     }
     resume_ok &= unchanged(f.workspace.worktree_path(), f.workspace.base_sha().as_str());
@@ -479,7 +501,7 @@ fn synthetic_claude_cases_and_failure_are_bounded() {
     let exe = root.join("claude");
     let script = r##"
 if [ "$1" = --help ]; then
-  printf 'Usage: claude\nOptions:\n  --max-turns <n>  limit\n  --resume <id>  resume\n  --json-schema <schema>  schema\n'
+  printf 'Usage: claude\nOptions:\n  --bare  minimal\n  -p, --print  print\n  --max-turns <n>  limit\n  -r, --resume [value]  resume\n  --json-schema <schema>  schema\n'
   exit 0
 fi
 mode=plan
@@ -488,28 +510,63 @@ for arg in "$@"; do
 done
 /bin/cat >/dev/null
 case "$mode" in
-  schema) printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"ok","structured_output":{"answer":"OK"},"num_turns":1}';;
+  schema) case " $* " in *" --max-turns 2 "*) :;; *) exit 8;; esac
+          printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"ok","structured_output":{"answer":"OK"},"num_turns":1}';;
   resume) printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"SECOND"}';;
   *) case " $* " in *" --no-session-persistence "*) text=OK;; *) text=FIRST;; esac
      printf '{"type":"result","subtype":"success","is_error":false,"result":"%s","session_id":"12345678-1234-1234-1234-123456789abc"}\n' "$text";;
 esac
 "##;
-    for (selection, expected_key) in [
-        (None, "claude-sentinel"),
-        (Some("api-key"), "claude-sentinel"),
-        (Some("subscription"), "absent"),
+    for (case, selection, expected_key, validation) in [
+        ("default", None, "claude-sentinel", None),
+        ("api-key", Some("api-key"), "claude-sentinel", None),
+        ("subscription", Some("subscription"), "absent", None),
+        (
+            "hidden-turn-cap",
+            Some("subscription"),
+            "absent",
+            Some(true),
+        ),
+        (
+            "unproven-turn-cap",
+            Some("subscription"),
+            "absent",
+            Some(false),
+        ),
     ] {
+        let case_script = match validation {
+            None => script.to_owned(),
+            Some(recognized) => {
+                let help = script.replace(
+                    r"  --max-turns <n>  limit\n",
+                    r"  --background  Background a session\n               --resume <id> in the background\n",
+                );
+                let response = if recognized {
+                    r#"printf "%s\n" "error: option '--max-turns <turns>' argument 'receipts-invalid' is invalid. must be a number" >&2; exit 1"#
+                } else {
+                    r#"printf 'Usage: claude\nOptions:\n  --bare  minimal\n'; exit 0"#
+                };
+                format!(
+                    r#"if [ "$1" = --bare ]; then
+  [ "$#" = 4 ] && [ "$2" = --print ] && [ "$3" = --help ] && [ "$4" = --max-turns=receipts-invalid ] || exit 9
+  if read -r entry; then exit 9; fi
+  {response}
+fi
+{help}"#
+                )
+            }
+        };
         fs::write(
             &exe,
             format!(
                 "#!/bin/sh\n[ \"${{ANTHROPIC_API_KEY-absent}}\" = '{expected_key}' ] && \
                  [ -z \"${{OPENAI_API_KEY+x}}${{CODEX_HOME+x}}\" ] && \
-                 [ \"${{CLAUDE_CONFIG_DIR-absent}}\" = 'claude-config' ] || exit 9\n{script}"
+                 [ \"${{CLAUDE_CONFIG_DIR-absent}}\" = 'claude-config' ] || exit 9\n{case_script}"
             ),
         )
         .unwrap();
         fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
-        let good = root.join(selection.unwrap_or("default"));
+        let good = root.join(case);
         fs::create_dir(&good).unwrap();
         fs::set_permissions(&good, fs::Permissions::from_mode(0o700)).unwrap();
         let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
@@ -525,11 +582,32 @@ esac
                 "qualification_tests::live_claude_qualification",
                 "--ignored",
                 "--exact",
+                "--nocapture",
             ]);
         if let Some(selection) = selection {
             cmd.env(AUTH_MODE, selection);
         }
         let out = cmd.output().unwrap();
+        if validation == Some(false) {
+            assert!(!out.status.success());
+            assert!(
+                fs::read_to_string(good.join("claude-plan.summary"))
+                    .unwrap()
+                    .contains("verdict=PASS cleanup=true")
+            );
+            assert!(
+                fs::read_to_string(good.join("claude-schema-turns.summary"))
+                    .unwrap()
+                    .contains("verdict=FAIL cleanup=true")
+            );
+            assert!(!good.join("claude-schema-turns.process").exists());
+            assert!(!good.join("claude-resume.summary").exists());
+            assert!(
+                String::from_utf8_lossy(&out.stderr)
+                    .contains("case=claude-schema-turns stage=start failure=POLICY_BLOCKED")
+            );
+            continue;
+        }
         assert!(
             out.status.success(),
             "synthetic Claude {selection:?}: {out:?}"
@@ -552,8 +630,8 @@ esac
 
     let limited = root.join("rate-limit");
     fs::create_dir(&limited).unwrap();
-    let rejected = r#"schema) printf '%s\n' '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected"}}'; printf"#;
-    let limited_script = script.replacen("schema) printf", rejected, 1);
+    let rejected = r#"schema) printf '%s\n' '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected"}}'; case"#;
+    let limited_script = script.replacen("schema) case", rejected, 1);
     fs::write(&exe, format!("#!/bin/sh\n{limited_script}")).unwrap();
     assert!(!claude_cases(&exe, &limited, env));
     assert!(
