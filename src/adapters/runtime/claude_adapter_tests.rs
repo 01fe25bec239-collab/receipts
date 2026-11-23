@@ -747,6 +747,75 @@ printf '%s\n' "$@" > argv
 }
 
 #[test]
+fn invalid_hidden_turn_evidence_never_starts_the_task() {
+    let expected = "error: option '--max-turns <turns>' argument 'receipts-invalid' is invalid. must be a number";
+    for (label, response) in [
+        ("unknown flag", "exit 1".to_owned()),
+        (
+            "wrong exit",
+            format!("printf '%s\\n' \"{expected}\" >&2; exit 0"),
+        ),
+        (
+            "wrong stream",
+            format!("printf '%s\\n' \"{expected}\"; exit 1"),
+        ),
+        (
+            "ambiguous",
+            format!("printf '%s\\n' \"{expected}\" \"{expected}\" >&2; exit 1"),
+        ),
+        (
+            "truncated",
+            format!(
+                "printf '%s\\n' \"{expected}\" >&2; /usr/bin/head -c {} /dev/zero >&2; exit 1",
+                receipts_workspace_execution::execution::STREAM_CAPTURE_LIMIT_BYTES + 1,
+            ),
+        ),
+        (
+            "timeout",
+            format!("printf '%s\\n' \"{expected}\" >&2; /bin/sleep 4; exit 1"),
+        ),
+        (
+            "changed executable",
+            format!("printf '# changed\\n' >> \"$0\"; printf '%s\\n' \"{expected}\" >&2; exit 1"),
+        ),
+    ] {
+        let f = Fixture::new("", "");
+        fs::write(&f.executable, format!(r#"#!/bin/sh
+if [ "$1" = --help ]; then
+  printf 'Usage: claude\nOptions:\n  --bare  minimal\n  -p, --print  print\n  --json-schema <schema>  schema\n'
+  exit 0
+fi
+if [ "$#" = 4 ] && [ "$1" = --bare ] && [ "$2" = --print ] && [ "$3" = --help ] && [ "$4" = --max-turns=receipts-invalid ]; then
+  if read -r entry; then exit 9; fi
+  printf '%s\n' probe > probe
+  {response}
+fi
+printf '%s\n' worker > worker
+"#)).unwrap();
+        let mut p = policy(false);
+        p.timeout =
+            ProcessTimeoutPolicy::new(Duration::from_secs(2), Duration::from_millis(100)).unwrap();
+        p.turn_budget = Some(2);
+        p.structured_output_schema = Some("{\"type\":\"object\"}".into());
+        assert!(
+            matches!(
+                f.adapter().start(&f.task(), &f.workspace, &p),
+                Err(FailureClass::PolicyBlocked)
+            ),
+            "{label}"
+        );
+        assert!(
+            f.workspace.worktree_path().join("probe").is_file(),
+            "{label}"
+        );
+        assert!(
+            !f.workspace.worktree_path().join("worker").exists(),
+            "{label}"
+        );
+    }
+}
+
+#[test]
 fn policy_controls_resume_tickets_and_reviewer_refusal() {
     let f = Fixture::new(
         "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\",\"session_id\":\"12345678-1234-1234-1234-123456789abc\"}\n",
@@ -908,6 +977,67 @@ fn native_turn_cap_and_conformance_refusal_controls() {
         || !fresh.workspace.worktree_path().join("pid").exists(),
     ));
     assert!(report.passed(), "{report:?}");
+}
+
+#[test]
+fn unproven_policy_help_never_starts_worker_or_hidden_probe() {
+    let mut admitted = Vec::new();
+    for (label, help) in [
+        (
+            "schema",
+            r"Usage: claude inspect [options]\nOptions:\n  --json-schema <schema>\n",
+        ),
+        (
+            "turns",
+            r"Usage: claude [options]\nOptions:\n  --bare\n  --print\n  --max-turns <>x>\n",
+        ),
+        (
+            "resume",
+            r"Usage: claude [options]\nOptions:\n  --resume <id>\n\nUsage: claude [options]\nOptions:\n  --resume\n",
+        ),
+        (
+            "resume continuation",
+            r"Usage: claude [options]\nOptions:\n   --resume\n  --resume [id]\n",
+        ),
+        (
+            "turns continuation",
+            r"Usage: claude [options]\nOptions:\n   --max-turns <>x>\n  --bare\n  -p, --print\n",
+        ),
+    ] {
+        let f = Fixture::new("", "");
+        fs::write(
+            &f.executable,
+            format!(
+                r#"#!/bin/sh
+case "$1" in
+  --help) printf '%b' '{help}'; exit 0;;
+  --bare)
+    : > hidden
+    printf '%s\n' "error: option '--max-turns <turns>' argument 'receipts-invalid' is invalid. must be a number" >&2
+    exit 1;;
+esac
+: > worker
+/bin/cat >/dev/null
+"#
+            ),
+        )
+        .unwrap();
+        let mut p = policy(false);
+        p.turn_budget = label.starts_with("turns").then_some(2);
+        p.session_persistence = label.starts_with("resume");
+        p.structured_output_schema = (label == "schema").then(|| r#"{"type":"object"}"#.into());
+        let refused = matches!(
+            f.adapter().start(&f.task(), &f.workspace, &p),
+            Err(FailureClass::PolicyBlocked)
+        );
+        if !refused
+            || f.workspace.worktree_path().join("worker").exists()
+            || f.workspace.worktree_path().join("hidden").exists()
+        {
+            admitted.push(label);
+        }
+    }
+    assert!(admitted.is_empty(), "{admitted:?}");
 }
 
 #[test]

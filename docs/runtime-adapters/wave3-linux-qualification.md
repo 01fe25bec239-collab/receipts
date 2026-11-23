@@ -101,12 +101,14 @@ run. Stop on rate limits and preserve the first outcome.
   AppArmor allowance. Compare that effective policy and binary separately
   before using it. A downloaded release Bubblewrap archive has its own pin.
   Previous guest launch paths and settings may have been removed.
-- Claude Code `2.1.322` is the prior macOS observation and a candidate
-  version. A1 must pin the official Linux ARM64 artifact's release provenance,
-  manifest digest and verified binary SHA-256 (and any resolved helpers) before
-  authorizing live Claude. No Linux Claude artifact or authenticated install is
-  attested here. An admitted x86_64 run likewise needs separate official
-  x86_64 pins.
+- The recorded Claude Code `2.1.322` Linux ARM64 executable has SHA-256
+  `f220ca50ea4f3222043ff83cc224a1262e0196e9897acc0871efa94235b0c1fd`. Its
+  [official release manifest](https://downloads.claude.ai/claude-code-releases/2.1.322/manifest.json)
+  has SHA-256 `05d2eff648bb528c1479c719bb8eca9a759657631e285d03aaf37fe779173f1c`.
+  Verify those identities and the resolved executable and any launcher for the
+  next authorized run. Keep the launch path stable throughout the run and bind
+  any launcher to the pinned CLI and its unmodified argv. An admitted x86_64
+  run needs separate official x86_64 pins.
 
 | Codex ARM64 reference | SHA-256 |
 | --- | --- |
@@ -235,7 +237,23 @@ command sequence. Preserve the output and review it before any further runs.
 
 Record Claude plan, schema/turn limit (exact schema and 1–2 turns) and
 FIRST/SECOND resume separately. The resume case also requires read-only and
-used-ticket refusal. Claude results carry `protected=false` and
+used-ticket refusal. The `2.1.322` help omits the documented `--max-turns` and
+mentions `--resume` in wrapped descriptions. A complete help capture supplies
+the option declarations. For a hidden turn cap, the adapter requires the
+expected numeric-validation error from a bounded help request with a fixed
+invalid option value and closed stdin. That request carries no prompt. An
+unproven option remains Unknown and a policy that requires it is refused.
+This establishes capability-probe evidence. The live schema and turn result
+and the live resume result need their own evidence.
+
+For a failed case, the private harness log records a fixed `start`, `collect`
+or `capture` stage and a failure category when available. For example,
+`case=claude-schema-turns stage=start failure=POLICY_BLOCKED` records a refusal
+before the adapter returned a handle. Preserve this with the case summary
+and any available bounded capture. These diagnostic lines carry no payloads
+or credentials.
+
+Claude results carry `protected=false` and
 `reduced_isolation=true`; they do not prove denial of reviewer writes.
 Require complete captures and unchanged tracked bytes, HEAD and Git status.
 Record CLI exit and protocol facts, cancel acceptance/reason, first event
